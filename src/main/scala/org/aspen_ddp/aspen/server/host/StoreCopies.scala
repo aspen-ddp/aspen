@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceState
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.DurableFiles
+import org.aspen_ddp.aspen.server.{DurableFiles, FileStat}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.Backend
@@ -54,49 +54,61 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
     val storePath = local.devicePath / storeId.directoryName
     if retiring.contains(storeId) then
       Future.successful(false)
-    else if !os.exists(storePath) then
-      Future.successful(true)
     else
-      retiring += storeId
-      val dropped =
-        try
-          if !os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
-            ctx.writeRebuildRequiredMarker(storePath)
-          val lostState = storePath / RebuildingStore.LostCrlStateFile
-          val saveFile = Backend.crlSaveFile(storePath)
-          val saved =
-            if os.exists(lostState) then
-              Future.unit
-            else if os.exists(saveFile) then
-              // The device CRL may hold the state too (a crash between the save file and its entries' deletion), and
-              // the file may be what was found unusable: those entries are kept beside it, durably before the move
-              val entries = storePath / RebuildingStore.LostCrlEntriesFile
-              local.crl.readStoreState(storeId).map: trs =>
-                if !trs.isEmpty && !os.exists(entries) then
-                  CrashRecoveryLog.saveStoreState(storeId, trs, entries)
-                DurableFiles.move(saveFile, lostState)
-            else
-              local.crl.readStoreState(storeId).map(trs => CrashRecoveryLog.saveStoreState(storeId, trs, lostState))
-          saved.flatMap(_ => local.crl.dropStore(storeId))
-        catch case NonFatal(t) => Future.failed(t)
-      dropped.transform: result =>
-        retiring -= storeId
-        result match
-          case Failure(t) =>
-            logger.error(s"Failed to save and drop the CRL state of store $storeId before retiring its copy at " +
-                         s"$storePath. Retrying at a later check. Error: $t")
-            Success(false)
-          case Success(_) =>
-            local.admission.releaseRetained(storeId)
-            // A device unloaded meanwhile is retired by whichever load of it comes next
-            Success(ctx.devices.devices.get(local.storageDeviceId).exists(_ eq local) &&
-                    moveToPendingDelete(local, storeId))
+      // A stat that fails is no absence (FileStat): the retire fails, to be retried, rather than report a clear path
+      val present =
+        try Success(FileStat.exists(storePath))
+        catch case NonFatal(t) => Failure(t)
+      present match
+        case Failure(t) =>
+          logger.error(s"Failed to tell whether a copy of store $storeId is at $storePath. Retrying at a later " +
+                       s"check. Error: $t")
+          Future.successful(false)
+        case Success(false) => Future.successful(true)
+        case Success(true) => retirePresent(local, storeId, storePath)
+
+  /** retire's steps for a copy known to be at `storePath` */
+  private def retirePresent(local: LocalStorageDeviceState, storeId: StoreId, storePath: os.Path): Future[Boolean] =
+    retiring += storeId
+    val dropped =
+      try
+        if !FileStat.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
+          ctx.writeRebuildRequiredMarker(storePath)
+        val lostState = storePath / RebuildingStore.LostCrlStateFile
+        val saveFile = Backend.crlSaveFile(storePath)
+        val saved =
+          if FileStat.exists(lostState) then
+            Future.unit
+          else if FileStat.exists(saveFile) then
+            // The device CRL may hold the state too (a crash between the save file and its entries' deletion), and
+            // the file may be what was found unusable: those entries are kept beside it, durably before the move
+            val entries = storePath / RebuildingStore.LostCrlEntriesFile
+            local.crl.readStoreState(storeId).map: trs =>
+              if !trs.isEmpty && !FileStat.exists(entries) then
+                CrashRecoveryLog.saveStoreState(storeId, trs, entries)
+              DurableFiles.move(saveFile, lostState)
+          else
+            local.crl.readStoreState(storeId).map(trs => CrashRecoveryLog.saveStoreState(storeId, trs, lostState))
+        saved.flatMap(_ => local.crl.dropStore(storeId))
+      catch case NonFatal(t) => Future.failed(t)
+    dropped.transform: result =>
+      retiring -= storeId
+      result match
+        case Failure(t) =>
+          logger.error(s"Failed to save and drop the CRL state of store $storeId before retiring its copy at " +
+                       s"$storePath. Retrying at a later check. Error: $t")
+          Success(false)
+        case Success(_) =>
+          local.admission.releaseRetained(storeId)
+          // A device unloaded meanwhile is retired by whichever load of it comes next
+          Success(ctx.devices.devices.get(local.storageDeviceId).exists(_ eq local) &&
+                  moveToPendingDelete(local, storeId))
 
   /** Step 4 of retire. Returns whether the path is clear. */
   private def moveToPendingDelete(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
     val storePath = local.devicePath / storeId.directoryName
     try
-      if os.exists(storePath) then
+      if FileStat.exists(storePath) then
         val pendingDir = StoreCopies.ensureDirectory(local.devicePath, RebuildingStore.PendingDeleteDirectory)
         val target = pendingDir / StoreCopies.pendingDeleteName(storeId)
         logger.warn(s"Retiring the copy of store $storeId at $storePath to $target. It is deleted once the store " +

@@ -99,7 +99,7 @@ class FsifInitializationSuite extends FileBasedTests:
     an[FsifRecovery.StoreLost] should be thrownBy FsifBackend.open(storeId, dir, layout, io, _ => ())
     os.exists(dir) shouldBe false
 
-  test("a directory whose FSIF files are all absent or empty is lost, and nothing is written (SL X14)"):
+  test("a directory whose FSIF files are all absent or empty is lost, and nothing is written (SL D5)"):
     val dir = tdir / "store"
     os.makeDir.all(dir)
     // A store whose FSIF files were lost or emptied (an incomplete restore): its config is all that is left

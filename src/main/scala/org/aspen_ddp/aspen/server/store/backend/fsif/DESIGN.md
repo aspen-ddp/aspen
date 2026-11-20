@@ -612,7 +612,8 @@ host after an upgrade, loses the whole pool, because the peers the rebuild needs
 away. This cannot be solved inside the backend: each store sees only its own files. See the `Backlog.txt` item
 "System-level protection against correlated 'lost store' declarations".
 
-Every case below runs without an operator. Line numbers are as of now; host code is named by class and method.
+Every case below runs without an operator. Code is named by class and method; a recovery check is located by its
+step in `FsifRecovery.recover` (the numbered step comments) and the `StoreLost` message it throws.
 
 ### 4.1 Detected by FSIF recovery (`FsifRecovery.StoreLost`)
 
@@ -621,26 +622,26 @@ for each: `StoreLoader.handleBackendOpened` logs, leaves the store offline, writ
 (`StoreRebuilds.markRebuildRequired`), and calls `DeviceReconciler.checkStorageDevice`. The `rebuild-required` marker is acted on as
 described in 4.5. A plain `IOException` from the open is not a loss (4.6).
 
-| # | Trigger | Where (`store/backend/fsif/FsifRecovery.scala:recover` unless noted) | Why it is believed to mean loss | What a false trigger from a systemic bug looks like |
+| # | Trigger | Where (`FsifRecovery.recover` unless noted) | Why it is believed to mean loss | What a false trigger from a systemic bug looks like |
 |---|---|---|---|---|
 | L0 | The store directory is missing, or every FSIF file is absent or empty | `FsifBackend.open` | A store directory appears at its path only complete, by StoreCreation's rename, so its files were lost (an incomplete restore or mount, a wiped directory) | A code path that makes a store directory outside StoreCreation (a new create path, a test helper copied into production), or a transfer or rebuild that moves a directory before its files are written |
-| L1 | Neither index file is valid (size, magic, CRC, or a slot < -1) | :168 | `initialize` writes index.a last, before the store is renamed into place, and a checkpoint empties index s only after index s+1 is forced. So a store always has one valid index unless something damaged it | An index size or CRC computation that changes with the code: e.g. a change to `IndexFile.EntrySize` or `sizeFor`, or a `segmentCount` read differently from the pool config. Every store would fail on first open after the upgrade |
-| L2 | An index or journal file is larger than `MaxLoadSize` (`Int.MaxValue - 16`) bytes | `load`, :112 | Not reachable from a state the backend produced. The index is at most `IndexFile.sizeFor(MaxSegmentCount)`. The active journal is at most `journalLengthBound` (1 GiB by default), because operations past `journalHardLimit` are held, frozen or not (2.9); a stale journal is one that was active | A bug in admission: a write path that appends without being admitted or covered by headroom, an `appendBound` that undercounts (a new record type or field), or a writer whose batches outgrow their records. The journal would then grow past the limit only on stores that keep taking writes while checkpoints cannot finish, e.g. a long freeze |
-| L3 | A journal with a valid scan has seq > m + 1 | :179 | A journal s+1 header is written only while index s is the newest, so s+2 cannot exist | Seq arithmetic off by one in the checkpoint switch or in step 5's finish; a misread of the header seq |
-| L4 | A journal is `Scan.Corrupt` and is not a stale journal (a valid header with seq < m). Corrupt means: (a) invalid header on a file longer than 28 bytes; (b) a CRC-valid batch whose records do not parse (`parseRecords` / `parseRecord`, `JournalFormat.scala` :121-169); (c) an invalid batch followed later by a CRC-valid batch numbered n+1 (`findLater`, :200) | :182-185; `JournalFormat.scan` | (a) the header rewrite forces after truncate(0); (b) the batch CRC covers the records; (c) batches are written strictly in sequence, so only the last can be torn, and the salt keeps user data from posing as a batch | (b) is the most dangerous: any change to the record encoding (a new record type, a `SegmentHeader` layout or type-byte change, a stricter parse check) makes **every** CRC-valid journal "corrupt" after an upgrade. (c) would fire on every store if the writer reused batch numbers, or if a retry path re-sent a batch at a different offset without truncating first |
-| L5 | No journal has seq m | :189 | Index m is written only after journal m's header is forced, and journal m is emptied only after index m+1 is forced | Step 5 or `finish` emptying the wrong journal; a journal naming scheme that changed |
-| L6 | Both journals have seq m | :190 | The header rewrite always targets the non-active journal | A checkpoint that writes header s+1 into the active file |
-| L7 | A Mapping or Delta carries an ext outside `[0, segmentCount)` (`Replay.InvalidRecord`) | `Replay.checkExt` (`Replay.scala`:13) via `replay`, :136 | Only a writer bug or corruption past the CRC produces one | A `segmentCount` that shrinks or is read from the wrong source at open: every store of the pool would fail on any record above the new count |
-| L8 | A kept Delta has sliceLength > segmentPayloadSize | :196-199 | `update` rejects such slices with `SliceTooLarge` | A `segmentPayloadSize` computed differently after an upgrade (e.g. from `forObjectSize` instead of the stored config) |
-| L9 | After replay, two exts map to one slot | :200-205 | Allocation marks the slot used, and freeing waits for the unmap to be durable | A bug in `tryFree` or `assign` that frees or double-assigns a slot; replay selection or Mapping order changed |
-| L10 | A kept Delta's slot, or a final mapped slot, is above `max(D0/stride, startTop+1) + mappings` | :206-219 | Lowest-free allocation makes each Mapping grow the slot count by at most one (3.6) | The highest-risk check. An allocator that skips a slot (e.g. a new reservation kind), a new write path that maps a slot not covered by `tailCows`, or a miscalculated bound would fire on every store after an upgrade, typically only on stores that had a crash with the right pattern in flight, which makes it look like scattered hardware loss |
-| L11 | After applying the kept Deltas and forcing, a mapped slot starts at or beyond the end of `data` | :230-236 | A mapped slot was either written in place (forced before index m+1) or its Delta was replayed now | A truncation that is too aggressive (compaction's `used` missing a mapped slot) that became durable; a `stride` change |
-| L12 | The computed slot count exceeds `Int.MaxValue` | :263-264 | Not reachable with a bounded data file | A `stride` computed as 0 or very small |
+| L1 | Neither index file is valid (size, magic, CRC, or a slot < -1) | step 1, "no valid index file" | `initialize` writes index.a last, before the store is renamed into place, and a checkpoint empties index s only after index s+1 is forced. So a store always has one valid index unless something damaged it | An index size or CRC computation that changes with the code: e.g. a change to `IndexFile.EntrySize` or `sizeFor`, or a `segmentCount` read differently from the pool config. Every store would fail on first open after the upgrade |
+| L2 | An index or journal file is larger than `MaxLoadSize` (`Int.MaxValue - 16`) bytes | `FsifRecovery.load`, "is too large to load" | Not reachable from a state the backend produced. The index is at most `IndexFile.sizeFor(MaxSegmentCount)`. The active journal is at most `journalLengthBound` (1 GiB by default), because operations past `journalHardLimit` are held, frozen or not (2.9); a stale journal is one that was active | A bug in admission: a write path that appends without being admitted or covered by headroom, an `appendBound` that undercounts (a new record type or field), or a writer whose batches outgrow their records. The journal would then grow past the limit only on stores that keep taking writes while checkpoints cannot finish, e.g. a long freeze |
+| L3 | A journal with a valid scan has seq > m + 1 | step 1, "has seq ... but the newest index has seq" | A journal s+1 header is written only while index s is the newest, so s+2 cannot exist | Seq arithmetic off by one in the checkpoint switch or in step 5's finish; a misread of the header seq |
+| L4 | A journal is `Scan.Corrupt` and is not a stale journal (a valid header with seq < m). Corrupt means: (a) invalid header on a file longer than 28 bytes; (b) a CRC-valid batch whose records do not parse (`JournalFormat.parseRecords` / `parseRecord`); (c) an invalid batch followed later by a CRC-valid batch numbered n+1 (`JournalFormat.findLater`) | step 1, "is corrupt"; `JournalFormat.scan` | (a) the header rewrite forces after truncate(0); (b) the batch CRC covers the records; (c) batches are written strictly in sequence, so only the last can be torn, and the salt keeps user data from posing as a batch | (b) is the most dangerous: any change to the record encoding (a new record type, a `SegmentHeader` layout or type-byte change, a stricter parse check) makes **every** CRC-valid journal "corrupt" after an upgrade. (c) would fire on every store if the writer reused batch numbers, or if a retry path re-sent a batch at a different offset without truncating first |
+| L5 | No journal has seq m | step 1, "no journal with seq" | Index m is written only after journal m's header is forced, and journal m is emptied only after index m+1 is forced | Step 5 or `finish` emptying the wrong journal; a journal naming scheme that changed |
+| L6 | Both journals have seq m | step 1, "both journals have seq" | The header rewrite always targets the non-active journal | A checkpoint that writes header s+1 into the active file |
+| L7 | A Mapping or Delta carries an ext outside `[0, segmentCount)` (`Replay.InvalidRecord`) | `Replay.checkExt` via `FsifRecovery.replay`, step 2, "invalid journal record" | Only a writer bug or corruption past the CRC produces one | A `segmentCount` that shrinks or is read from the wrong source at open: every store of the pool would fail on any record above the new count |
+| L8 | A kept Delta has sliceLength > segmentPayloadSize | step 2, "has slice length" | `update` rejects such slices with `SliceTooLarge` | A `segmentPayloadSize` computed differently after an upgrade (e.g. from `forObjectSize` instead of the stored config) |
+| L9 | After replay, two exts map to one slot | step 2, "is mapped by ext" | Allocation marks the slot used, and freeing waits for the unmap to be durable | A bug in `tryFree` or `assign` that frees or double-assigns a slot; replay selection or Mapping order changed |
+| L10 | A kept Delta's slot, or a final mapped slot, is above `max(D0/stride, startTop+1) + mappings` | step 2, `checkBound`, "beyond the reachable bound" | Lowest-free allocation makes each Mapping grow the slot count by at most one (3.6) | The highest-risk check. An allocator that skips a slot (e.g. a new reservation kind), a new write path that maps a slot not covered by `tailCows`, or a miscalculated bound would fire on every store after an upgrade, typically only on stores that had a crash with the right pattern in flight, which makes it look like scattered hardware loss |
+| L11 | After applying the kept Deltas and forcing, a mapped slot starts at or beyond the end of `data` | step 3, "beyond the data file" | A mapped slot was either written in place (forced before index m+1) or its Delta was replayed now | A truncation that is too aggressive (compaction's `used` missing a mapped slot) that became durable; a `stride` change |
+| L12 | The computed slot count exceeds `Int.MaxValue` | after step 5, "slot count ... is too large" | Not reachable with a bounded data file | A `stride` computed as 0 or very small |
 
 Related, for staging only: `RebuildingStore.openStaging` (`rebuild/RebuildingStore.scala`) opens the rebuild's
 staging store through the host's `BackendOpener` and catches `BackendStateLost`, which `StoreLost` extends. It
 deletes the staging directory and its checkpoint (`cleanupStaging`), so the next pass starts over. The live store is already Rebuilding, so this costs only
-rebuild progress. A recovery bug of the L1-L12 kind would make every rebuild restart from scratch forever.
+rebuild progress. A recovery bug of the L0-L12 kind would make every rebuild restart from scratch forever.
 
 ### 4.2 Detected at runtime by FSIF fail-stop (`onFatal`)
 
@@ -648,13 +649,13 @@ Every fail-stop calls `onFatal` once. The host's `onFatal` posts `BackendFailed`
 
 | # | Trigger | Where |
 |---|---|---|
-| L13 | A journal batch write or force fails with a non-ENOSPC error (including during an ENOSPC retry) | `FsifBackend.journalError`, :635 |
-| L14 | An in-place write fails with a non-ENOSPC error | `inPlaceDone`, :895-899 |
-| L15 | A data force fails with a non-ENOSPC error | `dataForceDone`, :966-968 |
-| L16 | A checkpoint step (open the other journal, header rewrite, index write, truncates) fails with a non-ENOSPC error | `checkpointIo`, :1215-1217 |
-| L17 | A copy-on-write segment write or force fails with a non-ENOSPC error | `cowWritten`, :1418-1420 |
-| L18 | Compaction: the move's raw read of slot t fails with **any** error; a move write or force fails with a non-ENOSPC error; the truncate of free tail slots fails with a non-ENOSPC error | `Compaction.copied` :152, `written` :221, `forced` :242; truncate via `guarded` :500-504 |
-| L19 | Any `NonFatal` exception escapes a serial task, checkpoint advance or compaction drive (an internal error), for example `allocateSlot`'s `IllegalStateException`, a rejected io task, or an NPE | `FsifBackend.guarded`, :484-505 |
+| L13 | A journal batch write or force fails with a non-ENOSPC error (including during an ENOSPC retry) | `FsifBackend.journalError` |
+| L14 | An in-place write fails with a non-ENOSPC error | `FsifBackend.inPlaceDone` |
+| L15 | A data force fails with a non-ENOSPC error | `FsifBackend.dataForceDone` |
+| L16 | A checkpoint step (open the other journal, header rewrite, index write, truncates) fails with a non-ENOSPC error | `FsifBackend.checkpointIo` |
+| L17 | A copy-on-write segment write or force fails with a non-ENOSPC error | `FsifBackend.cowWritten` |
+| L18 | Compaction: the move's raw read of slot t fails with **any** error; a move write or force fails with a non-ENOSPC error; the truncate of free tail slots fails with a non-ENOSPC error | `Compaction.copied`, `written`, `forced`; the truncate (`Compaction.truncate`) fails through `FsifBackend.guarded` |
+| L19 | Any `NonFatal` exception escapes a serial task, checkpoint advance or compaction drive (an internal error), for example `allocateSlot`'s `IllegalStateException`, a rejected io task, or an NPE | `FsifBackend.guarded` |
 
 **Why these are believed to mean loss.** After a write or fsync error other than ENOSPC, the page cache no longer
 says what is on disk, so the store's state cannot be trusted. The recovery a restart would run might well succeed,
@@ -701,8 +702,8 @@ counts as loss only at adoption (L21), where a transfer-out marker shows that a 
 
 ### 4.4 Count
 
-There are 22 automatic cases:
-- 12 found by FSIF recovery (L1-L12);
+There are 23 automatic cases:
+- 13 found at FSIF open (L0 by `FsifBackend.open`, L1-L12 by recovery);
 - 7 FSIF fail-stop sources (L13-L19), reaching the marker through the host routes listed in 4.2;
 - 3 generic host paths (L20-L22).
 
@@ -730,7 +731,7 @@ pools and hosts.
 
 These look like loss but never trigger a rebuild:
 
-- **Out of space at load** (`fsifOpened`, :1104-1123). The store is left offline and retried with backoff. A
+- **Out of space at load** (`StoreLoader.handleBackendOpened`). The store is left offline and retried with backoff. A
   failed create leaves nothing at the path and is created again by the next device check.
 - **Out of space at runtime.** ENOSPC or EDQUOT freezes writes (2.10). It is never fail-stop, including during
   retries. Only a non-ENOSPC error during a retry is fail-stop.
@@ -775,8 +776,8 @@ non-empty files and no valid index is lost and left untouched"; `StoreCreationSu
 the store path); `HostFsifLoadSuite` "an FSIF store whose files hold no valid index is marked for rebuild, not
 emptied", "a create that runs out of space leaves nothing at the store path, and the next device check serves it" and
 "a device load removes what a crashed create left in creating/, and never loads it". L0: `FsifInitializationSuite` "a
-missing directory is lost, ..." and "a directory whose FSIF files are all absent or empty is lost, ... (SL X14)";
-`HostFsifLoadSuite` "an FSIF store whose files are gone or empty is marked for rebuild, not served empty (SL X14)";
+missing directory is lost, ..." and "a directory whose FSIF files are all absent or empty is lost, ... (SL D5)";
+`HostFsifLoadSuite` "an FSIF store whose files are gone or empty is marked for rebuild, not served empty (SL D5)";
 `FsifFaultSuite` "with data writes frozen, commits past journalHardLimit are
 held, not failed, and complete once it clears" (L2 cannot be reached).
 

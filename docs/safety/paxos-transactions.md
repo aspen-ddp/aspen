@@ -98,8 +98,8 @@ save is durable sends a `TxPrepareResponse` (promise plus vote) to the leader an
 * **Recovery.** Any store whose Tx goes idle drives it. Store-side drivers send data-less, prefer-abort prepares
   (6.2), propose abort only on an abort-certain tally (P7a), and otherwise wait or re-propose a value their promise
   quorum reports.
-* **Bounded memory.** Stores forget a transaction (an abort at resolution, a commit at `TxFinalized`, the host status
-  cache after 30 s). The forget floor makes a store refuse every prepare for a transaction it may have forgotten
+* **Bounded memory.** Stores forget a transaction (an abort's CRL record at resolution and its Tx at the `TxFinalized`
+  its driver sends with it, a commit at `TxFinalized`, the host status cache after 30 s). The forget floor makes a store refuse every prepare for a transaction it may have forgotten
   (10.10), so no transaction is ever decided twice. A Tx left without an outcome past the horizon plus the margin
   decides from its peers' status (expiry, rules A-G).
 
@@ -137,7 +137,8 @@ forgotten (10.10). P2 is load-bearing because an acceptor accepts an Accept whos
 `Tx.answerPrepareAsAcceptor`, `Tx.sendDelayedPrepare` (a prepare answered once the objects load) and
 `Tx.receiveAccept` send from the completion handler of `crl.save`, which runs only once the entry is durable
 (`crash-recovery-log.md`). Handlers run on the CRL's completion thread and only send messages built before the save;
-the one state change a save completes (`Tx.voteDurable`) is posted to the store's executor (`Tx.saveState`). A CRL that
+the state changes a save completes (`Tx.voteDurable` in `Tx.saveState`, the release of a commit held for adopted data
+in `Tx.saveAdoptedData`, the continuation of `Tx.persistWithoutUpdateOf`) are posted to the store's executor. A CRL that
 fails or shuts down runs no handler of an unwritten entry (`CrlFailed`, `CrlClosed`), so no response follows it.
 
 **P4 Vote immutability.** A store's non-`Undetermined` disposition is decided once (`Tx.determineDisposition` decides
@@ -398,7 +399,10 @@ decided in `Tx.determineDisposition`, in this order:
 6. Otherwise `RequirementsChecker.check`. If every failure is a collision with a lock holder this transaction builds on
    (`Tx.awaitableHolders`: it requires the revision the holder writes, and the holder still holds its locks), the vote
    is withheld for up to `Tx.CollisionWait`. Otherwise `VoteCommit` (no errors) or `VoteAbort`; an abort whose cause is
-   only that objects already show T proves the commit instead (6.3).
+   only that objects already show T proves the commit instead (6.3). Growing KeyValue updates are checked against
+   `Frontend.maxKVSliceSize`, and on a rebuilt store that guards an object against inherited growth
+   (`Frontend.inheritedGrowthLock`) a growing update of it votes abort (`InheritedGrowthLock`), never waited out; an
+   update that grows nothing passes (10.10, the rebuilt store's inherited votes).
 
 "Withheld" means no response at all, which Paxos allows; drivers and the client retransmit. A withheld Tx holds no
 locks, so waits cannot form cycles. `lock()` runs right after the vote is decided and before it is durable; that is
@@ -419,9 +423,10 @@ commit vote. A Tx with no vote, not muted, that has seen no client prepare (`cli
    abort, requirements unchecked. The check runs as prepares arrive (`Tx.answerPrepare`), so the abort goes out with the
    first driver retransmit after the wait.
 3. A Tx recovered without a vote does not withhold its answer from a driver: the driver's prepare decides its
-   `NoClientPrepare` abort at once and the promise carries whatever its acceptor accepted. Once loaded it stays
-   undecided, so a retransmit of its client's prepare that arrives first is checked as usual. A Tx recovered with a vote
-   answers with it.
+   `NoClientPrepare` abort at once and the promise carries whatever its acceptor accepted. Loaded within
+   `MissingDataWait` of its recovery it stays undecided, so a retransmit of its client's prepare that arrives first is
+   checked as usual; loaded later, it decides its `NoClientPrepare` abort at load (`Tx.completeLoad`). A Tx recovered
+   with a vote answers with it.
 
 Why this matters: a driver may re-drive a transaction that aborted and was forgotten. A driver decides abort only when
 some object's pool has more than `w - t` non-commit votes in one round, and that object's commit votes can never exceed
@@ -456,7 +461,11 @@ it counts in `a <= w - c`. A recovered prover has Paxos state, so it no longer p
 
 A Tx recovered from the CRL keeps its persisted disposition and acceptor state and restores a resolution its saved
 status records (`Tx.oresolution`; status is saved only incidentally, by a prepare or accept after the resolution). A
-recovered resolved Tx takes no locks and applies its commit, or deletes its abort's state, once its objects load. A
+recovered resolved Tx needs no lookup and applies its commit, or deletes its abort's state, once its objects load. A
+restored commit with a commit vote relocks (`Tx.lock`: its locks and slice reservation, no check), counts as relocking
+in `Frontend.recoveringTransactions` and holds them until `Tx.doCommit` releases them: its backend commit may not have
+completed before the crash, and its locks keep a restored commit without a vote here waiting in lock order rather
+than applying over it (9.1). A restored abort, and a restored commit without a commit vote, take none. A
 resolution learned from the UnackedCommits tree (`unackedCommitFound`, `unackedCommitNotOwed`) is saved as
 `Unresolved` (`Tx.savedStatus`): a restart then looks the entry up again and takes the same path, rather than restoring a
 resolved commit that would seed the host cache with a non-finalized `Committed` and lose `notOwedHere`.
@@ -547,7 +556,8 @@ responses at its current id from valid acceptors. Resolution can also arrive wit
   kept alive by the client; neither are a learn-only driver's prepares and heartbeats (`Tx.fromProposer`).
 * An expiry commit at the store (`Store.finalizeExpiryCommit`).
 * A driver is created at most once per transaction per store (`Store.driveTransaction`), never while the store's CRL
-  state loads (`Frontend.recoveryPending`). It starts at the initial proposal only as the designated leader's first
+  state loads (`Frontend.recoveryPending`): a client prepare reaching the designated leader then starts none, and the
+  Tx it creates once the held messages are released is driven when idle. It starts at the initial proposal only as the designated leader's first
   driver; every other starts at round 2 or above its own acceptor's highest id (`TransactionDriver.Start`, P2). It
   receives any proof its store's Tx holds (`Store.giveProof`), then the cached prepare responses. It is removed when
   its store receives a `TxFinalized` for T after which the driver is finalized (`TransactionDriver.isFinalized`; one
@@ -593,7 +603,10 @@ nothing more (`Tx.saveState` requires it; P9).
 
 Not durable before sending: a proof (its evidence is the durable backend state), status-cache relays, a deleted
 abort's `TxResolved(false)` (`Tx.answerResolved`), `TxCommitted` re-sends, status replies (10.10; a commit vote is
-reported only once durable), and an expiry commit's `TxResolved`.
+reported only once durable), and an expiry commit's `TxResolved`. A status reply's `accepted` is the acceptor's
+in-memory state, which a save may not have made durable yet: rules B and C read an accepted value only as evidence that
+a driver proposed it, which traces it to a commit-certain or abort-certain tally (L1, L2) whether or not it survives a
+crash, and an accept never durable sent no `TxAcceptResponse`, so it helped choose nothing.
 
 | Event | CRL effect |
 |---|---|
@@ -645,10 +658,13 @@ every prepare and accept response, retransmits included: write amplification, no
   the backend only once no CRL state holding an applied blind Insert of it remains
   (`Frontend.awaitBlindInsertsDurable`; transaction-requirements.md 8.5, 9.4). A blind Insert of a key now absent
   still applies but reports the object, so the finalizer marks the store and repair installs the current state, where
-  the Tx did not vote commit here (it held no key lock that kept a later deletion out), where a repair wrote the object
-  past T's start (`Tx.repairInstalled`, `Frontend.recordRepairInstall`), or, for a recovered commit vote, where the
-  object's timestamp is past T's start (`Tx.issueCommits`, `reinserts`). A non-voter does not count toward `t`, so its
-  report costs a repair pass, not margin. A recovered Tx that did not vote commit reports every object it applies.
+  a repair wrote the object, or found it current, at a timestamp past T's start (`Tx.repairInstalled`,
+  `Frontend.recordRepairInstall`), where the Tx did not vote commit here (it held no key lock that kept a later
+  deletion out) and a committed Delete of the key started at or after T's start applied here, a no-op over the absent
+  key included (`Frontend.keyDeletedSince`, recorded by `Tx.issueCommits` through `recordKeyDeletions`), or, for a
+  recovered commit vote, where the object's timestamp is past T's start (`Tx.issueCommits`, `reinserts`). A non-voter's
+  Insert of a key no such deletion reached reports nothing. A non-voter does not count toward `t`, so its report costs
+  a repair pass, not margin. A recovered Tx that did not vote commit reports every object it applies.
   Objects whose earlier backend commit failed are not applied and are reported.
 * **Forgetting a committed T.** Where its CRL record would be deleted (after `TxFinalized` and its backend commits), it
   is replaced by an applied stub if an UnackedCommits entry may name this store: `TxFinalized` listed it in `owed`, or
@@ -873,7 +889,12 @@ on lock-only pools. The rebuilt store holds none of T's locks, so it votes abort
 until it knows which transactions its old votes may still back, then on their objects until each is decided
 (`Frontend.inheritedVoteLock`; rebuild-process.md, the rebuilt store's acceptor state). Otherwise, with `2t - w = 1`
 (Replication(3,2), (5,3)), the rebuilt store plus T's abort voter commit a conflicting T' on a lock-only object and T
-then commits with its lock requirement broken.
+then commits with its lock requirement broken. The release does not end every effect: a released T that grew a
+KeyValue object may have committed after the rebuild read it, so the rebuilt copy lacks its growth while T still
+counts the store among its commit voters. The store then votes abort on any growing update of each such object, and
+of every KeyValue object its first held-vote round finds marked against it, until a whole-object repair from a later
+snapshot releases it (`InheritedGrowthLock`, `Frontend.inheritedGrowthLocks`; transaction-requirements.md R16). Abort
+votes, so P-VC is untouched.
 
 **Why the floor timing is safe without cross-host clock agreement.** A store writes its cache entry for T after it saw
 T, when by `MaxStartLead` its clock read at least `start - 2 s`. The entry lives 30 s past its last write, so when it
@@ -965,7 +986,10 @@ Rules A-G, in order (`ExpiryTally.decideUnknown`):
 
 *Actions.* A commit (`Frontend.decideExpiry`, Commit) sends non-late `TxResolved(commit)` to every other store of T and
 to itself, and has a driver of its store finalize it (`Store.finalizeExpiryCommit`), whose missed-update marks repair
-the stores that never applied it. Applying late is safe: a commit voter's locks have held its locked parts unchanged
+the stores that never applied it. That driver tallied no votes, so its finalizer treats every store not acknowledging
+as a possibly counted voter (9.2), and a store that applies sends its `TxCommitted` to its own `lastProposer`, which
+need not be that driver: the marks and entries may name stores that did apply, at the cost of repair passes and
+applied stubs on a rare path. Applying late is safe: a commit voter's locks have held its locked parts unchanged
 since its vote (in memory, or through its CRL record and the recovery hold), repair defers to a store's own locks even
 with a proof (`Reconcile.RepairSnapshot.proven`), a conflicting commit would need a locked voter, and writes T does
 not lock are order-independent. A discard (C, D, E) releases locks and objects, deletes the CRL state, forgets the Tx

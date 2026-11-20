@@ -179,7 +179,11 @@ answers in this order:
    after the Tx the prepare creates and any driver started for it exist, so all of them learn it. A non-late one a
    driver treats as resolution (`onResolution(sendResolutionMessage = false)`) and, for a commit, runs the finalizer
    itself. If the store holds no Tx and the transaction is above its floor, the Frontend creates one marked
-   `outcomeDecided` (no locks; status queries get the cached outcome); below the floor it refuses the prepare.
+   `outcomeDecided` (no locks; status queries get the cached outcome); below the floor it refuses the prepare. The
+   entry may be the store's own: a Tx resolved committed records a non-finalized `Committed` (`Tx.resolved`), so the
+   idle driver a store starts after its `TxFinalized` was lost, whose prepare reaches its own store too, learns a
+   non-late commit from its own host's entry and starts a finalizer; a peer's finalized relay (`TxFinalized(late)`)
+   then makes it resolve late and cancel that finalizer (`resolveLate`; R-W10).
 3. **Live `Tx`** (`Tx.receivePrepare`): it answers with its fixed vote and an acceptor promise, sent only after the
    CRL save of that state completes (or after its objects load, then the save). A Tx that already applied the commit
    also resends `TxCommitted` to the proposer.
@@ -414,7 +418,10 @@ Mechanism and proofs: paxos-transactions.md (transaction horizon), `server/trans
 
 * A Tx unfinalized past the horizon plus the expiry margin (`Tx.mayExpire`: objects loaded, no late commit or
   forget-lookup held) begins expiry and sends `TxStatusRequest` to every other store of T, at once and then after 1,
-  2, 4 and every 8 heartbeats; each round counts only its own replies plus its own frozen state. Past the same point
+  2, 4 and every 8 heartbeats; each round counts only its own replies plus its own frozen state
+  (`Tx.ownExpiryStatus`), except that an unresolved commit voter whose vote is not yet durable is silent to its own
+  round as to its peers, its vote saved if no save holds it yet (`Tx.saveUndurableVote`), so the round holds rather than
+  discard a commit a later round would count. Past the same point
   its acceptor is frozen (`Tx.frozen`): it promises, accepts and votes nothing more, so the states the tallies count
   are final.
 * A store with no Tx answers a cached outcome, or "unknown" only below its floor (a permanent answer); a rebuilt store
@@ -546,7 +553,15 @@ saved data.
   holder may need a vote another store's waiter withholds, and the abort ends such a cross-store cycle. Any other vote,
   a lock-only one included, decides at once. A recovered Tx is not exempt: the rule is the same once it decides a vote. A
   `TxFinalized` reaching it while held is deferred like one for a commit held for its turn
-  (`Frontend.finalizationDeferred`), its CRL state kept until it applies.
+  (`Frontend.finalizationDeferred`), its CRL state kept until it applies. Such a Tx leaves `Frontend.transactions` at
+  the `TxFinalized` and lives on only in `deferredFinalizations` until its commit issues: `holdsTransaction`, the
+  `repairInstalled` notices and the `keyDeletions` pruning no longer see it, and its `TxCommitted` comes after T's
+  marks were written. The store was marked for T (it had not acknowledged T when T was finalized), and that mark is what
+  repairs its copy. A repair of an object the held commit changes does not consume that mark while the commit waits
+  there: a commit held for its turn has a commit of the object in flight (the reconcile is unsettled and parks), and a
+  holder it waits for in lock order on the object holds locks on it, which the reconcile defers, leaving its result
+  incomplete (`Reconcile.plan`, `ReconcileResult.complete`). A wait on another object it changes gives no such guard
+  (R-W11).
 
 ### 7.4 Replay of committed but unapplied updates
 
@@ -566,12 +581,18 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   violation, logged at error, skipped and reported; an allocation the backend missed is reported (no copy, no lost
   lock); any apply that throws fail-stops the store (transaction-requirements.md 8.5). A recovered Tx that did not vote
   commit reports every object it applies: it may have applied before the crash. A blind Insert of an absent key is
-  applied and its object reported where the Tx did not vote commit (it held no key lock keeping a later deletion out:
-  a deletion checked by a required revision alone may have applied first as a no-op), where a repair installed a
-  state newer than T's start (`Tx.repairInstalled`, `Frontend.recordRepairInstall`) or, for a recovered commit vote, whose in-memory record of such installs died with
-  the crash, where the object's timestamp is past T's start: the state may hold a later deletion of the key the store
-  never applied, so the finalizer marks the store and repair reconciles the object (transaction-requirements.md 9.4,
-  10.5c).
+  applied and its object reported where a repair wrote, or found current, a state newer than T's start
+  (`Tx.repairInstalled`, `Frontend.recordRepairInstall`, a reconcile that changes nothing included); where the Tx did
+  not vote commit (it held no key lock keeping a later deletion out) and a committed Delete of the key started at or
+  after T's start applied here, a no-op over the absent key included (`Frontend.keyDeletedSince`, recorded by
+  `recordKeyDeletions` at apply, pruned at `expiryHeartbeat` once below the floor with no held Tx started at or before
+  it; a deletion started earlier is never ordered after T); or, for a recovered commit vote, whose in-memory records
+  died with the crash, where the object's timestamp is past T's start. The state may hold a later deletion of the key
+  the store never applied, so the finalizer marks the store and repair reconciles the object
+  (transaction-requirements.md 9.4, 10.5c). A non-voter's Insert of a key no such deletion reached reports nothing, so
+  the routine non-voter of pipelined inserts keeps its transaction's finalizer on the clean fast path. These reports
+  reach a finalizer only while T's marker has not yet written: an apply after T's finalization relies on the store's
+  ErrorTree mark instead (R-W11).
 * The CRL's drop of applied object data (`Tx.allObjectCommitsComplete`, `CrashRecoveryLog.dropTransactionObjectData`)
   is in memory only, so a crash can recover a Tx with data it already applied. For allocations this matters: a
   deletion of an object an unconcluded Tx allocated here waits (`Frontend.awaitAllocationsDurable`) until that Tx's
@@ -831,8 +852,11 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 * **Size eviction**: logged as an error and raises the host's eviction watermark (a floor component), so the evicted
   entry's transaction is refused rather than joined afresh.
 * **Lost `TxFinalized`**: the idle Tx starts a driver after 5-6 s; the peers answer from their 30 s entries with
-  `TxResolved`+`TxFinalized(late)`; the driver resolves late and runs no actions; a commit voter that already applied
-  looks its entry up only for its stub. If even that window passes, nothing is re-decided: the Tx ends by expiry,
+  `TxResolved`+`TxFinalized(late)`; the driver resolves late, finalizes with no actions, and a commit voter that
+  already applied looks its entry up only for its stub. Unless a store of T on the same host saw `TxFinalized`, the
+  store's own host entry is a non-finalized `Committed` that answers the driver's prepare to its own store first: the
+  driver resolves non-late, starts a finalizer whose actions execute at once, and cancels it when the late answer
+  arrives (its marker writes nothing if that is within `errorTimeout`; R-W10). If even that window passes, nothing is re-decided: the Tx ends by expiry,
   concluding its known outcome once more than `w - t` primary acceptors no longer hold T.
 * **Clock skew**: no clock decides replay. Clocks remain in the forget floor's time leg (a step back of more than about
   8 s can let a store rejoin T, paxos-transactions.md), in the `acceptorSince` and `MaxStartLead` mutes, and in repair's
@@ -869,4 +893,47 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-None.
+### R-W10: after a lost TxFinalized the store's own status-cache entry makes its recovery driver re-run T's actions
+Verdict CONFIRMED. Priority 5. Effort S.
+Mechanism: a Tx resolved committed records a non-finalized `Committed` in its host's status cache (`Tx.resolved`). When
+its `TxFinalized` is lost and no other store of T on the host saw one, the store drives the idle Tx
+(`Store.heartbeat`), and its driver's prepare to its own store meets that entry in `Store.handleTransactionMessage`'s
+relay, which sends the store `TxResolved(committed, late = false)`. The driver takes it as resolution
+(`TransactionDriver.receiveTxResolved` -> `onResolution(sendResolutionMessage = false)`) and starts a finalizer
+(`startFinalizer`), whose actions all execute at once (`RegisteredTransactionFinalizerFactory.Finalizer`). The peers'
+finalized relay (`TxFinalized(late)`) arrives after the local answer and makes it `resolveLate`, which cancels the
+finalizer: the marker writes nothing if that is within `errorTimeout`, but the other actions have already run.
+Consequence: every lost `TxFinalized` at such a store re-executes T's non-marker finalization actions after T was
+finalized and forgotten (allocation-tree reads, TKVL split, join or tail-removal work), which `resolveLate`'s premise
+says it never does. If no late answer arrives within `errorTimeout` (peers unreachable, or past their caches after a
+size eviction), the marker writes ErrorTree marks for every store of T and UnackedCommits entries naming no
+incarnation for every one but this, and the `TxFinalized` that follows has every store write a stub: repair passes and
+CRL admission spent on stores that applied T long ago. The shipped actions tolerate a late re-run, so no safety effect.
+Fix: in the relay, send the self `TxResolved` of a non-finalized entry only when the store's own Tx for T is not
+already resolved (`frontend.transactions.get(txid).forall(_.knownOutcome.isEmpty)`): its own resolution is no news to
+its own driver, which then learns the outcome from its peers (late from their finalized relay, or by Paxos from their
+accepted values while they still hold T). One map lookup on the relay of a resolved, unfinalized entry; nothing on the
+hot path.
+
+### R-W11: a mark is consumed while a held commit waits on another object, so a blind Insert resurrects a deleted key
+Verdict PLAUSIBLE. Priority 2. Effort S.
+Mechanism: a committed Tx T at store S that holds no locks (a non-voter) waits to apply while a commit vote H holds
+locks colliding with it (`Tx.awaitLockHolders`), where H need only change some object T changes
+(`frontend.changes(h, _)`) and its colliding locks may lie on an object O2 other than O, on which T blind-Inserts key
+k. A commit held for its turn waits likewise for a commit in flight on O2 only (`Tx.holdForTurn`). T is finalized
+meanwhile (its `TxFinalized` defers, `Frontend.finalizationDeferred`), and S, which never acknowledged T, has T's
+ErrorTree mark for O. Once T is below S's forget floor (`RepairTarget.mayJoinTransaction`, the only gate an ErrorTree
+entry has: `StoreRepairer`, no `holdsTransaction` check), a repair of O at S finds O settled (`Frontend.reconcile`
+counts no held commit) and unlocked, installs the current state, in which a later committed transaction D deleted k,
+passes the completion gate (the read reflects D, past T's start) and deletes T's mark. When H releases, T applies its
+Insert of the absent k (`Tx.issueCommits`). It reports O only if it learned of the repair install (`repairInstalled`
+reaches `Frontend.transactions` only, which a deferred Tx has left), and any report goes in a `TxCommitted` that
+reaches no finalizer: T's marks were written already.
+Consequence: S holds key k, which every other store deleted, with no mark left to repair it: a permanent divergence of
+one key at one store, a lost unit of the write-threshold margin on O (S votes abort on a later `DoesNotExist(k)`
+insert, and no client can delete a key its read does not show). Needs H unresolved, or the in-flight commit of O2
+unfinished, past T's start plus the horizon (20 s): a lock holder under a partition or slow expiry.
+Fix: count an unapplied held commit as unsettled work on every object it changes: `Frontend.reconcile` parks (or
+answers stale) while `lockWaitingCommits` or `heldCommits` lists a Tx for the object, so the mark stays until T has
+applied, and the next pass reconciles the resurrected key away. Two map lookups on the repair path; nothing on the
+transaction path.

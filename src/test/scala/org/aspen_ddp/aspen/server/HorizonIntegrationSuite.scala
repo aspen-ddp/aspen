@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
-import org.aspen_ddp.aspen.server.store.Frontend
+import org.aspen_ddp.aspen.server.store.{Frontend, StoreIncarnationFile}
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
 
 import org.scalatest.Assertion
@@ -433,6 +433,7 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
     val hostA = net.newHost()
     val hostB = net.newHost()
     val rebuiltDir = os.temp.dir(deleteOnExit = true)
+    StoreIncarnationFile.writeFresh(rebuiltDir)
     for
       x <- allocateX()
       xBefore <- client.read(x)

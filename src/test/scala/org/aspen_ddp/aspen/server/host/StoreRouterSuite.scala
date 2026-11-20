@@ -18,6 +18,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreReco
 import org.aspen_ddp.aspen.server.crl.simple.{GrowthPolicy, SimpleCRL}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
+import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.{CompletionHandler, MapBackend}
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionStatusCache}
@@ -81,6 +82,8 @@ object StoreRouterSuite:
     val reads = new AtomicInteger(0)
 
     override def path: os.Path = dir
+    // Every store directory has its incarnation file from its creation
+    if !os.exists(dir / StoreIncarnationFile.FileName) then StoreIncarnationFile.writeFresh(dir)
 
     override def close(): Future[Unit] =
       closed = true

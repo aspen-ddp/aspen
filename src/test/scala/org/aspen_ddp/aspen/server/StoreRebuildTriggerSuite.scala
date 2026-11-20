@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.server.host.{ControlFixture, StoreRebuilds, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService}
@@ -473,6 +474,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     def backendAt(s: StoreId): MapBackend =
       val dir = deviceDir / s.directoryName
       os.makeDir.all(dir)
+      StoreIncarnationFile.writeFresh(dir)
       new MapBackend(s):
         override def path: os.Path = dir
     val loads = List(unlisted, listed).map(s => host.loadStore(deviceA, backendAt(s), None))

@@ -36,11 +36,16 @@
   `Host.LoadRetryCap` 5 min), so an Active store is never left unserved and untracked until a restart. A load that
   throws before its open (an unreadable `config.yaml`, `StoreLoader.awaitUnreadRetry`) and one whose executor slot
   an earlier close still holds (`HostThreading.AlreadyAssigned`) are left offline and retried the same way; a retry
-  keeps the waiting load's `onServed` (e.g. its `StoreMoved` gossip) for the open that serves it. An unreadable config
+  keeps the waiting load's `onServed` (e.g. its `StoreMoved` gossip) for the open that serves it. A load's `onServed`
+  runs only once its LoadStore has installed and recovered the store (`StoreLoader.awaitServed`), never at backend
+  open; a LoadStore that leaves the store awaiting a retry (no CRL room, no executor slot, a failed save-file removal)
+  hands the callback to that entry, and any other failure drops it. An unreadable config
   is logged at error once per retry cap. An Active entry on a loaded device with no `config.yaml` at its store path
   (directory or config lost), not served, opening or retiring, is rebuilt by the reconcile's Missing Stores pass:
-  marked offline, `StoreRebuilds.requestRebuild`, and with no directory its device-CRL entries dropped as leftovers
-  (`dropLeftoverCrlState`'s `missing`); a configless directory keeps them for the rebuild's retire. Every load path
+  marked offline and `StoreRebuilds.requestRebuild`. Its device-CRL entries stay (nothing durable records the
+  declaration, and the directory may come back before the flip commits): the rebuild's retire of a copy that is back
+  saves them, the rebuilt copy's empty `crl_save.log` drops what is left, and a re-placement's entry leaving the
+  device makes them leftovers. Every load path
   starts from a directory, so nothing else would notice it while the pool counted it writable.
   `DeviceDiscovery` deletes `creating/` when it loads a device. Bootstrap (`cmdline`) creates its stores the same way (`DefaultBackendOpener.createStore`)
 - Store lifecycle: the control thread builds the `Store` and calls `router.install`, where ownership passes to the
@@ -50,8 +55,19 @@
   Every exit (transfer out, shutdown, relinquish, fail-stop, failed CRL load) runs `Store.close`, which stops the
   store's drivers; a reload over a loaded store reusing its backend skips the close but calls
   `Store.shutdownDrivers` (cross-document-review 2.2). A new exit path must do one or the other
-- Store identity: `StoreLoader` passes `StoreIncarnationFile.loadOrCreate(backend.path, storeId)` to the Store, creating
-  the `incarnation` file on first load (`server/store/CLAUDE.md`)
+- Store identity: `StoreLoader.handleLoad` reads the `incarnation` file (`StoreIncarnationFile.load`) before building
+  the Store and never writes it: `StoreCreation` writes it into every new store directory (bootstrap included) and a
+  rebuild's `finish` replaces it (`server/store/CLAUDE.md`). A file known absent has the store retired unserved
+  (`retireUnserved`: marked `rebuild-required`, rebuilt as a new incarnation); one that cannot be stat'd, read or
+  parsed is left alone and the load retried through `storesAwaitingRetry` (`awaitUnreadRetry`), so a format change
+  in a release is an outage, never a fresh identity over a store's data and CRL state
+- Existence tests that decide a load or a destructive reconcile step use `server.FileStat`, never `os.exists`
+  (`Files.exists`, false on any stat error): absent only on ENOENT (or a parent that is no directory), otherwise it
+  throws. `tryLoadStore`'s config and marker checks and `handleLoad`'s `crl_save.log` check hold a load whose stat
+  fails back through `awaitUnreadRetry`; the Missing Stores pass, `dropLeftoverCrlState` and the Deleted Stores
+  pass skip such a store; `StoreCopies.retire` fails rather than report a clear path; `DeviceDiscovery.openDeviceCrl`
+  throws (device left for the next scan; a child whose config cannot be stat'd counts as a store directory) and so
+  does `holdsOwnState`. Tests fail a stat with a directory lacking search permission, or a link into one
 - Load time and the forget floor (`server/store/CLAUDE.md`): every Store `StoreLoader` builds records its load
   (`Frontend.loadedAt`), so after a restart, adoption or transfer in it refuses, for good, each transaction it does
   not hold that started before the load plus `MaxStartLead`. A store that arrived from another host had joined by that
@@ -148,7 +164,9 @@
   copy is retired (below) before the rebuild. Adoption of a device does the same for a `transferring-out` store
   without a valid save file instead of refusing the device, and adopts any `rebuild-required` directory as Rebuilding
   whatever its other markers. A network transfer validates the staged copy's save file before promotion and retries on
-  failure, since the source still holds the state
+  failure, since the source still holds the state; a resume of a promoted copy's pool update (`StoreTransfers.startIn`)
+  checks it again, and a copy marked `rebuild-required` or whose save file no longer validates is deleted and the
+  transfer restarted, as is one whose marker names another transfer
 - A lost device CRL does the same to every store on the device: if `<device>/crl` is absent from a device holding store
   dirs, or holds no stream files there (`openCRL(..., holdsStores = true)` throws `CrlMissing`: a device's stores exist
   only once its CRL was opened, so an emptied `crl/` is never taken as a new CRL), or `openCRL` throws (a corrupt
@@ -215,7 +233,7 @@
   durably, then removed, and whatever is left there is removed at device load and at each reconcile. So an
   interrupted delete never strips a marker from a copy at a store path or leaves a partial copy in `pending-delete/`.
   A copy that never was the owner's and holds nothing its source lacks is deleted directly (still rename-first):
-  `LocalDevices.discardStoreDirectory` and a stale arrived copy in `StoreTransfers.startIn`. Scratch areas
+  `LocalDevices.discardStoreDirectory` and a stale or unusable arrived copy in `StoreTransfers.startIn`. Scratch areas
   are never loaded, so they are deleted in place: `creating/`, transfer staging and `deleting/` are swept whole at
   device load (`DeviceDiscovery.loadOwnedDevice`); `rebuilding/<id>` holds a resumable checkpoint and is deleted
   only by `StoreRebuilds.abandonUnlisted` or a first pass's `createStaging`.
@@ -227,9 +245,10 @@
   file is durable: a crash or failed save before that leaves the device CRL holding them. A closed store that already
   has a valid `crl_save.log` ships it unchanged: the file is its whole state, so its device-CRL entries are copies or
   an earlier tenancy's leftovers, dropped (`dropStore`) as its load would drop them (`extractUnloaded`).
-  `DeviceReconciler.dropLeftoverCrlState` drops the entries of a store with no entry, no directory and no retire
-  running, as a safety net for a directory removed by hand. It releases only the admission charge retained for the
-  store when it was issued, and only if unchanged at completion (`CrlAdmission.retainedCharge` /
+  `DeviceReconciler.dropLeftoverCrlState` drops the entries of a store with no entry on the device, no directory
+  (a stat that answers absent) and no retire running, as a safety net for a directory removed by hand; a store its
+  entry names keeps them, even one the Missing Stores pass is rebuilding. It releases only the admission charge
+  retained for the store when it was issued, and only if unchanged at completion (`CrlAdmission.retainedCharge` /
   `releaseRetained(storeId, charge)`, by identity): a store landing meanwhile charges records the drop does not
   remove, and its recovery releases the whole charge
 - A rebuilt store's directory carries `rebuild-complete` from its move into place until its entry leaves

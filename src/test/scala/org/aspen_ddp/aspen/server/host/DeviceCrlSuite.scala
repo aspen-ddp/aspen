@@ -1519,6 +1519,83 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       reloaded should be(first)
       first should not be StoreIncarnation.default(storeId)
 
+  atest("a store whose save file cannot be stat'd at its load is held back and retried, never recovered without it (X-W18)"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    val fileTx = TransactionId(new UUID(9, 43))
+    val fileState = StoreRecoveryState(List(recoveryState(storeId, fileTx, Array[Byte](4, 5))))
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      // Its whole state is in its save file (an arrived transfer): the device CRL holds nothing for it. The file is
+      // reached through a link into a directory without search permission, so its stat alone fails (EACCES) while
+      // the rest of the store directory reads
+      locked = hostRoot / "locked"
+      _ = os.makeDir(locked)
+      _ = CrashRecoveryLog.saveStoreState(storeId, fileState, locked / "state.log")
+      _ = os.symlink(Backend.crlSaveFile(storeDir), locked / "state.log")
+      _ = os.perms.set(locked, "rw-------")
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.loader.awaitingRetryHasCallback(storeId).isDefined)
+      servedWhileUnreadable = host.control.router.loaded.contains(storeId)
+      awaiting = host.control.loader.awaitingRetryHasCallback(storeId)
+      _ = os.perms.set(locked, "rwx------")
+      fileKept = os.exists(Backend.crlSaveFile(storeDir))
+      _ = host.control.reconciler.scan()
+      // Recovered once the CRL holds the file's state, after its install
+      _ <- pumpUntil(host, host.control.router.loaded.get(storeId).exists(_.frontend.transactions.contains(fileTx)))
+      store = host.control.router.loaded(storeId)
+      recoveredFromFile = store.frontend.transactions.contains(fileTx)
+      _ <- store.backend.close()
+      _ = factory.shutdownAll()
+    yield
+      servedWhileUnreadable should be(false)
+      awaiting should be(defined)
+      fileKept should be(true)
+      recoveredFromFile should be(true)
+      os.exists(Backend.crlSaveFile(storeDir)) should be(false)
+
+  atest("a store whose incarnation file is missing is rebuilt, never given a fresh incarnation (SL-W15)"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      _ = os.remove(storeDir / StoreIncarnationFile.FileName)
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile))
+      served = host.control.router.loaded.contains(storeId)
+      _ = factory.shutdownAll()
+    yield
+      served should be(false)
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      os.exists(storeDir / StoreIncarnationFile.FileName) should be(false)
+
+  atest("a store whose incarnation file cannot be parsed is retried, the file never replaced (SL-W15)"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      file = storeDir / StoreIncarnationFile.FileName
+      original = os.read(file).trim
+      _ = os.write.over(file, "not a uuid")
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.loader.awaitingRetryHasCallback(storeId).isDefined)
+      servedWhileUnreadable = host.control.router.loaded.contains(storeId)
+      kept = os.read(file)
+      marked = os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile)
+      // Readable again (a release that reads its own format): the next retry serves it under its own incarnation
+      _ = os.write.over(file, original)
+      _ = host.control.reconciler.scan()
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      store = host.control.router.loaded(storeId)
+      incarnation = store.frontend.incarnation
+      _ <- store.backend.close()
+      _ = factory.shutdownAll()
+    yield
+      servedWhileUnreadable should be(false)
+      kept should be("not a uuid")
+      marked should be(false)
+      incarnation.uuid.toString should be(original)
+
   atest("a network transfer out of an unloaded store ships its device-CRL entries in its crl_save.log"):
     given ExecutionContext = executionContext
     val factory = newFactory()
@@ -2082,7 +2159,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       leftInCrl should be(Set())
       heldOnDisk(deviceDir, storeId) should be(Set())
 
-  atest("an Active store whose directory is missing is silenced, its device-CRL entries dropped, and rebuilt (X-W11)"):
+  atest("an Active store whose directory is missing is silenced and rebuilt, its device-CRL entries kept (X-W11, RB-W16)"):
     given ExecutionContext = executionContext
     val first = newFactory()
     val second = newFactory()
@@ -2092,14 +2169,18 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       host = newCrlHost(hostRoot, first)
       _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
       _ <- prepareInFlight(host, first.opened.head, storeId, txid)
-      // The directory is lost (a bad restore, a hand removal) while the entry still reads Active
+      // The directory goes missing (a bad restore, a mount finishing late) while the entry still reads Active
       _ <- host.control.router.loaded(storeId).backend.close()
       _ = first.shutdownAll()
-      _ = os.remove.all(storeDir)
+      aside = deviceDir / os.up / "aside"
+      _ = os.move(storeDir, aside)
       restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
       crl = second.opened.head
       _ = restarted.control.reconciler.checkAll()
-      _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty && crl.dropDone.isCompleted)
+      _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
+      // Later reconciles, the entry now Rebuilding, drop nothing either
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty)
       state <- client.getStorageDeviceState(deviceA)
       leftInCrl = held(crl, storeId)
       silenced = restarted.control.router.isOffline(storeId)
@@ -2108,7 +2189,42 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       rebuilds.created.map(_.storeId).toList should be(List(storeId))
       state.stores.get(storeId).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
       silenced should be(true)
-      leftInCrl should be(Set())
+      // Kept: had the directory come back before the flip, a copy loaded without them would answer for a transaction
+      // whose state and locks it lost. The rebuilt copy's empty crl_save.log drops them at its first load
+      leftInCrl should be(Set(txid))
+      crl.dropDone.isCompleted should be(false)
+
+  atest("an Active store whose config cannot be stat'd is not taken for missing: no rebuild, its entries kept (X-W18)"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      // No search permission: the config's stat fails (EACCES) while the directory and its files are there
+      _ = os.perms.set(storeDir, "rw-------")
+      restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
+      crl = second.opened.head
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty)
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty)
+      state <- client.getStorageDeviceState(deviceA)
+      leftInCrl = held(crl, storeId)
+      awaiting = restarted.control.loader.awaitingRetryHasCallback(storeId)
+      _ = os.perms.set(storeDir, "rwx------")
+      _ = second.shutdownAll()
+    yield
+      rebuilds.created should be(empty)
+      state.stores.get(storeId).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Active))
+      leftInCrl should be(Set(txid))
+      // Its load waits for a stat that answers
+      awaiting should be(defined)
 
   atest("an Active store whose directory lost its config is rebuilt, its copy retired with its CRL state (X-W11)"):
     given ExecutionContext = executionContext

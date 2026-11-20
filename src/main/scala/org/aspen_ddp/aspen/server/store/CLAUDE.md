@@ -78,8 +78,12 @@
   withholds its vote until the holder releases its locks, or for `Tx.CollisionWait` (500 ms, checked at heartbeat),
   so a single writer's next transaction need not abort while a store is behind on the previous one's outcome
 - Store identity: `StoreIncarnationFile` keeps the store's incarnation UUID in its directory's `incarnation` file (written
-  with `DurableFiles.write`). It survives restarts and transfers (the archive is the whole directory) and changes only on
-  a rebuild. A backend with no directory (`MapBackend`) gets `StoreIncarnation.default(storeId)` and no file.
+  with `DurableFiles.write` by `StoreCreation` when the directory is made, and replaced by a rebuild's `finish`). It
+  survives restarts and transfers (the archive is the whole directory) and changes only on a rebuild. A load only reads
+  it (`load`: `IncarnationLost` for a file known absent, any other failure thrown as is, never replaced; how the host
+  handles each: `server/host/CLAUDE.md`). A backend with no directory (`MapBackend`) gets
+  `StoreIncarnation.default(storeId)` and no file. Tests that load a backend from a hand-made directory write one with
+  `writeFresh`
 - Rebuilt stores: `Frontend.acceptorSince` (from the `acceptor-since` file `RebuildingStore.finish` writes) mutes a
   prepare for an unknown transaction started earlier (`Tx.muted`): proven committed if an object shows its update,
   otherwise forgotten with no promise, vote, accept or CRL save, as if the store were offline. Its old incarnation

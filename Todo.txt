@@ -1,8 +1,8 @@
 TODO
 ====
 
-Safety work list (from docs/safety/*, sixth pass, built 2026-11-19 against b9eb7860)
-------------------------------------------------------------------------------------
+Safety work list (from docs/safety/*, seventh pass, built 2026-11-20 against b48f4ee7 + working tree)
+----------------------------------------------------------------------------------------------------
 
 Every open weakness in docs/safety/* (the "## Open weaknesses" section at the end of each document) is listed below
 once, grouped where one change addresses several ids. Completed items are removed; their record is in git history.
@@ -45,7 +45,38 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-(no open items)
+2.1 [R-W11] A missed-update mark is consumed while a held commit waits on another object; its blind Insert resurrects.
+    PLAUSIBLE. Effort S. transaction-recovery.md.
+    A committed non-voter T at S waits to apply (Tx.awaitLockHolders) on a commit vote H whose colliding locks are on
+    O2, not on O where T blind-Inserts k (or is held for its turn by an in-flight commit on O2 only, holdForTurn). T
+    finalizes; S has T's ErrorTree mark for O. Once T's start is below S's forget floor, a repair of O finds it
+    settled and unlocked, installs the current state (where a later D deleted k) and deletes the mark. T then
+    applies Insert k; its report goes nowhere (repairInstalled reaches only `transactions`, TxCommitted reaches no
+    finalizer). Permanent divergence, one unit of margin on O. Needs H (or the O2 commit) unresolved > 20 s past T's
+    start.
+    Fix: Frontend.reconcile treats an object listed in lockWaitingCommits or heldCommits as unsettled (park or answer
+    stale), so the mark stays until T applies. Two map lookups on the repair path only. Consider with 5.5 (X-W21).
+
+2.2 [Q-W16] A required-revision-only key Delete applied in lock order after an Insert it precedes serially diverges.
+    PLAUSIBLE. Effort S. transaction-requirements.md.
+    refuseBlindWrites (builder and RequirementsChecker) accept a key Delete D checked only by requiredRevision.
+    Replication(3,2), Insert U of k with no revision requirement started before D: C votes commit on U, abort on D;
+    A, B commit D and A applies it; U then commits with A and C, so A ends D-then-U (k present). At C, D is a
+    committed non-voter, waits in lock order for U, re-checks clean (U moves no revision) and removes k. Nothing
+    reports a non-voter's Delete: C has A's revision and timestamp but lacks k, unmarked. R15's argument assumes the
+    store in both quorums saw the holder first. No production caller issues such a Delete (TKVL, repair, amoebafs,
+    vdisk all carry a KeyRevision or content lock); needs a client building one directly.
+    Fix: in both refuseBlindWrites, require every key Delete outside an allocated object's initial content to carry
+    a KeyRevision on its key or a content lock. Restate R7, R15, 2.5, 9.3, 9.4; re-examine Frontend.keyDeletions
+    (its documented cases are required-revision-only Deletes). No hot-path cost.
+
+2.3 [X-W20] A Replication pool of width >= 256 breaks the per-store tree key range and aliases store ids.
+    CONFIRMED. Effort S. cross-document-review.md.
+    Replication has no width bound (Reed-Solomon caps at 127). For pool index 255, (poolIndex + 1).toByte wraps to 0,
+    so StoreRepairer.scan's and inheritedGrowthScan's key ranges are empty: store 255 is never repaired and its growth
+    scan guards nothing. Above 256, poolIndex.toByte in createStoragePool gives two stores one id. No realistic
+    configuration triggers it; cheap enough to do early.
+    Fix: reject width > 255 at IDA construction / pool creation (or open-ended range for index 255 and a 256 cap).
 
 
 PRIORITY 3: systemic loss protection
@@ -53,7 +84,15 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-(no open items)
+3.1 [X-W22] FSIF reports any failed read as CorruptedObject at once; one transient error fail-stops a recovering store.
+    CONFIRMED. Effort S. cross-document-review.md.
+    FsifBackend.assemble, startRead and readExt map I/O errors (pread IOException, EIO, ENOMEM) and internal
+    exceptions (a rejected io task) to ReadError.CorruptedObject; only a torn header racing a write is retried. A
+    recovered commit vote's failed object load fail-stops the store (Tx.objectLoadFailed, D7). A host-wide transient
+    during a restart storm declares every FSIF store with a recovered commit vote lost together. RocksDB already
+    retries (RocksDBBackend.attemptRead, ReadRetryDelays).
+    Fix: a CRC mismatch or invalid header is damage and reports at once; I/O and internal exceptions retry with
+    ReadRetryDelays (or an FSIF equivalent) first. Failure path only.
 
 
 PRIORITY 4: liveness (hangs, stalls, livelocks)
@@ -61,29 +100,71 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
-(no open items)
+4.1 [SL-W17] A failed Store build in handleLoad leaves the store unserved and untracked until a restart.
+    CONFIRMED. Effort S. systemic-loss-protection.md.
+    When StoreLoader.handleLoad's `built` step fails (constructor, object cache, completion handler, or writeFresh
+    failing ENOSPC/EMFILE), abandonLoad leaves the store offline and unmarked and not in storesAwaitingRetry; no
+    reconcile pass loads an offline unmarked store. For a new store, the next createNewStore finds the directory and
+    flips the entry Active without loading it. An Active store nobody serves: one unit of w - t margin, silently.
+    Fix: put the store in storesAwaitingRetry with backoff in that branch, as the AlreadyAssigned branch does.
+
+4.2 [X-W19] A shipped Unconfirmed rebuilt copy stays offline at its destination until the hourly device check.
+    PLAUSIBLE. Effort S. cross-document-review.md.
+    An Unconfirmed copy (flip committed, entry then moved to TransferringOut) ships with rebuild-complete. The
+    destination's PoolRepointed branch calls loadStoreById and tryLoadStore keeps it offline; announceRepointed nudges
+    only the source's host, so only Main.CheckStorageDevicesPeriod (1 h) loads it, while the source copy is retired.
+    Up to an hour one unit of margin short. server/host/CLAUDE.md and rebuild-process.md 5.7 omit the wait.
+    Fix: clear the marker in the PoolRepointed branch (clearRebuildCompleteMarker), or in startOut before archiving.
+    Correct the CLAUDE.md text.
 
 
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.2 [SL-W12] A promoted transfer-in copy marked rebuild-required is still repointed, and the intact source released.
-    CONFIRMED. Effort S. systemic-loss-protection.md.
-    StoreTransfers.startIn tests transferred-in before rebuild-required, so after a D1/D2 declaration (holdsOwnState
-    false on a transient read error) or save-file damage (D3) it resumes recordTransferIn /
-    DeviceMetadata.updateStateForTransferredStore; the source's Deleted Stores pass and StoreCopies.release then delete
-    the intact source copy before the marked copy flips. A needless rebuild, one store short of margin meanwhile.
-    Fix: in startIn's resume branch, delete a promoted copy carrying rebuild-required, or whose save file fails
-    CrashRecoveryLog.loadValidStoreState, with StoreCopies.delete, and restart the transfer. Resume path only.
+5.1 [RP-W9] A repair pass that changes nothing makes in-flight inserters of a hot KeyValue object re-mark it.
+    CONFIRMED. Effort S. repair-process.md.
+    Every no-op pass records repairInstalls at max(read.ts, current.ts); every Tx on the object started below that,
+    any disposition, Inserting an absent key without a required revision (every TKVL insert of a new key) reports
+    the object (Tx.issueCommits reinserts -> objectCommitErrors): the finalizer waits errorTimeout and marks the store
+    again, so a hot node (metadata ErrorTree nodes included) stays at the repair floor while the load lasts. No data
+    at risk. The Frontend.repairInstalls scaladoc ("Empty except soon after a repair write") is stale.
+    Fix: record a no-op pass only when complete, at the entry's minimum timestamp (carried in RepairSnapshot); the
+    bootstrap sweep records nothing. Restate repair-process 6.2 and transaction-requirements 9.4. No hot-path cost.
 
-5.3 [X-W15] A load's onServed gossip runs when its LoadStore is queued, before the store is served.
+5.2 [RP-W10] A rebuilt store's growth guard on a KeyValue object that is then deleted is never released.
+    CONFIRMED. Effort S. repair-process.md.
+    inheritedGrowthLocks entries are removed only by inheritedGrowthRepaired on a complete reconcile; a deleted object
+    (TKVL join, missed deletion via repairDeletion / deleteObjectForRepair) is never reconciled again. Every vote then
+    computes RequirementsChecker.sliceGrowth (hot-path cost), the inherited-votes file is never removed, and each load
+    repeats the abort-everything round until the growth scan answers.
+    Fix: drop the guard and call removeInheritedStateWhenDone() when deleteObjectForRepair completes and when a
+    committed refcount-zero deletion applies, behind the holdsInheritedGrowthLocks test.
+
+5.3 [R-W10] After a lost TxFinalized, the store's own status-cache entry makes its recovery driver re-run T's actions.
+    CONFIRMED. Effort S. transaction-recovery.md.
+    Tx.resolved writes a non-finalized Committed into the host cache; with TxFinalized lost, the idle Tx's driver's
+    prepare to its own store hits the relay in Store.handleTransactionMessage, which sends TxResolved(late = false);
+    the driver runs onResolution and startFinalizer, executing every action before the peers' TxFinalized(late)
+    cancels it via resolveLate. Absent a late answer within errorTimeout, the marker writes marks, unincarnated
+    UnackedCommits entries and stubs everywhere. Hygiene only.
+    Fix: in the relay, skip the self TxResolved of a non-finalized entry when the store's own Tx for T is resolved.
+
+5.4 [CRL-W16] A closed store's transfer-out extraction may run on another device's copy of the store.
+    PLAUSIBLE. Effort S. crash-recovery-log.md.
+    startOut ships the pool device's directory (sourceDs) but extractUnloaded picks the first loaded device with a
+    directory for the store. With a second copy on another device of the host (an earlier tenancy, a source awaiting
+    retire, a failed retire) it validates/extracts that copy and drops that device's entries; the source ships with
+    no crl_save.log, the destination refuses it, every retransmit repeats. A stalled transfer, and the other copy's
+    entries lost from its future lost-crl-state.log.
+    Fix: pass sourceDs into closeForTransferOut / extractUnloaded.
+
+5.5 [X-W21] A held commit finalized before it applies is not seen as a lock holder; a prepare built on it votes abort.
     CONFIRMED. Effort S. cross-document-review.md.
-    StoreLoader.handleBackendOpened runs the callback after serveOpened, which only posts LoadStore; handleLoad can
-    still leave the store offline (tryChargeLoaded, AlreadyAssigned, device unloaded, save file sent to rebuild). Both
-    callers (DeviceShutdown.reloadClosedStores, StoreTransfers.reinstateAbandonedOut) gossip StoreMoved, so peers clear
-    their offline mark early. No safety effect.
-    Fix: run the callback when serveOpened's future succeeds; on failure merge it into the storesAwaitingRetry entry
-    (composeServed). Correct the scaladoc and the reinstateAbandonedOut comment.
+    A commit held for its turn keeps its locks but leaves Frontend.transactions at TxFinalized
+    (deferredFinalizations); holdsLocks and changes look only in transactions, so Tx.awaitableHolders finds no holder
+    and a pipelined single writer's next transaction votes abort. Lock-order waiters stay safe via heldCommits.
+    Performance only. Fix: have holdsLocks and changes also consult deferredFinalizations (one lookup per collision).
+    Check against 2.1, which reads the same state from repair.
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
@@ -95,14 +176,9 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.1 [SL-W13, X-W17] fsif/DESIGN.md section 4 and three test names are stale.
-    CONFIRMED. Effort S. systemic-loss-protection.md, cross-document-review.md.
-    DESIGN.md 4.6 cites "fsifOpened, :1104-1123" (the code is StoreLoader.handleBackendOpened); the 4.1/4.2 tables
-    cite drifted line numbers; 4.4 counts L1-L12 and 22 cases, omitting L0 (13 and 23). HostFsifLoadSuite,
-    FsifInitializationSuite and RocksDBBackendResourcesSuite test names cite the retired row "(SL X14)", quoted in
-    DESIGN.md. Fix: name methods instead of line numbers, correct the counts, cite "(SL D5)".
-
-7.2 [X-W16] server/repair/CLAUDE.md says the bootstrap sweep "neither counts nor parks"; it counts lock deferrals.
-    CONFIRMED. Effort S. cross-document-review.md.
-    StoreRepairer.repairUpdate calls deferral.record for sweep keys (unused; retainSweep prunes it). Fix: reword
-    (the sweep neither proves, parks nor counts stale passes), or skip deferral.record when allowProof is false.
+7.1 [RB-W17, X section 5] Scaladoc errors in the rebuild and repair code.
+    CONFIRMED. Effort S. rebuild-process.md, cross-document-review.md.
+    RebuildOutcome.Unconfirmed cites "rebuild-process 5.4" (it is 5.7); StoreRebuilds.startRebuild's scaladoc omits
+    Superseded and Unconfirmed among the outcomes that re-check the device; requestRebuild's scaladoc says a later
+    reconcile "finds the marker again" (a Missing Stores request has none); Frontend.repairInstalls' scaladoc is stale
+    (fix with 5.1). Fix: correct the texts.

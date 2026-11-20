@@ -3,8 +3,8 @@ package org.aspen_ddp.aspen.server.host
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
-import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, Host, StorageDeviceConfig, StorageDeviceManager,
-  StoreConfig}
+import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, FileStat, Host, StorageDeviceConfig,
+  StorageDeviceManager, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlConfigInvalid, CrlCorrupt, CrlLocked,
   CrlMissing, CrlSizingMismatch}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
@@ -554,9 +554,13 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                             sdCfg: StorageDeviceConfig,
                             children: Seq[os.Path]): CrashRecoveryLog =
     val crlDir = CrashRecoveryLog.deviceCrlDir(devicePath)
-    val storeDirs = children.filter(dir => os.isDir(dir) && os.isFile(dir / StoreConfig.configFilename))
+    // Stats that fail are no absence (FileStat). A child directory whose config cannot be stat'd may be a store, so it
+    // counts as one: missing it could take an emptied crl/ for a new CRL. A failed stat of a child or of crl/ itself
+    // throws, leaving the device unloaded for the next scan, rather than declare a crl/ that is there lost
+    val storeDirs = children.filter(dir =>
+      FileStat.isDir(dir) && FileStat.existence(dir / StoreConfig.configFilename).forall(identity))
     val lost =
-      if storeDirs.nonEmpty && ! os.exists(crlDir) then
+      if storeDirs.nonEmpty && ! FileStat.exists(crlDir) then
         logger.error(s"Storage device $devicePath holds stores but has no CRL directory. Its stores must be rebuilt")
         true
       else
@@ -640,11 +644,12 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  missing, cut short or another store's, does not hold its state that way. Or it carries rebuild-complete: a
    *  finished rebuild awaiting its flip, which has never served (StoreLoader.tryLoadStore leaves it offline), so its
    *  transaction state is empty. Its rebuild or the reconcile's Completed Rebuilds pass flips and loads it as it
-   *  would have over the old CRL; one finished for an earlier episode is retired by retireForeignCopy as before. */
+   *  would have over the old CRL; one finished for an earlier episode is retired by retireForeignCopy as before. A
+   *  failed stat throws (FileStat), leaving the device unloaded for the next scan. */
   private def holdsOwnState(storeDir: os.Path): Boolean =
     val saveFile = Backend.crlSaveFile(storeDir)
-    os.exists(storeDir / RebuildingStore.RebuildCompleteMarkerFile) ||
-      os.exists(saveFile) &&
+    FileStat.exists(storeDir / RebuildingStore.RebuildCompleteMarkerFile) ||
+      FileStat.exists(saveFile) &&
         Try(StoreConfig.loadStoreConfig(storeDir / StoreConfig.configFilename).storeId).toOption.exists: storeId =>
           CrashRecoveryLog.loadValidStoreState(saveFile, storeId).isRight
 

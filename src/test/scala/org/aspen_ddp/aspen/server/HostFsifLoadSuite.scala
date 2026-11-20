@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
@@ -13,6 +13,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LockstepThreading}
 import org.aspen_ddp.aspen.server.store.backend.{DefaultBackendOpener, StoreCreation}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
+import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.{CommitState, UpdateForm}
 import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifFile, FsifFiles, FsifLayout, FsifRecovery,
@@ -184,7 +185,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     host.loadStoreById(deviceA, storeId)
     host.testingOnlyHandleEvents()
 
-  atest("an FSIF store whose files are gone or empty is marked for rebuild, not served empty (SL X14)"):
+  atest("an FSIF store whose files are gone or empty is marked for rebuild, not served empty (SL D5)"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newSeamHost(hostRoot)
@@ -619,7 +620,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
     val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
-    reinstateAbandoned(host, storeDir, queued).map: _ =>
+    reinstateAbandoned(host, storeDir, queued).flatMap: _ =>
       // Still opening: not served, so nothing is gossiped yet
       host.control.router.offlineStores should contain(storeId)
       fsif(host).gossipedOnline should be(Nil)
@@ -627,7 +628,9 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.testingOnlyHandleEvents() // BackendOpened, then its LoadStore
       host.getStoreIds should contain(storeId)
       host.control.router.offlineStores should not contain storeId
-      fsif(host).gossipedOnline should be(List(storeId))
+      // Once the LoadStore's future, completed by its recovery, calls back
+      yieldUntil(fsif(host).gossipedOnline.nonEmpty).map: _ =>
+        fsif(host).gossipedOnline should be(List(storeId))
 
   atest("an FSIF store reinstated after an abandoned transfer out whose open fails is not gossiped"):
     val hostRoot = newHostDir()
@@ -660,6 +663,59 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
       fsif(host).gossipedOnline should be(Nil)
 
+  // X-W15: the gossip waits for the LoadStore to serve the store, not for the open that queues it
+  atest("an FSIF store reinstated after an abandoned transfer out whose LoadStore finds its save file lost is not gossiped"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
+    reinstateAbandoned(host, storeDir, queued).flatMap: _ =>
+      // Read by the LoadStore, after the open has succeeded
+      os.write.over(Backend.crlSaveFile(storeDir), Array[Byte](1, 2, 3))
+      queued.poll().run()
+      host.testingOnlyHandleEvents() // BackendOpened, then its LoadStore: the save file is unusable
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      // Time for any callback of the failed load to run
+      yieldUntil(fsif(host).gossipedOnline.nonEmpty, maxYields = 10).map: _ =>
+        host.getStoreIds should not contain storeId
+        host.control.router.offlineStores should contain(storeId)
+        fsif(host).gossipedOnline should be(Nil)
+
+  atest("a reinstated FSIF store whose LoadStore leaves it awaiting a retry gossips StoreMoved once, when a retry serves it"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
+    reinstateAbandoned(host, storeDir, queued).flatMap: _ =>
+      CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState(Nil), Backend.crlSaveFile(storeDir))
+      queued.poll().run()
+      // The loaded crl_save.log cannot be unlinked: its LoadStore unloads the store and leaves it awaiting a retry.
+      // Its incarnation file was written at its creation, so the read-only directory fails nothing before that removal
+      os.perms.set(storeDir, "r-x------")
+      val waited = Future.unit.flatMap: _ =>
+        host.testingOnlyHandleEvents()
+        // Its CRL load completes off the control context (CrashRecoveryLog.loadStore), then the failed removal
+        // posts SaveFileRemovalFailed
+        yieldUntil({ host.testingOnlyHandleEvents(); host.control.loader.awaitingRetryHasCallback(storeId).contains(true) },
+                   maxYields = 100000).map: _ =>
+          host.getStoreIds should not contain storeId
+          host.control.router.offlineStores should contain(storeId)
+          host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(true))
+          fsif(host).gossipedOnline should be(Nil)
+      waited.andThen(_ => os.perms.set(storeDir, "rwx------")).flatMap: _ =>
+        host.control.reconciler.scan() // the retry: its open is queued
+        queued.size should be(1)
+        queued.poll().run()
+        host.testingOnlyHandleEvents()
+        host.getStoreIds should contain(storeId)
+        yieldUntil({ host.testingOnlyHandleEvents(); fsif(host).gossipedOnline.nonEmpty }, maxYields = 100000).map: _ =>
+          os.exists(Backend.crlSaveFile(storeDir)) should be(false)
+          fsif(host).gossipedOnline should be(List(storeId))
+
   atest("a RocksDB store reinstated after an abandoned transfer out gossips StoreMoved within the device check"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
@@ -674,14 +730,16 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     fsif(host).deviceStates = Map(deviceA -> deviceState(deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
     host.control.reconciler.checkAll()
-    yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).map: _ =>
+    yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).flatMap: _ =>
       host.control.reconciler.activeDeviceChecks should not contain deviceA
-      // Opened synchronously, so gossiped by the check itself, before its LoadStore is handled
+      // Opened synchronously, but not gossiped until its LoadStore has served it (X-W15)
       host.control.router.offlineStores should not contain storeId
-      fsif(host).gossipedOnline should be(List(storeId))
+      host.getStoreIds should not contain storeId
+      fsif(host).gossipedOnline should be(Nil)
       host.testingOnlyHandleEvents()
       host.getStoreIds should contain(storeId)
-      fsif(host).gossipedOnline should be(List(storeId))
+      yieldUntil(fsif(host).gossipedOnline.nonEmpty).map: _ =>
+        fsif(host).gossipedOnline should be(List(storeId))
 
   // X-W8: a config read failure must not leave the store unserved and untracked until a restart
   atest("a store whose config cannot be read is left offline and retried at the device scans until it loads"):
@@ -730,7 +788,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     fsif(host).deviceStates = Map(deviceA -> deviceState(deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
     host.control.reconciler.checkAll()
-    yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).map: _ =>
+    yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).flatMap: _ =>
       // The marker is gone, so only the retry can take the store up again
       os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
       host.control.router.offlineStores should contain(storeId)
@@ -741,7 +799,8 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.control.reconciler.scan()
       host.testingOnlyHandleEvents()
       host.getStoreIds should contain(storeId)
-      fsif(host).gossipedOnline should be(List(storeId))
+      yieldUntil(fsif(host).gossipedOnline.nonEmpty).map: _ =>
+        fsif(host).gossipedOnline should be(List(storeId))
 
   atest("a reinstated FSIF store whose first open is out of space gossips StoreMoved once, when a retry serves it"):
     val hostRoot = newHostDir()
@@ -750,7 +809,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
     val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
-    reinstateAbandoned(host, storeDir, queued).map: _ =>
+    reinstateAbandoned(host, storeDir, queued).flatMap: _ =>
       fsif(host).outOfSpaceOpens = 1
       queued.poll().run()
       host.testingOnlyHandleEvents() // BackendOpened: out of space, left offline awaiting space
@@ -764,13 +823,15 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       queued.poll().run()
       host.testingOnlyHandleEvents() // BackendOpened served, then its LoadStore
       host.getStoreIds should contain(storeId)
-      fsif(host).gossipedOnline should be(List(storeId))
+      yieldUntil(fsif(host).gossipedOnline.nonEmpty).flatMap: _ =>
+        fsif(host).gossipedOnline should be(List(storeId))
 
-      // Exactly once: later scans and events gossip nothing more
-      host.control.reconciler.scan()
-      host.testingOnlyHandleEvents()
-      queued.size should be(0)
-      fsif(host).gossipedOnline should be(List(storeId))
+        // Exactly once: later scans and events gossip nothing more
+        host.control.reconciler.scan()
+        host.testingOnlyHandleEvents()
+        queued.size should be(0)
+        yieldUntil(fsif(host).gossipedOnline.size > 1, maxYields = 10).map: _ =>
+          fsif(host).gossipedOnline should be(List(storeId))
 
   atest("a reinstated FSIF store dropped from the space wait never runs its gossip, even if loaded later"):
     val hostRoot = newHostDir()

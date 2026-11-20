@@ -119,6 +119,7 @@ recorded", and a read decides (section 9).
 |-----------|---------|------|
 | Insert or advance an ErrorTree entry | `MissedUpdateMarker.writeBatch`, from the finalizing client's `MissedUpdateFinalizationAction` | `errorTimeout` (2 s) after the action executes, for each store that did not report a clean commit |
 | Insert an UnackedCommits entry | same batch | same, for each counted commit voter (every store when the voters are unknown) that sent no `TxCommitted`, or one with `keptForReplay`, and hosts an object T changes |
+| Insert an ErrorTree entry at `HLCTimestamp.Zero` (or rewrite a held one unchanged) | a host, through `MissedUpdateMarker.mark`: a rebuild (`RebuildingStore.markUnsettled`, a restore whose read reported a write lock, `recordAcceptedLoss`) or a rebuilt store's inherited-growth scan (`StoreRepairer.inheritedGrowthScan`, 10.3) | see section 3, marks that name no transaction |
 | Delete either kind | `StoreRepairer.deleteEntryIfUnchanged` only | after the object(s) are reconciled completely or proven deleted |
 | Point lookup of an UnackedCommits head | `Host.unackedLookup` (`server/store/UnackedCommitLookup.scala`) | a recovered, expiring or late commit vote |
 | Applied stubs | not repair's: each store writes and expires its own (`Frontend.expireStubs`; `server/transaction/CLAUDE.md`) | |
@@ -165,6 +166,12 @@ Properties used later: every entry is written after T committed and at least 2 s
 ErrorTree entry's `missedTimestamp` never moves backward; every ErrorTree mark moves the entry's revision, even one
 older than the held entry (12.4); an UnackedCommits entry is never rewritten in place, so its revision changes only
 by delete and re-create.
+
+Marks that name no transaction: a rebuild and a rebuilt store's inherited-growth scan record objects as missed at
+`HLCTimestamp.Zero` (2.6). Such a mark never displaces a newer one (it is written as the held value again, which still
+moves the entry's revision), `mayJoinTransaction(Zero)` is false at once, and the completion gate passes for any read.
+The entry then says only "this store's copy may be behind a committed state", which a complete pass from a later read
+satisfies by E1. The first two properties above hold for transaction marks only.
 
 ---
 
@@ -310,22 +317,24 @@ queued, and the shortcut can then complete the object for T from a phase-A read 
 still follows: every object of an UnackedCommits entry that the store did not apply also gets an ErrorTree mark from
 the same finalization (a store that sent no TxCommitted is marked for every hosted object that is not lock-only, and a
 changed object is never lock-only; a `keptForReplay` store reported every object it did not apply as a commit error,
-and an object it applied owes nothing), T is not finalized before both are written, and the mark creates a fresh entry that a later pass repairs
-from a read after T's commit. Deleting the UnackedCommits entry early costs nothing else: S cannot join T any more
-(5.4), so no Tx of S looks it up.
+and an object it applied owes nothing), T is not finalized before both are written, and the mark creates a fresh
+entry that a later pass repairs from a read after T's commit. Deleting the UnackedCommits entry early costs nothing
+else: S cannot join T any more (5.4), so no Tx of S looks it up.
 
 ### 5.4 Waiting until the store can no longer join the transaction
 
 Both kinds of entry are left for a later pass while `RepairTarget.mayJoinTransaction(store, start)` holds: the entry's
 transaction started at or above the store's forget floor (`StoreRouter.mayJoinTransaction` =
 `!Frontend.belowForgetFloor(start)`). The floor (`Frontend.forgetFloorMillis`) is the latest of `now - horizon`
-(`TransactionHorizon.Horizon`, 20 s), the store's load floor (`loadFloorMillis`: its load plus `MaxStartLead`, or the join ceiling its previous
-life on this host ran under when lower, `JoinCeiling.boundAtLoad`; its load plus `RebuildingStore.AcceptorSinceMargin`
-soon after an arrival) and the status cache's eviction watermark. At or above
-it, a replayed prepare could still create a Tx for T at the store after the scan's `holdsTransaction` check, apply T
-after the reconcile, and the entry would be deleted under that apply. Below it the store refuses every prepare for a
-transaction it does not hold (`Frontend.receivePrepare`), and a store never rejoins a transaction it forgot. The wait
-is at most the horizon plus `MaxStartLead` (2 s) plus clock skew. For an ErrorTree entry the check uses
+(`TransactionHorizon.Horizon`, 20 s), the store's load floor and the status cache's eviction watermark. The load floor
+(`loadFloorMillis`) is the load plus `MaxStartLead`, or the join ceiling the store's previous life on this host ran
+under when lower (`JoinCeiling.boundAtLoad`), and at least an arrival from another host plus
+`RebuildingStore.AcceptorSinceMargin` (10 s); a load within that margin of the arrival uses the load plus the margin.
+At or above the floor, a replayed prepare could still create a Tx for T at the store after the scan's
+`holdsTransaction` check, apply T after the reconcile, and the entry would be deleted under that apply. Below it the
+store refuses every prepare for a transaction it does not hold (`Frontend.receivePrepare`), and a store never rejoins
+a transaction it forgot. The wait is at most the horizon plus `MaxStartLead` (2 s) plus clock skew (the margin is
+shorter than the horizon). For an ErrorTree entry the check uses
 `missedTimestamp`, the newest merged miss; older merged misses started earlier and are below the floor too.
 
 ### 5.5 Entry deletion and its guard
@@ -388,9 +397,9 @@ commit for their turn (`heldCommits`). `commitFailed` includes objects poisoned 
 A rebuilt store also answers stale, before any of this, for a KeyValue object under its inherited-vote lock (every
 object until its first held-vote round completes), and turns a complete result into a stale one for an object it
 guards against growth unless the pass is whole-object and its snapshot was taken after the guard was set
-(`RepairSnapshot.takenAt`), when the guard ends (`Frontend.inheritedGrowthRepaired`; cross-document-review.md 2.3).
-The entry so outlives the guard, which only a repair can end. A stale result defers nothing by a lock, so the next
-pass is whole-object.
+(`RepairSnapshot.takenAt`), when the guard ends (`Frontend.inheritedGrowthRepaired`; 10.3,
+cross-document-review.md 2.3). The entry so outlives the guard, which only a repair can end. A stale result defers
+nothing by a lock, so the next pass is whole-object.
 
 `reconcileSettled`, all in one executor task:
 
@@ -398,43 +407,51 @@ pass is whole-object.
 2. `locks` = the read's reported locks, less the parts a proof covered (`snapshot.proven`), plus the store's own
    (`os.lockedKeys`, `os.objectLevelLocked`): a store that did not answer the read may hold locks of its own.
 3. `plan = Reconcile.plan(snapshot, current, read, storeId, locks)`.
-4. If the plan changes nothing, return its result. If the object holds commit votes' slice reservations
-   (`ObjectState.sliceReservations`, transaction-requirements.md R16) and the plan grows its KeyValue slice, measure
-   the planned state as a vote is measured (`Frontend.repairFitsReservations`, `RequirementsChecker.checkKVSliceSize`:
-   the planned slice plus every reservation, the count varint at the summed count). If it exceeds the KeyValue limit
-   (`Frontend.maxKVSliceSize`, which the votes' apply re-checks use), write nothing and answer stale: a later pass installs once the votes have applied or been released. Otherwise
-   mutate the in-memory state (key installs and deletes,
-   min/max/left/right, re-encode, data, metadata), insert it in the object cache, retain it, add it to `committing`
-   and count it in `txCommitsInFlight`, then `backend.repair(CommitState)`. Transactions on the object wait behind the
-   repair write as behind a commit. On completion `repairWriteComplete` releases it and passes the object's turn on
-   (`commitTurnFree`). A failed write restores the fields the plan changed to the loaded state the plan was built on
-   (`PreRepairState`: metadata, data, min/max/left/right and the touched keys), keeping the same instance, since lock
-   holders reference it and discarding it would fail their committed apply (`StaleObjectState`). That state was
-   settled, so it is the backend's, and no transaction locked, checked or applied the object while the write was in
-   flight. A repair of an object the store did not hold discards its state instead (the next use reloads the
-   backend's). Either way the promise fails, so the entry stays; the object is not marked failed, since no
-   transaction relied on the repaired state. While the write is outstanding, reads are served the repaired state from
-   memory, a state a quorum read returned; a failed write leaves the store as stale as before the repair (12.2).
+4. If the plan changes nothing, record it as an install (below) and return its result. If a KeyValue object holds
+   commit votes' slice reservations (`ObjectState.sliceReservations`, transaction-requirements.md R16) and the plan
+   changes it, measure the planned state as a vote is measured (`Frontend.repairFitsReservations`,
+   `RequirementsChecker.checkKVSliceSize`: the planned slice plus every reservation, the count varint at the summed
+   count). If it exceeds the KeyValue limit (`Frontend.maxKVSliceSize`, which the votes' apply re-checks use), write
+   nothing and answer stale: a later pass installs once the votes have applied or been released. Otherwise mutate the
+   in-memory state (key installs and deletes, min/max/left/right, re-encode, data, metadata), insert it in the object
+   cache, retain it, add it to `committing` and count it in `txCommitsInFlight`, then `backend.repair(CommitState)`.
+   Transactions on the object wait behind the repair write as behind a commit. On completion `repairWriteComplete`
+   releases it and passes the object's turn on (`commitTurnFree`). A failed write restores the fields the plan changed
+   to the loaded state the plan was built on (`PreRepairState`: metadata, data, min/max/left/right and the touched
+   keys), keeping the same instance, since lock holders reference it and discarding it would fail their committed
+   apply (`StaleObjectState`). That state was settled, so it is the backend's, and no transaction locked, checked or
+   applied the object while the write was in flight. A repair of an object the store did not hold discards its state
+   instead (the next use reloads the backend's). Either way the promise fails, so the entry stays; the object is not
+   marked failed, since no transaction relied on the repaired state. While the write is outstanding, reads are served
+   the repaired state from memory, a state a quorum read returned; a failed write leaves the store as stale as before
+   the repair (12.2).
 
 A repair write whose plan removes keys (`plan.deletes`) reaches the backend only once no CRL state the store holds of
-another transaction still holds a blind Insert of one of them that the store applied (`Frontend.awaitBlindInsertsDurable`,
-transaction-requirements.md 9.4): such a state is saved again without the object's update first, or its conclusion
-made durable. A recovered commit vote therefore never writes back a key repair removed. The object stays held in
-memory and counted in flight meanwhile, as for any repair write. Every repair write also records the object timestamp
-it installs (`Frontend.repairInstalls`): a transaction started before it that later applies a blind Insert of a key
-absent here reports the object, since the installed state may hold a deletion of the key this store never held
-(transaction-requirements.md 9.4). The recorded timestamp is the installed object's: a pass narrowed to deferred
-keys (6.3) does not raise it, so a deletion such a pass installs can be recorded below the deleting transaction D's
-start. That loses nothing: the store holds the key at the snapshot's revision and the read lacks it, so the store has
-not applied D (a key delete applied there would have removed it, and one it cannot apply fails, Q8), and D's mark of
-the store exists or follows. Written before the whole-object pass that narrowed this one read the entry, it set that
-pass's `minTimestamp` to at least D's start, and that pass, not stale, raised the store's timestamp to a read at least that new. Written between
-the passes, it moved the entry's revision, and `DeferralState.observeEntry` made this pass whole-object. Written after
-the entry's delete, it is a fresh entry, repaired whole-object from a read reflecting D, which removes a key written
-back meanwhile. A pass whose plan changes nothing records no install, yet its entry's delete can remove the store's
-mark for a key deletion the store already matched (a required-revision Delete applied there as a no-op on the absent
-key): a Tx that did not vote commit here reports its apply of a blind Insert of an absent key whatever repair recorded
-(`Tx.issueCommits`), and a commit voter's lock on the key defers it here (M6).
+another transaction still holds a blind Insert of one of them that the store applied
+(`Frontend.awaitBlindInsertsDurable`, transaction-requirements.md 9.4): such a state is saved again without the
+object's update first, or its conclusion made durable. A recovered commit vote therefore never writes back a key
+repair removed. The object stays held in memory and counted in flight meanwhile, as for any repair write.
+
+Every repair write records the object timestamp it installs (`Frontend.recordRepairInstall`, `repairInstalls`, kept
+until it falls below the forget floor), and so does every pass whose plan changes nothing, whatever its result, at
+the later of the read's and the store's object timestamp: such a pass's entry delete can remove the store's mark for
+a deletion of a key the store never held and the read lacks too. Every Tx on the object started before the recorded
+timestamp, held now or created while the record lasts (`registerReplayHazards`), is told (`Tx.repairInstalled`), and
+its apply of a blind Insert of a key absent here reports the object, whether or not it voted commit here
+(`Tx.issueCommits`), since the installed or matched state may hold a deletion of the key this store never applied
+(transaction-requirements.md 9.4). A committed Delete the store applied as a no-op over the absent key is recorded
+apart (`Frontend.keyDeletions`), so a non-voter's blind Insert of a key also reports after a deletion of it applied
+here. The record of a no-op pass can renew the entry of a hot object (RP-W9).
+
+The recorded timestamp of a write is the installed object's: a pass narrowed to deferred keys (6.3) does not raise
+it, so a deletion such a pass installs can be recorded below the deleting transaction D's start. That loses nothing:
+the store holds the key at the snapshot's revision and the read lacks it, so the store has not applied D (a key
+delete applied there would have removed it, and one it cannot apply fails, Q8), and D's mark of the store exists or
+follows. Written before the whole-object pass that narrowed this one read the entry, it set that pass's
+`minTimestamp` to at least D's start, and that pass, not stale, raised the store's timestamp to a read at least that
+new. Written between the passes, it moved the entry's revision, and `DeferralState.observeEntry` made this pass
+whole-object. Written after the entry's delete, it is a fresh entry, repaired whole-object from a read reflecting D,
+which removes a key written back meanwhile.
 
 ### 6.3 `Reconcile.plan`
 
@@ -692,6 +709,34 @@ window is an accepted limitation (13).
 
 There is no read-driven repair path: a read never writes a store's copy, and every repair goes through Reconcile.
 
+### 10.3 A rebuilt store's inherited-growth scan and guards
+
+A rebuilt store guards each KeyValue object it may hold without a committed growth its lost incarnation voted for
+(`Frontend` "Inherited growth", cross-document-review.md 2.3): a growing update of it votes abort
+(`InheritedGrowthLock`) until a repair shows the store holds that growth. Its first held-vote round, past the
+inherited-votes gate, finds the objects through `StoreRepairer.inheritedGrowthScan` (the host's
+`HeldVoteQuery.growthScan`):
+
+1. Mark, at `HLCTimestamp.Zero` (section 3), every object of the transactions the peers reported that the
+   AllocationTree lists in the store's pool and that is a KeyValue object, and wait for the marks to commit. Each such
+   object then has an entry whatever its transaction's outcome. An unlisted one is deleted, or an allocation the
+   rebuild's pending sweep covers.
+2. Walk the store's range of both trees and list every KeyValue object with an entry: an ErrorTree entry typed
+   KeyValue (a typeless one is left out: repair acts on it only for a proven deletion, so no repair would end its
+   guard), or an object of an UnackedCommits entry. An entry that cannot be decoded, a failed read or a failed mark
+   fails the scan; the round is retried.
+
+The listed objects are guarded at once (`growthScanAnswered`). An inherited transaction released later guards those
+of its objects the scan listed. Until the first round's scan answers, every object is under the inherited-vote lock,
+so every KeyValue reconcile answers stale (6.2) and no KeyValue entry is consumed by a reconcile while the guards are
+being found. A guard ends only at a complete whole-object reconcile from a snapshot the store numbered after the guard
+was set (`repairSnapshotSeq`, `RepairSnapshot.takenAt`, `inheritedGrowthRepaired`): the repair read began after that
+snapshot, so after the transaction committed, and by E1 reflects it. Any other complete result for a guarded object is
+turned stale, so its entry stays for a pass that can end the guard. The release does not wait for the entry's
+completion gate (6.4), which concerns the entry's own misses, not the guard's transaction. The inherited-votes file
+stays while any guard does: a reload repeats the round and finds what is still guarded through the entries the guards
+kept. A repair that drops a guarded object (`repairDeletion`) ends no guard (RP-W10).
+
 ---
 
 ## 11. Invariants
@@ -779,8 +824,11 @@ but the object was unreadable already.
 
 ### 12.6 Entry whose store has been rebuilt or transferred
 
-- Rebuilding: not repairable; entries stay. After promotion the next scan reconciles them (no-ops, since the rebuild
-  copied current state) and removes them. Entries are keyed by pool index, so a rebuilt store inherits them harmlessly.
+- Rebuilding: not repairable; entries stay. After promotion the next scans reconcile them (mostly no-ops, since the
+  rebuild copied current state) and remove them, together with the entries the rebuild itself wrote at
+  `HLCTimestamp.Zero` (2.6). Entries are keyed by pool index, so a rebuilt store inherits them harmlessly. A rebuilt
+  store's KeyValue reconciles answer stale until its first held-vote round has found its growth guards, and a guarded
+  object's until a pass that ends its guard (10.3).
 - Transferred or adopted: repairable only on the host the pool entry names, on the named device (fence). An in-flight
   `snapshot`/`reconcile`/`repairDelete` fails with `StoreNotHosted`. The entry stays for the new host.
 
@@ -848,4 +896,46 @@ its read threshold stalls the scan until the deadline.
 
 ## 14. Open weaknesses
 
-(none)
+### RP-W9: A repair pass that changes nothing makes in-flight inserters of a hot KeyValue object report it, so its entry renews itself
+Verdict CONFIRMED. Priority 5. Effort S.
+Mechanism: `Frontend.reconcileSettled` records every pass whose plan changes nothing, whatever its result, in
+`repairInstalls` at the later of the read's and the store's object timestamp (`recordRepairInstall`), telling every
+held Tx; a Tx created while the record lasts (until it falls below the forget floor) is told at registration
+(`registerReplayHazards`). `Tx.repairInstalled` puts the object in `repairedUnder` for every Tx started before that
+timestamp, and `Tx.issueCommits` then reports the object (`reinserts`, `objectCommitErrors`) whenever the Tx's update
+has no required revision and Inserts a key absent here, whatever its disposition: every ordinary TKVL insert of a new
+key. On a KeyValue object under concurrent inserts the read's timestamp is the newest applied start, so the inserters
+in flight at the pass, and those of clients whose clocks lag, started below it. Each report makes its finalizer wait
+`errorTimeout`, write a marker batch and mark the store again (`MissedUpdateFinalizationAction.updateCommitErrors`);
+the next pass of the new entry changes nothing too, and records again.
+Consequence: once a hot object (a busy TKVL node, a metadata pool's own ErrorTree nodes included, whose marker
+writes are such inserts) has one entry on a caught-up store, its repair can sustain itself at the floor interval for
+as long as the insert load lasts: a read, an entry delete and a marker batch per pass, and the inserters lose the
+clean-finalization fast path. No data is at risk. The scaladoc of `Frontend.repairInstalls` ("Empty except soon
+after a repair write") is stale.
+Fix: record a no-op pass only when its result is complete (only then does its entry delete remove a mark), and at the
+entry's minimum timestamp (the newest merged miss's start, or T's start, carried to the store in `RepairSnapshot`)
+instead of the read's or the store's timestamp. A deletion the store never applied whose mark that delete removes
+started at or before it, so an Insert started before the deletion is still reported, while a reporter's new mark
+carries its own older start and the following pass records no higher, so the loop dies out. The bootstrap sweep
+(minimum timestamp zero, deleting no entries) then records nothing. The narrowed-pass argument of 6.2 and
+transaction-requirements.md 9.4 is restated for the new timestamp. Repair path only; no hot-path cost.
+
+### RP-W10: A growth guard on a rebuilt store's KeyValue object that is deleted is never released, so the store keeps its inherited state and per-vote growth check until a reload
+Verdict CONFIRMED. Priority 5. Effort S.
+Mechanism: an entry of `Frontend.inheritedGrowthLocks` is removed only by `inheritedGrowthRepaired`, on a complete
+reconcile (10.3). A guarded object deleted before such a reconcile, by a transaction (a TKVL join deleting a node)
+or as a deletion the store missed, has its entry settled by a read that proves the deletion: `StoreRepairer`'s
+`repairListed` or `repairAbsent` calls `repairDeletion` (`Frontend.deleteObjectForRepair`), which bypasses
+`reconcileForRepair`, and no reconcile of the object can follow (its reads fail `InvalidObject`). An entry dropped
+that way between the scan's walk and `growthScanAnswered` leaves the same guard.
+Consequence: `holdsInheritedGrowthLocks` stays true, so every transaction the store votes on computes
+`RequirementsChecker.sliceGrowth` (`Tx`'s vote), the per-transaction cost the rare case was meant to confine to the
+window before repair, and `removeInheritedStateWhenDone` never removes the inherited-votes file. The store's next load
+then repeats the held-vote round: it votes abort on every object (`inheritedVoteLock` while `inheritedVotes` is None)
+and answers stale for every KeyValue repair until the round's growth scan, a walk of its whole range of both trees,
+answers. That round finds no entry for the deleted object and drops the guard. No data is at risk: the guard only
+refuses growth of an object that no longer exists.
+Fix: drop the object's guard, then `removeInheritedStateWhenDone()`, when `deleteObjectForRepair` completes and when a
+committed deletion of the object applies here (the refcount-zero commit). Each is behind the `holdsInheritedGrowthLocks`
+test, so a store never rebuilt pays one boolean test on a deletion only.

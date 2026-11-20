@@ -60,7 +60,7 @@ class RocksDBBackendResourcesSuite extends AnyFunSuite with Matchers:
     finally
       os.remove.all(dir)
 
-  test("a store directory without its database is lost, and open creates nothing (SL X14)"):
+  test("a store directory without its database is lost, and open creates nothing (SL D5)"):
     val dir = os.temp.dir()
     try
       // A store whose RocksDB files are gone (an incomplete restore): only its config remains

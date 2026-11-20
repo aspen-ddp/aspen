@@ -411,27 +411,40 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
 
         // A promoted copy belongs to the transfer whose id its marker records. One left by an
         // earlier transfer that was aborted or given up on predates whatever the source has
-        // accepted since, so resuming it would install stale data. Discard it and start over.
+        // accepted since, so resuming it would install stale data. One found lost since its
+        // promotion -- marked rebuild-required (a CRL loss declaration that could not read it),
+        // or its save file no longer valid -- would be repointed onto, and the source's intact
+        // copy then released, as promotion refuses for a staged copy. Until the pool update
+        // commits the source still holds the state, so either is discarded and the transfer
+        // started over.
         val promotedMarker = finalPath / StoreTransfer.TransferredInMarkerFile
         val staleKept = os.exists(promotedMarker) &&
           locally:
             val markerId = try os.read(promotedMarker).trim catch case _: Throwable => ""
-            if transferId.exists(_.toString == markerId) then
-              false
-            else
-              logger.warn(s"Discarding the arrived copy of store $storeId on device $toDeviceid: it " +
-                          s"belongs to transfer '$markerId', not to the current transfer $transferId")
-              // Rename-first: a failure leaves the copy whole behind its marker. The source still owns the store
-              if StoreCopies.delete(devicePath, finalPath, s"a stale arrived copy of store $storeId") then
-                toDevice.offlineStores -= storeId
-                ctx.router.clearOfflineUnlessHeld(storeId)
-                false
+            val unusable =
+              if !transferId.exists(_.toString == markerId) then
+                Some(s"it belongs to transfer '$markerId', not to the current transfer $transferId")
+              else if os.exists(finalPath / RebuildingStore.RebuildRequiredMarkerFile) then
+                Some("it is marked rebuild-required")
               else
-                true
+                CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(finalPath), storeId) match
+                  case Right(_) => None
+                  case Left(err) => Some(s"its CRL save file is no longer usable: $err")
+            unusable match
+              case None => false
+              case Some(why) =>
+                logger.warn(s"Discarding the arrived copy of store $storeId on device $toDeviceid: $why")
+                // Rename-first: a failure leaves the copy whole behind its marker. The source still owns the store
+                if StoreCopies.delete(devicePath, finalPath, s"an unusable arrived copy of store $storeId") then
+                  toDevice.offlineStores -= storeId
+                  ctx.router.clearOfflineUnlessHeld(storeId)
+                  false
+                else
+                  true
 
         // A stale copy that could not be deleted must not be resumed: the next check tries again
         if staleKept then
-          logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: the stale arrived copy at " +
+          logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: the unusable arrived copy at " +
                        s"$finalPath could not be deleted. Retrying at a later check")
 
         // A copy promoted by an earlier attempt -- normally one that crashed before its metadata
@@ -749,9 +762,9 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  both this device's offlineStores and the host.s. Those two sets and the marker file are
    *  three representations of one fact and must not be allowed to disagree.
    *
-   *  StoreMoved is gossiped from tryLoadStore's onServed, once the store is served: at once for a backend that opens
-   *  in the caller, otherwise when its open, which runs off the control thread, has succeeded. A store whose open
-   *  fails is not gossiped.
+   *  StoreMoved is gossiped from tryLoadStore's onServed, once the store is served: once the LoadStore its open
+   *  queues has installed it and it has recovered, whether the backend opened in the caller or off the control
+   *  thread. A store whose open or LoadStore leaves it offline is not gossiped.
    *
    *  If the load fails after the marker is gone, this pass will not pick it up again, since it
    *  keys off the marker that is now removed: the store stays offline and the device scans retry

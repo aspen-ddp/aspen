@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlClosed, CrlFailed, S
   TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading, StoreLoader}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
-import org.aspen_ddp.aspen.server.store.{Frontend, Store}
+import org.aspen_ddp.aspen.server.store.{Frontend, Store, StoreIncarnationFile}
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 
@@ -43,6 +43,8 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     tempRoots += root
     val storeDir = root / "store"
     os.makeDir.all(storeDir)
+    // Every store directory has its incarnation file from its creation
+    StoreIncarnationFile.writeFresh(storeDir)
     val backend = new MapBackend(crlStoreId):
       override def path: os.Path = storeDir
     backend.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
@@ -241,6 +243,8 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     tempRoots += root
     val storeDir = root / "store"
     os.makeDir.all(storeDir)
+    // Every store directory has its incarnation file from its creation
+    StoreIncarnationFile.writeFresh(storeDir)
     val backend = new MapBackend(crlStoreId):
       override def path: os.Path = storeDir
     backend.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
@@ -370,6 +374,8 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     tempRoots += root
     val storeDir = root / "store"
     os.makeDir.all(storeDir)
+    // Every store directory has its incarnation file from its creation
+    StoreIncarnationFile.writeFresh(storeDir)
     val backend = new MapBackend(crlStoreId):
       override def path: os.Path = storeDir
     backend.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),

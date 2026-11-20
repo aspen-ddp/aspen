@@ -57,7 +57,9 @@
   the stale count, so parking continues once started. A hot object alternating busy and locked passes so reaches a proof
   (repair-process 8.1). An ErrorTree entry's deferral key (`errorDeferralKey`) is its tree key alone, so both counts
   survive the entry's rewrite by a later mark; `DeferralState.observeEntry` drops only the next pass's narrowing to the
-  deferred keys when the entry's revision has moved. The bootstrap sweep (no proofs) neither counts nor parks
+  deferred keys when the entry's revision has moved. The bootstrap sweep (no proofs) neither proves, parks nor counts
+  stale passes, and never narrows to deferred keys; `DeferralState.record` still counts its lock-deferred passes per
+  node (`sweepDeferralKey`), a count nothing reads, pruned by `retainSweep`
 - The completion gate (`read.timestamp >= missedTimestamp`) is sound (repair-process 6.4): object timestamps never
   decrease, and a copied one (Reconcile, rebuild) is a read's, the max over the stores matching its revision, so a
   read that reflects the missed transaction passes it. A whole-object KeyValue pass that defers a locked key still

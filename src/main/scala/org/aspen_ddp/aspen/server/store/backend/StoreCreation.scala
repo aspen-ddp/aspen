@@ -5,13 +5,14 @@ import java.util.UUID
 import scala.util.control.NonFatal
 
 import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
+import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import scribe.Logging
 
 /** Creates store directories atomically, for every backend (systemic-loss-protection 4.1, row D5).
  *
- *  A store directory reaches its final path only complete: the backend's files, initialized and closed, and its
- *  `StoreConfig`, all durable. It is built in a scratch directory under the device's `creating/` and renamed into
- *  place, so a crash leaves either nothing at the target or the whole store. Opening therefore never creates: a
+ *  A store directory reaches its final path only complete: the backend's files, initialized and closed, its
+ *  incarnation file and its `StoreConfig`, all durable. It is built in a scratch directory under the device's
+ *  `creating/` and renamed into place, so a crash leaves either nothing at the target or the whole store. Opening therefore never creates: a
  *  store path whose backend files are missing or blank is a store that lost them, and its backend reports
  *  `BackendStateLost`. Rebuilds and transfers already arrive this way (staging, then a move).
  *
@@ -34,6 +35,8 @@ object StoreCreation extends Logging:
         throw new java.nio.file.FileAlreadyExistsException(target.toString)
       os.makeDir.all(scratch)
       init(scratch)
+      // The store's identity, made with it: a load never creates one (StoreIncarnationFile)
+      StoreIncarnationFile.writeFresh(scratch)
       DurableFiles.write(scratch / StoreConfig.configFilename, storeCfg.yamlConfig)
       DurableFiles.syncTree(scratch)
       os.makeDir.all(target / os.up)

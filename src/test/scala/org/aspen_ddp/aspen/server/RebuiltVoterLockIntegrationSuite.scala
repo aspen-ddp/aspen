@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, TransactionDisposition, TransactionId}
 import org.aspen_ddp.aspen.server.repair.{RepairPolicy, StoreRepairer}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
-import org.aspen_ddp.aspen.server.store.Frontend
+import org.aspen_ddp.aspen.server.store.{Frontend, StoreIncarnationFile}
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
 
 import scala.concurrent.Future
@@ -110,6 +110,7 @@ class RebuiltVoterLockIntegrationSuite extends IntegrationTestSuite with org.sca
       _ <- pump(net.hostFor(sid(1)).control.loader.closeStore(sid(1), extractCrl = false), clock = false)
       _ = RebuildingStore.writeAcceptorSince(rebuiltDir, HLCTimestamp.now)
       _ = RebuildingStore.writeInheritedVotes(rebuiltDir, System.currentTimeMillis())
+      _ = StoreIncarnationFile.writeFresh(rebuiltDir)
       rebuilt = new MapBackend(sid(1)):
         override def path: os.Path = rebuiltDir
       _ = rebuilt.m = lostData

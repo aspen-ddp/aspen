@@ -1771,6 +1771,34 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       os.exists(promoted) should be(false)
       recorded(host2).transferOutcomes.get(t.movingStore) should be(None)
 
+  // SL-W12: a promoted copy found lost before its pool update commits (marked rebuild-required by a CRL loss
+  // declaration, or its save file damaged since promotion) is not repointed while the source still holds the state
+  for (lost, damage) <- List[(String, os.Path => Unit)](
+        "marked rebuild-required" -> (p => os.write.over(p / RebuildingStore.RebuildRequiredMarkerFile, "")),
+        "with a damaged crl_save.log" -> (p => os.write.over(Backend.crlSaveFile(p), Array[Byte](1, 2, 3))))
+  do
+    atest(s"a promoted copy $lost is discarded on resume and the store shipped again (SL-W12)"):
+      given ExecutionContext = executionContext
+
+      for
+        t <- startTransferIn()
+        _ = recorded(t.host).holdTransferOutcomes()
+        promoted = t.deviceDir / t.movingStore.directoryName
+        _ = t.transfers.finishTransferIn(t.movingStore)
+        _ <- pumpUntil(os.exists(promoted))
+        _ = damage(promoted)
+
+        transfers2 = new StagedTransferService
+        host2 = newHost(t.hostRoot, transferService = transfers2)
+        _ = host2.control.reconciler.checkAll()
+        _ <- pumpUntil(transfers2.transfersIn.nonEmpty)
+        poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+      yield
+        transfers2.transfersIn.size should be(1)
+        os.exists(promoted) should be(false)
+        recorded(host2).transferOutcomes.get(t.movingStore) should be(None)
+        poolState.stores(t.movingStore.poolIndex).storageDeviceId should not be net.secondDeviceId
+
   // rebuild-process FS17: a copy an earlier tenancy left at the store's path (a finished rebuild awaiting its flip, a
   // lost copy), the store having since been re-placed away and transferred back
   for marker <- List(RebuildingStore.RebuildCompleteMarkerFile, RebuildingStore.RebuildRequiredMarkerFile) do

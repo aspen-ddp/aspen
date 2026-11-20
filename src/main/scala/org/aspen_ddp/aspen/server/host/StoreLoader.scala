@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.host
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.LogRateLimit
-import org.aspen_ddp.aspen.server.{DurableFiles, Host, StoreConfig}
+import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, Host, StoreConfig}
 import org.aspen_ddp.aspen.server.Host.{BackendFailed, BackendOpened, LoadStore, LoadStoreById, ShutdownStore,
   LoadRetry, StoreFailedOnClose, UnloadFailedStore}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, StoreRecoveryState}
@@ -73,50 +73,61 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   private[server] def awaitingRetryHasCallback(storeId: StoreId): Option[Boolean] =
     storesAwaitingRetry.get(storeId).map(_.onServed.isDefined)
 
-  // `onServed` runs, on the control thread, once the store is recorded as served and its LoadStore queued: before
-  // this returns when the backend opens in the caller (RocksDB), otherwise once BackendOpened is handled. It never
-  // runs if the store is not served (skipped, already open or opening, or its open fails), except that an open that
-  // fails with its data intact hands it to the store's next open (LoadRetry). It runs at most once. A caller that must act
-  // once the store is served passes it rather than reading offlineStores after the call.
+  // `onServed` runs, on the control thread, once the store is served: once the LoadStore its open queues has
+  // installed it and it has recovered (its LoadStore's future succeeds), whether the backend opened in the caller
+  // (RocksDB) or off the control thread. It never runs if the store is not served (skipped, already open or opening,
+  // its open fails, or its LoadStore leaves it offline), except that a load that fails with its data intact (an open
+  // error, an unreadable config, no executor slot, no CRL room yet) hands it to the store's next open (LoadRetry). It
+  // runs at most once. A caller that must act once the store is served passes it rather than reading offlineStores
+  // after the call.
   def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: os.Path,
                    onServed: Option[() => Unit] = None): Unit =
     val storeCfgPath = potentialStoreFile / StoreConfig.configFilename
-    if os.exists(storeCfgPath) then
-      try
-        val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath)
-        if os.exists(potentialStoreFile / RebuildingStore.RebuildRequiredMarkerFile) then
-          // Its CRL state is gone. The reconcile flips its entry to Rebuilding, and the rebuild
-          // discards this directory before writing a fresh copy.
-          logger.warn(s"Not loading store ${storeCfg.storeId}: its CRL save file was lost and it " +
-                      s"awaits a rebuild. $potentialStoreFile")
-          keepMarkedCopyOffline(sds, storeCfg.storeId)
-        else if os.exists(potentialStoreFile / StoreTransfer.TransferOutMarkerFile) then
-          logger.info("Skipping load of offline store marked for transfer out. " +
-                      s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
-          keepMarkedCopyOffline(sds, storeCfg.storeId)
-        else if os.exists(potentialStoreFile / StoreTransfer.TransferredInMarkerFile) then
-          // Arrived, but the pool may still name the source. StoreTransfers.startIn resumes the
-          // metadata step for it, and reconcileDeviceState loads it if that step already committed.
-          logger.info("Skipping load of transferred-in store awaiting its pool update. " +
-                      s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
-          keepMarkedCopyOffline(sds, storeCfg.storeId)
-        else if os.exists(potentialStoreFile / RebuildingStore.RebuildCompleteMarkerFile) then
-          // A finished rebuild whose flip may not have committed (a crash between the move and the flip,
-          // rebuild-process 5.7). The rebuild's completion removes the marker and loads it once the flip commits; for
-          // an entry already Active, the reconcile does (DeviceReconciler)
-          logger.info("Skipping load of rebuilt store awaiting its device entry's flip out of Rebuilding. " +
-                      s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
-          keepMarkedCopyOffline(sds, storeCfg.storeId)
-        else if opening.contains(storeCfg.storeId) || router.get(storeCfg.storeId).isDefined then
-          logger.debug(s"Not loading store ${storeCfg.storeId} again: it is already open or opening")
-        else
-          startOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)
-      catch
-        case t: Throwable => awaitUnreadRetry(sds, potentialStoreFile, onServed, t)
-    else if os.isDir(potentialStoreFile) && isStoreDirectoryName(potentialStoreFile) then
-      // Never a half-made store (creates, transfers and rebuilds move a store into place whole), so a store whose
-      // config was lost. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass
-      logger.error(s"Not loading $potentialStoreFile: it has no ${StoreConfig.configFilename}")
+    // Every existence test here is FileStat's: a stat that fails is no absence. A marker taken as absent would load a
+    // store it must keep offline, so a failed stat takes the unreadable-config retry like a failed read
+    // (cross-document-review 2.2)
+    val hasConfig =
+      try Right(FileStat.exists(storeCfgPath))
+      catch case NonFatal(t) => Left(t)
+    hasConfig match
+      case Left(t) => awaitUnreadRetry(sds, potentialStoreFile, onServed, t)
+      case Right(true) =>
+        try
+          val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath)
+          if FileStat.exists(potentialStoreFile / RebuildingStore.RebuildRequiredMarkerFile) then
+            // Its CRL state is gone. The reconcile flips its entry to Rebuilding, and the rebuild
+            // discards this directory before writing a fresh copy.
+            logger.warn(s"Not loading store ${storeCfg.storeId}: its CRL save file was lost and it " +
+                        s"awaits a rebuild. $potentialStoreFile")
+            keepMarkedCopyOffline(sds, storeCfg.storeId)
+          else if FileStat.exists(potentialStoreFile / StoreTransfer.TransferOutMarkerFile) then
+            logger.info("Skipping load of offline store marked for transfer out. " +
+                        s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
+            keepMarkedCopyOffline(sds, storeCfg.storeId)
+          else if FileStat.exists(potentialStoreFile / StoreTransfer.TransferredInMarkerFile) then
+            // Arrived, but the pool may still name the source. StoreTransfers.startIn resumes the
+            // metadata step for it, and reconcileDeviceState loads it if that step already committed.
+            logger.info("Skipping load of transferred-in store awaiting its pool update. " +
+                        s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
+            keepMarkedCopyOffline(sds, storeCfg.storeId)
+          else if FileStat.exists(potentialStoreFile / RebuildingStore.RebuildCompleteMarkerFile) then
+            // A finished rebuild whose flip may not have committed (a crash between the move and the flip,
+            // rebuild-process 5.7). The rebuild's completion removes the marker and loads it once the flip commits; for
+            // an entry already Active, the reconcile does (DeviceReconciler)
+            logger.info("Skipping load of rebuilt store awaiting its device entry's flip out of Rebuilding. " +
+                        s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
+            keepMarkedCopyOffline(sds, storeCfg.storeId)
+          else if opening.contains(storeCfg.storeId) || router.get(storeCfg.storeId).isDefined then
+            logger.debug(s"Not loading store ${storeCfg.storeId} again: it is already open or opening")
+          else
+            startOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)
+        catch
+          case t: Throwable => awaitUnreadRetry(sds, potentialStoreFile, onServed, t)
+      case Right(false) if os.isDir(potentialStoreFile) && isStoreDirectoryName(potentialStoreFile) =>
+        // Never a half-made store (creates, transfers and rebuilds move a store into place whole), so a store whose
+        // config was lost. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass
+        logger.error(s"Not loading $potentialStoreFile: it has no ${StoreConfig.configFilename}")
+      case Right(false) => ()
 
   /** Records a store directory a marker keeps from loading as offline on its device, and silences the store unless it
    *  is served or opening here. The router's mark is by store id, and the store may be served from another device of
@@ -128,7 +139,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     sds.offlineStores += storeId
 
   /** A load that threw before any open started: its config could not be read (an I/O error, a resource limit, a
-   *  corrupt file) or a marker check failed. Unless the store is open or opening (an offer repeated over a served
+   *  corrupt file), or the stat of its config or a marker failed (FileStat). Also a LoadStore whose save file or
+   *  incarnation file could not be read or stat'd (handleLoad), with no open in flight by then. Unless the store is open or opening (an offer repeated over a served
    *  store), it is left offline and put in storesAwaitingRetry, as a failed open is, so the device scans offer it to
    *  tryLoadStore again with backoff. Without this, a load from a pass that removed its marker first (Completed
    *  Transfers In, Completed Rebuilds) or that offers it once (device load, reloadClosedStores) would leave an Active
@@ -146,12 +158,12 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         val waitScans = previous.map(w => math.min(w.waitScans * 2, loadRetryCapScans)).getOrElse(1)
         if previous.exists(_.waitScans == loadRetryCapScans) then
           // Once per cap interval: a config that stays unreadable leaves the store unserved
-          logger.error(s"Store $storeId still cannot be loaded: its config could not be read. Retrying in " +
+          logger.error(s"Store $storeId still cannot be loaded: its directory could not be read. Retrying in " +
                        s"$waitScans device scans. $storePath. Error: $err")
         else if previous.isDefined then
           logger.debug(s"Store $storeId still cannot be loaded. Retrying in $waitScans device scans. Error: $err")
         else
-          logger.warn(s"Store $storeId cannot be loaded: its config could not be read. Leaving it offline and " +
+          logger.warn(s"Store $storeId cannot be loaded: its directory could not be read. Leaving it offline and " +
                       s"retrying, with backoff. $storePath. Error: $err")
         router.markOffline(storeId)
         sds.offlineStores += storeId
@@ -228,8 +240,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  - any other failure (out of space, Backend.isOutOfSpace, or an I/O, lock or resource error): nothing says the
    *    data is gone, so the store is left offline and unloaded, recorded in storesAwaitingRetry, and ScanDevices
    *    retries it with backoff.
-   *  ShutdownStore completions deferred meanwhile are then put again, after the LoadStore, and then the load's
-   *  onServed callback, if any, runs for a served store.
+   *  ShutdownStore completions deferred meanwhile are then put again, after the LoadStore. The load's onServed
+   *  callback, if any, waits for that LoadStore (awaitServed).
    *
    *  An `inline` outcome is handled within startOpen, where nothing can have changed since the open began; the
    *  device may not be registered yet (DeviceDiscovery registers it once each store has been offered). */
@@ -239,7 +251,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val deferred = opening.getOrElse(storeId, Nil)
     opening -= storeId
     val registered = ctx.devices.devices.get(sds.storageDeviceId).exists(_ eq sds)
-    var servedCallback: Option[() => Unit] = None
     def leaveOffline(): Unit =
       router.markOffline(storeId)
       router.clearLoading(storeId)
@@ -262,7 +273,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           newStores += storeId
         val served = serveOpened(sds, storeCfg, storePath, backend)
         created.foreach(_.completeWith(served))
-        servedCallback = onServed
+        onServed.foreach(awaitServed(storeId, served, _))
       case Failure(e: BackendStateLost) =>
         logger.error(s"Store $storeId cannot be loaded: its backend found its acknowledged state lost. " +
                      s"Rebuilding it. $storePath. Error: ${e.getMessage}")
@@ -301,10 +312,23 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         storesAwaitingRetry += storeId -> LoadRetry(sds, storePath, waitScans, waitScans, onServed)
         created.foreach(_.tryFailure(e))
     deferred.reverse.foreach(ctx.post)
-    // After the replay, so a callback that throws cannot lose a deferred shutdown's completion
-    servedCallback.foreach: callback =>
-      try callback()
-      catch case NonFatal(t) => logger.warn(s"The served callback of store $storeId failed: $t")
+
+  /** Runs a load's onServed `callback` on the control thread once its LoadStore has served the store (`served`
+   *  succeeds). A LoadStore that leaves the store offline with its data intact puts it in storesAwaitingRetry
+   *  (handleLoad, or the SaveFileRemovalFailed that StoreRouter.crlLoaded posts before failing `served`), and the
+   *  callback joins that entry, to run for the open that serves it. The join is posted to controlEvents, behind that
+   *  event (lockstep keeps control events and control-context callbacks apart). Any other failure (its device
+   *  unloaded, its save file sent to a rebuild, its CRL state failing to load) drops it: whatever takes the store
+   *  over next has not served it either. */
+  private def awaitServed(storeId: StoreId, served: Future[Unit], callback: () => Unit): Unit =
+    served.onComplete:
+      case Success(_) =>
+        try callback()
+        catch case NonFatal(t) => logger.warn(s"The served callback of store $storeId failed: $t")
+      case Failure(_) =>
+        ctx.threading.controlEvents.execute: () =>
+          storesAwaitingRetry.get(storeId).foreach: wait =>
+            storesAwaitingRetry += storeId -> wait.copy(onServed = composeServed(wait.onServed, Some(callback)))
 
   /** Called once per device scan. Retries the load of every store in storesAwaitingRetry whose backoff has run
    *  out, whose device is still loaded here and not shutting down, and which is still offline and unloaded. Others
@@ -316,8 +340,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       if ! ctx.devices.devices.get(deviceId).exists(_ eq wait.sds) || router.get(storeId).isDefined ||
          ! wait.sds.offlineStores.contains(storeId) || opening.contains(storeId) then
         storesAwaitingRetry -= storeId
-      else if ! os.exists(wait.storePath / StoreConfig.configFilename) then
-        // Nothing left to load. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass
+      else if FileStat.existence(wait.storePath / StoreConfig.configFilename).contains(false) then
+        // Nothing left to load. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass. A failed
+        // stat is retried as below: tryLoadStore takes it for an unreadable config
         logger.error(s"Store $storeId awaiting a load retry no longer has a ${StoreConfig.configFilename} at " +
                      s"${wait.storePath}. Dropping the retry")
         storesAwaitingRetry -= storeId
@@ -361,12 +386,23 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val failed = backend.hasFailed
     // The store's device's CRL. A store loaded directly onto a device this host has not loaded uses the test seam's
     val deviceCrl = ctx.devices.devices.get(storageDeviceId).map(_.crl).orElse(ctx.unloadedDeviceCrl)
+    // Whether the store has a save file: a stat that fails says nothing (FileStat). Taken as absent, it would recover
+    // the store from a device CRL that holds none of its state, and the file, still there, would have the next load
+    // drop everything saved since (cross-document-review 2.2). So the load is held back and retried instead
+    val hasSaveFile = if failed then Success(false) else Try(FileStat.exists(backend.crlSaveFile))
+    // The store's identity, read before anything is built. Never created here: every store directory gets one when it
+    // is made (StoreCreation, RebuildingStore.finish). One that is missing is lost, which makes the store a new
+    // incarnation, and one written fresh over a store keeping its data and CRL state would skip the commits it owes
+    // (a recovered commit vote finding its UnackedCommits entry under the old incarnation; cross-document-review 2.2)
+    val incarnation =
+      if failed then Failure(new IllegalStateException("not read")) else
+        Try(StoreIncarnationFile.load(backend.path, backend.storeId))
     val savedState =
       if failed then
         // Failed-stop between its open and this event. Its BackendFailed found nothing to
         // unload, or will, so it is retired here.
         Left(new java.io.IOException(s"the backend of store ${backend.storeId} failed before it was served"))
-      else if os.exists(backend.crlSaveFile) then
+      else if hasSaveFile.getOrElse(false) then
         CrashRecoveryLog.loadValidStoreState(backend.crlSaveFile, backend.storeId).map(Some(_))
       else
         Right(None)
@@ -383,8 +419,30 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         router.clearLoading(backend.storeId)
         p.failure(err)
 
+      case _ if hasSaveFile.isFailure || incarnation.failed.toOption.exists(e =>
+          !e.isInstanceOf[StoreIncarnationFile.IncarnationLost]) =>
+        // Not known to be gone, only unread: left offline, its files untouched, and retried with backoff as an
+        // unreadable config is. A reload over a served store leaves that store serving
+        val err = hasSaveFile.failed.toOption.orElse(incarnation.failed.toOption).get
+        val replaced = router.entry(backend.storeId).isDefined
+        if replaced then
+          logger.warn(s"Not reloading store ${backend.storeId}: its save file or incarnation file could not be read. " +
+                      s"The loaded copy keeps serving. Error: $err")
+        abandonLoad(storageDeviceId, backend, replaced, err, p)
+        if !replaced then
+          ctx.devices.devices.get(storageDeviceId).foreach(awaitUnreadRetry(_, backend.path, None, err))
+
       case (Left(err), _) =>
         ctx.rebuilds.crlSaveFileLost(storageDeviceId, backend, err)
+        router.clearLoading(backend.storeId)
+        p.failure(err)
+
+      case _ if incarnation.isFailure =>
+        // Its incarnation file is gone: the store's identity is lost with it, so it is rebuilt as a new incarnation
+        val err = incarnation.failed.get
+        logger.error(s"Store ${backend.storeId} cannot be loaded: its incarnation file is missing. Rebuilding it. " +
+                     s"Error: $err")
+        ctx.rebuilds.retireUnserved(storageDeviceId, backend)
         router.clearLoading(backend.storeId)
         p.failure(err)
 
@@ -443,7 +501,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 RebuildingStore.readAcceptorSince(backend.path),
                 inheritedVotesAfter = RebuildingStore.readInheritedVotes(backend.path, ctx.transactionHorizon),
                 heldVoteQuery = ctx.heldVoteQuery,
-                incarnationOverride = Some(StoreIncarnationFile.loadOrCreate(backend.path, storeId)),
+                incarnationOverride = Some(incarnation.get),
                 poolIDA = poolIDA,
                 admissionTier = admissionTier,
                 // Its backend's completion handler is set below, after the Store is built: recovered transactions read

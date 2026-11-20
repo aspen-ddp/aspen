@@ -465,13 +465,7 @@ Every clock comparison that crosses subsystems, and what bounds it:
 
 ## 5. Contradictions
 
-Between the documents:
-
-* systemic-loss-protection.md section 2 describes FSIF's unclassified read failures as design while the RocksDB
-  backend retries transient ones before declaring: the two backends give one declaration (D7) different triggers
-  (X-W22).
-
-Terms they share mean the same in each:
+Between the documents, none is open. Terms they share mean the same in each:
 
 * A transaction that "holds" or "has applied" a blind Insert's update at a store, for a key deletion's wait, includes
   a commit voter that has not applied yet (`Tx.holdsUpdateOf`; crash-recovery-log.md 3.4, transaction-requirements.md
@@ -522,20 +516,3 @@ Consequence: a collision abort and a client retry for a pipelined writer whose p
 earlier backend commit at one store when its finalization arrives: performance only. Repair is unaffected: the held
 commit stays in `heldCommits`, so its objects are unsettled until it applies.
 Fix: have `holdsLocks` and `changes` also consult `deferredFinalizations`. One extra map lookup on a collision only.
-
-### X-W22: FSIF reports any failed read as CorruptedObject at once, so one transient error fail-stops a recovering store
-Verdict CONFIRMED. Priority 3. Effort S.
-Mechanism: `FsifBackend.assemble` maps a failed disk read (`Failure(t)`: an `IOException` from `pread`, EIO from a
-retried SCSI timeout, ENOMEM) to `ReadError.CorruptedObject`, as `startRead` does for any exception and `readExt` for
-a rejected io task; only a torn header racing a write is retried. A recovered commit vote whose object load fails with
-anything but ObjectNotFound fail-stops its store (`Tx.objectLoadFailed` -> `Frontend.failStop`, systemic-loss
-declaration D7) unless writes are frozen. The RocksDB backend retries the same failures (`RocksDBBackend.attemptRead`,
-`ReadRetryDelays`) and declares at once only on a Corruption status or an undecodable value.
-Consequence: on FSIF a transient read error during a restart's recovery declares the store lost and rebuilds it. A
-host-wide transient (memory pressure, a controller reset) during a restart storm does this to every FSIF store with a
-recovered commit vote at once, the correlated declaration systemic-loss-protection.md guards against; with the pool
-then below `t` writable stores it is an outage, and with more than `w - r` of one pool's stores declared, a loss
-unless they are reinstated.
-Fix: classify as RocksDB does: a CRC mismatch or an invalid header is damage and reports at once; an I/O or internal
-exception retries after each of `RocksDBBackend.ReadRetryDelays` (or an FSIF equivalent) before `CorruptedObject`. A
-fatal backend keeps reporting at once. Failure path only; no hot-path cost.

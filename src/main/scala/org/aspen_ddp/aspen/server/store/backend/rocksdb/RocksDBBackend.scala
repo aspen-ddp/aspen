@@ -22,10 +22,6 @@ object RocksDBBackend extends Logging {
   /** Thrown by `decodeDBValue` when a stored value does not have a valid encoding */
   class CorruptedObjectEncoding(msg: String) extends RuntimeException(msg)
 
-  /** Backoff before each retry of a read failing without a Corruption status: about 1.1 s in all, enough to ride out
-    * a start-up burst of EMFILE, ENOMEM or a transient EIO while every store of a host recovers at once */
-  val ReadRetryDelays: Seq[FiniteDuration] = Seq(10.millis, 100.millis, 1.second)
-
   /** True for a RocksDB error that reports damaged data rather than a failure to read it */
   def isCorruption(e: RocksDBException): Boolean =
     Option(e.getStatus).exists(_.getCode == Status.Code.Corruption)
@@ -219,7 +215,7 @@ object RocksDBBackend extends Logging {
 class RocksDBBackend(dbPath: os.Path,
                      override val storeId: StoreId,
                      val executionContext: ExecutionContext,
-                     readRetryDelays: Seq[FiniteDuration] = RocksDBBackend.ReadRetryDelays,
+                     readRetryDelays: Seq[FiniteDuration] = RetryScheduler.ReadRetryDelays,
                      scheduler: RetryScheduler = SharedRetryScheduler) extends Backend {
 
   import RocksDBBackend._

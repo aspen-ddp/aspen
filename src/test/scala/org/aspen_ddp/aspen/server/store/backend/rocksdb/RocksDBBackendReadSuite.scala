@@ -34,7 +34,7 @@ object RocksDBBackendReadSuite:
     * else read the database. */
   final class FailingReads(dir: os.Path, failures: Seq[Throwable], scheduler: RetryScheduler,
                            stored: Option[Array[Byte]])
-    extends RocksDBBackend(dir, storeId, ExecutionContext.global, RocksDBBackend.ReadRetryDelays, scheduler):
+    extends RocksDBBackend(dir, storeId, ExecutionContext.global, RetryScheduler.ReadRetryDelays, scheduler):
     private val remaining = mutable.Queue(failures*)
     @volatile var attempts = 0
     override protected def getValue(key: Array[Byte]): Future[Option[Array[Byte]]] =
@@ -73,7 +73,7 @@ class RocksDBBackendReadSuite extends AnyFunSuite with Matchers:
     val (result, backend, scheduler) = readOnce(Seq(status(Status.Code.IOError), status(Status.Code.Busy)))
     result.isLeft should be(true)
     backend.attempts should be(3)
-    scheduler.delays.toSeq should be(RocksDBBackend.ReadRetryDelays.take(2))
+    scheduler.delays.toSeq should be(RetryScheduler.ReadRetryDelays.take(2))
 
   test("a read failing with a non-RocksDB exception is retried"):
     val (result, backend, _) = readOnce(Seq(new java.io.IOException("Too many open files")))
@@ -87,11 +87,11 @@ class RocksDBBackendReadSuite extends AnyFunSuite with Matchers:
     scheduler.delays should be(empty)
 
   test("a read failing persistently reports CorruptedObject once its retries are spent"):
-    val n = RocksDBBackend.ReadRetryDelays.size + 1
+    val n = RetryScheduler.ReadRetryDelays.size + 1
     val (result, backend, scheduler) = readOnce(Seq.fill(n)(status(Status.Code.IOError)))
     result should be(Right(ReadError.CorruptedObject))
     backend.attempts should be(n)
-    scheduler.delays.toSeq should be(RocksDBBackend.ReadRetryDelays)
+    scheduler.delays.toSeq should be(RetryScheduler.ReadRetryDelays)
 
   test("a value too short to decode reports CorruptedObject"):
     val (result, _, scheduler) = readOnce(Nil, storedValue = Some(Array[Byte](0, 1)), store = false)

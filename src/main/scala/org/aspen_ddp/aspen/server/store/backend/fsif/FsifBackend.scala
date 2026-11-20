@@ -362,7 +362,7 @@ class FsifBackend(val storeId: StoreId,
   override def bootstrapOverwrite(objectId: ObjectId, data: DataBuffer): Unit =
     throw new UnsupportedOperationException("FSIF stores cannot be bootstrap stores")
 
-  override def read(pointer: ObjectPointer): Unit = post(startRead(pointer))
+  override def read(pointer: ObjectPointer): Unit = post(startRead(pointer, tuning.readRetryDelays.toList))
 
   override def commit(state: CommitState, transactionId: TransactionId): Unit =
     val id = state.objectId
@@ -1495,7 +1495,8 @@ class FsifBackend(val storeId: StoreId,
   private def completeRead(id: ObjectId, result: Either[ReadState, ReadError.Value]): Unit =
     handler.foreach(_.complete(Read(storeId, id, result)))
 
-  private def startRead(pointer: ObjectPointer): Unit =
+  /** `retries`: the delays left before a read failing without evidence of damage reports `CorruptedObject` */
+  private def startRead(pointer: ObjectPointer, retries: List[FiniteDuration]): Unit =
     if fatal.isDefined then
       completeRead(pointer.id, Right(ReadError.CorruptedObject))
     else
@@ -1504,13 +1505,30 @@ class FsifBackend(val storeId: StoreId,
         case Some(x) =>
           // Not behind X's gate: while X is gated its index entry is unchanged (the gated operation assigns it in the
           // task that releases the gate), and a copy-on-write held by ENOSPC must not hold reads
-          try readExt(pointer, x)
+          try readExt(pointer, x, retries)
           catch
-            case NonFatal(t) =>
-              logger.error(s"FSIF store $storeId: read of ${pointer.id} failed: $t")
-              completeRead(pointer.id, Right(ReadError.CorruptedObject))
+            case NonFatal(t) => readFailed(pointer, retries, t)
 
-  private def readExt(pointer: ObjectPointer, x: Int): Unit =
+  /** A read failed without evidence of damage (an I/O error, a rejected io task, an internal exception): retry it
+    * after the next delay, or report `CorruptedObject` once none is left, the backend has failed or it is closing (a
+    * retry never touches closed files). A recovered commit vote fail-stops the store on that report (systemic-loss
+    * D7), so one transient host condition must not cause it.
+    */
+  private def readFailed(pointer: ObjectPointer, retries: List[FiniteDuration], t: Throwable): Unit =
+    retries match
+      case delay :: rest if fatal.isEmpty && !closing =>
+        logger.warn(s"FSIF store $storeId: read of ${pointer.id} failed, retrying in $delay: $t")
+        scheduler.schedule(delay, () => post(
+          if closing then
+            completeRead(pointer.id, Right(ReadError.CorruptedObject))
+          else
+            startRead(pointer, rest)))
+      case _ =>
+        val tried = tuning.readRetryDelays.size - retries.size
+        logger.error(s"FSIF store $storeId: read of ${pointer.id} failed after $tried retries: $t")
+        completeRead(pointer.id, Right(ReadError.CorruptedObject))
+
+  private def readExt(pointer: ObjectPointer, x: Int, retries: List[FiniteDuration]): Unit =
     val slot = index.slots(x)
     if fatal.isDefined then
       completeRead(pointer.id, Right(ReadError.CorruptedObject))
@@ -1532,59 +1550,61 @@ class FsifBackend(val storeId: StoreId,
             val length = math.max(issueLength, disk.map(_.sliceLength).getOrElse(0))
             (disk, if length > 0 then dataFile.read(base + SegmentHeader.Size, length) else Array.emptyByteArray)
           }
-          post(finishRead(pointer, x, st, issueVersion, r))
+          post(finishRead(pointer, x, st, issueVersion, retries, r))
         }))
       catch
         case NonFatal(t) =>
-          finishRead(pointer, x, st, issueVersion, Failure(t))
+          finishRead(pointer, x, st, issueVersion, retries, Failure(t))
 
   private def finishRead(pointer: ObjectPointer, x: Int, st: SlotState, issueVersion: Long,
-                         r: Try[(Option[SegmentHeader], Array[Byte])]): Unit =
+                         retries: List[FiniteDuration], r: Try[(Option[SegmentHeader], Array[Byte])]): Unit =
     st.reads -= 1
     readsInFlight -= 1
     val moved = index.slots(x) != st.slot || index.ids(x) != pointer.id || !slotStates.get(st.slot).contains(st)
-    val result: Option[Either[ReadState, ReadError.Value]] =
+    val outcome: ReadOutcome =
       if fatal.isDefined then
-        Some(Right(ReadError.CorruptedObject))
+        ReadOutcome.Done(Right(ReadError.CorruptedObject))
       else if moved then
-        None
+        ReadOutcome.Again
       else
-        val res = Try(assemble(pointer.id, x, st, r)).getOrElse(Right(ReadError.CorruptedObject))
-        // A disk read racing an in-place write can tear the header (pread/pwrite are not atomic), e.g. its length
-        // when no Delta was pending at issue. If the slot changed meanwhile, the failure may be that race: retry.
-        val raced = res == Right(ReadError.CorruptedObject) && r.isSuccess && st.version != issueVersion
-        if raced then None else Some(res)
+        r.flatMap(disk => Try(assemble(pointer.id, x, st, disk))) match
+          case Failure(t) => ReadOutcome.Failed(t)
+          case Success(res) =>
+            // A disk read racing an in-place write can tear the header (pread/pwrite are not atomic), e.g. its length
+            // when no Delta was pending at issue. If the slot changed meanwhile, the failure may be that race: retry.
+            if res == Right(ReadError.CorruptedObject) && st.version != issueVersion then
+              ReadOutcome.Again
+            else
+              ReadOutcome.Done(res)
     st.prune()
     if st.dead then
       tryFree(st)
     else
       dropIfUnused(st)
-    result match
-      case Some(res) => completeRead(pointer.id, res)
-      case None => startRead(pointer) // X moved or changed meanwhile, or the read raced a write: read again
+    outcome match
+      case ReadOutcome.Done(res) => completeRead(pointer.id, res)
+      case ReadOutcome.Again => startRead(pointer, retries) // X moved or changed meanwhile, or raced a write
+      case ReadOutcome.Failed(t) => readFailed(pointer, retries, t)
 
+  /** Reports `CorruptedObject` only on evidence of damage: no valid header, or a CRC mismatch */
   private def assemble(id: ObjectId, x: Int, st: SlotState,
-                       r: Try[(Option[SegmentHeader], Array[Byte])]): Either[ReadState, ReadError.Value] =
-    r match
-      case Failure(t) =>
-        logger.error(s"FSIF store $storeId: read of $id from slot ${st.slot} failed: $t")
+                       read: (Option[SegmentHeader], Array[Byte])): Either[ReadState, ReadError.Value] =
+    val (disk, slice) = read
+    st.newestHeader.orElse(disk) match
+      case None =>
+        logger.error(s"FSIF store $storeId: slot ${st.slot} holding $id has no valid header")
         Right(ReadError.CorruptedObject)
-      case Success((disk, slice)) =>
-        st.newestHeader.orElse(disk) match
-          case None =>
-            logger.error(s"FSIF store $storeId: slot ${st.slot} holding $id has no valid header")
-            Right(ReadError.CorruptedObject)
-          case Some(h) if h.sliceLength < 0 || h.sliceLength > layout.segmentPayloadSize =>
-            Right(ReadError.CorruptedObject)
-          case Some(h) =>
-            val buf = SlotState.overlay(h, slice, st.deltas)
-            if !SegmentHeader.verify(h, buf) then
-              logger.error(s"FSIF store $storeId: CRC mismatch reading $id from slot ${st.slot}")
-              Right(ReadError.CorruptedObject)
-            else if h.objectId != id || h.externalIndex != x then
-              Right(ReadError.ObjectNotFound)
-            else
-              Left(ReadState(id, h.metadata, h.objectType, DataBuffer(buf), Set()))
+      case Some(h) if h.sliceLength < 0 || h.sliceLength > layout.segmentPayloadSize =>
+        Right(ReadError.CorruptedObject)
+      case Some(h) =>
+        val buf = SlotState.overlay(h, slice, st.deltas)
+        if !SegmentHeader.verify(h, buf) then
+          logger.error(s"FSIF store $storeId: CRC mismatch reading $id from slot ${st.slot}")
+          Right(ReadError.CorruptedObject)
+        else if h.objectId != id || h.externalIndex != x then
+          Right(ReadError.ObjectNotFound)
+        else
+          Left(ReadState(id, h.metadata, h.objectType, DataBuffer(buf), Set()))
 
 object FsifBackend:
   private val Zero = ObjectId(new UUID(0, 0))
@@ -1605,6 +1625,14 @@ object FsifBackend:
     /** Journal s's handle once the writer has switched, until step 4 has emptied it */
     var oldFile: Option[FsifFile] = None
     def switching: Boolean = phase == CheckpointPhase.Draining || phase == CheckpointPhase.Header
+
+  /** How a finished disk read ends: completed, issued again at once (the slot moved or the read raced a write), or
+    * failed without evidence of damage (retried after a delay)
+    */
+  private enum ReadOutcome:
+    case Done(result: Either[ReadState, ReadError.Value])
+    case Again
+    case Failed(t: Throwable)
 
   /** An operation held by ENOSPC: `retry` re-issues its I/O, `abort` ends it on fail-stop */
   private final class HeldOp(val retry: () => Unit, val abort: () => Unit)

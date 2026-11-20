@@ -40,6 +40,8 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
   private var opsLeft = -1L
   /** Writes, forces and truncates that took effect, across all files */
   private var opsDone = 0L
+  /** Pending failReads rules, each with the reads it still fails */
+  private val readFaults = mutable.ArrayBuffer[ReadRule]()
   /** Faults thrown by failNext / failWhile rules, by (file, op) */
   private val faults = mutable.Map[(String, FaultOp), Int]()
 
@@ -65,6 +67,13 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
   def failWhile(fault: Fault, file: String => Boolean = _ => true,
                 ops: Set[FaultOp] = FaultOp.values.toSet)(p: => Boolean): Unit = lock.synchronized:
     persistent += Rule(fault, file, ops, () => p)
+
+  /** The next `n` reads of a matching file throw IOException("Input/output error") and return nothing. Reads are
+   *  not ops: they are not counted, and failNext / failWhile rules never fail them.
+   */
+  def failReads(n: Int, file: String => Boolean = _ => true): Unit = lock.synchronized:
+    require(n >= 0)
+    readFaults += ReadRule(file, n)
 
   /** After `n` more writes, forces or truncates (across all files), every later one fails with no effect and
    *  throws, as if the machine had stopped. Call `crash()` afterward for the durable image.
@@ -172,6 +181,12 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
 
     def read(position: Long, length: Int): Array[Byte] = lock.synchronized:
       check()
+      val i = readFaults.indexWhere(r => r.left > 0 && r.file(name))
+      if i >= 0 then
+        readFaults(i).left -= 1
+        if readFaults(i).left == 0 then
+          readFaults.remove(i)
+        throw new IOException("Input/output error")
       f.cache.read(position, length)
 
     def write(position: Long, bytes: Array[Byte]): Unit = lock.synchronized:
@@ -206,6 +221,8 @@ object SimulatedFsifFiles:
   val SectorSize = 512
 
   private case class Rule(fault: Fault, file: String => Boolean, ops: Set[FaultOp], active: () => Boolean)
+
+  private final class ReadRule(val file: String => Boolean, var left: Int)
 
   private enum Op:
     case Write(position: Long, bytes: Array[Byte])

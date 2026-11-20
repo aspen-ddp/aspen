@@ -19,7 +19,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, Completion, CompletionHandler,
-  Read, UpdateForm}
+  Read, RetryScheduler, UpdateForm}
 
 class FsifFaultSuite extends FileBasedTests:
   import FsifBackendSuite.{GateEc, InlineEc, ShuffleEc, isInPlace, isKind}
@@ -517,6 +517,66 @@ class FsifFaultSuite extends FileBasedTests:
         h.await(h.backend.close())
         h.fatals.size shouldBe 1
 
+  // ---- Read failures: only evidence of damage reports at once ----
+
+  private def scheduled(h: Harness): List[FiniteDuration] =
+    import scala.jdk.CollectionConverters.*
+    h.sched.get.delays.asScala.toList
+
+  test("a transient read I/O error is retried after each ReadRetryDelays step and then reads the object"):
+    val h = new Harness
+    val p = ptr(1, oid(1))
+    h.commitOk(alloc(p, bytes(40, 1), 1))
+    h.quiesce()
+    h.files.failReads(2, isData)
+    val f = h.issueRead(p)
+    h.pump()
+    f.isCompleted shouldBe false
+    h.tick()
+    f.isCompleted shouldBe false
+    h.tick()
+    h.await(f).left.map(_.data.getByteArray.toList) shouldBe Left(bytes(40, 1).toList)
+    scheduled(h) shouldBe RetryScheduler.ReadRetryDelays.take(2).toList
+    h.fatals.size shouldBe 0
+    h.rec.unexpected.size shouldBe 0
+
+  test("a read I/O error that outlasts every retry reports CorruptedObject without fail-stopping the store"):
+    val h = new Harness
+    val p = ptr(1, oid(1))
+    h.commitOk(alloc(p, bytes(40, 1), 1))
+    h.quiesce()
+    h.files.failReads(RetryScheduler.ReadRetryDelays.size + 1, isData)
+    h.await(h.issueRead(p)) shouldBe Right(ReadError.CorruptedObject)
+    scheduled(h) shouldBe RetryScheduler.ReadRetryDelays.toList
+    h.fatals.size shouldBe 0
+    h.readData(p) shouldBe bytes(40, 1).toList
+    h.commitOk(overwrite(p, bytes(40, 2), 2))
+
+  test("a CRC mismatch reports CorruptedObject at once, with no retry"):
+    val h = new Harness
+    val p = ptr(1, oid(1))
+    h.commitOk(alloc(p, bytes(100, 1), 1))
+    h.quiesce()
+    val d = h.files.open(FsifRecovery.DataFile)
+    try d.write(layout.slotOffset(h.slotOf(1)) + SegmentHeader.Size + 10, Array.fill[Byte](8)(0x5A))
+    finally d.close()
+    h.read(p) shouldBe Right(ReadError.CorruptedObject)
+    scheduled(h) shouldBe Nil
+
+  test("a read retry that fires after close reports CorruptedObject without touching the closed files"):
+    val h = new Harness
+    val p = ptr(1, oid(1))
+    h.commitOk(alloc(p, bytes(40, 1), 1))
+    h.quiesce()
+    h.files.failReads(1, isData)
+    val f = h.issueRead(p)
+    h.pump()
+    f.isCompleted shouldBe false
+    h.await(h.backend.close())
+    h.tick()
+    h.await(f) shouldBe Right(ReadError.CorruptedObject)
+    h.fatals.size shouldBe 0
+
   test("rebuildWrite and rebuildFlush throw out-of-space instead of hanging while frozen"):
     // The store is frozen by something else
     locally:
@@ -971,7 +1031,11 @@ object FsifFaultSuite:
   /** Runs scheduled retries only when the test calls `tick()`, ignoring their delay */
   final class ManualScheduler extends org.aspen_ddp.aspen.server.store.backend.RetryScheduler:
     private val queue = new ConcurrentLinkedQueue[Runnable]()
-    def schedule(delay: FiniteDuration, task: Runnable): Unit = queue.add(task)
+    /** Every delay scheduled so far, in order */
+    val delays = new ConcurrentLinkedQueue[FiniteDuration]()
+    def schedule(delay: FiniteDuration, task: Runnable): Unit =
+      delays.add(delay)
+      queue.add(task)
     def pending: Int = queue.size
     /** Runs the retries scheduled so far (not those they schedule) */
     def tick(): Unit =

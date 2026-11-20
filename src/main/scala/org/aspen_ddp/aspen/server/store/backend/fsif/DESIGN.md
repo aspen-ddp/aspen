@@ -218,8 +218,13 @@ queued.
    `CorruptedObject` and the slot's `version` changed (pread and pwrite are not atomic, so the header read could
    tear).
 
-Reads never wait for in-place writes, frozen or not. A read I/O failure gives `CorruptedObject` and does **not**
-fail-stop the store.
+Reads never wait for in-place writes, frozen or not. Only evidence of damage (no valid header, a CRC mismatch) or a
+fail-stopped backend gives `CorruptedObject` at once. A failure that is not evidence of damage (an I/O error from the
+disk read, a rejected io task, an internal exception while issuing or assembling) is retried after each of
+`tuning.readRetryDelays` (default `RetryScheduler.ReadRetryDelays`: 10 ms, 100 ms, 1 s) on `scheduler`, issued from
+step 1 again, and gives `CorruptedObject` only once they are spent, or at once when the backend is closing (a retry
+never touches closed files). A recovered commit vote fail-stops its store on `CorruptedObject` (systemic-loss D7), so
+one transient host condition must not produce it. A read failure does **not** fail-stop the backend.
 
 ### 2.7 Checkpoints
 

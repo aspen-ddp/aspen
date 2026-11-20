@@ -53,15 +53,7 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-3.1 [X-W22] FSIF reports any failed read as CorruptedObject at once; one transient error fail-stops a recovering store.
-    CONFIRMED. Effort S. cross-document-review.md.
-    FsifBackend.assemble, startRead and readExt map I/O errors (pread IOException, EIO, ENOMEM) and internal
-    exceptions (a rejected io task) to ReadError.CorruptedObject; only a torn header racing a write is retried. A
-    recovered commit vote's failed object load fail-stops the store (Tx.objectLoadFailed, D7). A host-wide transient
-    during a restart storm declares every FSIF store with a recovered commit vote lost together. RocksDB already
-    retries (RocksDBBackend.attemptRead, ReadRetryDelays).
-    Fix: a CRC mismatch or invalid header is damage and reports at once; I/O and internal exceptions retry with
-    ReadRetryDelays (or an FSIF equivalent) first. Failure path only.
+(no open items)
 
 
 PRIORITY 4: liveness (hangs, stalls, livelocks)

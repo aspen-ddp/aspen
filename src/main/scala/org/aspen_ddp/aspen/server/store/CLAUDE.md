@@ -297,9 +297,11 @@
   no durability (crash-recovery-log 3.4); it is for tests, and no opener constructs it
 - A read reports `CorruptedObject` only on evidence of damage, since a recovered commit vote's load failure
   fail-stops the store (systemic-loss D7). RocksDB (`RocksDBBackend.read`): a Corruption status or an undecodable
-  value reports at once; any other failure is retried after each of `ReadRetryDelays` (10 ms, 100 ms, 1 s) on the
-  host-wide `backend.SharedRetryScheduler` (also FSIF's ENOSPC timer), then reported; a closed database is not
-  retried. Tests inject read failures by overriding `getValue`
+  value reports at once. FSIF (`FsifBackend.assemble`): a CRC mismatch, no valid header, or a fail-stopped backend
+  reports at once. In both, any other failure is retried after each of `RetryScheduler.ReadRetryDelays` (10 ms,
+  100 ms, 1 s; FSIF's `FsifTuning.readRetryDelays`) on the host-wide `backend.SharedRetryScheduler` (also FSIF's
+  ENOSPC timer), then reported; a closed database or closing FSIF backend is not retried. Tests inject read failures
+  by overriding `getValue` (RocksDB) or with `SimulatedFsifFiles.failReads` (FSIF)
 - Pluggable: RocksDB, in-memory Map, and FSIF (`backend/fsif`, a flat file of fixed-size segments located by a
   4-byte storePointer, with a journal and checkpointed index; design in `backend/fsif/DESIGN.md`). FSIF freezes
   writes on ENOSPC and keeps serving reads. A repair write never overwrites a different occupant of its slot: it

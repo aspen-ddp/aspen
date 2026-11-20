@@ -1416,31 +1416,32 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   private def insert(key: Key) = Insert(key, Array[Byte](7))
 
-  private val blindInsertPresent = (t: TransactionId) => KVTx(t, Nil, List(insert(kk1)))
-  private val blindInsertAbsent = (t: TransactionId) => KVTx(t, Nil, List(insert(kk9)))
+  // Key-level inserts (no required revision), each checking its key as an Insert must (refuseBlindWrites)
+  private val insertPresent = (t: TransactionId) => KVTx(t, List(KeyValueUpdate.Exists(kk1)), List(insert(kk1)))
+  private val insertAbsent = (t: TransactionId) => KVTx(t, List(KeyValueUpdate.DoesNotExist(kk9)), List(insert(kk9)))
 
   test("two MayExist requirements on an absent key collide") {
     val may = (t: TransactionId) => KVTx(t, List(KeyValueUpdate.MayExist(kk9)), Nil)
     lockThenCheckKV(emptyKVObject(), may(tx1), may(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
   }
 
-  test("two blind inserts of one key collide, absent or present") {
-    lockThenCheckKV(emptyKVObject(), blindInsertAbsent(tx1), blindInsertAbsent(tx2)) shouldBe
+  test("two key-level inserts of one key collide, absent or present") {
+    lockThenCheckKV(emptyKVObject(), insertAbsent(tx1), insertAbsent(tx2)) shouldBe
       Map(oid1 -> TransactionCollision(tx1))
-    lockThenCheckKV(kvObjectWithKey(), blindInsertPresent(tx1), blindInsertPresent(tx2)) shouldBe
+    lockThenCheckKV(kvObjectWithKey(), insertPresent(tx1), insertPresent(tx2)) shouldBe
       Map(oid1 -> TransactionCollision(tx1))
   }
 
-  test("blind inserts of different keys do not collide") {
-    lockThenCheckKV(kvObjectWithKey(), blindInsertPresent(tx1), blindInsertAbsent(tx2)) shouldBe Map()
-    lockThenCheckKV(kvObjectWithKey(), blindInsertAbsent(tx1), blindInsertPresent(tx2)) shouldBe Map()
+  test("key-level inserts of different keys do not collide") {
+    lockThenCheckKV(kvObjectWithKey(), insertPresent(tx1), insertAbsent(tx2)) shouldBe Map()
+    lockThenCheckKV(kvObjectWithKey(), insertAbsent(tx1), insertPresent(tx2)) shouldBe Map()
   }
 
-  test("a blind insert and key requirements on its key collide in both arrival orders") {
+  test("a key-level insert and key requirements on its key collide in both arrival orders") {
     val pairs = List(
-      (() => kvObjectWithKey(), KVTx(_, List(KeyRevision(kk1, rev1)), Nil), blindInsertPresent),
-      (() => kvObjectWithKey(), KVTx(_, List(KeyValueUpdate.Exists(kk1)), Nil), blindInsertPresent),
-      (() => emptyKVObject(), KVTx(_, List(KeyValueUpdate.DoesNotExist(kk9)), Nil), blindInsertAbsent))
+      (() => kvObjectWithKey(), KVTx(_, List(KeyRevision(kk1, rev1)), Nil), insertPresent),
+      (() => kvObjectWithKey(), KVTx(_, List(KeyValueUpdate.Exists(kk1)), Nil), insertPresent),
+      (() => emptyKVObject(), KVTx(_, List(KeyValueUpdate.DoesNotExist(kk9)), Nil), insertAbsent))
     for (mk, req, write) <- pairs do
       lockThenCheckKV(mk(), req(tx1), write(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
       lockThenCheckKV(mk(), write(tx1), req(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
@@ -1448,7 +1449,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   test("a vote's planned locks collide exactly as the locks it takes (Tx.lockWaitBlocked)") {
     val kinds: List[TransactionId => KVTx] = List(
-      blindInsertPresent, blindInsertAbsent,
+      insertPresent, insertAbsent,
       KVTx(_, List(KeyRevision(kk1, rev1)), Nil),
       KVTx(_, List(KeyRevision(kk9, rev1)), Nil),
       KVTx(_, List(KeyValueUpdate.Exists(kk1)), Nil),
@@ -1497,7 +1498,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("an object-level operation locks the whole object") {
     val relink = (t: TransactionId) => KVTx(t, Nil, List(SetRight(Array[Byte](1))), requiredRevision = Some(rev1))
     val withinRange = (t: TransactionId) => KVTx(t, List(KeyValueUpdate.WithinRange(kk9, ByteArrayKeyOrdering)), Nil)
-    for other <- List(withinRange, blindInsertAbsent, blindInsertPresent) do
+    for other <- List(withinRange, insertAbsent, insertPresent) do
       lockThenCheckKV(kvObjectWithKey(), relink(tx1), other(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
       lockThenCheckKV(kvObjectWithKey(), other(tx1), relink(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
   }
@@ -1517,6 +1518,27 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       Map(oid1 -> BlindWrite())
     // Refused at the apply re-check too
     KVTx(tx1, Nil, List(Delete(kk1))).check(kvObjectWithKey(), applying = true) shouldBe Map(oid1 -> BlindWrite())
+  }
+
+  test("an Insert with no requirement that checks its key, and no required revision or content lock, is refused") {
+    KVTx(tx1, Nil, List(insert(kk9))).check(kvObjectWithKey()) shouldBe Map(oid1 -> BlindWrite())
+    // MayExist, WithinRange and KeyObjectRevision check nothing of the key's own state, nor does another key's check
+    for req <- List(KeyValueUpdate.MayExist(kk9), KeyValueUpdate.WithinRange(kk9, ByteArrayKeyOrdering),
+                    KeyValueUpdate.KeyObjectRevision(kk9, rev1), KeyRevision(kk1, rev1)) do
+      KVTx(tx1, List(req), List(insert(kk9))).check(kvObjectWithKey()) shouldBe Map(oid1 -> BlindWrite())
+    // Refused at the apply re-check too
+    KVTx(tx1, Nil, List(insert(kk9))).check(kvObjectWithKey(), applying = true) shouldBe Map(oid1 -> BlindWrite())
+  }
+
+  test("an Insert passes with a check on its key, a required revision or a content lock") {
+    for req <- List(KeyValueUpdate.DoesNotExist(kk9)) do
+      KVTx(tx1, List(req), List(insert(kk9))).check(kvObjectWithKey()) shouldBe Map()
+    for req <- List(KeyRevision(kk1, rev1), KeyValueUpdate.Exists(kk1)) do
+      KVTx(tx1, List(req), List(insert(kk1))).check(kvObjectWithKey()) shouldBe Map()
+    KVTx(tx1, Nil, List(insert(kk9)), requiredRevision = Some(rev1)).check(kvObjectWithKey()) shouldBe Map()
+    val locked = KeyValueUpdate(kp1, None, Some(KeyValueUpdate.FullContentLock(List(KeyRevision(kk1, rev1)))), Nil)
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(locked), kvObjectWithKey(),
+      Map(oid1 -> kvData(List(insert(kk9)))), nanoTime = () => 0L)._1 shouldBe Map()
   }
 
   test("an object-level operation with no required revision is refused, even under a content lock") {
@@ -1548,15 +1570,15 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   test("applying a committed transaction ignores other transactions' write locks") {
     val objects = kvObjectWithKey()
-    blindInsertPresent(tx1).lock(objects)
-    blindInsertAbsent(tx1).lock(objects)
-    blindInsertPresent(tx2).check(objects, applying = true) shouldBe Map()
-    blindInsertAbsent(tx2).check(objects, applying = true) shouldBe Map()
+    insertPresent(tx1).lock(objects)
+    insertAbsent(tx1).lock(objects)
+    insertPresent(tx2).check(objects, applying = true) shouldBe Map()
+    insertAbsent(tx2).check(objects, applying = true) shouldBe Map()
   }
 
   test("unlock releases write locks after the commit inserted or deleted the key") {
     val objects = kvObjectWithKey()
-    val tx = KVTx(tx1, List(KeyValueUpdate.MayExist(kk9), KeyRevision(kk1, rev1)), List(Delete(kk1), insert(kk9)))
+    val tx = KVTx(tx1, List(KeyValueUpdate.DoesNotExist(kk9), KeyRevision(kk1, rev1)), List(Delete(kk1), insert(kk9)))
     tx.check(objects) shouldBe Map()
     tx.lock(objects)
     objects(oid1).lockedWriteTransactions shouldBe Set(tx1)
@@ -1569,8 +1591,8 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   test("unlock leaves another transaction's lock on a written key") {
     val objects = emptyKVObject()
-    blindInsertAbsent(tx1).lock(objects)
-    blindInsertAbsent(tx2).unlock(objects)
+    insertAbsent(tx1).lock(objects)
+    insertAbsent(tx2).unlock(objects)
     objects(oid1).lockedWriteTransactions shouldBe Set(tx1)
   }
 

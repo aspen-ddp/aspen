@@ -7,8 +7,9 @@
   nodes in a transaction fails with `NodeAlreadyModified`; `getContainingNode`/`TieredKeyValueListNode` are KV-only.
 - `prepareUpdates(inserts: List[TKVLInsert], deletes)` changes many keys in one transaction on either kind, updating
   each node once. `TKVLInsert.requireDoesNotExist` makes allocate-and-insert retry loops safe. Writes are per-key
-  checked by default; `PutRequirement` (`MustNotExist`, ...) and `TKVLInsert.blind` opt into weaker checks, so a
-  blind write needs a pin elsewhere in the transaction or `replaySafe`.
+  checked by default; `PutRequirement` (`MustNotExist`, ...) chooses the check. A `DoesNotExist` put is no pin, so it
+  needs a pin elsewhere in the transaction or `replaySafe`. There is no unchecked put: stores refuse an Insert that
+  checks nothing of its key (transaction-requirements 2.5).
 - Each `RootManager` owns a `TierCache` (default `LruTierCache`: 5 nodes per tier >= 1, plus the root when on
   tier >= 1; `NoCache` for tests and finalization actions). Stale entries cost only reads, except that `splitTree`
   through another instance can make warm instances return moved entries. `LruTierCache(anyRoot = true)` also
@@ -76,9 +77,7 @@
   `KeyRevision`, of an absent key `DoesNotExist`; a delete (single, batch, rename's old key, `deleteOneAtATime`)
   requires the key's `KeyRevision`, and a key the node does not hold is not deleted; rename's new key gets
   `KeyRevision` or `DoesNotExist`. These are per key: no node-level serialization. A competing write fails them as an
-  ordinary abort that the caller retries, never `KeyAlreadyExists`. `PutRequirement.Blind` (`TKVLInsert.blind`) opts
-  out, for idempotent upserts only (stores apply it last-writer-wins on the transaction's timestamp; there is no
-  blind delete); `AtRevision(rev)` requires a given revision.
+  ordinary abort that the caller retries, never `KeyAlreadyExists`. `AtRevision(rev)` requires a given revision.
 - KV trees only: `TKVLInsert(requiredRevision = Some(rev))` is an `AtRevision` put, and `prepareUpdates`'
   `deletesAtRevision` deletes a key only if the node read holds it at the given revision, else the batch aborts with
   `KeyNotAtRevision` (DataObject planning rejects it with `UnsupportedRequirement`). Together they move an entry under
@@ -97,7 +96,7 @@
   value; put-if-absent with `_ => None`)
 - `TKVLInsert.requireDoesNotExist` (`MustNotExist`) works on both kinds: KV via `DoesNotExist`, DataObject via the
   node's revision guard (the key's range changes only through an update of its node). Only it fails with
-  `KeyAlreadyExists`, when the node read holds the key. On DataObject trees `Checked` and `Blind` add nothing (every
+  `KeyAlreadyExists`, when the node read holds the key. On DataObject trees `Checked` adds nothing (every
   rewrite requires the node revision); `AtRevision` is KV-only (`UnsupportedRequirement`).
 - A node deleted by a join, a tail removal, a root reduction or a DataObject `deleteList` has its version bumped, not just its revision
   locked. A lock leaves the revision unchanged, so a racing removal that read the node as a predecessor could still

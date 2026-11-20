@@ -327,7 +327,6 @@ class TKVLBatchRequirementSuite extends TKVLBatchSuiteSupport:
         assert(stored == Some(value(40).bytes.toList))
 
   test("a conditional insert takes no other requirement"):
-    assertThrows[IllegalArgumentException](TKVLInsert(Key(1), value(1), blind = true, replaces = Some(Some(_))))
     assertThrows[IllegalArgumentException](
       TKVLInsert(Key(1), value(1), requireDoesNotExist = true, replaces = Some(Some(_))))
 

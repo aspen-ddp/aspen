@@ -249,7 +249,8 @@ trait ReedSolomonIntegrationTests:
 
       updateTx = client.newTransaction()
       _ = updateTx.update(kp, None, None,
-                          List(KeyValueUpdate.KeyRevision(key, afterInsert.contents(key).revision)),
+                          List(KeyValueUpdate.KeyRevision(key, afterInsert.contents(key).revision),
+                            KeyValueUpdate.DoesNotExist(other)),
                           List(Insert(key, replacement.bytes), Insert(other, original.bytes)))
       _ <- updateTx.commit()
 

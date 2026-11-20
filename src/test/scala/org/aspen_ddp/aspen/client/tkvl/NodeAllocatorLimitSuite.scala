@@ -200,7 +200,7 @@ class NodeAllocatorLimitSuite extends IntegrationTestSuite with NodeFillBehaviou
       _ = tx0.bumpVersion(radicle, kvos0.revision)
       _ <- tx0.commit()
       tx1 = TestTransactions.replaySafe(client.newTransaction())
-      frm = KVObjectRootManager.setNewRoot(client, host, treeKey, true,
+      frm = KVObjectRootManager.setNewRoot(client, host, treeKey,
         Root(0, ByteArrayKeyOrdering, Some(rootNode), na))(using tx1)
       _ <- tx1.commit()
       rootManager <- frm

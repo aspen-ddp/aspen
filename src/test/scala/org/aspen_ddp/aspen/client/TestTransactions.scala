@@ -11,3 +11,11 @@ object TestTransactions:
   def replaySafe(tx: Transaction): Transaction =
     tx.replaySafe("test")
     tx
+
+  /** The check an Insert of `key` into the object `kvos` was read from needs (stores refuse an Insert that checks
+    * nothing of its key): `Exists` if it holds the key, `DoesNotExist` if not
+    */
+  def keyCheck(kvos: KeyValueObjectState,
+               key: org.aspen_ddp.aspen.common.objects.Key): org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRequirement =
+    import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
+    if kvos.contents.contains(key) then KeyValueUpdate.Exists(key) else KeyValueUpdate.DoesNotExist(key)

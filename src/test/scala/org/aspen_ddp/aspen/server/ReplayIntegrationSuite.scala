@@ -233,10 +233,10 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
     for
       (x, y) <- allocateXY(Map())
       xBefore <- client.read(x)
-      // T: the overwrite of x at its revision is the pin; the insert of k into y is blind
+      // T: the overwrite of x at its revision is the pin; the insert of k into y is checked by DoesNotExist only
       t <- commitRecorded: tx =>
              tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
-             tx.update(y, None, None, Nil, List(Insert(k, Array[Byte](2))))
+             tx.update(y, None, None, List(KeyValueUpdate.DoesNotExist(k)), List(Insert(k, Array[Byte](2))))
              Future.unit
       _ = (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t)))
       // T2: k is deleted, at T's revision of it
@@ -315,10 +315,10 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
             // The designated leader's store can be marked too: when the client's prepare reaches it after the
             // resolution, it applies the commit only at TxFinalized, too late to send TxCommitted in time
             marked should contain (lagging)
-      // T2: a blind write of k, pinned by x, which every store applies, the lagging one included
+      // T2: a write of k checked only by Exists, pinned by x, which every store applies, the lagging one included
       t2 <- client.transactUntilSuccessful: tx =>
               tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](3)))
-              tx.update(y, None, None, Nil, List(Insert(k, Array[Byte](3))))
+              tx.update(y, None, None, List(KeyValueUpdate.Exists(k)), List(Insert(k, Array[Byte](3))))
               Future.successful(tx.id)
       _ <- settle(clock = false)
       _ = (0 until 5).foreach(i => storeKeyRevision(i, y) shouldBe Some(ObjectRevision(t2)))

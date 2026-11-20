@@ -146,8 +146,8 @@ class KVObjectRootManagerSuite extends IntegrationTestSuite:
   atest("a corrupt root entry fails with InvalidRoot"):
     for
       rm <- newTree()
-      _ <- inTx(tx => Future.successful(tx.update(rm.pointer, None, None, Nil,
-        List(Insert(treeKey, Array[Byte](1, 2, 3))))))
+      _ <- inTx(tx => Future.successful(tx.update(rm.pointer, None, None,
+        List(KeyValueUpdate.Exists(treeKey)), List(Insert(treeKey, Array[Byte](1, 2, 3))))))
       err <- rm.getRoot().failed
     yield
       assert(err.isInstanceOf[InvalidRoot])

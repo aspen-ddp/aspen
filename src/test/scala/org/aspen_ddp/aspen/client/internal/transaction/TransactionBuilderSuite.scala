@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Delete, DeleteLeft, DeleteMax, DeleteMin, DeleteRight, Insert, Key, KeyValueObjectPointer, KeyValueOperation, ObjectId, ObjectRevision, SetLeft, SetMax, SetMin, SetRight}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
-import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, Exists, FullContentLock, KeyRevision}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, Exists, FullContentLock, KeyRevision, MayExist}
 import org.aspen_ddp.aspen.common.objects.ObjectRefcount
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -195,7 +195,8 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   }
   test("no pin: KeyRevision with an Insert of another key") {
     withPins:
-      val b = mkBuilder(); b.update(kvp, None, None, List(KeyRevision(k1, rev1)), List(Insert(k2, Array[Byte](9))))
+      val b = mkBuilder()
+      b.update(kvp, None, None, List(KeyRevision(k1, rev1), DoesNotExist(k2)), List(Insert(k2, Array[Byte](9))))
       intercept[UnpinnedTransaction](buildPin(b))
   }
   test("no pin: setRefcount to the same refcount") {
@@ -235,8 +236,17 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   test("an object-level operation under a required object revision is not blind") {
     val b = mkBuilder(); b.update(kvp, Some(rev1), None, Nil, List(SetMin(Key(Array[Byte](1))))); buildPin(b)
   }
-  test("a blind Insert is allowed") {
-    val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, None, None, Nil, List(ins1)); buildPin(b)
+  test("an Insert that checks nothing of its key is refused even when replay-safe") {
+    for reqs <- List(Nil, List(MayExist(k1)), List(KeyRevision(k2, rev1))) do
+      val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, None, None, reqs, List(ins1))
+      intercept[BlindKeyValueWrite](buildPin(b))
+  }
+  test("an Insert passes with a check on its key, a required revision or a content lock") {
+    for reqs <- List(List(DoesNotExist(k1)), List(Exists(k1)), List(KeyRevision(k1, rev1))) do
+      val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, None, None, reqs, List(ins1)); buildPin(b)
+    val r = mkBuilder(); r.update(kvp, Some(rev1), None, Nil, List(ins1)); buildPin(r)
+    val c = mkBuilder(); c.replaySafe("test")
+    c.update(kvp, None, Some(FullContentLock(List(KeyRevision(k2, rev1)))), Nil, List(ins1)); buildPin(c)
   }
   test("an allocated object's initial content may set object-level parts and keys") {
     val b = mkBuilder()
@@ -260,7 +270,8 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   }
   test("a KeyValueUpdate is flagged pinned only when it writes a key it carries a KeyRevision on") {
     def flag(ops: List[KeyValueOperation]): Boolean =
-      val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, None, None, List(KeyRevision(k1, rev1)), ops)
+      val inserted = ops.collect { case i: Insert if i.key != k1 => DoesNotExist(i.key) }
+      val b = mkBuilder(); b.replaySafe("test"); b.update(kvp, None, None, KeyRevision(k1, rev1) :: inserted, ops)
       buildPin(b)._1.requirements.collectFirst { case u: KeyValueUpdate => u.pinned }.get
     flag(List(ins1)) shouldBe true
     flag(List(Delete(k1), Insert(k2, Array[Byte](1)))) shouldBe true

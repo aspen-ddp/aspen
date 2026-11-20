@@ -85,13 +85,13 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Now split the tree
       splitTx = client.newTransaction()
       newRoot <- tree.splitTree(splitAtKey)(using splitTx)
-      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, true, newRoot)(using splitTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, newRoot)(using splitTx)
       _ <- splitTx.commit()
       _ <- waitForTransactionsToComplete()
 
       /*
       setTx = client.newTransaction()
-      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, true, newRoot)(using setTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, newRoot)(using setTx)
       _ <- setTx.commit()
       _ <- waitForTransactionsToComplete()
        */
@@ -166,7 +166,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Now split the tree at key 5
       splitTx = client.newTransaction()
       newRoot <- tree.splitTree(splitAtKey)(using splitTx)
-      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, true, newRoot)(using splitTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, newRoot)(using splitTx)
       _ <- splitTx.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -256,7 +256,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Now split the tree at key 5 (exact match)
       splitTx = client.newTransaction()
       newRoot <- tree.splitTree(splitAtKey)(using splitTx)
-      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, true, newRoot)(using splitTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, newRoot)(using splitTx)
       _ <- splitTx.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -325,7 +325,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Now split the tree
       splitTx = client.newTransaction()
       newRoot <- tree.splitTree(splitAtKey)(using splitTx)
-      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, true, newRoot)(using splitTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, newRoot)(using splitTx)
       _ <- splitTx.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -389,7 +389,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Now split the tree
       splitTx = client.newTransaction()
       newRoot <- tree.splitTree(splitAtKey)(using splitTx)
-      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, true, newRoot)(using splitTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, newRoot)(using splitTx)
       _ <- splitTx.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -499,7 +499,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Now split the tree (creating empty new tree)
       splitTx = client.newTransaction()
       newRoot <- tree.splitTree(splitAtKey)(using splitTx)
-      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, true, newRoot)(using splitTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, newRoot)(using splitTx)
       _ <- splitTx.commit()
       _ <- waitForTransactionsToComplete()
 

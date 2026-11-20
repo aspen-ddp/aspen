@@ -53,8 +53,11 @@ object RequirementsChecker extends Logging {
       }
 
     /** The store's copy of TransactionBuilder.refuseBlindWrites. Unless the transaction allocates the object (its
-      * initial content), a key Delete needs a KeyRevision on its key or a content lock, and a change of min, max, left
-      * or right needs a required revision. A blind Delete leaves no tombstone and object-level parts carry no
+      * initial content), a key Delete needs a KeyRevision on its key or a content lock, a change of min, max, left or
+      * right needs a required revision, and a key Insert needs a required revision, a content lock or a requirement
+      * that checks its key (KeyValueUpdate.checkedKeys). An unconditioned Insert passes at a store that applied a
+      * later Delete of its key first and is a no-op at one that applied a later write of it first, so the two orders
+      * diverge unreported (transaction-requirements R15). A blind Delete leaves no tombstone and object-level parts carry no
       * timestamp, so neither can be ordered against other writes, and repair cannot see them: a no-op blind Delete
       * leaves no trace for its snapshot and an object-level change that does not move the revision escapes a repair
       * proof's ExclusiveRevisionLock (repair-process 1.2, Q8; transaction-requirements 2.5). A required revision does
@@ -66,8 +69,11 @@ object RequirementsChecker extends Logging {
       val oid = r.objectPointer.id
       if !allocating.contains(oid) then
         lazy val revisionChecked = r.requirements.iterator.collect { case kr: KeyValueUpdate.KeyRevision => kr.key }.toSet
+        lazy val keyChecked = KeyValueUpdate.checkedKeys(r.requirements)
         ops.foreach {
-          case _: Insert =>
+          case i: Insert =>
+            if r.requiredRevision.isEmpty && r.contentLock.isEmpty && !keyChecked.contains(i.key) then
+              throw ObjectErr(oid, BlindWrite())
           case d: Delete =>
             if r.contentLock.isEmpty && !revisionChecked.contains(d.key) then throw ObjectErr(oid, BlindWrite())
           case _ => if r.requiredRevision.isEmpty then throw ObjectErr(oid, BlindWrite())

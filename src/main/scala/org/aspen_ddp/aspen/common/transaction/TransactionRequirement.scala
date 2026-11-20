@@ -107,5 +107,19 @@ object KeyValueUpdate {
   /** The key exists and its timestamp is greater than `timestamp` */
   case class TimestampGreaterThan(key: Key, timestamp: HLCTimestamp) extends KeyRequirement
 
+  /** The keys whose state `requirements` check: present at a revision, present, absent, or present with a timestamp.
+    * `MayExist`, `WithinRange` and `KeyObjectRevision` check nothing of the key's own state. An Insert outside an
+    * allocation's initial content needs its key here, a required revision or a content lock (refuseBlindWrites)
+    */
+  def checkedKeys(requirements: List[KeyRequirement]): Set[Key] =
+    requirements.iterator.collect {
+      case r: KeyRevision => r.key
+      case r: Exists => r.key
+      case r: DoesNotExist => r.key
+      case r: TimestampEquals => r.key
+      case r: TimestampLessThan => r.key
+      case r: TimestampGreaterThan => r.key
+    }.toSet
+
 }
 

@@ -30,8 +30,8 @@ class RepairProofsSuite extends IntegrationTestSuite:
     for
       _ <- client.transactUntilSuccessful: tx =>
              tx.replaySafe("test")
-             tx.update(ptr, None, None, Nil, List(Insert(key, Array[Byte](9))))
-             Future.unit
+             client.read(ptr).map: kvos =>
+               tx.update(ptr, None, None, List(org.aspen_ddp.aspen.client.TestTransactions.keyCheck(kvos, key)), List(Insert(key, Array[Byte](9))))
       _ <- net.waitForTransactionsToComplete()
     yield ()
 

@@ -207,7 +207,7 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
                                key: Key,
                                requirement: PutRequirement): Unit =
     requirement match
-      case PutRequirement.Checked | PutRequirement.Blind =>
+      case PutRequirement.Checked =>
       case PutRequirement.MustNotExist =>
         if content.entries.exists(_._1 == key) then
           throw new KeyAlreadyExists(key)

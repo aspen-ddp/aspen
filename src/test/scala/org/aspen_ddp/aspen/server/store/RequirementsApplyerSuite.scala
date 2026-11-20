@@ -4,7 +4,7 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, RequirementCheckFailure, DataUpdateOperation, KeyValueUpdate, LocalTimeRequirement,
   RefcountUpdate, ExclusiveRevisionLock, RevisionMismatch, SharedRevisionLock, TransactionId, VersionBump}
@@ -42,7 +42,9 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.KeyValue, kvos.encode())
     o.kvState = Some(kvos)
     val payload = KeyValueOperation.encode(List(Insert(Key(Array[Byte](1)), Array[Byte](2))), Replication(3, 2))(0)
-    val req = KeyValueUpdate(kp1, requiredRevision, None, Nil)
+    // An Insert needs a check on its key unless it has a required revision (refuseBlindWrites)
+    val keyChecks = if requiredRevision.isEmpty then List(KeyValueUpdate.DoesNotExist(Key(Array[Byte](1)))) else Nil
+    val req = KeyValueUpdate(kp1, requiredRevision, None, keyChecks)
     val result = RequirementsApplyer.apply(tx1, timestamp, List(req), HashMap(oid1 -> o), HashMap(oid1 -> payload))
     assert(result.skipped.isEmpty)
     assert(result.failed.isEmpty)
@@ -234,25 +236,34 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     o.kvState = Some(kvos)
     o
 
-  /** Applies a blind Insert(blindKey, value) by `txid` at `ts` (no required revision, no key requirement) */
+  /** A KeyValue object holding blindKey at rev1, older than every insert the tests apply */
+  private def heldKVObject(): ObjectState =
+    val o = emptyKVObject()
+    o.kvState.get.content = Map(blindKey -> new ValueState(Value(Array[Byte](0)), rev1, ts1, None))
+    o.data = o.kvState.get.encode()
+    o
+
+  /** Applies an Insert(blindKey, value) by `txid` at `ts` checked by `Exists(blindKey)` alone: a key-level Insert
+    * with no revision check, which a later write of the key supersedes (last writer wins)
+    */
   private def applyBlindInsert(o: ObjectState, txid: TransactionId, ts: HLCTimestamp, value: Array[Byte],
                                maxSliceSize: Option[Long] = None): RequirementsApplyer.Result =
     val payload = KeyValueOperation.encode(List(Insert(blindKey, value)), Replication(3, 2))(0)
-    RequirementsApplyer.apply(txid, ts, List(KeyValueUpdate(kp1, None, None, Nil)), HashMap(oid1 -> o),
-      HashMap(oid1 -> payload), maxSliceSize)
+    RequirementsApplyer.apply(txid, ts, List(KeyValueUpdate(kp1, None, None, List(KeyValueUpdate.Exists(blindKey)))),
+      HashMap(oid1 -> o), HashMap(oid1 -> payload), maxSliceSize)
 
   private def blindValue(o: ObjectState): (Seq[Byte], ObjectRevision, HLCTimestamp) =
     val vs = o.kvState.get.content(blindKey)
     (vs.value.bytes.toSeq, vs.revision, vs.timestamp)
 
-  test("two blind inserts of a key applied in opposite orders converge to the later one (Req F1)") {
+  test("two Exists-checked inserts of a key applied in opposite orders converge to the later one (Req F1)") {
     val a = Array[Byte](1)
     val b = Array[Byte](2)
-    val inOrder = emptyKVObject()
+    val inOrder = heldKVObject()
     applyBlindInsert(inOrder, txA, wall(100), a)
     applyBlindInsert(inOrder, txB, wall(200), b)
 
-    val reversed = emptyKVObject()
+    val reversed = heldKVObject()
     applyBlindInsert(reversed, txB, wall(200), b)
     val late = applyBlindInsert(reversed, txA, wall(100), a)
 
@@ -263,8 +274,8 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     assert(reversed.kvState.get.encode().getByteArray sameElements inOrder.kvState.get.encode().getByteArray)
   }
 
-  test("a re-applied older blind insert does not regress a newer one; the same insert re-applies idempotently (Req F2)") {
-    val o = emptyKVObject()
+  test("a re-applied older Exists-checked insert does not regress a newer one; the same insert re-applies idempotently (Req F2)") {
+    val o = heldKVObject()
     applyBlindInsert(o, txA, wall(100), Array[Byte](1))
     applyBlindInsert(o, txB, wall(200), Array[Byte](2))
 
@@ -276,19 +287,19 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     blindValue(o) shouldBe ((Seq[Byte](2), ObjectRevision(txB), wall(200)))
   }
 
-  test("blind inserts at equal timestamps are ordered by revision") {
+  test("Exists-checked inserts at equal timestamps are ordered by revision") {
     val ts = wall(100)
-    val first = emptyKVObject()
+    val first = heldKVObject()
     applyBlindInsert(first, txA, ts, Array[Byte](1))
     applyBlindInsert(first, txB, ts, Array[Byte](2))
-    val second = emptyKVObject()
+    val second = heldKVObject()
     applyBlindInsert(second, txB, ts, Array[Byte](2))
     applyBlindInsert(second, txA, ts, Array[Byte](1))
     blindValue(first) shouldBe blindValue(second)
   }
 
-  test("the object timestamp never goes backwards for blind KeyValue and Refcount updates (Req F4)") {
-    val o = emptyKVObject()
+  test("the object timestamp never goes backwards for key-level KeyValue and Refcount updates (Req F4)") {
+    val o = heldKVObject()
     applyBlindInsert(o, txB, wall(200), Array[Byte](2))
     applyBlindInsert(o, txA, wall(100), Array[Byte](1))
     assert(o.metadata.timestamp == wall(200))
@@ -303,7 +314,7 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
   }
 
   test("the slice size checked for a superseded insert is the size applied") {
-    val o = emptyKVObject()
+    val o = heldKVObject()
     applyBlindInsert(o, txB, wall(200), new Array[Byte](40))
     val size = o.kvState.get.encodedSize
     // The late, smaller insert keeps the larger value, so the size is unchanged: a limit equal to it passes and the

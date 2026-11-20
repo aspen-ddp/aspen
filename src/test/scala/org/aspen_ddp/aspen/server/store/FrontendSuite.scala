@@ -1231,7 +1231,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     populate(backend)
     f(frontend, backend, net)
 
-  /** Sends a client prepare, started `age` ago, of txid1: an insert of key 1 with only `MayExist(k(1))` required, to
+  /** Sends a client prepare, started `age` ago, of txid1: an insert of key 1 with only `Exists(k(1))` required, to
     * kvPtr whose key 1 already carries txid1's revision. Its requirements pass, so it is answered
     * TxResolved(committed) only by a store that proves without checking them: a muted one
     */
@@ -1240,7 +1240,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.bootstrapAllocate(oid2, ObjectType.KeyValue, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(100)),
       KVObjectState.encode(None, None, None, None, contents))
     val insert = KeyValueOperation.encode(List(new Insert(k(1), Array[Byte](1))), ida)(0)
-    val update = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.MayExist(k(1))))
+    val update = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.Exists(k(1))))
     val txd = lockTxd(txid1, List(update)).copy(startTimestamp = ago(age))
     frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
       objectUpdates = List(ObjectUpdate(oid2, insert))))
@@ -2405,7 +2405,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
       val revA = ObjectRevision(txid1)
       val tsA = HLCTimestamp(100L << 16)
-      // txid1, a MayExist insert of k(1), applied and persisted: k(1) carries its revision and timestamp
+      // txid1, an Exists-checked insert of k(1), applied and persisted: k(1) carries its revision and timestamp
       val contents = Map(k(1) -> new ValueState(Value(Array[Byte](1)), revA, tsA, None))
       val applied = new ObjectState(oid2, Metadata(rev0, ObjectRefcount(1, 1), tsA), ObjectType.KeyValue,
         KVObjectState.encode(None, None, None, None, contents))
@@ -2414,7 +2414,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       def insert(v: Byte) = KeyValueOperation.encode(List(new Insert(k(1), Array[Byte](v))), ida)(0)
       def checked(txid: TransactionId) = lockTxd(txid, List(KeyValueUpdate(kvPtr, None, None,
         List(KeyValueUpdate.KeyRevision(k(1), revA)), pinned = true)))
-      val blind = lockTxd(txid1, List(KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.MayExist(k(1))))))
+      val blind = lockTxd(txid1, List(KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.Exists(k(1))))))
         .copy(startTimestamp = tsA)
       def vote(t: TransactionDescription, v: Byte) = TransactionRecoveryState(storeId, t.serialize(),
         List(ObjectUpdate(oid2, insert(v))), TransactionDisposition.VoteCommit, TransactionStatus.Unresolved,
@@ -2467,11 +2467,12 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     prepareResponses(net, txid3).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
   }
 
-  test("a store applying two blind inserts of a key in opposite order keeps the later one (Req F1)") {
+  test("a store applying two Exists-checked inserts of a key in opposite order keeps the later one (Req F1)") {
     val (frontend, backend, net, stops) = failStopFixture()
     val now = System.currentTimeMillis()
     def blindInsert(txid: TransactionId, startMs: Long) =
-      lockTxd(txid, List(KeyValueUpdate(kvPtr, None, None, Nil))).copy(startTimestamp = HLCTimestamp(startMs << 16))
+      lockTxd(txid, List(KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.Exists(k(1))))))
+        .copy(startTimestamp = HLCTimestamp(startMs << 16))
     def insertOf(v: Byte) = KeyValueOperation.encode(List(new Insert(k(1), Array[Byte](v))), ida)(0)
 
     // A votes commit here and holds k(1). B, started after A committed elsewhere, collides here but is committed by
@@ -2526,7 +2527,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("a store votes abort on an unpinned description not marked replaySafe, and commit once it is marked") {
     val (frontend, _, net) = validatingFixture()
-    val blind = KeyValueUpdate(kvPtr, None, None, Nil)
+    val blind = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.DoesNotExist(k(4))))
     prepare(frontend, net, lockTxd(txid1, List(blind)).copy(replaySafe = false), insertK(4)).disposition shouldBe
       TransactionDisposition.VoteAbort
     prepare(frontend, net, lockTxd(txid2, List(blind)), insertK(4)).disposition shouldBe
@@ -2542,12 +2543,13 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   test("a store relies on the pinned flag of an object another pool holds") {
-    // The store holds only kvPtr's unpinned blind insert. The pin is on another pool's object, whose stores check
+    // The store holds only kvPtr's unpinned key-level insert. The pin is on another pool's object, whose stores check
     // the flag: a false one gets their abort votes, so the transaction cannot commit
     val (frontend, _, net) = validatingFixture()
     val elsewhere = KeyValueObjectPointer(ObjectId(new UUID(0, 13)), otherPoolId, Array[Byte]())
     val pinElsewhere = KeyValueUpdate(elsewhere, None, None, List(KeyValueUpdate.KeyRevision(k(1), rev0)), pinned = true)
-    val txd = lockTxd(txid1, List(KeyValueUpdate(kvPtr, None, None, Nil), pinElsewhere)).copy(
+    val txd = lockTxd(txid1, List(KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.DoesNotExist(k(4)))),
+      pinElsewhere)).copy(
       replaySafe = false, poolIDAMap = Map(poolId -> ida, otherPoolId -> ida))
     frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
       objectUpdates = List(ObjectUpdate(oid2, insertK(4)))))
@@ -2754,8 +2756,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("a vote colliding with a commit waiting in lock order waits for it, then votes on the applied state") {
     val (frontend, _, net, _) = failStopFixture()
     keyWriteWaitsInLockOrder(frontend, net)
-    // A blind Insert of key 1: it would take the key's lock, which txid2's write collides with, so it waits
-    val txd3 = lockTxd(txid3, List(KeyValueUpdate(kvPtr, None, None, Nil)))
+    // An Exists-checked Insert of key 1: it would take the key's lock, which txid2's write collides with, so it waits
+    val txd3 = lockTxd(txid3, List(KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.Exists(k(1))))))
     frontend.receiveTransactionMessage(mkPrepare(txd3, fromClient = true).copy(
       objectUpdates = List(ObjectUpdate(oid2, insertOf(1)))))
     def vote3 = net.sentTx.collect { case r: TxPrepareResponse if r.transactionId == txid3 => r.disposition }
@@ -2769,7 +2771,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("a vote colliding with a commit waiting in lock order votes abort once CollisionWait passes (Q-W9)") {
     val (frontend, _, net, stops) = failStopFixture()
     keyWriteWaitsInLockOrder(frontend, net)
-    val txd3 = lockTxd(txid3, List(KeyValueUpdate(kvPtr, None, None, Nil)))
+    val txd3 = lockTxd(txid3, List(KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.Exists(k(1))))))
     frontend.receiveTransactionMessage(mkPrepare(txd3, fromClient = true).copy(
       objectUpdates = List(ObjectUpdate(oid2, insertOf(1)))))
     def vote3 = net.sentTx.collect { case r: TxPrepareResponse if r.transactionId == txid3 => r }
@@ -3024,12 +3026,14 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       new TestCrl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded, deferRecovery = true,
       onFailStop = err => stops = stops :+ err)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
-    // txid1 voted commit inserting keys 4 and 5 under DoesNotExist(4), and was re-saved Committed before its backend
-    // commit completed. txid2, started later, a blind Insert of key 4 that this store did not vote commit on, was
-    // re-saved Committed too. Listed first, txid2's objects load first
-    val t = committedKV(txid1, TransactionDisposition.VoteCommit, List(KeyValueUpdate.DoesNotExist(k(4))),
+    // txid1 voted commit inserting keys 4 and 5 under DoesNotExist, and was re-saved Committed before its backend
+    // commit completed. txid2, started later, a DoesNotExist Insert of key 4 that this store did not vote commit on,
+    // was re-saved Committed too. Listed first, txid2's objects load first
+    val t = committedKV(txid1, TransactionDisposition.VoteCommit,
+      List(KeyValueUpdate.DoesNotExist(k(4)), KeyValueUpdate.DoesNotExist(k(5))),
       List(new Insert(k(4), Array[Byte](4)), new Insert(k(5), Array[Byte](5))))
-    val u = committedKV(txid2, TransactionDisposition.VoteAbort, Nil, List(new Insert(k(4), Array[Byte](9))),
+    val u = committedKV(txid2, TransactionDisposition.VoteAbort, List(KeyValueUpdate.DoesNotExist(k(4))),
+      List(new Insert(k(4), Array[Byte](9))),
       startDelta = 1000L)
     frontend.recover(StoreRecoveryState(List(u, t), Map()))
 
@@ -4104,8 +4108,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("a recovered commit vote re-applies its Insert where no later write reached the object or the key is present") {
     for (req, state) <- List(
            (insertK4, () => kvAt(HLCTimestamp(1))), // nothing written since: T never applied here
-           // A blind Insert of key 4, present: last writer wins settles it
-           (KeyValueUpdate(kvPtr, None, None, Nil), () => kvAt(keys = 1 to 4)))
+           // An Exists-checked Insert of key 4, present: last writer wins settles it
+           (KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.Exists(k(4)))), () => kvAt(keys = 1 to 4)))
     do
       val (frontend, backend, net, _, _) = unackedFixture(List(req), ops = insertK4Ops, kvState = state)
       frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, unackedTxid, committed = true,
@@ -4986,7 +4990,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   test("an unappliable update held behind an in-flight commit is checked only once that commit persists") {
     val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
     val insertKey4 = KeyValueOperation.encode(List(new Insert(k(4), Array[Byte](4))), ida)(0)
-    prepare(frontend, net, lockTxd(txid1, List(keyRevision(1))), insertKey4).disposition shouldBe
+    prepare(frontend, net, lockTxd(txid1, List(KeyValueUpdate(kvPtr, None, None,
+      List(KeyValueUpdate.KeyRevision(k(1), rev0), KeyValueUpdate.DoesNotExist(k(4)))))), insertKey4).disposition shouldBe
       TransactionDisposition.VoteCommit
     resolve(frontend, net, txid1, committed = true)
     backend.heldCommits shouldBe 1
@@ -5186,7 +5191,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     */
   def blindInsertWaitsInLockOrderOnAnotherObject(frontend: Frontend, net: TestNet): Unit =
     prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
-    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1), KeyValueUpdate(kvPtr, None, None, Nil))), insertOf(4))
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1),
+      KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.DoesNotExist(k(4)))))), insertOf(4))
       .disposition shouldBe TransactionDisposition.VoteAbort
     commitErrors(frontend, net, txid2) shouldBe Nil
     committedMessages(net) shouldBe Nil
@@ -5932,9 +5938,9 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       result.stale shouldBe false) shouldBe List(oid2)
   }
 
-  test("a non-voter's blind Insert over a present key reports nothing") {
+  test("a non-voter's key-level Insert over a present key reports nothing") {
     val (frontend, backend, net) = lockFixture()
-    val overK1 = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.MayExist(k(1))))
+    val overK1 = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.Exists(k(1))))
     val data = KeyValueOperation.encode(List(new Insert(k(1), Array[Byte](9))), ida)(0)
     prepare(frontend, net, lockTxd(txid3, List(overK1)), data).disposition shouldBe TransactionDisposition.VoteCommit
     prepare(frontend, net, lockTxd(txid1, List(overK1)), data).disposition shouldBe TransactionDisposition.VoteAbort

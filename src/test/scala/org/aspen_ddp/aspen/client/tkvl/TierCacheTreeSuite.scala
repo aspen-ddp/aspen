@@ -214,7 +214,7 @@ class TierCacheTreeSuite extends TreeKindSuiteBase:
         _ <- f.warm.get(moved)
         tx = client.newTransaction()
         newRoot <- f.warm.splitTree(Key(15), false)(using tx)
-        fnewRm = KVObjectRootManager.setNewRoot(client, f.rm.pointer, Key(Array[Byte](1)), true, newRoot)(using tx)
+        fnewRm = KVObjectRootManager.setNewRoot(client, f.rm.pointer, Key(Array[Byte](1)), newRoot)(using tx)
         _ <- tx.commit()
         _ <- waitForTransactionsToComplete()
         cached = f.rm.cache.root
@@ -235,7 +235,7 @@ class TierCacheTreeSuite extends TreeKindSuiteBase:
         _ <- f.warm.get(moved)
         tx = client.newTransaction()
         newRoot <- f.warm.splitTree(Key(15), false)(using tx)
-        _ = KVObjectRootManager.setNewRoot(client, f.rm.pointer, Key(Array[Byte](1)), true, newRoot)(using tx)
+        _ = KVObjectRootManager.setNewRoot(client, f.rm.pointer, Key(Array[Byte](1)), newRoot)(using tx)
         left <- tx.commit().flatMap(_ => f.warm.get(moved))
       yield
         assert(left.isEmpty)
@@ -248,7 +248,7 @@ class TierCacheTreeSuite extends TreeKindSuiteBase:
         _ <- f.warm.get(Key(25))
         tx = client.newTransaction()
         newRoot <- f.warm.splitTree(Key(15), false)(using tx)
-        _ = KVObjectRootManager.setNewRoot(client, f.rm.pointer, Key(Array[Byte](1)), true, newRoot)(using tx)
+        _ = KVObjectRootManager.setNewRoot(client, f.rm.pointer, Key(Array[Byte](1)), newRoot)(using tx)
         seen <- tx.commit().map(_ => f.rm.cache.root)(using ExecutionContext.parasitic)
       yield
         assert(seen.isEmpty)

@@ -141,7 +141,7 @@ abstract class TreeKindParitySuiteBase extends TreeKindSuiteBase:
           _ <- setAll(tree, all)
           tx = client.newTransaction()
           newRoot <- tree.splitTree(splitKey, inclusive)(using tx)
-          fnewRm = KVObjectRootManager.setNewRoot(client, rm.pointer, Key(Array[Byte](1)), true, newRoot)(using tx)
+          fnewRm = KVObjectRootManager.setNewRoot(client, rm.pointer, Key(Array[Byte](1)), newRoot)(using tx)
           _ <- tx.commit()
           _ <- waitForTransactionsToComplete()
           newRm <- fnewRm

@@ -6,7 +6,8 @@ import org.aspen_ddp.aspen.common.objects.ObjectRevision
   *
   * On a KeyValue-object tree each case is a per-key requirement on the node, derived from the node as read, so it
   * adds no node-level serialization. On a DataObject tree every rewrite already requires the node's revision, so
-  * `Checked` and `Blind` add nothing and `AtRevision` is unsupported.
+  * `Checked` adds nothing and `AtRevision` is unsupported. There is no unconditioned put: stores refuse an Insert
+  * that checks nothing of its key (transaction-requirements 2.5).
   */
 enum PutRequirement:
   /** The default: `KeyRevision(k, rev)` if the node read holds the key, `DoesNotExist(k)` if not. A competing write
@@ -17,5 +18,3 @@ enum PutRequirement:
   case MustNotExist
   /** `KeyRevision(k, rev)` */
   case AtRevision(rev: ObjectRevision)
-  /** No key requirement. For idempotent upserts only: the put wins over any concurrent write of the key */
-  case Blind

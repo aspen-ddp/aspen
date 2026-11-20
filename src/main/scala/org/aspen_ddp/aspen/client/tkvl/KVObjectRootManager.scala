@@ -152,23 +152,19 @@ object KVObjectRootManager extends RootManagerFactory {
 
   val typeUUID: UUID = UUID.fromString("CE36789D-42F1-43F9-9464-E9B44419D8C4")
 
-  /**
+  /** Stores `root` under `rootKey` of `hostingObject`, which must not hold the key (`DoesNotExist`)
    * @return future to a new KVObjectManager. Future completes after the
    *         transaction commits
    */
   def setNewRoot(client: AspenClient,
                  hostingObject: KeyValueObjectPointer,
                  rootKey: Key,
-                 requireKeyNotExist: Boolean,
                  root: Root)(using tx:Transaction): Future[KVObjectRootManager] =
 
     given ExecutionContext = client.clientContext
 
-    val kreqs = if requireKeyNotExist then
-      KeyValueUpdate.DoesNotExist(rootKey) :: Nil
-    else
-      Nil
-    tx.update(hostingObject, None, None, kreqs, Insert(rootKey, root.encode()) :: Nil)
+    tx.update(hostingObject, None, None, KeyValueUpdate.DoesNotExist(rootKey) :: Nil,
+      Insert(rootKey, root.encode()) :: Nil)
     tx.result.map:  _ =>
       new KVObjectRootManager(client, rootKey, hostingObject)
 
@@ -203,5 +199,5 @@ object KVObjectRootManager extends RootManagerFactory {
     // requirement is what guards against clobbering an existing tree. An empty tree needs no root node
     // object, so Root.orootObject is None until the first insert.
     Root.create(client, ordering, nodeAllocator, initialContent, kind).map: root =>
-      setNewRoot(client, pointer, key, true, root)
+      setNewRoot(client, pointer, key, root)
 }

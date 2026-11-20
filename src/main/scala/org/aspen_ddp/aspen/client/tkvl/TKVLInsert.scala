@@ -10,8 +10,6 @@ import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
   * makes the common allocate-an-object-and-store-its-pointer pattern safe to retry: a retry of a transaction that did
   * commit fails instead of storing a second pointer.
   *
-  * With `blind`, the insert has no key requirement (`PutRequirement.Blind`), for idempotent upserts only.
-  *
   * With `requiredRevision`, the key must be held at that revision (`PutRequirement.AtRevision`, KeyValue-object trees
   * only).
   *
@@ -25,13 +23,11 @@ import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
 final case class TKVLInsert(key: Key,
                             value: Value,
                             requireDoesNotExist: Boolean = false,
-                            blind: Boolean = false,
                             requiredRevision: Option[ObjectRevision] = None,
                             replaces: Option[Value => Option[Value]] = None):
-  require(List(requireDoesNotExist, blind, requiredRevision.isDefined, replaces.isDefined).count(identity) <= 1,
-    "A TKVLInsert takes at most one of requireDoesNotExist, blind, requiredRevision and replaces")
+  require(List(requireDoesNotExist, requiredRevision.isDefined, replaces.isDefined).count(identity) <= 1,
+    "A TKVLInsert takes at most one of requireDoesNotExist, requiredRevision and replaces")
 
   def requirement: PutRequirement =
     if requireDoesNotExist then PutRequirement.MustNotExist
-    else if blind then PutRequirement.Blind
     else requiredRevision.fold(PutRequirement.Checked)(PutRequirement.AtRevision(_))

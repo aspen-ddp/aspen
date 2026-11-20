@@ -666,7 +666,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       splitTx = client.newTransaction()
       newRoot <- tree.splitTree(splitAtKey)(using splitTx)
-      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, root.pointer, newTreeKey, true, newRoot)(using splitTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, root.pointer, newTreeKey, newRoot)(using splitTx)
       _ <- splitTx.commit()
       _ <- waitForTransactionsToComplete()
 

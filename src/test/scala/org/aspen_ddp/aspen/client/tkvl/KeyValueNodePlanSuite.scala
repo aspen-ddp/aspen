@@ -448,12 +448,6 @@ class KeyValueNodePlanSuite extends AnyFunSuite:
     assert(keyReqs(planBatch(shape, List(BatchOp.Put(key(2), value(10), PutRequirement.Checked)), 1024)) ==
       List(KeyValueUpdate.DoesNotExist(key(2))))
 
-  test("a Blind put adds no key requirement"):
-    val shape = shapeHolding(key(1) -> new ObjectRevision(UUID.randomUUID()))
-    for k <- List(key(1), key(2)) do
-      assert(keyReqs(planInsert(shape, k, value(10), 1024, PutRequirement.Blind)) == Nil)
-      assert(keyReqs(planBatch(shape, List(BatchOp.Put(k, value(10), PutRequirement.Blind)), 1024)) == Nil)
-
   test("an AtRevision put requires the given revision"):
     val rev = new ObjectRevision(UUID.randomUUID())
     val shape = shapeHolding(key(1) -> new ObjectRevision(UUID.randomUUID()))

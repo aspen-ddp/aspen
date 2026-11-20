@@ -45,17 +45,6 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.2 [Q-W16] A key Delete after a blind Insert of its key that a later write superseded diverges the replica.
-    PLAUSIBLE. Effort M. transaction-requirements.md.
-    Narrowed: a key Delete now needs a KeyRevision on its key or a content lock (a required revision alone is
-    refused by both refuseBlindWrites; SimpleTaskExecutor.deallocateTask now takes a content lock). Residual: a truly
-    blind (or MayExist) Insert U of k superseded at store C by a later write W, then a Delete D checked against W's
-    value: C applies U (no-op), W, D in lock order and removes k; A applied D first and then U as a commit voter
-    over the absent k, so k is present there. Neither reports. No production caller issues a truly blind or MayExist
-    Insert. Fix options: refuse Inserts with no requirement on their key (outside an allocation's initial content),
-    or report a Delete applied in lock order after a superseded Insert of its key and a commit voter's Insert over a
-    key a Delete started since removed (keyDeletedSince for voters too).
-
 2.3 [X-W20] A Replication pool of width >= 256 breaks the per-store tree key range and aliases store ids.
     CONFIRMED. Effort S. cross-document-review.md.
     Replication has no width bound (Reed-Solomon caps at 127). For pool index 255, (poolIndex + 1).toByte wraps to 0,

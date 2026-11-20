@@ -104,7 +104,7 @@ branch of `RequirementsChecker.check`:
 | `MayExist(k)` | present: no other K or C; absent: no other N | K if present, else N | |
 | `DoesNotExist(k)` | absent (`KeyExistenceError` if present), no other N | N (`absentKeyLocks(k)`) | |
 | `TimestampEquals/LessThan/GreaterThan(k, ts)` | present, key timestamp ==, <, > ts, no other K or C | K | no production caller |
-| `Insert(k, v)` | written-key lock check (step 7) | `RequirementsLocker.plannedLocks` from `KVWrites.keys`: K if present, else N | a blind insert (no requirement on k) still locks k |
+| `Insert(k, v)` | written-key lock check (step 7); needs a check on k, a required revision or a content lock (step 3) | `RequirementsLocker.plannedLocks` from `KVWrites.keys`: K if present, else N | |
 | `Delete(k)` | as Insert; needs `deletesKeys` and a `KeyRevision(k, _)` or a content lock (step 3) | as Insert | leaves no trace |
 | `SetMin/SetMax/SetLeft/SetRight`, `DeleteMin/Max/Left/Right` | `objectLevel`, so whole-object; needs a required revision (step 3) | X (`plannedLocks`, `KVWrites.objectLevel`) | |
 
@@ -122,10 +122,11 @@ tx, unlocked) only when it wins `KVObjectState.insertWins` (later transaction ti
 equal is the same transaction re-applying), otherwise it is a no-op, not a skip; `Delete` removes the key; the eight
 object-level operations set or clear `min/max/left/right`. Then `state.data := kvs.encode()`.
 
-Last-writer-wins makes sequential blind Inserts of one key converge whatever order a store applies them in. A checked
-Insert (`KeyRevision`, `DoesNotExist`, a required revision) always wins in practice: its check rejects a key written
-later, and the client's HLC places it after the state it read. Deletes and object-level fields carry no timestamp, so
-they cannot be ordered this way; that is why blind ones are refused (section 2.5).
+Last-writer-wins makes Inserts of one key checked only for presence (`Exists`, the timestamp requirements) converge
+whatever order a store applies them in; such an Insert passes its check over a later write of its key and is then a
+no-op. An Insert checked by `KeyRevision`, `DoesNotExist` or a required revision always wins in practice: its check
+rejects a key written later, and the client's HLC places it after the state it read. Deletes and object-level fields
+carry no timestamp, so they cannot be ordered this way; that is why unchecked ones are refused (section 2.5).
 
 Traces (`appliedBy`): object revision == txid for `DataUpdate`, `VersionBump` and a KV update with a required
 revision; for a KV update without one, any current key carrying revision txid; an allocated object (`allocatedOver`)
@@ -184,11 +185,18 @@ serial, but neither the builder nor the stores check it. The builder records the
 The stores that hold a `pinned` object check the claim against the operations (`FalsePin`); a store that does not hold
 the object relies on the flag, which is sound because a false flag draws abort votes on that object from every honest
 store of its pool. The blind-write rule is enforced at every check, vote and apply re-check (`refuseBlindWrites`):
-outside an allocated object's initial content, a key Delete needs a `KeyRevision` on that key or a content lock, and an
+outside an allocated object's initial content, a key Delete needs a `KeyRevision` on that key or a content lock, an
 object-level change needs a required revision (a content lock does not move the revision that a repair proof's
-`ExclusiveRevisionLock` locks). A required revision does not cover a Delete: an Insert moves no revision, so a Delete
-checked only by it passes its re-check at a store that applied an Insert of its key first, and removes the key
-unreported (R15, 9.3). A `KeyRevision` or a content lock fails there once the Insert changed the key.
+`ExclusiveRevisionLock` locks), and a key Insert needs a required revision, a content lock, or a requirement that
+checks its key's state (`KeyValueUpdate.checkedKeys`: `KeyRevision`, `Exists`, `DoesNotExist`, the timestamp
+requirements; not `MayExist`, `WithinRange` or `KeyObjectRevision`). A required revision does not cover a Delete: an
+Insert moves no revision, so a Delete checked only by it passes its re-check at a store that applied an Insert of its
+key first, and removes the key unreported (R15, 9.3). A `KeyRevision` or a content lock fails there once the Insert
+changed the key. An Insert that checks nothing of its key would pass at a store that applied a later Delete of the key
+first, and be a no-op (superseded) at one that applied a later write of the key first, so the two orders diverge with
+nothing to report (R15). With its key checked, the Insert fails after the Delete, or holds the key's lock so that the
+later write comes after it. In this document, as in the code (`Frontend.blindInsertRecords`), a *blind* Insert means a
+key-level one, in a `KeyValueUpdate` without a required revision: it is checked, but moves no object revision.
 
 The validation runs at vote only. It depends on the description and the store's pool alone, so a committed
 transaction passed it at a write threshold of every pool's stores. The `replaySafe` bit is the one claim stores must
@@ -197,8 +205,8 @@ trust: no store can prove a replay harmless. A malicious client is outside the t
 TKVL planners derive per-write checks (`client/tkvl/KeyValueListNode.putRequirements` / `deleteRequirements`): a put
 gets `KeyRevision(k, rev)` for a key the node read holds and `DoesNotExist(k)` otherwise (`PutRequirement.Checked`, the
 default), or exactly `DoesNotExist` (`MustNotExist`) or `KeyRevision(k, rev)` (`AtRevision`); a delete gets the key's
-`KeyRevision`. `PutRequirement.Blind` (`TKVLInsert.blind`) has no production caller. `MissedUpdateMarker` writes
-conditional checked inserts (`TKVLInsert.replaces`).
+`KeyRevision`. There is no unchecked put. `MissedUpdateMarker` writes conditional checked inserts
+(`TKVLInsert.replaces`).
 
 ## 3. Lock classes
 
@@ -267,7 +275,7 @@ Additional rules:
 | SharedRevisionLock | S | X, C, R, K, N, an open preference window | applies nothing |
 | KV with `requiredRevision` | X, plus C/K/N/R for its items | anything on the object | revision chain |
 | KV with key items only | K/N on named and written keys, R | X, S, C, same-key K/N | key requirement chain |
-| Blind `Insert` | K or N on the key | X, S, C, same-key K/N | last writer wins on (timestamp, revision) |
+| Key-level `Insert` checked only for presence | K on the key | X, S, C, same-key K/N | last writer wins on (timestamp, revision) |
 | `FullContentLock` | C | X, S, C, any K/N/R | content set |
 | `WithinRange` | R | X, S, C | none needed |
 | Append / WriteRange | X | anything on the object | revision chain |
@@ -311,16 +319,15 @@ reaches the backend only once no CRL state holding a blind Insert of it remains 
 applied (10.5c).
 
 **R7 (no divergence between replicas).** Committed transactions not ordered by R1 either touch disjoint keys and no
-common object-level field (K/N/X locks at the common store), or are blind Inserts of one key (last writer wins), so
+common object-level field (K/N/X locks at the common store), or are Inserts of one key checked only for its presence
+(last writer wins), so
 their application order does not change the result, the slice-size check included, which each vote makes against
 the growth of every vote held beside it (R16). The object timestamp is the max of every applied transaction's,
 so it is order-independent too. A store that applies them in an order its re-check rejects skips and reports, and
 repair restores it, provided a read threshold of stores applied the skipped update. A commit voter of T never applies in
 such an order: a committed transaction that holds no locks at a store waits to apply while a transaction there holds
 locks it collides with on an object both change (8.3, lock order). So only stores that did not vote commit for T skip it
-(at most `w - t`), and T's `t >= r` voters hold it. Exception: a store can apply a key Delete after a blind Insert of
-the key that it superseded (last writer wins) while another store applied the Insert after the Delete, and nothing
-rejects or reports either order (R15, Q-W16).
+(at most `w - t`), and T's `t >= r` voters hold it.
 
 **R8 (lock lifetime).** Locks are released when: the Tx resolves abort; the Tx resolves commit and its commit is not
 held (`doCommit` releases them before applying); a held commit is finally issued; the Tx expires (`Tx.expire`) or is
@@ -342,12 +349,12 @@ holder's re-check and leave a counted commit vote standing for neither its lock 
 may instead have voted for the newcomer first (the holder's prepare reached it only after the newcomer applied
 there, while it reached this store first): the newcomer then precedes the holder, and the wait applies them here in
 the reverse order. That is harmless when the newcomer's apply re-check fails after the holder's update (skipped and
-reported at a store that did not vote for it, a repair pass) or the two commute. Every key Delete carries a `KeyRevision` on its key or a content
-lock (2.5), which fails after the holder's Insert changed the key: the Delete is skipped and reported. With the Delete
-as the holder, the Insert's apply over the absent key is reported where the Insert did not vote commit (9.4). The one
-pair that does neither is a blind Insert (no requirement on its key, or `MayExist`) that a later write of the key
-supersedes at this store, so its apply changes nothing and the newcomer Delete's check still passes, while the
-common store applied the Delete first and the Insert, as a commit voter, over the absent key (Q-W16). At recovery every recovered commit vote relocks, an unresolved one and one whose committed
+reported at a store that did not vote for it, a repair pass) or the two commute. Every key Delete carries a
+`KeyRevision` on its key or a content lock, and every Insert a check on its key (2.5). So a holder's Insert changes
+its key here: a write of the key that would supersede it waits for it, since the holder holds the key's lock, and the
+newcomer Delete's check then fails after it and the Delete is skipped and reported. With the Delete as the holder, the
+newcomer Insert's check fails after it (`KeyRevision`, `Exists`) or, a `DoesNotExist`, passes and writes the key back
+here, which is reported where the Insert did not vote commit (9.4). At recovery every recovered commit vote relocks, an unresolved one and one whose committed
 resolution was restored alike (R13), and a Tx that does not relock (an abort vote, no vote, a restored resolution
 without a commit vote) completes its load only after every relocking commit vote has relocked, so it never misses
 such a holder (transaction-recovery.md 7.2).
@@ -657,7 +664,8 @@ through the same `releaseObjects`.
    repair installs the state (repair-process.md).
 3. Concurrent key-level KV updates of one object hold disjoint key sets, or they would have collided at the common
    store (R2, R4).
-4. Sequential blind Inserts of one key apply last-writer-wins, so a lagging store or a crash re-apply converges.
+4. Sequential Inserts of one key checked only for presence apply last-writer-wins, so a lagging store or a crash
+   re-apply converges. Every other Insert's check fails over a later write of its key.
 5. Object timestamps are the max of all applied updates, so they agree once the same set is applied.
 
 A non-voter that applies a revision-chained update after a later unrelated update raised the object's timestamp (a
@@ -779,8 +787,9 @@ about 1.5 s and then checks the post-A state. (b) S voted abort for A or never s
 fails `RevisionMismatch`. B built on the pre-A revision (a stale client) may get S's commit vote, but at least `t`
 stores voted for A and either hold A's locks or applied it, leaving at most `w - t < t` stale stores. B cannot commit.
 
-*Blind requirements.* A requirement that does not name the previous value (a blind Insert, `MayExist`, `WithinRange`)
-passes on stale and fresh stores alike; its meaning is the application's.
+*Blind requirements.* A requirement that does not name the previous value (`Exists`, `MayExist`, `WithinRange`)
+passes on stale and fresh stores alike; its meaning is the application's. An Insert needs more than `MayExist` or
+`WithinRange` on its key (2.5).
 
 *An update awaiting repair.* A store with a pending ErrorTree entry is stale in the same sense. Repair installs only
 what the store still shows as at the snapshot, deferring locked keys and objects with a commit in flight
@@ -810,8 +819,8 @@ whichever order they loaded in. A re-applies only on a non-late outcome or a fou
 with no entry applies nothing (lateCommit, transaction-recovery.md). When it does re-apply, its re-check fails where its
 update was chained (a revision, refcount or checked key requirement), and the recovered vote takes it as applied
 (8.5): it held its locks until it applied and relocked them at recovery, so only its update and the writes after it in
-lock order changed the object, whether or not the update leaves a trace for `appliedBy` (2.3). A blind key write (an
-Insert with `MayExist` or no requirement on its key) passes its re-check and applies again: its Insert ties with the
+lock order changed the object, whether or not the update leaves a trace for `appliedBy` (2.3). An Insert checked only
+for its key's presence (`Exists`) passes its re-check and applies again: its Insert ties with the
 entry it wrote (`insertWins`), and the `ValueState` it installs keeps the key's lock (`RequirementsApplyer.apply`), so B
 stays locked. A key Delete is never blind, so its re-check fails once applied and it never removes a key under B.
 
@@ -820,8 +829,8 @@ missing update: `MissingObjectUpdate` at the re-check. The update was applied be
 recovered vote takes it as applied (8.5).
 
 (c) A recovered commit vote re-applies its update when its outcome is learned. Revision, refcount and `KeyRevision`
-requirements fail on a store that applied a later chained write, and the vote takes the object as applied (8.5). A
-blind Insert over a present key re-applies harmlessly (last writer wins). A `DoesNotExist` or blind Insert of a key now
+requirements fail on a store that applied a later chained write, and the vote takes the object as applied (8.5). An
+`Exists`-checked Insert over a present key re-applies harmlessly (last writer wins). A `DoesNotExist` or blind Insert of a key now
 absent passes its re-check again, and applies: T never applied it. Had T applied it and a later transaction deleted the
 key, the deletion would have reached the backend only once T's CRL state no longer held the update
 (`Frontend.awaitBlindInsertsDurable`, 9.4), so the recovered vote would find it missing and take it as applied. This
@@ -850,8 +859,8 @@ repair of an object the store did not hold discards its state instead. Repair wr
 
 (a) The insert carries `KeyRevision(k, r)` or `Exists(k)`: stores that applied the delete fail it (`KeyExistenceError`),
 the stale ones (at most `w - t`) pass. Abort. (b) `DoesNotExist(k)` with an old view: the fresh stores pass, stores
-still holding the key fail, and the commit needs `t` fresh stores: correct. (c) A blind Insert resurrects the key by
-design, on every store alike. (d) A delete's commit reaching a lagging store before the insert it is built on: its
+still holding the key fail, and the commit needs `t` fresh stores: correct. (c) An Insert with no check on its key is
+refused (2.5), so no insert resurrects a key without a check that sees the delete. (d) A delete's commit reaching a lagging store before the insert it is built on: its
 `KeyRevision` fails there, the store skips and reports it, then applies the insert: repaired. (e) Re-apply of an insert
 from a recovered CRL record (or through an UnackedCommits entry) after a later delete: the delete reached the backend
 only once the insert's update was dropped from the CRL state, so the re-apply finds it missing and inserts nothing
@@ -909,24 +918,4 @@ non-exclusive sibling. Repair's object-level proof is an `ExclusiveRevisionLock`
 
 ## Open weaknesses
 
-### Q-W16: A key Delete after a blind Insert of its key that a later write superseded diverges the replica silently
-Verdict PLAUSIBLE. Priority 2. Effort M.
-Narrowed: both `refuseBlindWrites` now require a key Delete to carry a `KeyRevision` on its key or a content lock (a
-required revision alone no longer covers it), which closes the case of a Delete checked only by the object revision
-and of a `DoesNotExist` Insert (tested by `RequirementsCheckerSuite`, `TransactionBuilderSuite`). Residual mechanism:
-take a blind Insert U of key k (no requirement on k, or `MayExist(k)`), a write W of k started after U, and a Delete
-D of k checked by `KeyRevision(k, W)` (or a content lock taken over W's value). With Replication(3, 2), U's prepare
-reaches store C early and store A late. At C, U votes commit; W applies (as a non-voter in lock order after U, or
-before U's apply), so U's Insert is superseded (`insertWins`) and changes nothing. D's prepare meets U's lock at C and
-votes abort; A and B commit D, and A applies it. U's prepare then reaches A after D persisted: A votes commit (nothing
-is required of k) and U commits with A and C. A applies U over the absent k: k present with U's value. At C, D waits
-in lock order for U, re-checks against W's value (unchanged by U) and removes k. Neither A (a commit voter) nor C (a
-Delete whose check passed) reports anything. B, applying U as a non-voter after D, reports it (`keyDeletedSince`), and
-the repair reads A's and B's copy.
-Consequence: C lacks k with no ErrorTree mark while A holds it: permanent replica divergence of one key that repair
-never visits. No production caller issues a truly blind or `MayExist` Insert (`PutRequirement.Blind` has none; the
-missed-update marker and TKVL puts are checked), so the trigger needs a client building one directly.
-Fix options: refuse an Insert with no requirement on its key outside an allocation's initial content (removes
-blind Inserts; their last-writer-wins rule then matters only for re-applies), or report at apply a Delete applied in
-lock order after a holder whose Insert of the same key was superseded here, and a commit voter's Insert over a key
-that a Delete started at or after its start removed here (as `keyDeletedSince` does for non-voters).
+None.

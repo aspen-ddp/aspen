@@ -123,6 +123,23 @@ class TransactionFailureSuite extends IntegrationTestSuite:
       err shouldBe a[UnpinnedTransaction]
       attempts should be(1)
 
+  atest("transactUntilSuccessful fails at once with BlindKeyValueWrite instead of retrying"):
+    given ExecutionContext = executionContext
+    var attempts = 0
+    for
+      err <- client.transactUntilSuccessful: tx =>
+        attempts += 1
+        tx.replaySafe("test")
+        // An Insert that checks nothing of its key: refused by the builder
+        tx.update(radicle, None, None, Nil,
+          List(org.aspen_ddp.aspen.common.objects.Insert(org.aspen_ddp.aspen.common.objects.Key(Array[Byte](99)),
+            Array[Byte](1))))
+        Future.successful(())
+      .failed
+    yield
+      err shouldBe a[BlindKeyValueWrite]
+      attempts should be(1)
+
   atest("transactUntilSuccessfulWithRecovery fails at once with UnpinnedTransaction"):
     given ExecutionContext = executionContext
     var attempts = 0

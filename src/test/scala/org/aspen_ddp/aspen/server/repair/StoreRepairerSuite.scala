@@ -147,8 +147,9 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       _ <- client.transactUntilSuccessful: tx =>
              tx.replaySafe("test")
-             tx.update(ptr, None, None, Nil, List(Insert(Key(Array[Byte](9)), Array[Byte](10))))
-             Future.unit
+             val key = Key(Array[Byte](9))
+             client.read(ptr).map: kvos =>
+               tx.update(ptr, None, None, List(org.aspen_ddp.aspen.client.TestTransactions.keyCheck(kvos, key)), List(Insert(key, Array[Byte](10))))
       _ <- net.waitForTransactionsToComplete()
       os <- client.read(ptr)
     yield os.timestamp
@@ -814,16 +815,23 @@ class StoreRepairerSuite extends IntegrationTestSuite:
         (0 until net.stores.size).foreach(i => storeKeys(i, ptr) shouldBe initial.keySet)
       ptr
 
-  /** A revision-less update of `ptr`. Each Delete requires its key's revision as an online store holds it: the
-    * builder refuses a blind delete (BlindKeyValueWrite)
+  /** A revision-less update of `ptr`. Each Delete requires its key's revision as an online store holds it, and each
+    * Insert `Exists` or `DoesNotExist` as most online stores hold it (a store that missed a write may differ): the
+    * builder refuses an unchecked write (BlindKeyValueWrite)
     */
   private def kvUpdate(ptr: KeyValueObjectPointer, ops: List[org.aspen_ddp.aspen.common.objects.KeyValueOperation])
                       (tx: Transaction): Unit =
     val online = (0 until net.stores.size).filterNot(i => net.offlineStores.contains(sid(i)))
-    val revisions = ops.collect { case d: org.aspen_ddp.aspen.common.objects.Delete => d.key }.map: key =>
-      val rev = online.iterator.flatMap(i => stored(i, ptr.id).flatMap(_.kvState).flatMap(_.content.get(key))).next()
-      KeyValueUpdate.KeyRevision(key, rev.revision)
-    tx.update(ptr, None, None, revisions, ops)
+    def heldAt(key: Key) = online.map(i => stored(i, ptr.id).flatMap(_.kvState).flatMap(_.content.get(key)))
+    val checks = ops.collect {
+      case d: org.aspen_ddp.aspen.common.objects.Delete =>
+        KeyValueUpdate.KeyRevision(d.key, heldAt(d.key).flatten.head.revision)
+      case i: Insert =>
+        val held = heldAt(i.key)
+        if held.count(_.nonEmpty) * 2 > held.size then KeyValueUpdate.Exists(i.key)
+        else KeyValueUpdate.DoesNotExist(i.key)
+    }
+    tx.update(ptr, None, None, checks, ops)
 
   test("a store that missed a KV insert and then applied a later update to another key gets the missed key"):
     for
@@ -1546,10 +1554,12 @@ class StoreRepairerSuite extends IntegrationTestSuite:
             storeHasObject(2, kvPtr.id) shouldBe true
             storeHasObject(0, kvPtr.id) shouldBe false
       readFailure <- client.read(kvPtr).failed
-      // A revision-less insert needs nothing of the object's state, so a client needs only the pointer to send it
-      blindInsert <- attemptFails(_.update(kvPtr, None, None, Nil, List(Insert(k1, Array[Byte](1)))))
+      // A revision-less DoesNotExist insert needs nothing of the object's state, so a client needs only the pointer
+      // to send it
+      blindInsert <- attemptFails(_.update(kvPtr, None, None, List(KeyValueUpdate.DoesNotExist(k1)),
+                       List(Insert(k1, Array[Byte](1)))))
       keyed <- attemptFails(_.update(kvPtr, None, None,
-                 List(KeyValueUpdate.KeyRevision(k0, before.contents(k0).revision)),
+                 List(KeyValueUpdate.KeyRevision(k0, before.contents(k0).revision), KeyValueUpdate.DoesNotExist(k2)),
                  List(Delete(k0), Insert(k2, Array[Byte](2)))))
       atRevision <- attemptFails(_.update(kvPtr, Some(before.revision), None, Nil, List(Insert(k3, Array[Byte](3)))))
       _ <- settle()

@@ -19,8 +19,11 @@
   required revision is not enough either: an Insert moves no revision, transaction-requirements 2.5); a
   min/max/left/right change needs a required revision (a content lock does not move the revision a repair proof
   locks; repair-process 1.2, Q8). It fails with `BlindKeyValueWrite`, even when replay-safe, and stores
-  refuse the same writes (`BlindWrite`). Blind Inserts are allowed: stores apply them last-writer-wins, but keep nothing
-  to order a delete or an object-level change by
+  refuse the same writes (`BlindWrite`). A key Insert needs a required revision, a content lock or a requirement that
+  checks its key (`KeyValueUpdate.checkedKeys`: `KeyRevision`, `Exists`, `DoesNotExist`, the timestamp ones; not
+  `MayExist`): an unchecked Insert passes at a store that applied a later Delete of its key first and is superseded at
+  one that applied a later write first, diverging unreported (transaction-requirements 2.5, R15). The retry helpers
+  (`ExponentialBackoffRetryStrategy`) fail at once on `BlindKeyValueWrite`, as on `UnpinnedTransaction`
 - `TransactionBuilder.addAllocatingObject` adds the object's `AllocationFinalizationAction` itself, once per object, so
   every allocation records its AllocationTree entry, which repair and rebuild find objects by (rebuild-process 7).
   `ObjectAllocator` does not add it

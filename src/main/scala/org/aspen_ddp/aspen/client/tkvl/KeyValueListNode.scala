@@ -509,7 +509,6 @@ object KeyValueListNode extends Logging {
           throw new KeyAlreadyExists(key)
         DoesNotExist(key) :: Nil
       case PutRequirement.AtRevision(revision) => KeyRevision(key, revision) :: Nil
-      case PutRequirement.Blind => Nil
 
   /** The key requirements of a delete of `key` from the node `shape` was read from: the key's `KeyRevision` as read.
     * Nothing for a key the node does not hold, which is not deleted.

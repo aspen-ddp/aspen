@@ -41,10 +41,12 @@ final case class ObjectSizeLimitExceeded(objectPointer:ObjectPointer, newLength:
   */
 final case class UnpinnedTransaction(transactionId: TransactionId) extends TransactionCreationError
 
-/** Thrown for a KeyValue update with neither a required revision nor a content lock that deletes a key it holds no
-  * `KeyRevision` on, or changes min, max, left or right, outside an allocated object's initial content. Stores apply
-  * blind Inserts last-writer-wins, but keep no tombstone or timestamp to order those writes by, so two of them applied
-  * in opposite orders, or a crash re-apply, would leave a store permanently diverged (transaction-requirements 2.5).
+/** Thrown, outside an allocated object's initial content, for a KeyValue update that deletes a key with neither a
+  * `KeyRevision` on it nor a content lock, changes min, max, left or right without a required revision, or Inserts a
+  * key with no requirement that checks it (`KeyValueUpdate.checkedKeys`), no required revision and no content lock.
+  * Stores keep no tombstone or object-level timestamp to order such writes by, so two of them applied in opposite
+  * orders at two stores would leave one permanently diverged (transaction-requirements 2.5, R15). A programming error:
+  * the retry helpers do not retry it.
   */
 final case class BlindKeyValueWrite(objectPointer: ObjectPointer, reason: String) extends TransactionCreationError
 

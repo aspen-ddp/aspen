@@ -48,14 +48,17 @@
   no longer fits is skipped and reported. A non-growing update always passes. A repair install that grows a slice
   holding reservations is measured the same way, against `maxKVSliceSize` (`Frontend.repairFitsReservations`), and if
   it does not fit, writes nothing and answers stale (repair-process M6a). The apply-time check stays: FSIF's slice limit is its segment payload, so an oversized slice would fail the backend commit
-- Apply is order-independent for what the builder lets through (transaction-requirements 9.3): every key Insert is
+- Apply is order-independent for what the builder lets through (transaction-requirements 9.3): every key Insert
+  carries a check on its key (or a required revision or content lock; refuseBlindWrites, below) and is
   last-writer-wins on (transaction timestamp, revision) (`KVObjectState.insertWins`; `growth` and `encodedSizeAfter` use the same
   rule). A superseded Insert is a no-op, not a skip: no report and no fail-stop. The object timestamp is the max of its
   value and the transaction's. No tombstones, so `TransactionBuilder` refuses blind key deletes and blind object-level
   ops (`BlindKeyValueWrite`), and stores refuse them too (`RequirementsChecker.refuseBlindWrites`, `BlindWrite`, at vote
   and apply re-check): unless the transaction allocates the object, a key Delete needs a `KeyRevision` on its key or a
-  content lock (a required revision does not cover it: an Insert moves no revision), and a min/max/left/right change
-  a required revision (a content lock does not move the revision a repair proof locks; repair-process 1.2, Q8). A
+  content lock (a required revision does not cover it: an Insert moves no revision), a min/max/left/right change a
+  required revision (a content lock does not move the revision a repair proof locks; repair-process 1.2, Q8), and a key
+  Insert a required revision, a content lock or a requirement that checks its key (`KeyValueUpdate.checkedKeys`; not
+  `MayExist`): unchecked, it could pass after a later Delete at one store and be superseded at another (R15). A
   re-apply (a recovered commit vote, or one applying through its UnackedCommits entry) never writes back a key deleted
   since: see Key deletion after a blind insert
 - Allocations (transaction-requirements 9.4): an object in `txd.allocatingObjects` is loaded like any other (cache,

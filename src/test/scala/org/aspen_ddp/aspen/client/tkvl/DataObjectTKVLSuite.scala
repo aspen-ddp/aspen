@@ -375,7 +375,7 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
       _ <- setAll(tree, all)
       tx = client.newTransaction()
       newRoot <- tree.splitTree(Key(12), inclusive)(using tx)
-      fnewRm = KVObjectRootManager.setNewRoot(client, rm.pointer, Key(Array[Byte](1)), true, newRoot)(using tx)
+      fnewRm = KVObjectRootManager.setNewRoot(client, rm.pointer, Key(Array[Byte](1)), newRoot)(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
       newRm <- fnewRm
@@ -537,7 +537,7 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
         Key.AbsoluteMinimum, None)))(using tx0)
       _ <- tx0.commit()
       tx1 = TestTransactions.replaySafe(client.newTransaction())
-      frm = KVObjectRootManager.setNewRoot(client, host, treeKey, true,
+      frm = KVObjectRootManager.setNewRoot(client, host, treeKey,
         Root(1, ordering, Some(u), nodeAllocator, TreeKind.DataObjects))(using tx1)
       _ <- tx1.commit()
       rm <- frm

@@ -39,7 +39,7 @@ class JoinFinalizationActionSuite extends IntegrationTestSuite:
 
       tx1 = TestTransactions.replaySafe(client.newTransaction())
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      fmgr = KVObjectRootManager.setNewRoot(client, hosting, Key(Array[Byte](0)), true,
+      fmgr = KVObjectRootManager.setNewRoot(client, hosting, Key(Array[Byte](0)),
                 Root(2, IntegerKeyOrdering, Some(t), nodeAllocator))(using tx1)
       _ <- tx1.commit()
       mgr <- fmgr
@@ -91,7 +91,7 @@ class JoinFinalizationActionSuite extends IntegrationTestSuite:
 
       tx1 = TestTransactions.replaySafe(client.newTransaction())
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-      fmgr = KVObjectRootManager.setNewRoot(client, hosting, Key(Array[Byte](0)), true,
+      fmgr = KVObjectRootManager.setNewRoot(client, hosting, Key(Array[Byte](0)),
                 Root(2, IntegerKeyOrdering, Some(t), nodeAllocator))(using tx1)
       _ <- tx1.commit()
       mgr <- fmgr

@@ -298,21 +298,25 @@ class TransactionBuilder(
     requirements  = DataUpdate(objectPointer, requiredRevision, DataUpdateOperation.Overwrite) :: requirements
   }
 
-  /** Stores apply a blind key Insert last-writer-wins on (timestamp, revision), so a lagging store or a crash
-    * re-apply cannot regress a later write of the key (KVObjectState.insertWins). A Delete leaves no tombstone and
-    * object-level parts carry no timestamp, so the same cannot be done for them. Unless it is the initial content of
-    * an object this transaction allocates (transaction-requirements 2.5), an update must not delete a key without a
-    * KeyRevision on it or a content lock, and must not change an object-level part without a required revision: only
-    * that moves the revision a repair proof locks (repair-process 1.2, Q8). A required revision does not cover a
-    * Delete: an Insert moves no revision, so a store that applied an Insert of the key first would pass the Delete's
-    * re-check and remove the key, unreported (transaction-requirements 9.3). Stores refuse the same writes
-    * (RequirementsChecker, BlindWrite).
+  /** A Delete leaves no tombstone and object-level parts carry no timestamp, so neither can be ordered against other
+    * writes by the stores. Unless it is the initial content of an object this transaction allocates
+    * (transaction-requirements 2.5), an update must not delete a key without a KeyRevision on it or a content lock,
+    * must not change an object-level part without a required revision (only that moves the revision a repair proof
+    * locks; repair-process 1.2, Q8), and must not Insert a key without a check on it: a required revision, a content
+    * lock, or a key requirement that tests the key's state (`KeyValueUpdate.checkedKeys`; not `MayExist`). A required
+    * revision does not cover a Delete: an Insert moves no revision, so a store that applied an Insert of the key first
+    * would pass the Delete's re-check. An unconditioned Insert passes at a store that applied a later Delete of its key
+    * first, and is superseded (a no-op) at one that applied a later write of it, so the two orders diverge unreported
+    * (transaction-requirements R15, 9.3). Stores refuse the same writes (RequirementsChecker, BlindWrite).
     */
   private def refuseBlindWrites(kvu: KVUpdate): Unit =
     if !allocatingObjects.exists(_.id == kvu.pointer.id) then
       lazy val revisionChecked = kvu.requirements.collect { case r: KeyValueUpdate.KeyRevision => r.key }.toSet
+      lazy val keyChecked = KeyValueUpdate.checkedKeys(kvu.requirements)
       kvu.operations.foreach:
-        case _: Insert =>
+        case i: Insert =>
+          if kvu.requiredRevision.isEmpty && kvu.contentLock.isEmpty && !keyChecked.contains(i.key) then
+            throw BlindKeyValueWrite(kvu.pointer, "Insert of a key with no requirement that checks it")
         case d: Delete =>
           if kvu.contentLock.isEmpty && !revisionChecked.contains(d.key) then
             throw BlindKeyValueWrite(kvu.pointer, "Delete of a key with no KeyRevision or content lock")

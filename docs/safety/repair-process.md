@@ -391,7 +391,12 @@ commit for their turn (`heldCommits`). `commitFailed` includes objects poisoned 
 2. `locks` = the read's reported locks, less the parts a proof covered (`snapshot.proven`), plus the store's own
    (`os.lockedKeys`, `os.objectLevelLocked`): a store that did not answer the read may hold locks of its own.
 3. `plan = Reconcile.plan(snapshot, current, read, storeId, locks)`.
-4. If the plan changes nothing, return its result. Otherwise mutate the in-memory state (key installs and deletes,
+4. If the plan changes nothing, return its result. If the object holds commit votes' slice reservations
+   (`ObjectState.sliceReservations`, transaction-requirements.md R16) and the plan grows its KeyValue slice, measure
+   the planned state as a vote is measured (`Frontend.repairFitsReservations`, `RequirementsChecker.checkKVSliceSize`:
+   the planned slice plus every reservation, the count varint at the summed count). If it exceeds `maxSliceSize`,
+   write nothing and answer stale: a later pass installs once the votes have applied or been released. Otherwise
+   mutate the in-memory state (key installs and deletes,
    min/max/left/right, re-encode, data, metadata), insert it in the object cache, retain it, add it to `committing`
    and count it in `txCommitsInFlight`, then `backend.repair(CommitState)`. Transactions on the object wait behind the
    repair write as behind a commit. On completion `repairWriteComplete` releases it and passes the object's turn on
@@ -522,6 +527,7 @@ is stale, so the entry stays and the next pass installs. A listed occupant is lo
 | M4 | Install on the executor in one task; refuse while the object is unsettled | `Frontend.reconcile` | A repair write interleaving with a commit's backend write (backend writes of one object are unordered) |
 | M5 | The repair write is itself an in-flight commit (retained, `committing`, `txCommitsInFlight`) | `Frontend.reconcileSettled` | A transaction or read seeing the pre-repair backend state while the write is outstanding |
 | M6 | The store's own locks defer parts as the read's do | `Frontend.reconcileSettled` | Repairing over a part the store's own voted transaction is about to write |
+| M6a | A plan that grows a KeyValue slice installs only if the planned slice plus the held votes' reservations fits `maxSliceSize`; otherwise stale | `Frontend.repairFitsReservations` | A counted commit voter's apply re-check failing on size (R16) after the install grew the slice under its reservation |
 | M7 | Refcount only with a strictly higher `updateSerial`, or when the store has no copy | `Reconcile.planRefcount` | Lowering a refcount; un-deleting |
 | M8 | DataObject data only when revisions differ, the read is not older than the store, and the store's revision still equals the snapshot's | `Reconcile.planData` | Installing an older revision over a newer one (revisions are transaction ids, so no ABA) |
 | M9 | A copy is never created without its refcount, never while the object level is locked, never if the store deleted it after the snapshot | `Reconcile.plan`, `planData`, `planKeyValue` | Resurrecting a deleted slice |
@@ -835,22 +841,4 @@ its read threshold stalls the scan until the deadline.
 
 ## 14. Open weaknesses
 
-### RP-W8: A repair install grows a KeyValue slice under held commit votes' slice reservations, so a counted voter's apply fails on size
-Verdict CONFIRMED. Priority 1. Effort S.
-Mechanism: store S holds commit votes V and V2 on KeyValue object O, each reserving its growth
-(`ObjectState.sliceReservations`, `RequirementsLocker.lock`); each passed `RequirementsChecker.checkKVSliceSize`
-against S's copy, which lacks keys b committed elsewhere while S was silent. V2 aborts elsewhere (its peers, holding
-b, voted abort on size) but is still held at S. S's entry for O is repaired: `Frontend.reconcile` treats held votes
-as settled, `reconcileSettled` defers only the keys S's votes lock (M6), and `Reconcile.planKeyValue` installs b with
-no size check. The slice plus the reservations now exceeds `maxSliceSize`. V commits with S counted. `Tx.issueCommits`
-re-checks with `applying = true`: `checkKVSliceSize` counts V2's reservation against the grown slice, throws
-`SliceSizeExceeded`, and V's update of O is skipped at S ("INVARIANT VIOLATION ... Skipped and reported"). R16
-(transaction-requirements.md) holds that the slice plus every reservation fits because only a checked vote or an
-apply changes the slice; a repair install is a third, unchecked change.
-Consequence: a counted commit voter does not apply a committed update, so V sits on one store fewer than its vote
-count: write-threshold margin lost to asynchrony alone. A non-voter's skip of V on size, which R16 permits, can then
-take V below `r` with no failure: committed data lost. Repair restores it only if the survivors still reach `r`.
-Fix: in `Frontend.reconcileSettled`, when O holds `sliceReservations` of other transactions and the plan grows the
-slice (installs or object-level parts), run the `checkKVSliceSize` measure on the planned state with those
-reservations. If it does not fit, write nothing and answer stale, so a later pass installs once the votes apply or
-are released. This costs only repair passes on objects that hold growing votes.
+(none)

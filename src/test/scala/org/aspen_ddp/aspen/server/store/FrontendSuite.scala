@@ -4958,6 +4958,56 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
 
+  test("a repair whose install would overfill the slice beside held commit votes' reservations is stale, so each " +
+    "voter's apply fits") {
+    // The populated object is 88 bytes. Each vote rewrites its key with a 20-byte value (+19 reserved): 126 with both.
+    // Installing key 4 (+28) would make it 154, over the limit, and fail txid1's apply re-check on size
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, new TestCrl,
+      new TransactionStatusCache(), maxSliceSize = Some(140L), loadedAt = FrontendSuite.longLoaded)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    def rewrite(n: Int): DataBuffer =
+      KeyValueOperation.encode(List(new Insert(k(n), Array.fill[Byte](20)(n.toByte))), ida)(0)
+    prepare(frontend, net, lockTxd(txid1, List(keyRevision(1))), rewrite(1)).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid2, List(keyRevision(2))), rewrite(2)).disposition shouldBe
+      TransactionDisposition.VoteCommit
+
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, kvPtr), kvRead(1 to 4), done)
+    done.future.value.get.get.stale shouldBe true
+    backend.m(oid2).kvState.get.content.keySet shouldBe Set(k(1), k(2), k(3))
+
+    resolve(frontend, net, txid1, committed = true)
+    committedMessages(net).filter(_.transactionId == txid1).flatMap(_.objectCommitErrors) shouldBe Nil
+    backend.m(oid2).kvState.get.content(k(1)).revision shouldBe ObjectRevision(txid1)
+  }
+
+  test("a repair that grows the slice installs while it fits beside held commit votes' reservations") {
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, new TestCrl,
+      new TransactionStatusCache(), maxSliceSize = Some(154L), loadedAt = FrontendSuite.longLoaded)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    def rewrite(n: Int): DataBuffer =
+      KeyValueOperation.encode(List(new Insert(k(n), Array.fill[Byte](20)(n.toByte))), ida)(0)
+    prepare(frontend, net, lockTxd(txid1, List(keyRevision(1))), rewrite(1)).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid2, List(keyRevision(2))), rewrite(2)).disposition shouldBe
+      TransactionDisposition.VoteCommit
+
+    val done = Promise[ReconcileResult]()
+    frontend.reconcileForRepair(repairSnapshot(frontend, kvPtr), kvRead(1 to 4), done)
+    done.future.value.get.get.changed shouldBe true
+    backend.m(oid2).kvState.get.content.keySet shouldBe Set(k(1), k(2), k(3), k(4))
+
+    resolve(frontend, net, txid1, committed = true)
+    committedMessages(net).filter(_.transactionId == txid1).flatMap(_.objectCommitErrors) shouldBe Nil
+  }
+
   /** A read of op1 newer than anything the fixtures commit, at revision txid2 */
   def newerRepairState(): DataObjectState =
     val ts = HLCTimestamp((System.currentTimeMillis() + 1_000L) << 16)

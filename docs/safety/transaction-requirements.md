@@ -349,7 +349,9 @@ disjoint entries. So the size check (`RequirementsChecker.checkKVSliceSize`, at 
 growing update unless the worst state any apply order reaches fits: the current slice plus every positive growth
 reserved by another transaction plus its own, with the entry-count varint taken at the summed count. Invariant: the
 current slice plus every reservation fits. A growing vote is admitted only if it holds afterwards; an apply moves its
-reservation into the slice, at no more than the reserved size, and a release drops it, so neither breaks it, and a
+reservation into the slice, at no more than the reserved size, and a release drops it, so neither breaks it. A repair
+install, the one other change to a store's slice, keeps it too: a plan that grows a slice holding reservations is
+measured the same way and, if it does not fit, writes nothing and answers stale (repair-process.md 6.2, M6a). So a
 commit voter's apply re-check never fails on size. An update that grows nothing passes beside any reservation, so an
 oversized object can always be shrunk; one that removes bytes but adds entries counts as growing. A committed
 transaction that holds no reservation here (the store did not vote commit for it, so at most `w - t` such stores) is

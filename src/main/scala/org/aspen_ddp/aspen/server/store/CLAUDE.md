@@ -40,7 +40,9 @@
   dropped by `unlock`, only when the store has a slice limit). `RequirementsChecker.checkKVSliceSize`, at vote and at
   the apply re-check, fails a growing update unless the current slice plus every other transaction's positive growth
   plus its own fits, the count varint taken at the summed count. So a commit voter's apply never fails on size; a
-  committed non-voter that no longer fits is skipped and reported. A non-growing update always passes. The apply-time
+  committed non-voter that no longer fits is skipped and reported. A non-growing update always passes. A repair
+  install that grows a slice holding reservations is measured the same way (`Frontend.repairFitsReservations`) and,
+  if it does not fit, writes nothing and answers stale (repair-process M6a). The apply-time
   check stays: FSIF's slice limit is its segment payload, so an oversized slice would fail the backend commit
 - Apply is order-independent for what the builder lets through (transaction-requirements 9.3): every key Insert is
   last-writer-wins on (transaction timestamp, revision) (`KVObjectState.insertWins`; `growth` and `encodedSizeAfter` use the same

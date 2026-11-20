@@ -39,18 +39,6 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.3 [RP-W8] A repair install grows a KeyValue slice under held slice reservations; a counted voter's apply then fails.
-    CONFIRMED. Effort S. repair-process.md.
-    Frontend.reconcile does not treat held commit votes as unsettled and reconcileSettled defers only the keys the
-    store's own votes lock, so Reconcile.planKeyValue installs missed keys with no size check while votes V and V2
-    hold ObjectState.sliceReservations. V's apply re-check (checkKVSliceSize, applying = true) counts V2's reservation
-    against the larger slice and throws SliceSizeExceeded: a counted voter skips a committed update ("INVARIANT
-    VIOLATION ... skipped and reported"). With a non-voter skipping it too (R16 allows), V can drop below r.
-    Fix: in Frontend.reconcileSettled, when the object holds other transactions' sliceReservations and the plan grows
-    the slice, apply the checkKVSliceSize measure to the planned state plus those reservations; if it does not fit,
-    write nothing and answer stale so a later pass installs. Cost only on repair passes over objects with growing
-    votes. Does not cover 2.1.
-
 1.4 [CRL-W11] The body of the entry before a torn newest entry is recovered without its checksum.
     CONFIRMED. Effort S. crash-recovery-log.md.
     StreamReader.lastIntactEntry checks only the last entry's body; on failure it returns the previous entry

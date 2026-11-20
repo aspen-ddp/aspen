@@ -29,7 +29,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter whose re-check fails holds it already (2.3) |
 | Transaction requirements | Repair | A repair write that installs a newer state tells every Tx of the object started before it (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert applied over it reports the object; a pass that installs nothing tells none, and a non-voter's blind Insert of an absent key reports its object regardless |
 | Requirements (lock order) | Recovery | Every recovered commit vote (unresolved, or with a restored committed resolution) has relocked before a recovered Tx that does not relock applies (`Frontend.recoveredTransactionLoaded`, transaction-recovery.md 7.2) |
-| Requirements (slice limit) | Repair, rebuild | The commit votes a store holds on a KeyValue object fit `maxSliceSize` together (`ObjectState.sliceReservations`, R16); a repair install keeps them fitting (it does not: repair-process.md RP-W8), and the union of every committed growth fits too (it need not: X-W9) |
+| Requirements (slice limit) | Repair, rebuild | The commit votes a store holds on a KeyValue object fit `maxSliceSize` together (`ObjectState.sliceReservations`, R16); a repair install keeps them fitting (`Frontend.repairFitsReservations`, repair-process.md M6a), and the union of every committed growth fits too (it need not: X-W9) |
 | Client reads | Requirements, rebuild | `InvalidObject.provesDeletion`: a commit voter of an unapplied allocation answers `AllocationPending` (2.5) |
 | Transaction recovery | Repair | ErrorTree and UnackedCommits entries are consumed only once the store can no longer join T, and only by the store the pool names |
 | Transaction recovery | Metadata pools | Marker batches commit (finalization waits for them) |
@@ -283,9 +283,10 @@ skipped silently (X-W11). This
   no key lock that kept the deletion out, reports every blind Insert of a key absent before its apply, as it does
   after a required-revision Delete that its re-check cannot see, and a recovered non-voter (after a restart, a
   transfer or an adoption) reports every object it applies (`Tx.issueCommits`).
-* Repair and rebuild install a KeyValue object's read state with no size check (`Reconcile.planKeyValue`,
-  `RebuildingStore.restore`). A committed apply never exceeds the limit at a commit voter, since the votes a store
-  holds fit together (R16); a repair install can (repair-process.md RP-W8), and so can the read state itself, the union
+* Rebuild installs a KeyValue object's read state with no size check (`RebuildingStore.restore`); repair checks it
+  only beside held votes' reservations (`Frontend.repairFitsReservations`). A committed apply never exceeds the limit
+  at a commit voter, since the votes a store holds fit together (R16) and a repair install that would break that is
+  stale (repair-process.md M6a). The read state itself can exceed the limit: it is the union
   of growths committed by different voter sets, each of which fit only at the stores that checked it (X-W9). FSIF
   refuses a slice above its segment payload (`CommitError.SliceTooLarge`, `rebuildWrite`).
 * A data copy is installed only from a read no older than the store's copy, or of equal timestamp and a different

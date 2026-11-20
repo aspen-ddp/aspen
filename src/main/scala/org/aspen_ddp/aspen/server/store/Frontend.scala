@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit,
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{ExpiryTally, TransactionStatusCache, Tx}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
-import org.aspen_ddp.aspen.common.util.LogRateLimit
+import org.aspen_ddp.aspen.common.util.{LogRateLimit, Varint}
 import scribe.Logging
 import org.aspen_ddp.aspen.server.host.JoinCeiling
 import org.aspen_ddp.aspen.client.{ReadLocks, ObjectState as ClientObjectState}
@@ -2164,6 +2164,10 @@ class Frontend(val storeId: StoreId,
 
     if plan.changesNothing then
       p.success(plan.result)
+    else if !repairFitsReservations(loaded, plan) then
+      logger.trace(s"Store $storeId: repair of ${read.pointer.id} would overfill the slice beside its held commit " +
+        "votes' reservations. Left for a later pass")
+      p.success(ReconcileResult(Set(), false, stale = true))
     else
       // What a failed write restores (repairWriteComplete). Only the fields the plan changes: a locked key's ValueState
       // is deferred, so never replaced
@@ -2213,6 +2217,34 @@ class Frontend(val storeId: StoreId,
       awaitBlindInsertsDurable(objectId, None, () => removed): () =>
         if stopped || closed then done.tryFailure(new IllegalStateException(s"Store $storeId stopped"))
         else backend.repair(CommitState(read.pointer, os.metadata, os.objectType, os.data), done)
+
+  /** Whether `plan`, applied to `loaded`, keeps the slice within maxSliceSize beside the growth the commit votes held
+    * on the object reserve (ObjectState.sliceReservations). Only a checked vote or an apply may otherwise change a
+    * slice that holds reservations, which is what keeps the slice plus every reservation within the limit, so each
+    * commit voter's apply re-check fits (transaction-requirements R16). A plan that grows the slice is measured as a
+    * vote is (RequirementsChecker.checkKVSliceSize). One that does not fit is left for a later pass, once the votes
+    * have applied or been released. A plan that grows neither bytes nor entries always fits
+    */
+  private def repairFitsReservations(loaded: Option[ObjectState], plan: ReconcilePlan): Boolean =
+    val fits = for
+      limit <- maxSliceSize
+      os <- loaded
+      if os.sliceReservations.nonEmpty
+      kvs <- os.kvState
+    yield
+      val level = plan.objectLevel
+      val content = kvs.content -- plan.deletes ++ plan.installs.map((key, vs) =>
+        key -> new ValueState(vs.value, vs.revision, vs.timestamp, None))
+      def sansCount(size: Int, count: Int): Long = size.toLong - Varint.getUnsignedIntEncodingLength(count)
+      val after = KVObjectState.encodedSize(level.fold(kvs.min)(_.min), level.fold(kvs.max)(_.max),
+        level.fold(kvs.left)(_.left), level.fold(kvs.right)(_.right), content)
+      val growth = SliceGrowth(sansCount(after, content.size) - sansCount(kvs.encodedSize, kvs.content.size),
+        content.size - kvs.content.size)
+      try
+        RequirementsChecker.checkKVSliceSize(os.objectId, kvs, growth, os.sliceReservations.valuesIterator, limit)
+        true
+      catch case _: RequirementsChecker.ObjectErr => false
+    fits.getOrElse(true)
 
   /** A repair's backend write of `os` completed: its state is no longer held in memory for the write, and the
     * transactions waiting behind it may proceed.

@@ -855,12 +855,4 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-### R-W8: `Tx.issueCommits` cites a nonexistent `Frontend.awaitReplayHazardsDurable`
-Verdict CONFIRMED. Priority 7. Effort S.
-Mechanism: the comment above `recoveredApplied` in `Tx.issueCommits` says a key's deletion reaches the backend only
-once no CRL state holds a blind Insert of it "(Frontend.awaitReplayHazardsDurable)". No such symbol exists: the
-mechanism is `Frontend.awaitBlindInsertsDurable` (registered through `Frontend.registerReplayHazards`), which the
-same file's `insertedKeys`, `holdsUpdateOf` and the `reportedApplied` comment cite correctly.
-Consequence: a reader following the safety argument for taking a recovered vote's failed re-check as applied, and
-for re-applying an Insert of an absent key, finds no such method.
-Fix: cite `Frontend.awaitBlindInsertsDurable` in that comment.
+(no open weaknesses)

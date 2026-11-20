@@ -205,7 +205,9 @@
   durable; one that holds its update of the object here (`Tx.holdsUpdateOf`: it issued its commit, or voted commit,
   whose lock puts the deletion after it) until its state is saved without that update (`persistWithoutUpdateOf`;
   its recovered vote then finds the update missing and takes it as applied). A non-voter that has not applied holds
-  an update the store lacks: nothing waits for it. Inline for every object no recent blind write covers
+  an update the store lacks: nothing waits for it, and its later apply of a blind Insert of a key absent before it
+  reports the object (`Tx.issueCommits`; the deletion may have applied first, e.g. a required-revision Delete, a
+  no-op on the absent key). Inline for every object no recent blind write covers
 - Late blind Insert after a repair install (transaction-requirements 9.4): a repair write can install a later
   transaction's key deletion at a store that never held the Insert, which a delayed T would then write back at this
   store alone, possibly with no mark (its TxCommitted inside `errorTimeout`). `repairInstalls` keeps the latest object

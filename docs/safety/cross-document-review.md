@@ -27,7 +27,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Transaction requirements | CRL, recovery | Recovered commit votes re-take their locks before any message is handled |
 | Transaction requirements | CRL, recovery | A key's deletion (commit or repair write) reaches the backend only once no CRL state holding an applied blind Insert of the key remains (`Frontend.awaitBlindInsertsDurable`), so a recovered Insert of an absent key was never applied |
 | Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter whose re-check fails holds it already (2.3) |
-| Transaction requirements | Repair | A repair write that installs a newer state tells every Tx of the object started before it (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert applied over it reports the object; a pass that installs nothing tells none (X-W7) |
+| Transaction requirements | Repair | A repair write that installs a newer state tells every Tx of the object started before it (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert applied over it reports the object; a pass that installs nothing tells none, and a non-voter's blind Insert of an absent key reports its object regardless |
 | Requirements (lock order) | Recovery | Every recovered commit vote has relocked before a recovered Tx with a restored resolution applies (`Frontend.recoveredTransactionLoaded`, transaction-recovery.md 7.2) |
 | Client reads | Requirements, rebuild | `InvalidObject.provesDeletion`: a commit voter of an unapplied allocation answers `AllocationPending` (2.5) |
 | Transaction recovery | Repair | ErrorTree and UnackedCommits entries are consumed only once the store can no longer join T, and only by the store the pool names |
@@ -257,11 +257,10 @@ The premises other subsystems take from this:
   state (`awaitBlindInsertsDurable`, 2.3), and every repair write records the object timestamp it installs
   (`Frontend.recordRepairInstall`) for the Txs of the object started before it, so a non-voter's later blind Insert
   of a key the install removed reports the object (transaction-requirements.md 9.4). A repair pass that finds the
-  store's copy already equal to the read writes nothing and records nothing; a non-voter still holding T then writes
-  the key back unreported if T's own marks missed the store (X-W7). The write-back in the other order, a non-voter
-  applying T after a required-revision Delete that its re-check cannot see, is transaction-requirements.md's Q-W13;
-  a recovered non-voter (after a restart, a transfer or an adoption) reports every object it applies, so neither
-  arises through a store's reload.
+  store's copy already equal to the read writes nothing and records nothing; a non-voter still holding T, which held
+  no key lock that kept the deletion out, reports every blind Insert of a key absent before its apply, as it does
+  after a required-revision Delete that its re-check cannot see, and a recovered non-voter (after a restart, a
+  transfer or an adoption) reports every object it applies (`Tx.issueCommits`).
 * A data copy is installed only from a read no older than the store's copy, or of equal timestamp and a different
   revision (`Reconcile.planData`): a refcount or key-level write moves the timestamp without the revision, so the
   revision decides. That rule overwrites a store's copy only with what a read majority holds, which includes every
@@ -363,7 +362,6 @@ Between the documents: none. Terms they share mean the same in each:
 
 Between a document, scaladoc or guide outside docs/safety and the code, open:
 
-* `Tx.issueCommits` cites a nonexistent `Frontend.awaitReplayHazardsDurable` (transaction-recovery.md R-W8).
 * `Tx.persistWithoutUpdateOf`, `Tx.droppedUpdates` and `server/transaction/CLAUDE.md` name allocations only
   (crash-recovery-log.md CRL-W10).
 * `server/store/backend/fsif/DESIGN.md` 4.6 says a failed open is retried only by a restart (systemic-loss-protection.md
@@ -374,31 +372,6 @@ Between a document, scaladoc or guide outside docs/safety and the code, open:
 ---
 
 ## Open weaknesses
-
-### X-W7: A key Delete's mark can be repaired at a store before a non-voter's blind Insert of the key applies there
-Verdict PLAUSIBLE. Priority 2. Effort S. Concerns transaction-requirements.md (9.4, Q-W13).
-Mechanism: T Inserts k blindly (`DoesNotExist(k)`, as a TKVL put does) into a KeyValue object; S holds T's data but
-voted abort (a collision there), and T commits elsewhere. At S, T's apply is held in lock order behind a holder H of a
-lock on another key T writes (`Tx.awaitLockHolders`; H undecided, its tally possibly undecidable, transaction-
-requirements.md 12). D, built on the post-T state, deletes k with a `KeyRevision` (the TKVL delete). S lacks k, so it
-votes abort, and D's commit, holding no locks at S and colliding with no holder there (T holds none), applies at once:
-its re-check fails, the object is skipped and reported, and D's finalizer marks S. A later transaction E applies at S
-and at the read's responders, so S's object timestamp equals the read's. D's mark is repaired at S once D can no
-longer join there (60 s age gate, `mayJoinTransaction`, `mayHoldTransaction`, all about D only): `Reconcile.plan`
-finds k absent in both and the timestamps equal, so the plan changes nothing, `recordRepairInstall` is never called,
-and the entry is deleted. When H releases, T applies at S: k is absent, so its re-check passes, `insertWins` writes k,
-and `Tx.issueCommits` reports nothing (`repairedUnder` is empty and T is not a recovered vote). If T's finalizer has
-not marked S yet, S's `TxCommitted` naming nothing is counted and S gets no mark for T. A finalizer's marker writes
-`errorTimeout` (2 s) after it is created and the finalizer completes only once it has, so this needs T's marker
-writes to fail over the whole wait (a degraded metadata pool, `TransactionDriver.finalizerRetryDelay` restarting the
-finalizer, each restart taking the `TxCommitted`s received so far).
-Consequence: S keeps k while every other store has it deleted, at the same revision, with no entry left: permanent
-replica divergence until k is written again. It needs a lock-order wait at S outlasting D's repair, a later write
-E, and T's marker failing over the same time, so it is rare. Q-W13's first fix (require a `KeyRevision` or content lock on every
-key Delete) does not cover it.
-Fix: Q-W13's second fix covers both: in `Tx.issueCommits`, report a blind Insert of a key absent before the apply
-when the Tx did not vote commit here (it holds no lock that kept a deletion out). A non-voter is not counted toward
-the write threshold, so the report costs a repair pass, not margin.
 
 ### X-W8: A store whose config cannot be read at load, or whose executor slot is still held, is left unserved and untracked
 Verdict PLAUSIBLE. Priority 4. Effort S. Concerns systemic-loss-protection.md and the host load paths.

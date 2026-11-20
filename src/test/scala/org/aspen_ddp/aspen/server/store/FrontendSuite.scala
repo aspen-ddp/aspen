@@ -5500,6 +5500,37 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lateInsert(Some(-1000), beforeVote = true) shouldBe Nil
   }
 
+  test("a non-voter's blind Insert of an absent key applied after a required-revision Delete of it reports the object (Q-W13)") {
+    val (frontend, backend, net) = lockFixture()
+    // txid3 holds key 4's lock, so T (txid1) votes abort here; T commits elsewhere and its resolution is delayed
+    prepare(frontend, net, lockTxd(txid3, List(insertK4)), insertK4Data).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid1, List(insertK4)), insertK4Data).disposition shouldBe
+      TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid3, committed = false)
+    // D, built on the post-T state, deletes key 4 checked only by a required revision: a no-op here, where k4 is absent
+    val delete = KeyValueUpdate(kvPtr, Some(rev0), None, Nil, deletesKeys = true)
+    prepare(frontend, net, lockTxd(txid2, List(delete)), KeyValueOperation.encode(List(new Delete(k(4))), ida)(0))
+      .disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid2, committed = true)
+    kvKeys(backend) should not contain k(4)
+
+    resolve(frontend, net, txid1, committed = true)
+    kvKeys(backend) should contain (k(4))
+    committedMessages(net).filter(_.transactionId == txid1).flatMap(_.objectCommitErrors) shouldBe List(oid2)
+  }
+
+  test("a non-voter's blind Insert over a present key reports nothing") {
+    val (frontend, backend, net) = lockFixture()
+    val overK1 = KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.MayExist(k(1))))
+    val data = KeyValueOperation.encode(List(new Insert(k(1), Array[Byte](9))), ida)(0)
+    prepare(frontend, net, lockTxd(txid3, List(overK1)), data).disposition shouldBe TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid1, List(overK1)), data).disposition shouldBe TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid3, committed = false)
+    resolve(frontend, net, txid1, committed = true)
+    committedMessages(net).filter(_.transactionId == txid1).flatMap(_.objectCommitErrors) shouldBe Nil
+  }
+
   test("a store loaded with such an entry recreates the transaction") {
     val saved = savedAfterFailedCommit()
     val backend = new MapBackend(storeId)

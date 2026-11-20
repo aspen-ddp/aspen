@@ -45,17 +45,7 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.1 [Q-W13, X-W7] A non-voter's blind Insert applied after a Delete of its key writes the key back unreported.
-    PLAUSIBLE. Effort S. transaction-requirements.md, cross-document-review.md.
-    Q-W13: a store that did not vote commit for T applies a later D first (a Delete on a required revision alone is
-    a no-op on the absent key), then T's Insert passes its re-check and writes k back; issueCommits' reinserts test
-    covers only repairedUnder objects and recovered votes. X-W7: D carries a KeyRevision, fails at S and marks it, but
-    a later write E leaves S's timestamp equal to the repair read's, so the repair installs nothing, records no
-    repair install, and deletes the entry; T's held lock-order apply then writes k back. Permanent silent divergence.
-    Fix (covers both): in Tx.issueCommits, report a blind Insert of a key absent before the apply whenever the Tx did
-    not vote commit here. A non-voter is not counted toward t, so the report costs a repair pass, not margin.
-    Tightening the Delete rule alone fixes Q-W13 but not X-W7 (and would need a content lock in
-    SimpleTaskExecutor.deallocateTask).
+(no open items)
 
 
 PRIORITY 3: systemic loss protection
@@ -116,8 +106,7 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.1 [R-W8, CRL-W10] Tx.scala scaladoc. CONFIRMED. Effort S. transaction-recovery.md, crash-recovery-log.md.
-    Tx.issueCommits cites a nonexistent Frontend.awaitReplayHazardsDurable (it is awaitBlindInsertsDurable).
+7.1 [CRL-W10] Tx.scala scaladoc. CONFIRMED. Effort S. crash-recovery-log.md.
     Tx.persistWithoutUpdateOf, Tx.droppedUpdates and server/transaction/CLAUDE.md describe only the deletion of an
     object the Tx allocated; awaitBlindInsertsDurable also calls it for blind-Insert key deletions.
 

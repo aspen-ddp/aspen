@@ -262,7 +262,7 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   a store that never saw T (below a quorum): its entry can exist only through the unknown-voters case, which names no
   incarnation. A replay Tx there that voted commit applies T through it on a late commit (its vote passed T's pin,
   and it has held its locks since; a blind Insert of a key whose later deletion repair installed there is applied
-  and reported, `server/store/CLAUDE.md`);
+  and reported, as is every non-voter's blind Insert of a key absent before its apply, `server/store/CLAUDE.md`);
   otherwise the entry's reconcile installs the committed state, since repair leaves the entry until the store can no
   longer join T
   (`server/repair/CLAUDE.md`; transaction-recovery 5.4)

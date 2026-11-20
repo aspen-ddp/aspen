@@ -610,8 +610,9 @@ repaired. A commit voter never applies in that order: the later update waits for
 T's `t` voters hold T and repair restores the at most `w - t` stores that skipped it. A recovered `DoesNotExist` or blind Insert whose key a later
 transaction deleted no longer holds its update in its CRL state (9.4), so it never writes the key back (10.5c).
 A key Delete checked by a `KeyRevision` or a content lock fails at a store that lacks the Insert it follows, so that
-store skips and reports it. One checked only by a required revision passes there, deletes nothing, and the Insert
-applied after it is not rejected either (Q-W13). TKVL deletes always carry a `KeyRevision` or a content lock.
+store skips and reports it. One checked only by a required revision passes there and deletes nothing; the Insert
+applied after it, by a Tx that did not vote commit here, passes its re-check on the absent key, and is applied and
+reported (9.4). TKVL deletes always carry a `KeyRevision` or a content lock.
 
 ### 9.4 Deletion and allocation
 
@@ -638,11 +639,18 @@ each other covering transaction T whose update Inserts one of those keys is hand
   object's update (`persistWithoutUpdateOf`), and the write waits for that save;
 * otherwise (a non-voter that has not applied): nothing waits. Its update is one the store does not hold and may yet
   apply. When the deletion follows T in the serial order (a required-revision Delete, which T's key lock ordered
-  after T at T's voters), that later apply writes the key back at this store alone, unreported (Q-W13).
+  after T at T's voters), that later apply writes the key back at this store alone, and reports it (below).
 
 So a recovered commit vote that still holds a blind Insert of an absent key never applied it, and applies it (10.5c).
 The cost is one index entry per Tx with a blind KeyValue update, and a decode only for a key deletion soon after a
 blind write of the same object; nothing on the ordinary commit path.
+
+A Tx that did not vote commit here held no key lock that kept a later deletion of its key out, so its apply of a
+blind Insert of a key absent before the apply always reports the object in `objectCommitErrors` (`Tx.issueCommits`):
+the deletion may have applied first (a required-revision Delete, a no-op on the absent key), or reached the store
+through a repair that found nothing to change (cross-document-review.md 2.4). The finalizer marks the store, and the
+mark's repair installs the object's current state. A non-voter is not counted toward the write threshold, so the
+report costs a repair pass, not margin.
 
 A store can also hold a key's deletion it never applied: repair installs it from a read (a whole-object reconcile),
 at a store that may never have held the Insert either. A transaction T that reaches such a store later (a delayed
@@ -657,7 +665,7 @@ a key absent before the apply, on an object so marked, applies and reports the o
 (`Tx.issueCommits`): the finalizer marks the store, and the mark's repair, once T can no longer join here, installs
 the object's current state. A recovered commit vote, whose marks were lost with the crash, reports the same apply when
 any write newer than T's start reached the object. The map is empty except soon after a repair write, so an ordinary
-commit checks nothing; a counted voter that reports only adds a repair pass.
+commit voter checks nothing; a counted voter that reports only adds a repair pass.
 
 An allocation is read like any other object (`Frontend.readObjectForTransaction`): the in-memory state, `ObjectNotFound`
 while a deletion is in flight, else the backend. Only a backend miss gives the fresh `Allocating` state
@@ -828,32 +836,6 @@ object-level proof is an `ExclusiveRevisionLock` (`server/repair/RepairProofs.pr
   transaction's lifetime than the write threshold's margin covers, and is alarmed; there is no way out of the wait.
 
 ## Open weaknesses
-
-### Q-W13: A non-voter's blind Insert applied after a required-revision Delete of its key writes the key back unreported
-Verdict PLAUSIBLE. Priority 2. Effort S.
-Mechanism: T Inserts k blindly (`DoesNotExist(k)`, `MayExist`, or no key requirement) and commits; its voters hold
-N(k) or K(k) until they apply. D, built on the post-T state, deletes k checked only by a required revision (2.5
-allows a Delete with a `KeyRevision`, a content lock or a required revision). T's key-level write does not move the
-revision, so D's check passes on pre-T and post-T states alike. At T's voters, D's X collides with T's key lock, so D
-is ordered after T (R4, lock order 8.3). At a store S that holds T's data but did not vote commit for T (an abort
-vote from a collision there, say) and learns T's outcome late (a lost or delayed `TxResolved`, then a retransmit or
-`TxFinalized`), D votes and applies first: its Delete of the absent k is a no-op. `Frontend.awaitBlindInsertsDurable`
-finds T's record covering k and lets D proceed, since T neither issued its commit nor voted commit
-(`Tx.holdsUpdateOf`). T then applies: its re-check passes (k absent), `insertWins` installs k, and `Tx.issueCommits`
-reports nothing, because its `reinserts` test covers only `repairedUnder` objects and recovered commit votes. The
-same holds for a Tx for T created at S only after D applied (a delayed client prepare whose vote passes T's pin
-elsewhere): `repairInstalls` records repair writes only, not a transaction's deletion. A store whose D carries a
-`KeyRevision` or content lock fails D instead and reports it (a report whose repair can still come first:
-cross-document-review.md, X-W7). TKVL deletes carry a `KeyRevision` or a content lock.
-The one production caller that deletes keys on a required revision alone, `compute/impl/SimpleTaskExecutor`'s
-`deallocateTask`, empties a task object whose other writes carry a `KeyRevision` or a required revision, so it meets
-no blind Insert.
-Consequence: S keeps k while every other store has it deleted, at the same revision and timestamp, with no ErrorTree
-entry. The replicas diverge permanently until a later write of k.
-Fix: either require a `KeyRevision` or a content lock for every key Delete outside an allocation (builder and
-`refuseBlindWrites`), so D fails and reports at any store lacking T's Insert; or report, in `Tx.issueCommits`, a blind
-Insert of an absent key applied by a Tx that did not vote commit or whose vote saw an object timestamp past T's start.
-The awaitBlindInsertsDurable branch that lets a non-voter through could also mark that Tx, as `repairInstalled` does.
 
 ### Q-W14: A lock-order waiter withholds colliding lock-only votes it would never wait for
 Verdict CONFIRMED. Priority 5. Effort S.

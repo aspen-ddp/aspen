@@ -1189,23 +1189,26 @@ class Tx( trs: TransactionRecoveryState,
     }
 
     // Objects on which this apply writes back a key the store may have held deleted: a blind Insert of a key now
-    // absent, where a repair wrote a state newer than this transaction's start (repairInstalled), or, for a recovered
-    // commit vote, whose marks were lost with the crash, where any write newer than its start reached the object. The
-    // state may hold a later transaction's deletion of the key, from a read, at a store that never held T's update. The
+    // absent, where this Tx did not vote commit here (it held no key lock that kept a later deletion out: a deletion
+    // checked by a required revision alone applied first as a no-op, or repair installed it from a read with nothing
+    // to change), where a repair wrote a state newer than this transaction's start (repairInstalled), or, for a
+    // recovered commit vote, whose marks were lost with the crash, where any write newer than its start reached the
+    // object. The state may hold a later transaction's deletion of the key at a store that never held T's update. The
     // apply still runs, and reports the object, so the finalizer marks the store and repair installs the object's
-    // current state (transaction-requirements 10.5c). Repair writes are rare and a recovery rarer: a commit applied
-    // normally checks nothing here
+    // current state (transaction-requirements 9.4, 10.5c). A non-voter is not counted toward the write threshold, so
+    // its report costs a repair pass, not margin; a commit voter applied normally checks nothing here
     val reinserts = requirements.iterator.collect {
       case r: KeyValueUpdate if r.requiredRevision.isEmpty => r.objectPointer.id
     }.filter { oid =>
       objects.get(oid).exists { state =>
-        val suspect = repairedUnder.contains(oid) ||
-          (recovered && disposition == TransactionDisposition.VoteCommit && state.metadata.timestamp > txd.startTimestamp)
+        val suspect = disposition != TransactionDisposition.VoteCommit || repairedUnder.contains(oid) ||
+          (recovered && state.metadata.timestamp > txd.startTimestamp)
+        // An undecodable update fails its re-check and is skipped and reported by the apply: it writes nothing back
         suspect && !failedHere.contains(oid) && state.kvState.exists { kvs =>
-          ou.get(oid).exists(u => opsOf(u).exists {
+          ou.get(oid).exists(u => scala.util.Try(opsOf(u)).toOption.exists(_.exists {
             case o: Insert => !kvs.content.contains(o.key)
             case _ => false
-          })
+          }))
         }
       }
     }.toSet
@@ -1231,7 +1234,7 @@ class Tx( trs: TransactionRecoveryState,
     // later transaction superseded it, or the update leaves no trace (a refcount, key deletes), or its data was dropped
     // from the CRL state once applied (persistWithoutUpdateOf, after a deletion of the object or of a key it inserts).
     // A re-applied Insert of an absent key was never applied: a key's deletion reaches the backend only once no CRL
-    // state holds a blind Insert of it (Frontend.awaitReplayHazardsDurable), so it applies again, and is not skipped
+    // state holds a blind Insert of it (Frontend.awaitBlindInsertsDurable), so it applies again, and is not skipped
     val skippedObjects = objects.filter((oid, _) => result.skipped.contains(oid) && !failedHere.contains(oid))
     val recoveredApplied =
       if recovered && disposition == TransactionDisposition.VoteCommit then

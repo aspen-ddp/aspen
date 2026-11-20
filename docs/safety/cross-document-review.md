@@ -186,8 +186,11 @@ retry cap. This
   can bring the store back onto this device while a copy occupies its path: `StoreTransfers.startIn` refuses an
   existing path, except an earlier tenancy's `rebuild-complete` or `rebuild-required` copy, which it retires before
   asking for any bytes, and not while a rebuild of the store still runs here (rebuild-process.md FS18). So an Active
-  entry here over this rebuild's copy was made Active by this episode. Its wait for a store served here tests the
-  store id alone, so a transfer between two devices of one host never starts (X-W13). A rebuilt copy carries an empty
+  entry here over this rebuild's copy was made Active by this episode. The retire waits for a copy served from the
+  destination's path or a store opening, never for the transfer's source served from another device of this host,
+  which closes only for the StartStoreTransfer sent past the retire; a marked copy's load leaves the store served there
+  unsilenced (`StoreLoader.keepMarkedCopyOffline`), and a removed copy clears the router's offline mark only when no
+  other device here holds the store offline (`StoreRouter.clearOfflineUnlessHeld`). A rebuilt copy carries an empty
   `crl_save.log` (`RebuildingStore.writeEmptyCrlState`), so its first load (by the flip, the Completed Rebuilds pass,
   a restart, a reinstatement or an adoption) drops whatever device-CRL entries an earlier copy left under its id
   (`StoreLoader.awaitCrlLoad`), and a transfer out of the unloaded copy ships the file and drops them
@@ -436,18 +439,6 @@ Between a document, scaladoc or guide outside docs/safety and the code, open: X-
 ---
 
 ## Open weaknesses
-
-### X-W13: A transfer between two devices of one host onto a path holding an earlier tenancy's copy never starts
-Verdict CONFIRMED. Priority 4. Effort S.
-Mechanism: `StoreTransfers.retireEarlierTenancy` waits while `ctx.router.loaded.contains(storeId)`, by store id
-alone. When device A of this host serves the store and device B's path holds a `rebuild-complete` or
-`rebuild-required` copy of an earlier tenancy, the wait never ends: only `startOut` closes A's store, after a
-`StartStoreTransfer` that `startIn` sends only past this branch. Each device check logs and does nothing.
-Consequence: the transfer (operator or rebalancer) is stuck TransferringOut/TransferringIn until aborted; A keeps
-serving, so no margin is lost.
-Fix: wait only when the store is served or opening at B's path (`ctx.router.entry(storeId)` whose backend path is
-`local.devicePath / storeId.directoryName`, or `ctx.loader.isOpening`), as `retireForeignCopy` tests. Also check that
-`tryLoadStore`'s `router.markOffline(storeId)` on B's marked copy cannot mark A's served store offline.
 
 ### X-W15: A load's `onServed` gossip runs when its LoadStore is queued, before the store is served
 Verdict CONFIRMED. Priority 5. Effort S.

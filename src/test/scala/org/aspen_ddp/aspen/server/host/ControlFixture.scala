@@ -518,6 +518,20 @@ trait ControlFixture:
     devices.devices += (sds.storageDeviceId -> sds)
     host.control.publishView()
 
+  /** Installs a stand-in for `storeId` in `host`'s router, served from a device of the host other than any test
+   *  device and from no store path on one (a map backend), as the source of a transfer between two devices of one host
+   *  is served while the destination prepares. Nothing runs on it: its executor is inline and its network and CRL are
+   *  inert. */
+  protected def installServedElsewhere(host: Host, storeId: StoreId): Unit =
+    import org.aspen_ddp.aspen.server.store.FrontendSuite.{TestCrl, TestNet}
+    val store = new org.aspen_ddp.aspen.server.store.Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.parasitic,
+      new org.aspen_ddp.aspen.server.store.backend.MapBackend(storeId),
+      org.aspen_ddp.aspen.server.store.cache.ObjectCache.NoCache, new TestNet,
+      BackgroundTaskManager.NoBackgroundTaskManager, new TestCrl,
+      new org.aspen_ddp.aspen.server.transaction.TransactionStatusCache(), null,
+      TransactionDriver.noErrorRecoveryFactory, Duration(40, SECONDS), None)
+    host.control.router.install(store, HostThreading.InlineStoreExecutor)
+
   /** The devices `host` has loaded. */
   protected def loadedDevices(host: Host): Map[StorageDeviceId, LocalStorageDeviceState] =
     host.control.devices.devices

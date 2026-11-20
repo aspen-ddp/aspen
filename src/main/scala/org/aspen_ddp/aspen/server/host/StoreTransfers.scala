@@ -423,8 +423,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                           s"belongs to transfer '$markerId', not to the current transfer $transferId")
               // Rename-first: a failure leaves the copy whole behind its marker. The source still owns the store
               if StoreCopies.delete(devicePath, finalPath, s"a stale arrived copy of store $storeId") then
-                ctx.router.clearOffline(storeId)
                 toDevice.offlineStores -= storeId
+                ctx.router.clearOfflineUnlessHeld(storeId)
                 false
               else
                 true
@@ -571,20 +571,24 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  Retired before any bytes are asked for, so before the transfer's metadata step can make the entry Active:
    *  a rebuild's flip finding an Active entry adopts it without an episode check (DeviceMetadata.markRebuiltStoreActive).
    *  For the same reason it waits while a rebuild of the store runs here: the reconcile cancels one whose entry has
-   *  moved (StoreRebuilds.abandonUnlisted), and one past its latch could still move a copy into the path. A served
-   *  store waits too: whatever path took it out of service retires or reloads it. */
+   *  moved (StoreRebuilds.abandonUnlisted), and one past its latch could still move a copy into the path. A copy
+   *  served from this path, or a store still opening, waits too: whatever path took it out of service retires or
+   *  reloads it. The store served from another device of this host does not: that is the source of a transfer
+   *  between two devices of one host, closed only by the StartStoreTransfer sent once this path is clear. */
   private def retireEarlierTenancy(local: LocalStorageDeviceState, storeId: StoreId): Unit =
-    if ctx.rebuilds.rebuildingStoreIds.contains(storeId) || ctx.router.loaded.contains(storeId) then
+    val storePath = local.devicePath / storeId.directoryName
+    val servedHere = ctx.router.entry(storeId).exists(_.store.backend.path == storePath)
+    if ctx.rebuilds.rebuildingStoreIds.contains(storeId) || servedHere || ctx.loader.isOpening(storeId) then
       logger.info(s"Not transferring store $storeId onto device ${local.storageDeviceId} yet: its path holds a copy " +
-                  s"of an earlier tenancy, which waits for a rebuild or a close of the store here to end")
+                  s"of an earlier tenancy, which waits for a rebuild, an open or a close of the store here to end")
     else if !ctx.copies.isRetiring(storeId) then
       logger.warn(s"Retiring the copy of an earlier tenancy of store $storeId at its path on device " +
                   s"${local.storageDeviceId} before transferring the store onto it")
       ctx.copies.retire(local, storeId).foreach: clear =>
         if clear then
-          ctx.router.clearOffline(storeId)
-          local.offlineStores -= storeId
           local.loadedStores -= storeId
+          local.offlineStores -= storeId
+          ctx.router.clearOfflineUnlessHeld(storeId)
           ctx.reconciler.checkStorageDevice(local.storageDeviceId)
 
   /** Returns the request's handling, which fails when the request is refused. Only tests look at

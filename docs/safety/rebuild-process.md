@@ -831,8 +831,9 @@ old tenancy's copy at its path: a finished rebuild awaiting its flip (`rebuild-c
 (`retireEarlierTenancy`) retires it (`StoreCopies.retire`) before asking for any bytes, so it is gone before the
 transfer's metadata step can make the entry Active (a flip finding an Active entry adopts it without an episode check),
 and checks the device again once the path is clear, which starts the transfer. While a rebuild of the store still runs
-on this host (being cancelled by `abandonUnlisted`; past its latch it could still move a copy into the path) or the
-store is served on this host, it waits. A rebuild that moves its copy in after the transfer started makes the
+on this host (being cancelled by `abandonUnlisted`; past its latch it could still move a copy into the path), the
+store is opening, or a copy is served from the path, it waits. The transfer's source served from another device of
+this host does not hold it: that store closes only for the StartStoreTransfer sent once the path is clear. A rebuild that moves its copy in after the transfer started makes the
 transfer's promotion fail and retry; its flip then reads TransferringIn and gets `Discard`.
 
 ---

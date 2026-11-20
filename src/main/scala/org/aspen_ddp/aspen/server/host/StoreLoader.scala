@@ -89,28 +89,24 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           // discards this directory before writing a fresh copy.
           logger.warn(s"Not loading store ${storeCfg.storeId}: its CRL save file was lost and it " +
                       s"awaits a rebuild. $potentialStoreFile")
-          router.markOffline(storeCfg.storeId)
-          sds.offlineStores += storeCfg.storeId
+          keepMarkedCopyOffline(sds, storeCfg.storeId)
         else if os.exists(potentialStoreFile / StoreTransfer.TransferOutMarkerFile) then
           logger.info("Skipping load of offline store marked for transfer out. " +
                       s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
-          router.markOffline(storeCfg.storeId)
-          sds.offlineStores += storeCfg.storeId
+          keepMarkedCopyOffline(sds, storeCfg.storeId)
         else if os.exists(potentialStoreFile / StoreTransfer.TransferredInMarkerFile) then
           // Arrived, but the pool may still name the source. StoreTransfers.startIn resumes the
           // metadata step for it, and reconcileDeviceState loads it if that step already committed.
           logger.info("Skipping load of transferred-in store awaiting its pool update. " +
                       s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
-          router.markOffline(storeCfg.storeId)
-          sds.offlineStores += storeCfg.storeId
+          keepMarkedCopyOffline(sds, storeCfg.storeId)
         else if os.exists(potentialStoreFile / RebuildingStore.RebuildCompleteMarkerFile) then
           // A finished rebuild whose flip may not have committed (a crash between the move and the flip,
           // rebuild-process 5.7). The rebuild's completion removes the marker and loads it once the flip commits; for
           // an entry already Active, the reconcile does (DeviceReconciler)
           logger.info("Skipping load of rebuilt store awaiting its device entry's flip out of Rebuilding. " +
                       s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
-          router.markOffline(storeCfg.storeId)
-          sds.offlineStores += storeCfg.storeId
+          keepMarkedCopyOffline(sds, storeCfg.storeId)
         else if opening.contains(storeCfg.storeId) || router.get(storeCfg.storeId).isDefined then
           logger.debug(s"Not loading store ${storeCfg.storeId} again: it is already open or opening")
         else
@@ -121,6 +117,15 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       // Never a half-made store (creates, transfers and rebuilds move a store into place whole), so a store whose
       // config was lost. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass
       logger.error(s"Not loading $potentialStoreFile: it has no ${StoreConfig.configFilename}")
+
+  /** Records a store directory a marker keeps from loading as offline on its device, and silences the store unless it
+   *  is served or opening here. The router's mark is by store id, and the store may be served from another device of
+   *  this host (the source of a transfer onto this one, whose path holds an earlier tenancy's copy): marking it would
+   *  report that store offline (HostStoreView) and keep the shutdown of its own device from closing it. */
+  private def keepMarkedCopyOffline(sds: LocalStorageDeviceState, storeId: StoreId): Unit =
+    if router.get(storeId).isEmpty && !opening.contains(storeId) then
+      router.markOffline(storeId)
+    sds.offlineStores += storeId
 
   /** A load that threw before any open started: its config could not be read (an I/O error, a resource limit, a
    *  corrupt file) or a marker check failed. Unless the store is open or opening (an offer repeated over a served

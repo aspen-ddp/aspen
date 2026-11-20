@@ -1803,6 +1803,49 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         os.exists(retired.head / RebuildingStore.LostCrlStateFile) should be(true)
         host.control.transfers.transferringIn.keySet should be(Set(movingStore))
 
+  // rebuild-process FS17, for a transfer between two devices of one host: the source is served here until the
+  // StartStoreTransfer the destination sends once its path is clear, so the retire waits only for a copy served from
+  // the destination's own path
+  for marker <- List(RebuildingStore.RebuildCompleteMarkerFile, RebuildingStore.RebuildRequiredMarkerFile) do
+    atest(s"a transfer in over an earlier tenancy's $marker copy, its source served on another device here, starts"):
+      given ExecutionContext = executionContext
+
+      val hostRoot = newHostDir()
+      val deviceDir = writeDevice(hostRoot, "dev0", net.secondDeviceId)
+      val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+      val earlier = writeStoreDir(deviceDir, movingStore)
+      os.write.over(earlier / marker, "")
+      val transfers = new StagedTransferService
+      val host = newHost(hostRoot, transferService = transfers)
+      installServedElsewhere(host, movingStore)
+
+      for
+        _ <- net.createSecondDevice()
+        _ <- waitForTransactionsToComplete()
+        _ <- pumpUntil(loadedDevices(host).contains(net.secondDeviceId))
+        local = loadedDevices(host)(net.secondDeviceId)
+
+        // A scan of the destination device offers the marked copy: it is kept offline there without silencing the
+        // store served from the other device
+        _ = host.control.loader.tryLoadStore(local, earlier)
+        markedOffline = local.offlineStores.contains(movingStore)
+        routerOfflineAfterScan = host.control.router.isOffline(movingStore)
+
+        _ <- client.transferStore(movingStore, net.secondDeviceId)
+        _ <- waitForTransactionsToComplete()
+        _ = host.control.reconciler.checkAll()
+        _ <- pumpUntil(startTransferSent(transfers, movingStore, 1))
+      yield
+        markedOffline should be(true)
+        routerOfflineAfterScan should be(false)
+        startTransferSent(transfers, movingStore, 1) should be(true)
+        os.exists(earlier) should be(false)
+        os.list(deviceDir / RebuildingStore.PendingDeleteDirectory).map(_.last.startsWith(movingStore.directoryName))
+          .toList should be(List(true))
+        host.control.router.get(movingStore).isDefined should be(true)
+        host.control.router.isOffline(movingStore) should be(false)
+        host.control.currentView.repairable should contain(movingStore)
+
   atest("a store carrying the transferred-in marker is not loaded at startup"):
     // A real Host rather than one with the recording tryLoadStore seam, which records every
     // candidate and honours no marker.

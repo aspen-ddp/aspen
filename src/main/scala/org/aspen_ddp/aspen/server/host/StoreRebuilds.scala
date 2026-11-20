@@ -479,8 +479,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private def unsilence(storeId: StoreId, clear: Boolean): Unit =
     if silenced.contains(storeId) then
       silenced -= storeId
-      if clear && !ctx.devices.devices.values.exists(_.offlineStores.contains(storeId)) then
-        ctx.router.clearOffline(storeId)
+      if clear then
+        ctx.router.clearOfflineUnlessHeld(storeId)
 
   /** Checks `deviceId` again after a backoff, so a store whose rebuild pass or flip failed is retried without waiting
    *  for the periodic sweep (an hour) and without spinning (rebuild-process 5.7). The first delay is

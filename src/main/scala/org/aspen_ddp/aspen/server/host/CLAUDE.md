@@ -15,7 +15,11 @@
   not closed when the task runs (tasks queued ahead of a close still run). Unknown stores are answered from the
   calling thread; offline ones are silent, as are all unknown ones until the startup scan's LoadStores are handled.
   A store whose load is under way is silent too: `loading` from `StoreLoader.startOpen` until install, and
-  `awaitingDevice` while its device's shutdown-marker lookup (or adoption) decides. Neither mark is `offline`
+  `awaitingDevice` while its device's shutdown-marker lookup (or adoption) decides. Neither mark is `offline`.
+  The router's `offline` mark is by store id, but two devices of one host can each hold a copy of a store (a transfer
+  between them, an earlier tenancy's copy at the destination's path): `tryLoadStore` keeps a marked copy offline on
+  its device without silencing a store served or opening here (`keepMarkedCopyOffline`), and a pass that removes a
+  copy clears the mark only if no other loaded device holds the store offline (`StoreRouter.clearOfflineUnlessHeld`)
 - Backend opens are backend-neutral: `BackendOpener.open` (`server.store.backend`) returns a Future and decides where
   the open runs (RocksDB inline, FSIF on `FsifOpenEc`); `StoreLoader.startOpen` handles an already-completed one
   inline and otherwise posts `BackendOpened`. A rebuild's staging store opens through the same opener (passed by
@@ -191,8 +195,10 @@
     retire every marked store at once.
   - `StoreTransfers.startIn`, for a `rebuild-complete` or `rebuild-required` copy an earlier tenancy left at the
     path of a store transferring onto the device (re-placed away while the host was down, then transferred back;
-    rebuild-process FS18). It retires before asking for bytes, waits while a rebuild of the store runs here or the
-    store is served, and checks the device again once the path is clear, which starts the transfer.
+    rebuild-process FS18). It retires before asking for bytes, waits while a rebuild of the store runs here, the
+    store is opening, or a copy is served from this path (not while the transfer's source is served from another
+    device of this host: it closes only for the StartStoreTransfer sent once the path is clear), and checks the
+    device again once the path is clear, which starts the transfer.
   - The Deleted Stores pass, for an offline store whose entry has left the device. The store stays offline until its
     path is clear, so a failed retire is retried.
     A store served from the device that its entry does not list (a copy put back by hand: `tryLoadStore` reads no

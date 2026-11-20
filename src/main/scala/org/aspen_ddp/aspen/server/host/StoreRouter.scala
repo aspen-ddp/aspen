@@ -389,6 +389,14 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
     offline.remove(storeId)
     ctx.publishView()
 
+  /** Clears a store's offline mark unless a loaded device of this host still holds the store offline. The mark is by
+   *  store id, and two devices of one host can each hold a copy (a transfer between them, an earlier tenancy's copy):
+   *  a copy that leaves one device's offlineStores does not unsilence the other's. Callers remove it from their own
+   *  device's offlineStores first. */
+  private[host] def clearOfflineUnlessHeld(storeId: StoreId): Unit =
+    if !ctx.devices.devices.values.exists(_.offlineStores.contains(storeId)) then
+      clearOffline(storeId)
+
   /** Marks a store whose load is under way, so its messages are dropped rather than answered UnknownStore. Not part
    *  of the HostStoreView, so nothing is published. */
   private[host] def markLoading(storeId: StoreId): Unit = loading.add(storeId)

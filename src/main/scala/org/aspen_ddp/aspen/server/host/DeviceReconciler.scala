@@ -411,13 +411,13 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       ctx.copies.release(local, remote)
 
   /** The Deleted Stores pass's retire of `storeId`'s copy on `local`, whose entry no longer names it. The store
-   *  leaves offlineStores, and its router offline mark goes, only once its path is clear, so a failed retire is
-   *  retried by the next pass. A copy that reaches pending-delete has the device checked again, so it is released
-   *  without waiting for the periodic check. */
+   *  leaves offlineStores, and its router offline mark goes (unless another device here holds the store offline), only
+   *  once its path is clear, so a failed retire is retried by the next pass. A copy that reaches pending-delete has the
+   *  device checked again, so it is released without waiting for the periodic check. */
   private def retireUnowned(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     def forget(): Unit =
-      ctx.router.clearOffline(storeId)
       local.offlineStores -= storeId
+      ctx.router.clearOfflineUnlessHeld(storeId)
     if !os.exists(local.devicePath / storeId.directoryName) then
       forget()
     else if !ctx.copies.isRetiring(storeId) then

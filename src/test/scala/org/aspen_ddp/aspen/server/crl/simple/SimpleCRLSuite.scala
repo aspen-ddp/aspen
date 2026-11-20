@@ -1779,6 +1779,17 @@ class SimpleCRLSuite extends FileBasedTests {
     i3.crl.shutdown()
   }
 
+  test("A torn newest entry over a corrupt entry before it fails the open with CrlCorrupt") {
+    twoEntries(tdir)
+    val f = tdir / "0.crl"
+    // A's entry rotted after it was acknowledged (a byte of its txd), then B's write was torn by a crash
+    flip(f, LogEntry.StaticEntryHeaderSize + 1)
+    val bytes = os.read.bytes(f)
+    java.util.Arrays.fill(bytes, 4096 + LogEntry.StaticEntryHeaderSize, 4096 + LogEntry.StaticEntryHeaderSize + 10, 0.toByte)
+    os.write.over(f, bytes)
+    assertThrows[CrlCorrupt](SimpleCRL(tdir, 3, 1024 * 1024))
+  }
+
   test("A corrupt entry followed by valid newer ones fails the open instead of rolling back to the entry before it") {
     val i = SimpleCRL(tdir, 3, 1024 * 1024)
     saveAndWait(i.crl, transactionId, trsValidTxd)

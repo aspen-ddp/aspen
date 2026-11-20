@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
+import org.aspen_ddp.aspen.server.crl.CrlCorrupt
+
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.util.UUID
@@ -95,9 +97,11 @@ class StreamReader(val streamId: StreamId, val filePath: os.Path, val crlId: UUI
 
   def headEntry: Option[LogEntry.EntryHeader] = readEntry(0)
 
-  /** The newest entry of the current cycle that is wholly intact, with its offset. Entries are followed from the head
-    * while their headers are intact; only the last one's body is checked, because only the write in flight at a crash
-    * can be torn. A torn last entry yields the one before it, unchecked: recovery checks every entry it reads */
+  /** The newest entry of the current cycle that is wholly intact, with its offset; its body is always checked, so
+    * recovery need not check it again. Entries are followed from the head while their headers are intact. A last
+    * entry whose body fails its checksum is the write in flight at a crash, torn, and yields the entry before it. Only
+    * that one write can be torn, so the entry before it must be intact: if its body fails too, it is corrupt and this
+    * throws CrlCorrupt rather than return it */
   def lastIntactEntry(): Option[(Long, LogEntry.EntryHeader)] =
     @tailrec
     def follow(prev: Option[(Long, LogEntry.EntryHeader)], cur: (Long, LogEntry.EntryHeader))
@@ -114,6 +118,10 @@ class StreamReader(val streamId: StreamId, val filePath: os.Path, val crlId: UUI
       else
         scribe.warn(s"CRL stream $filePath: dropping the entry at ${last._1} (serial number " +
                     s"${last._2.entrySerialNumber}), whose body fails its checksum: a write torn by a crash")
+        prev.foreach: (offset, h) =>
+          if !bodyIntact(offset, h) then
+            throw CrlCorrupt(s"CRL stream $filePath: the body of the entry at $offset (serial number " +
+                             s"${h.entrySerialNumber}), before a torn newest entry, fails its checksum")
         prev
 
   /** The first wholly intact entry, of any cycle, at or after `from` whose serial number is above `serialNumber`.

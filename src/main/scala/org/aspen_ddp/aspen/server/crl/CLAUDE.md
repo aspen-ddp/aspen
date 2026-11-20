@@ -81,7 +81,8 @@
   caller declares the CRL lost instead of creating an empty one under live stores. So anything that creates
   stores on a device not yet loaded (`Main.bootstrap`) creates its CRL first
 - Each entry header carries CRC32Cs of the header and of the body (`LogEntry`). Recovery drops a torn newest entry
-  (only the write in flight at a crash can be torn) and throws `CrlCorrupt` for any other failed checksum, or when an
+  (only the write in flight at a crash can be torn) and throws `CrlCorrupt` for any other failed checksum (the body
+  of the entry before a dropped one is checked too, `StreamReader.lastIntactEntry`), or when an
   intact entry newer than the last one found exists in that stream or the next. Data is read only from entries
   the walk verified. All-zero regions are not entries. Every header bears the CRL id from `crl/sizing`, and
   `StreamReader.readHeader` takes no other header for an entry: the old-cycle object data that the newer-entry scan

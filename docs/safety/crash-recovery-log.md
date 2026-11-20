@@ -111,8 +111,8 @@ no failure, no per-transaction bound, no growth) are for CRLs that keep nothing 
   and as the last 16 bytes of the static region (`LogEntry.createEntryBuffers`, `StreamReader.readHeader`,
   `StreamReader.bodyIntact`). The header also bears the CRL's id, so only this CRL's writes are entries (5.2).
 - **C7 (only the in-flight write may be torn).** Recovery drops the newest entry if its body fails its checksum: that
-  can only be the write in flight at a crash, which no handler acknowledged. Any other failed checksum, and any
-  intact entry newer than the newest one found, throws `CrlCorrupt` (5.7).
+  can only be the write in flight at a crash, which no handler acknowledged. Any other failed checksum (the entry
+  before a dropped one included), and any intact entry newer than the newest one found, throws `CrlCorrupt` (5.7).
 - **C8 (broken chain is fatal).** If an entry needed for recovery cannot be read, or data a live record names lies
   outside the dynamic data of every verified entry, `openCRL` throws (`Recovery.BrokenEntryChain`, `CrlCorrupt`). It
   never returns a partial state.
@@ -593,9 +593,10 @@ written only into the active stream, so every piece in a stream is reached as "n
 1. **Newest entry.** Streams are ordered by the serial of their head entry (offset 0) and the first with a wholly
    intact entry wins (`StreamReader.lastIntactEntry`). Within a stream, entries are followed from the head while their
    headers are intact, carry the stream's current UUID (read from offset 0) and have rising serials; only the last
-   one's body is checked. A torn last entry is dropped with a warning and the entry before it is the last, its body
-   unchecked: the walk skips the body check of the last entry, so that entry's body is never verified (CRL-W11). A stream
-   whose only entry is a torn head (a rotation write in flight at a crash) yields to the stream before it.
+   one's body is checked. A torn last entry is dropped with a warning and the entry before it is the last once its
+   body is checked too: only one write can be torn, so a failure there is corruption and throws `CrlCorrupt`. The
+   entry returned has always passed its body check, so the walk does not check it again. A stream whose only entry is
+   a torn head (a rotation write in flight at a crash) yields to the stream before it.
 2. **Nothing newer.** `newerIntactEntry` scans the active stream past the last entry, and all of the next stream, for
    an intact entry of any cycle with a higher serial, hopping intact headers by their size and anything else by
    4 KiB. An intact header bears this CRL's id (5.2), so object data in those regions is never a hit. A hit throws
@@ -1141,8 +1142,8 @@ last-built form (W3, W5), so recovery returns that form. Tested by tearing each 
 three-lap run, the evacuation and then the head, at each sector prefix (SimpleCRLSuite).
 
 **10.3 Corruption of a durable entry.** A bad checksum in any entry the walk visits, or in the newest entry's header
-when a newer entry follows, throws `CrlCorrupt`; data is read only from verified entries. The exception is the body
-of the entry before a dropped torn one, which nothing checks (CRL-W11). Rot exactly in the newest
+when a newer entry follows, throws `CrlCorrupt`; data is read only from verified entries. That includes the entry
+before a dropped torn one: rot there beside a torn write is two faults, not one torn write (5.7). Rot exactly in the newest
 acknowledged entry is indistinguishable from a torn write: that entry is dropped and its promises, votes or data are
 lost, as with a lying cache. Rot in an entry recovery no longer needs still makes the CRL lost when it hides a newer
 entry or lies in the walk. Both are accepted: the outcome is a rebuild, simple rather than optimized.
@@ -1268,24 +1269,6 @@ at `writeHead`'s `require`, which only a bug can reach.
 ---
 
 ## Open weaknesses
-
-### CRL-W11: The body of the entry before a torn newest entry is recovered without its checksum
-Verdict CONFIRMED. Priority 1. Effort S.
-Mechanism: `StreamReader.lastIntactEntry` follows the active stream's entries checking headers only. When the last
-one's body fails (`bodyIntact` false) it returns the entry before it, `prev`, without checking `prev`'s body (its
-scaladoc: "unchecked: recovery checks every entry it reads"). `Recovery.recover` then uses `prev` as `lastEntry`, and
-its walk (`loadPrevious`) skips the body check for `lastEntryLocation` ("The last entry's body was checked when it was
-found"). So `prev`'s static region is loaded by `LogEntry.loadStaticEntryContent` and its dynamic extent recorded in
-`verified` with no CRC check anywhere. The trigger is rot (or a misdirected write) in the body of the newest durable
-entry, which every handler of it has acknowledged, coinciding with a crash that tears the next write.
-Consequence: corrupted promises, accepted values, dispositions, statuses or data locations of `prev`'s records are
-recovered as genuine instead of throwing `CrlCorrupt` (C7, C8, 10.3), and an object update is read from bytes the
-checksum never covered. A wrongly recovered promise or acceptance can let the store contradict what it acknowledged
-(a split decision); wrong data can be applied as a committed update.
-Fix: in `lastIntactEntry`, check `prev`'s body as well when the last one is dropped, and drop to `prev` only if it
-passes. If it fails, the CRL is corrupt: return a marker that `Recovery.recover` turns into `CrlCorrupt`, since only
-the write in flight can be torn. Correct both scaladocs. Only the open pays: one extra body read, and only after a
-torn write.
 
 ### CRL-W12: A CRL that dies while a store awaits its recovery read marks that store for rebuild
 Verdict CONFIRMED. Priority 3. Effort S.

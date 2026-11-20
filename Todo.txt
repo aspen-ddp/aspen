@@ -39,15 +39,7 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.4 [CRL-W11] The body of the entry before a torn newest entry is recovered without its checksum.
-    CONFIRMED. Effort S. crash-recovery-log.md.
-    StreamReader.lastIntactEntry checks only the last entry's body; on failure it returns the previous entry
-    unchecked, and Recovery.loadPrevious skips the body check for lastEntryLocation ("checked when it was found").
-    Rot or a misdirected write in the newest acknowledged entry plus a torn next write recovers corrupt promises,
-    acceptances, votes or data as genuine instead of failing CrlCorrupt: a possible split decision or wrong data.
-    Fix: when lastIntactEntry drops the last entry, check prev's body too; if it fails, Recovery throws CrlCorrupt.
-    Correct both scaladocs. One extra body read at open, only after a torn write. (Two coincident faults; P1 because
-    the result is silent corruption, not a detected loss.)
+(no open items)
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence

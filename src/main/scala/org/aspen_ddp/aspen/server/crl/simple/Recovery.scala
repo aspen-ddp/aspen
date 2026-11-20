@@ -109,7 +109,7 @@ object Recovery extends Logging:
         if h.entrySerialNumber >= newerSerialNumber then
           throw BrokenEntryChain(s"the entry at $previousEntryLocation has serial number " +
                                  s"${h.entrySerialNumber}, not older than the $newerSerialNumber linking to it")
-        // The last entry's body was checked when it was found
+        // StreamReader.lastIntactEntry checked the last entry's body, whether or not it dropped a torn one after it
         if previousEntryLocation != lastEntryLocation && !reader.bodyIntact(offset, h) then
           throw CrlCorrupt(s"the body of the entry at $previousEntryLocation, serial number " +
                                  s"${h.entrySerialNumber}, fails its checksum")

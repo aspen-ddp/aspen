@@ -39,22 +39,6 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.2 [Q-W15, X-W10] A recovered commit voter whose committed resolution was restored takes no locks or reservation.
-    CONFIRMED (Q-W15), PLAUSIBLE (X-W10). Effort S. transaction-requirements.md, cross-document-review.md.
-    Q-W15: T's CRL state was re-saved Committed (a prepare or accept after the resolution: Tx.receiveAccept /
-    answerPrepareWithState, savedStatus) before its backend commit completed; at recovery Tx.lock skips it (R13). A
-    restored non-voter U on the same KeyValue object (a blind Insert of a key T checks with KeyRevision, or a growth
-    that fits only without T's reservation) can complete first from deferredRecovered; T's re-check then fails and
-    Tx.issueCommits' recoveredApplied takes the skipped object as already applied, unreported. A counted voter misses
-    a committed update; with a non-voter that also lacks T, T is below r and lost. X-W10: until T applies, S reports
-    no lock for it (lockedKeys, objectLevelLocked, lockedWriteTransactions), so reads and repair elsewhere take the
-    pre-T state as current: stale reads, and a repair of a lagging replica's mark deletes it with nothing installed.
-    Fix (covers both): a recovered VoteCommit with a restored Committed resolution relocks in Tx.lock (locks and slice
-    reservation, no check) and counts as relocking in Frontend.recoveringTransactions until it applies; doCommit
-    releases as usual. Recovery-only cost. Reordering deferredRecovered alone is not enough. Restate R13, P12,
-    transaction-requirements 8.3/8.5, transaction-recovery 7.2 step 3 and 7.4, and server/transaction/CLAUDE.md
-    (cross-document-review.md section 5 lists the contradiction).
-
 1.3 [RP-W8] A repair install grows a KeyValue slice under held slice reservations; a counted voter's apply then fails.
     CONFIRMED. Effort S. repair-process.md.
     Frontend.reconcile does not treat held commit votes as unsettled and reconcileSettled defers only the keys the

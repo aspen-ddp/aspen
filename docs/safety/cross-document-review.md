@@ -24,11 +24,11 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Paxos transactions | Rebuild | A rebuilt store is muted for transactions started before its `acceptor-since` and answers expiry as `amnesiac` |
 | CRL | Paxos, recovery | A save skipped after a final deletion (C1, C9) belongs to a transaction the store has concluded (2.1) |
 | CRL | Store lifecycle | Entries leave the device CRL only after another durable copy exists or the store is unservable on disk |
-| Transaction requirements | CRL, recovery | Recovered unresolved commit votes re-take their locks and slice reservations before any message is handled; a commit voter whose committed resolution was restored takes none (transaction-requirements.md Q-W15, X-W10) |
+| Transaction requirements | CRL, recovery | Recovered commit votes, unresolved or with a restored committed resolution, re-take their locks and slice reservations before any message is handled, and a restored one holds them until it applies (transaction-requirements.md R13) |
 | Transaction requirements | CRL, recovery | A key's deletion (commit or repair write) reaches the backend only once no CRL state holding an applied blind Insert of the key remains (`Frontend.awaitBlindInsertsDurable`), so a recovered Insert of an absent key was never applied |
 | Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter whose re-check fails holds it already (2.3) |
 | Transaction requirements | Repair | A repair write that installs a newer state tells every Tx of the object started before it (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert applied over it reports the object; a pass that installs nothing tells none, and a non-voter's blind Insert of an absent key reports its object regardless |
-| Requirements (lock order) | Recovery | Every recovered unresolved commit vote has relocked before a recovered Tx that does not relock applies (`Frontend.recoveredTransactionLoaded`, transaction-recovery.md 7.2); restored commit voters are holders nothing waits for (Q-W15) |
+| Requirements (lock order) | Recovery | Every recovered commit vote (unresolved, or with a restored committed resolution) has relocked before a recovered Tx that does not relock applies (`Frontend.recoveredTransactionLoaded`, transaction-recovery.md 7.2) |
 | Requirements (slice limit) | Repair, rebuild | The commit votes a store holds on a KeyValue object fit `maxSliceSize` together (`ObjectState.sliceReservations`, R16); a repair install keeps them fitting (it does not: repair-process.md RP-W8), and the union of every committed growth fits too (it need not: X-W9) |
 | Client reads | Requirements, rebuild | `InvalidObject.provesDeletion`: a commit voter of an unapplied allocation answers `AllocationPending` (2.5) |
 | Transaction recovery | Repair | ErrorTree and UnackedCommits entries are consumed only once the store can no longer join T, and only by the store the pool names |
@@ -207,11 +207,12 @@ skipped silently (X-W11). This
   re-check. Reads choose the revision by count alone (`BaseObjectReader.getStoreStates`, per key in
   `KeyValueObjectReader.resolve`, where only a lock held by the transaction of a revision present defers the answer)
   and rely on T's `t` commit voters holding T or its lock. The lock order guarantees that for a live voter. For a
-  recovered voter too: a recovered Tx that does not relock (a restored resolution) completes its load only after every
-  recovered commit vote has relocked (`Frontend.recoveredTransactionLoaded`), so its apply waits for them in lock
-  order. The exception is a commit voter whose committed resolution was restored: it takes no locks or reservation
-(R13), so nothing waits for it and reads report no lock for it until it applies (transaction-requirements.md Q-W15,
-X-W10). A recovered unresolved voter whose re-check fails therefore holds T already (transaction-requirements.md 8.5), and one
+  recovered voter too: every recovered commit vote relocks, one whose committed resolution was restored included, which
+  holds its locks and reservation until it applies (transaction-requirements.md R13), and a recovered Tx that does not
+  relock (an abort vote, no vote, a restored resolution without a commit vote) completes its load only after every
+  relocking commit vote has relocked (`Frontend.recoveredTransactionLoaded`), so its apply waits for them in lock
+  order, and reads see the lock of a voter that has yet to apply. A recovered voter whose re-check fails therefore
+  holds T already (transaction-requirements.md 8.5), and one
   whose Insert of an absent key passes never applied it: a key's deletion reaches the backend only once no CRL state
   holding an applied blind Insert of the key remains (`Frontend.awaitBlindInsertsDurable`, transaction-requirements.md
   9.4). A live voter's failed re-check is an invariant violation, logged and reported.
@@ -236,8 +237,8 @@ X-W10). A recovered unresolved voter whose re-check fails therefore holds T alre
   there, such as a repair proof or a vdisk fence lock) decides at once (transaction-requirements.md 8.3). That also
   guards a restored commit voter: once the store stops `holding`, it is issued, held for its turn (`commitInFlight`
   withholds every new vote on its objects and unsettles them for repair) or waits in lock order (`lockWaitBlocked`), so
-  no new transaction, repair proofs included, commits over it at this store; what it lacks is a lock reads can see
-  (X-W10).
+  no new transaction, repair proofs included, commits over it at this store, and its relocked locks (R13) show reads
+  and repair that it has yet to apply.
 * A lock-only vote is not waited for, and a repair install may change an object under one: shared revision locks are
   outside `ObjectState.objectLevelLocked`. It has no update to lose; its skipped re-check is reported
   (transaction-requirements.md 8.5), and the shared lock did its work during the vote.
@@ -388,13 +389,6 @@ Between the documents:
   device-CRL entries), is unsafe when the unlink succeeded and only the directory force failed: the file is gone, so
   the dropped entries were the whole state. CRL-W13's, unloading with `closeUnloaded(dropDurably = false)`, is the one
   to implement.
-* paxos-transactions.md P12 ("lock order (9.1) sees every holder"), transaction-requirements.md 8.3 and 8.5 and
-  transaction-recovery.md 7.2 and 7.4 state that every recovered commit vote relocks, so a recovered Tx finds every
-  holder and a recovered voter's failed re-check means it applied T. transaction-requirements.md Q-W15 shows that a
-  commit voter whose committed resolution was restored does not relock; those statements hold for unresolved
-  recovered votes only until Q-W15 is fixed. Q-W15's consequence is also wider than it states: with a non-voter that
-  skipped T, T's update falls below `r` (priority 1), and before T applies, reads and repair elsewhere see no lock for
-  it (X-W10).
 * transaction-recovery.md R-W9's proposed narrower report must still cover every hazard the current rule covers
   (transaction-requirements.md 9.4): a committed Delete of the key applied here that removed an older value, not only
   one that was a no-op over an absent key (a Delete checked by an object revision alone passes whether or not T's
@@ -443,22 +437,6 @@ KeyValue update with no required object revision when the slice plus its growth 
 high-water mark (for example half the headroom left below `maxSliceSize`), with a distinct error; the TKVL writer
 retries such an insert pinned (`KeyValueListNode.applyChange` with `pinned`, a required revision), so committed
 near-limit growths form a chain each checked against its predecessor's full state. Only near-full objects pay.
-
-### X-W10: A commit voter whose committed resolution was restored reports no lock until it applies, so reads and repair elsewhere take the pre-T state as current
-Verdict PLAUSIBLE. Priority 1. Effort S.
-Mechanism: the setup of transaction-requirements.md Q-W15. At store S, T voted commit and its resolution was re-saved
-Committed before a crash; at recovery `Tx.lock` skips it (R13), so S's `ObjectState.lockedKeys`,
-`objectLevelLocked` and `lockedWriteTransactions` show nothing for T while it is held for its turn or waits in lock
-order (`Tx.awaitLockHolders`) behind another recovered commit. Replication(3, 2): T's voters S and A, non-voter N,
-whose apply of T was skipped and reported (a stale replica, or R16's size skip). A read during the wait
-(`Frontend.readForNetwork`) gets the pre-T state with no lock from S and N, which reaches `r = 2`
-(`BaseObjectReader.getStoreStates`): a stale read of a committed T. Repair of N's mark reads the same, finds N's copy
-equal (`Reconcile.plan`), and deletes the entry, so N is never repaired once S applies. If Q-W15's overtaking also
-happens, S drops T too and T is held by A alone, below `r`.
-Consequence: a committed update is invisible to reads for the wait, and a write built on the stale read can commit at
-S and N over it (T's update overwritten); otherwise N's divergence is permanent. One crash plus ordinary concurrency.
-Fix: Q-W15's fix (a restored commit voter relocks, with its slice reservation, until it applies) closes this too;
-one Todo item.
 
 ### X-W11: An Active entry whose store directory is missing on a loaded device is never served, rebuilt or reported
 Verdict CONFIRMED. Priority 3. Effort S.

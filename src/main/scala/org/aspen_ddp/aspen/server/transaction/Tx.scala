@@ -663,11 +663,17 @@ class Tx( trs: TransactionRecoveryState,
     late
 
   /** Holds the requirement locks from a commit vote until the transaction resolves, so that this store votes abort
-    * on conflicting transactions in the meantime. Locks have no purpose once the outcome is known, including the
-    * resolution a Tx recovered from the CRL restores from its saved status.
+    * on conflicting transactions in the meantime. A live Tx locks only while unresolved: once it learns the outcome its
+    * locks have no purpose. A recovered commit vote whose saved status restores Committed locks too, and holds them
+    * until it applies (doCommit), as a live voter that learned the commit does. Its backend commit may not have
+    * completed before the crash, and until it applies its locks keep everything ordered behind it: a restored commit
+    * without a vote here waits for it in lock order rather than applying over it and failing its re-check, which a
+    * recovered voter would take as already applied (transaction-requirements 8.5); and readers and repair see the lock,
+    * so they do not take the state it replaces as current. A restored abort has nothing to apply and takes none
     */
   private def lock(): Unit =
-    if !locked && !outcomeKnown && txStatus == TransactionStatus.Unresolved &&
+    val restoredCommit = recovered && txStatus == TransactionStatus.Committed && !committing && !committed
+    if !locked && !outcomeKnown && (txStatus == TransactionStatus.Unresolved || restoredCommit) &&
       disposition == TransactionDisposition.VoteCommit then
       locked = true
       val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap

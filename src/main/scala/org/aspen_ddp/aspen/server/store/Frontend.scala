@@ -813,8 +813,9 @@ class Frontend(val storeId: StoreId,
     */
   @volatile private var awaitingCrl: Boolean = false
 
-  /** Recovered transactions whose objects have not all loaded yet, and whether each relocks: an unresolved commit
-    * vote, which takes its locks again at completeLoad (a restored resolution takes none)
+  /** Recovered transactions whose objects have not all loaded yet, and whether each relocks: a commit vote, unresolved
+    * or with a restored Committed resolution, which takes its locks again at completeLoad (Tx.lock). A restored abort,
+    * and a Tx without a commit vote, take none
     */
   private var recoveringTransactions: Map[TransactionId, Boolean] = Map()
 
@@ -935,14 +936,15 @@ class Frontend(val storeId: StoreId,
         // A transaction with no objects here never loads any
         if pointers.nonEmpty then
           recoveringTransactions += (txd.transactionId -> (trs.disposition == TransactionDisposition.VoteCommit &&
-            trs.status == TransactionStatus.Unresolved))
+            trs.status != TransactionStatus.Aborted))
         Some((tx, pointers))
     }
     recovered.foreach((tx, pointers) => pointers.foreach(ptr => readObjectForTransaction(tx, ptr)))
 
-  /** A recovered transaction has loaded (or failed to load) all its objects. An unresolved commit vote completes its
-    * load at once, taking its locks again. Every other one completes only once every recovered commit vote that
-    * relocks has done so, those with a persisted vote first. One applying a restored commit resolution earlier would
+  /** A recovered transaction has loaded (or failed to load) all its objects. A commit vote that relocks (unresolved,
+    * or with a restored Committed resolution, which it then applies) completes its load at once, taking its locks
+    * again. Every other one completes only once every recovered commit vote that relocks has done so, those with a
+    * persisted vote first. One applying a restored commit resolution earlier would
     * find no lock holder to wait for in lock order (Tx.awaitLockHolders) and could apply over a vote's update first,
     * failing its re-check (transaction-recovery.md 7.2); one deciding its vote earlier could take locks that conflict
     * with a recovered vote's.

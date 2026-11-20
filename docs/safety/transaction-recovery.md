@@ -488,8 +488,9 @@ ends in a rebuild: its counted commit votes are lost with it (rebuild-process.md
 the persisted status and the acceptor state. A saved status of Committed or Aborted (re-saved by a prepare or accept
 after the resolution, before an abort's state is deleted; one deleted saves nothing more and answers with the abort,
 `Tx.stateDeleted`, crash-recovery-log 6.1 A4; the CRL persists it) is restored into `oresolution`: once its objects load such a Tx applies the
-commit with the recovered re-check rules, or deletes the abort's state, takes no locks and needs no lookup, then waits
-for `TxFinalized` as a live resolved Tx does. The constructor also seeds the host status cache with the saved status.
+commit with the recovered re-check rules, or deletes the abort's state, and needs no lookup, then waits for
+`TxFinalized` as a live resolved Tx does. A restored commit with a commit vote relocks first and holds its locks until
+it applies (step 3); a restored abort takes none. The constructor also seeds the host status cache with the saved status.
 A Tx resolved through its UnackedCommits entry (`unackedCommitFound`, `unackedCommitNotOwed`) saves `Unresolved` on
 every later prepare or accept (`Tx.savedStatus`): restored as resolved, it would seed the host status cache with a
 non-finalized `Committed` for a T every peer may have forgotten, whose relay answers non-late and would make the
@@ -500,17 +501,21 @@ Ordering (`Frontend.recoveredTransactionLoaded`, `Tx.completeLoad`):
 
 1. Every recovered Tx is registered before any object read starts, so a synchronously loaded one cannot release the
    held messages early.
-2. A recovered `VoteCommit` with unresolved status completes its load as soon as its objects load. Every other
-   recovered Tx completes only once every such vote has: the ones loaded by then complete together, first those with
-   a persisted vote (an abort vote, or a restored resolution), then those without, each group in the order its
+2. A recovered `VoteCommit` with unresolved or restored Committed status (one that relocks) completes its load as
+   soon as its objects load. Every other recovered Tx completes only once every such vote has: the ones loaded by then
+   complete together, first those with a persisted vote (an abort vote, or a restored resolution without a commit
+   vote), then those without, each group in the order its
    objects loaded; one whose objects load after that completes at once (`Frontend.recoveringTransactions`,
    `deferredRecovered`, `undecidedRecovered`). A recovered vote is kept, never
    recomputed (it may already have been counted). A Tx without a vote promises and votes abort to any driver at once,
    but stays undecided after load so a client retransmit that arrives first is still checked; completing last, it
    cannot take locks that conflict with a recovered commit vote.
-3. `completeLoad` calls `lock()`: a recovered `VoteCommit` with unresolved status retakes its requirement locks
-   (`RequirementsLocker.lock`), so new transactions collide with it exactly as before the crash. A Tx with a restored
-   commit resolution takes no locks and applies in the same `completeLoad`, waiting in lock order
+3. `completeLoad` calls `lock()`: a recovered `VoteCommit` retakes its requirement locks and slice reservation
+   without a check (`RequirementsLocker.lock`), so new transactions collide with it exactly as before the crash. One
+   with a restored commit resolution then applies in the same `completeLoad`, holding them until `doCommit` releases
+   them: its backend commit may not have completed before the crash, and until it applies the locks order the
+   transactions behind it and show readers and repair that it has yet to apply (transaction-requirements.md R13). A
+   restored commit without a commit vote here takes no locks and applies in its `completeLoad`, waiting in lock order
    (`Tx.awaitLockHolders`) for the holders it collides with. Every recovered commit vote has relocked by then (step 2),
    so it never applies over a recovered vote's update before that vote applies.
 4. `completeLoad` requests the UnackedCommits lookup if `needsUnackedCheck` (7.5).
@@ -554,7 +559,7 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   object-level operations are refused by the builder and the stores. The remaining replay classes are in
   transaction-requirements.md.
 * A recovered commit voter whose re-check fails on an object it changes takes it as applied: it held its locks until
-  it applied and relocked them at recovery, so only its update and the writes after it in lock order changed the
+  it applied and relocked them at recovery (with a restored commit resolution too, 7.2 step 3), so only its update and the writes after it in lock order changed the
   object (superseded, traceless, or its data dropped once applied). A live voter's failed re-check is an invariant
   violation, logged at error, skipped and reported; an allocation the backend missed is reported (no copy, no lost
   lock); any apply that throws fail-stops the store (transaction-requirements.md 8.5). A recovered Tx that did not vote

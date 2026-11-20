@@ -221,9 +221,10 @@ locks on the store's object states (`Tx.lock`), and a vote that grows a KeyValue
 (`ObjectState.sliceReservations`, counted by every other size check), including after a restart: a recovered commit
 vote re-takes them, and the Frontend holds all transaction messages until every recovered vote has loaded its objects
 (`Frontend.recoverTransactions`, `recoveredTransactionLoaded`, `holding`); a recovered Tx that does not relock completes
-its load only after every recovered commit vote has relocked, so lock order (9.1) sees every holder. A Tx created after
-its outcome is known
-(`Tx.outcomeDecided`) or recovered with a resolved status takes none. Details: `transaction-requirements.md`.
+its load only after every recovered commit vote has relocked, so lock order (9.1) sees every holder. A recovered commit
+vote whose saved status restores Committed relocks too, and holds its locks and reservation until it applies. A Tx
+created after its outcome is known (`Tx.outcomeDecided`), a restored abort, and a recovered Tx without a commit vote
+take none. Details: `transaction-requirements.md` R13.
 
 **P13 Object data lives in the CRL until the backend commit succeeds.** `crl.dropTransactionObjectData` runs only once
 every issued backend commit completed without error (`Tx.allObjectCommitsComplete`). A failed backend commit keeps

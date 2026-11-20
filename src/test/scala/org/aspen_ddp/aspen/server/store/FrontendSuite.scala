@@ -2856,6 +2856,66 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     stops() shouldBe Nil
   }
 
+  /** A recovered state of `txid` with `disposition`, resolved Committed, writing `ops` to kvPtr under `reqs` */
+  private def committedKV(txid: TransactionId, disposition: TransactionDisposition.Value,
+                          reqs: List[KeyValueUpdate.KeyRequirement], ops: List[KeyValueOperation],
+                          startDelta: Long = 0L): TransactionRecoveryState =
+    val txd0 = lockTxd(txid, List(KeyValueUpdate(kvPtr, None, None, reqs)))
+    val txd = txd0.copy(startTimestamp = HLCTimestamp(txd0.startTimestamp.asLong + (startDelta << 16)))
+    TransactionRecoveryState(storeId, txd.serialize(), List(ObjectUpdate(oid2, KeyValueOperation.encode(ops, ida)(0))),
+      disposition, TransactionStatus.Committed, PersistentState.initial)
+
+  test("a commit vote recovered Committed relocks, so a restored non-voter cannot apply over it first (Q-W15)") {
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    val net = new TestNet
+    var stops = List[Throwable]()
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net,
+      new TestCrl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded, deferRecovery = true,
+      onFailStop = err => stops = stops :+ err)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    // txid1 voted commit inserting keys 4 and 5 under DoesNotExist(4), and was re-saved Committed before its backend
+    // commit completed. txid2, started later, a blind Insert of key 4 that this store did not vote commit on, was
+    // re-saved Committed too. Listed first, txid2's objects load first
+    val t = committedKV(txid1, TransactionDisposition.VoteCommit, List(KeyValueUpdate.DoesNotExist(k(4))),
+      List(new Insert(k(4), Array[Byte](4)), new Insert(k(5), Array[Byte](5))))
+    val u = committedKV(txid2, TransactionDisposition.VoteAbort, Nil, List(new Insert(k(4), Array[Byte](9))),
+      startDelta = 1000L)
+    frontend.recover(StoreRecoveryState(List(u, t), Map()))
+
+    // Applied first, txid2 would fail txid1's re-check, which a recovered voter takes as already applied: key 5 lost
+    kvKeys(backend) should contain allOf (k(4), k(5))
+    committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe
+      List(txid1 -> Nil, txid2 -> List(oid2))
+    stops shouldBe Nil
+  }
+
+  test("a commit vote recovered Committed reports its locks until it applies (Req R13)") {
+    val backend = new DeferredCommitBackend
+    populate(backend)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net,
+      new TestCrl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded, deferRecovery = true)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    // Both voted commit and were re-saved Committed. txid1 applies first; txid2 waits for its backend commit to persist
+    val first = committedKV(txid1, TransactionDisposition.VoteCommit, List(KeyValueUpdate.DoesNotExist(k(4))),
+      List(new Insert(k(4), Array[Byte](4))))
+    val second = committedKV(txid2, TransactionDisposition.VoteCommit, List(KeyValueUpdate.DoesNotExist(k(5))),
+      List(new Insert(k(5), Array[Byte](5))), startDelta = 1000L)
+    frontend.recover(StoreRecoveryState(List(first, second), Map()))
+    backend.heldCommits shouldBe 1
+
+    // A reader learns that txid2, not yet applied, holds a lock: the state it is served is not current
+    lockedWriteTransactions(frontend, net, kvPtr) should contain (txid2)
+
+    backend.deliverCommits()
+    backend.deliverCommits()
+    kvKeys(backend) should contain allOf (k(4), k(5))
+    committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe
+      List(txid1 -> Nil, txid2 -> Nil)
+    lockedWriteTransactions(frontend, net, kvPtr) shouldBe empty
+  }
+
   test("a commit vote recovered with a persisted Aborted status deletes its state on load and holds no locks") {
     val crl = new TestCrl
     val (frontend, net, stops) = recoveredVote(mkObjectState(oid1), status = TransactionStatus.Aborted, crl = crl)

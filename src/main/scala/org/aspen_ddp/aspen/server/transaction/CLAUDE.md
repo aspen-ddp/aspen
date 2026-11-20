@@ -152,9 +152,14 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   suppress nothing. A found entry of any incarnation is never taken as absent. The entry is left for the repair scan,
   whose reconcile installs the committed state
 - A recovered Tx whose saved status is resolved (re-saved by a prepare or accept after the resolution) restores it
-  into `oresolution`. It takes no locks and needs no lookup: once its objects load and every recovered unresolved
-  commit vote has relocked (`Frontend.recoveredTransactionLoaded` defers its `completeLoad`, so lock order sees every
-  holder) it applies the commit with the recovered re-check rules, or deletes the abort's state, then waits for TxFinalized as a live resolved Tx does.
+  into `oresolution` and needs no lookup. A restored commit with a commit vote relocks (`Tx.lock`: locks and slice
+  reservation, no check) and counts as relocking (`Frontend.recoveringTransactions`), holding them until `doCommit`
+  releases them: its backend commit may not have completed, and without them a restored non-voter could apply first
+  and fail its re-check, which `recoveredApplied` would take as applied, and reads and repair would see no lock for an
+  update not yet applied (transaction-requirements R13). Any other restored resolution takes no locks: once its
+  objects load and every relocking recovered commit vote has relocked (`Frontend.recoveredTransactionLoaded` defers
+  its `completeLoad`, so lock order sees every holder) it applies the commit with the recovered re-check rules, or
+  deletes the abort's state. Either then waits for TxFinalized as a live resolved Tx does.
   A resolution learned from the tree (`unackedCommitFound`, `unackedCommitNotOwed`) saves `Unresolved`
   (`Tx.savedStatus`): restored as resolved it would seed the host cache with a non-finalized `Committed` for a T its
   peers forgot and lose `notOwedHere`; restored unresolved it looks its entry up again (transaction-recovery 7.2)

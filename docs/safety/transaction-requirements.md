@@ -333,16 +333,17 @@ while another transaction there holds locks its requirements or writes on an obj
 (section 4), when that holder changes one of the objects it changes (8.3). If that holder
 commits, a store in both write quorums held its lock until it applied and only then voted for the newcomer, so the
 holder precedes it in every serial order; applying the newcomer first would let it break the holder's re-check and
-leave a counted commit vote standing for neither its lock nor its update. At recovery a Tx that does not relock (an
-abort vote, no vote, a restored resolution) completes its load only after every recovered unresolved commit vote has
-relocked, so it never misses such a holder (transaction-recovery.md 7.2). Exception: a commit voter whose committed
-resolution was restored takes no locks (R13), so it is a holder nothing waits for (Q-W15).
+leave a counted commit vote standing for neither its lock nor its update. At recovery every recovered commit vote
+relocks, an unresolved one and one whose committed resolution was restored alike (R13), and a Tx that does not relock
+(an abort vote, no vote, a restored resolution without a commit vote) completes its load only after every relocking
+commit vote has relocked, so it never misses such a holder (transaction-recovery.md 7.2).
 
 **R16 (commit votes held together fit the slice limit together).** A commit vote whose KeyValue update grows its
 object (`SliceGrowth.grows`: it adds bytes or entries) reserves that growth on the object with its locks
 (`ObjectState.sliceReservations`, computed by `RequirementsChecker.sliceGrowth` in `Tx.lock` and taken by
 `RequirementsLocker.lock`, released by `unlock`; live and recovered votes alike, only when the store has a slice limit,
-`Frontend.maxSliceSize`). A Tx that takes no locks reserves nothing: a restored commit resolution does not (Q-W15).
+`Frontend.maxSliceSize`). A Tx that takes no locks reserves nothing; a recovered commit vote whose committed
+resolution was restored relocks, and reserves, until it applies (R13).
 Compatible K/N locks let several votes on disjoint keys hold at once, and their growths add up, since they change
 disjoint entries. So the size check (`RequirementsChecker.checkKVSliceSize`, at vote and at the apply re-check) fails a
 growing update unless the worst state any apply order reaches fits: the current slice plus every positive growth
@@ -366,9 +367,14 @@ vote (`completeLoad` decides only when it has none).
 **R12 (waiting is safe).** A Tx waiting for a lock holder or for in-flight commits holds no locks and gives no vote,
 so waits form no cycle and cannot make two transactions both commit.
 
-**R13 (no locks once the outcome is known).** `lock()` is skipped when the outcome is known (`outcomeKnown`, a
-resolution restored from the CRL, or `txStatus` resolved). Exception: a restored commit voter needs them until it
-applies (Q-W15).
+**R13 (no locks once the outcome is known, except a restored commit voter's until it applies).** `lock()` is skipped
+when the outcome is known (`outcomeKnown`, a restored abort, or `txStatus` resolved), with one exception: a recovered
+commit vote whose saved status restores Committed (re-saved by a prepare or accept after the resolution, possibly
+before its backend commit completed) relocks, locks and slice reservation without a check, as an unresolved
+recovered vote does, and holds them until it applies (`doCommit` releases them as for a live voter). Without them a
+restored commit that has no vote here could apply first (R15 would find no holder), fail the voter's re-check, and
+the recovered-voter rule (8.5) would take the skipped object as applied; and reads and repair would see no lock for
+an update the store has yet to apply, and take the state it replaces as current.
 
 **R14 (a commit voter that cannot apply stops counting).** A commit voter has dropped its locks before it applies,
 so one that cannot hold the update it voted for must not keep serving as if it had: an apply that threw fail-stops
@@ -547,8 +553,8 @@ the re-check after the wait only costs time.
   transaction superseded it (10.5a), the update leaves no trace for `appliedBy` (a `RefcountUpdate`, a KV update whose
   operations are all key Deletes), or its data was dropped from T's CRL state once applied (`MissingObjectUpdate`
   after `Tx.persistWithoutUpdateOf`: an allocation then a deletion, or a blind Insert then a deletion of its key, 9.4).
-  The rule does not filter by reason. It fails for a voter whose committed resolution was restored, which held no
-  locks or reservation since the restart (Q-W15). Proofs never use this rule: a store that never voted on T has no such bound, and proofs see only `appliedBy`. A
+  The rule does not filter by reason. It holds for a voter whose committed resolution was restored too: it relocks
+  until it applies (R13). Proofs never use this rule: a store that never voted on T has no such bound, and proofs see only `appliedBy`. A
   recovered vote whose object is not found (`ObjectNotFound`) applies nothing and reports it;
 * a skipped lock-only object has no update to lose: it is skipped, logged and reported, never fail-stopped. The usual
   cause is a later commit applied first over the lock: a fence takeover after a vdisk block
@@ -768,8 +774,9 @@ key's lock since its own check; it reports the apply when a repair installed a s
 object (9.4).
 
 (d) A recovered vote whose saved status is resolved (a prepare or accept after the resolution re-saved it) restores the
-resolution, takes no locks (R13) and applies the commit or deletes the abort's state once loaded. A restored commit
-voter that had not persisted its update can therefore be overtaken by another restored commit (Q-W15).
+resolution and applies the commit or deletes the abort's state once loaded. A restored commit vote relocks first and
+holds its locks until it applies (R13), so a restored commit without a vote here, which completes its load only after
+it, waits for it in lock order (R15) and cannot overtake it; a restored abort takes no locks.
 
 ### 10.6 Failed backend commit
 
@@ -843,33 +850,4 @@ object-level proof is an `ExclusiveRevisionLock` (`server/repair/RepairProofs.pr
 
 ## Open weaknesses
 
-### Q-W15: A recovered commit voter with a restored commit resolution holds no locks or slice reservation, so another restored commit can apply first and its re-check failure is taken as "already applied"
-Verdict CONFIRMED. Priority 1. Effort S.
-Mechanism: at store S, T voted commit and U, a committed non-voter (say an abort vote with a `TransactionCollision`
-on T's lock), changes the same KeyValue object. U is a blind Insert of a key k that T's update checks with
-`KeyRevision(k)` and writes, or U grows the object into room T's reservation held (R16). Before the crash T's commit is
-issued and its backend write in flight (or held for its turn), U is queued behind it (`holdForTurn`) or waits in lock
-order, and a prepare or accept arriving after the resolution has re-saved both CRL states with status Committed
-(`Tx.receiveAccept` / `answerPrepareWithState`, `savedStatus`). S crashes before T's backend commit completes. At
-recovery both restore `oresolution`, and `Tx.lock` skips both (`txStatus` resolved, R13), so neither holds locks or
-`sliceReservations`. Both are non-relocking, so `Frontend.recoveredTransactionLoaded` puts them in `deferredRecovered`
-(or completes one whose objects load late at once), and they complete in the order their objects loaded. If U completes
-first, `Tx.awaitLockHolders` finds no holder, and U's apply re-check (blind Insert, or `checkKVSliceSize` without T's
-reservation) passes, so U applies. T then queues behind U's commit and its re-check fails (`RevisionMismatch` /
-`KeyTimestampError` on k, or `SliceSizeExceeded`). In `Tx.issueCommits`, `recoveredApplied` takes every skipped
-changed object of a recovered `VoteCommit` as already applied, whatever the reason. T's update of the object (its
-other keys and fields) is dropped at S and not reported, and S's counted commit vote stands for neither its lock nor
-its update. R15's recovery argument covers unresolved commit votes only, and 8.5's "a failed re-check means the store
-applied T before the crash" does not hold for this T.
-Consequence: a counted commit voter lacks a committed update, which T reports nothing about. That is margin loss
-from one crash plus ordinary concurrency. U, as a recovered non-voter, reports the object it applies
-(`reportedApplied`), so U's finalizer marks S and repair eventually restores it. The loss lasts until that repair.
-If a non-voter also lacks T (a replica that missed an earlier update, or one that skipped T on size, R16), T is
-held by fewer than `r` stores and is lost before that repair. Until T applies at S, S also reports no lock for it,
-so reads and repair elsewhere take the pre-T state as current (cross-document-review.md, X-W10).
-Fix: treat a recovered `VoteCommit` with a restored Committed resolution like an unresolved recovered commit vote
-until it applies: it relocks (locks and slice reservation, without a check) in `Tx.lock`, and it counts as relocking
-in `Frontend.recoveringTransactions`, so every other recovered Tx completes after it and waits for it in lock order.
-`doCommit` releases the locks as usual. The cost falls on recovery only. Restate R13 as "no locks once the outcome is
-known, except a recovered commit voter's restored commit, until it applies". Update `server/transaction/CLAUDE.md` and
-transaction-recovery.md 7.2 step 3.
+None.

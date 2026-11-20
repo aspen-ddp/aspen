@@ -105,7 +105,7 @@ branch of `RequirementsChecker.check`:
 | `DoesNotExist(k)` | absent (`KeyExistenceError` if present), no other N | N (`absentKeyLocks(k)`) | |
 | `TimestampEquals/LessThan/GreaterThan(k, ts)` | present, key timestamp ==, <, > ts, no other K or C | K | no production caller |
 | `Insert(k, v)` | written-key lock check (step 7) | `RequirementsLocker.plannedLocks` from `KVWrites.keys`: K if present, else N | a blind insert (no requirement on k) still locks k |
-| `Delete(k)` | as Insert; needs `deletesKeys` and a `KeyRevision(k, _)`, a required revision or a content lock (step 3) | as Insert | leaves no trace |
+| `Delete(k)` | as Insert; needs `deletesKeys` and a `KeyRevision(k, _)` or a content lock (step 3) | as Insert | leaves no trace |
 | `SetMin/SetMax/SetLeft/SetRight`, `DeleteMin/Max/Left/Right` | `objectLevel`, so whole-object; needs a required revision (step 3) | X (`plannedLocks`, `KVWrites.objectLevel`) | |
 
 `KVWrites.from` decodes each KV update's writes in `Tx.lock` and keeps them in `Tx.lockedWrites`, so `unlock` releases
@@ -184,9 +184,11 @@ serial, but neither the builder nor the stores check it. The builder records the
 The stores that hold a `pinned` object check the claim against the operations (`FalsePin`); a store that does not hold
 the object relies on the flag, which is sound because a false flag draws abort votes on that object from every honest
 store of its pool. The blind-write rule is enforced at every check, vote and apply re-check (`refuseBlindWrites`):
-outside an allocated object's initial content, a key Delete needs a `KeyRevision` on that key, a required revision or
-a content lock, and an object-level change needs a required revision (a content lock does not move the revision that a
-repair proof's `ExclusiveRevisionLock` locks).
+outside an allocated object's initial content, a key Delete needs a `KeyRevision` on that key or a content lock, and an
+object-level change needs a required revision (a content lock does not move the revision that a repair proof's
+`ExclusiveRevisionLock` locks). A required revision does not cover a Delete: an Insert moves no revision, so a Delete
+checked only by it passes its re-check at a store that applied an Insert of its key first, and removes the key
+unreported (R15, 9.3). A `KeyRevision` or a content lock fails there once the Insert changed the key.
 
 The validation runs at vote only. It depends on the description and the store's pool alone, so a committed
 transaction passed it at a write threshold of every pool's stores. The `replaySafe` bit is the one claim stores must
@@ -316,8 +318,9 @@ so it is order-independent too. A store that applies them in an order its re-che
 repair restores it, provided a read threshold of stores applied the skipped update. A commit voter of T never applies in
 such an order: a committed transaction that holds no locks at a store waits to apply while a transaction there holds
 locks it collides with on an object both change (8.3, lock order). So only stores that did not vote commit for T skip it
-(at most `w - t`), and T's `t >= r` voters hold it. Exception: a non-voter can apply a required-revision-only key
-Delete after an Insert of the key that follows it serially, and nothing rejects or reports that order (R15, Q-W16).
+(at most `w - t`), and T's `t >= r` voters hold it. Exception: a store can apply a key Delete after a blind Insert of
+the key that it superseded (last writer wins) while another store applied the Insert after the Delete, and nothing
+rejects or reports either order (R15, Q-W16).
 
 **R8 (lock lifetime).** Locks are released when: the Tx resolves abort; the Tx resolves commit and its commit is not
 held (`doCommit` releases them before applying); a held commit is finally issued; the Tx expires (`Tx.expire`) or is
@@ -339,11 +342,12 @@ holder's re-check and leave a counted commit vote standing for neither its lock 
 may instead have voted for the newcomer first (the holder's prepare reached it only after the newcomer applied
 there, while it reached this store first): the newcomer then precedes the holder, and the wait applies them here in
 the reverse order. That is harmless when the newcomer's apply re-check fails after the holder's update (skipped and
-reported at a store that did not vote for it, a repair pass) or the two commute. The one pair that does neither is
-a key Delete checked only by the object's required revision and an Insert of the same key, which moves no revision:
-with the Delete as the newcomer nothing reports the reversed order (Q-W16); with the Delete as the holder the Insert's
-apply is reported (9.4). Every production key Delete carries a `KeyRevision` or a content lock, which fails after
-the holder's Insert. At recovery every recovered commit vote relocks, an unresolved one and one whose committed
+reported at a store that did not vote for it, a repair pass) or the two commute. Every key Delete carries a `KeyRevision` on its key or a content
+lock (2.5), which fails after the holder's Insert changed the key: the Delete is skipped and reported. With the Delete
+as the holder, the Insert's apply over the absent key is reported where the Insert did not vote commit (9.4). The one
+pair that does neither is a blind Insert (no requirement on its key, or `MayExist`) that a later write of the key
+supersedes at this store, so its apply changes nothing and the newcomer Delete's check still passes, while the
+common store applied the Delete first and the Insert, as a commit voter, over the absent key (Q-W16). At recovery every recovered commit vote relocks, an unresolved one and one whose committed
 resolution was restored alike (R13), and a Tx that does not relock (an abort vote, no vote, a restored resolution
 without a commit vote) completes its load only after every relocking commit vote has relocked, so it never misses
 such a holder (transaction-recovery.md 7.2).
@@ -661,10 +665,8 @@ refcount change or blind Insert with a later start) fails `ObjectTimestampError`
 A commit voter never applies in that order: the later update waits for its vote in lock order (8.3, R15), so T's `t`
 voters hold T and repair restores the at most `w - t` stores that skipped it. A recovered `DoesNotExist` or blind Insert
 whose key a later transaction deleted no longer holds its update in its CRL state (9.4), so it never writes the key back
-(10.5c). A key Delete checked by a `KeyRevision` or a content lock fails at a store that lacks the Insert it follows, so
-that store skips and reports it. One checked only by a required revision passes there and deletes nothing; the Insert
-applied after it, by a Tx that did not vote commit here, passes its re-check on the absent key, and is applied and
-reported (9.4). TKVL deletes always carry a `KeyRevision` or a content lock.
+(10.5c). Every key Delete is checked by a `KeyRevision` or a content lock (2.5), so it fails at a store that lacks the Insert
+it follows (it checks the key at the Insert's revision), and that store skips and reports it.
 
 ### 9.4 Deletion and allocation
 
@@ -690,9 +692,9 @@ each other covering transaction T whose update Inserts one of those keys is hand
   recovered vote sharing the lock, cast after T's update persisted, 10.5a): T's state is saved again without the
   object's update (`persistWithoutUpdateOf`), and the write waits for that save;
 * otherwise (a non-voter that has not applied): nothing waits. Its update is one the store does not hold and may yet
-  apply. When the deletion follows T in the serial order (a required-revision Delete that a store voting for both
-  voted after T's update applied there), that later apply writes the key back at this store alone, and reports it
-  (below).
+  apply. When the deletion follows T in the serial order (a Delete checked against a later write of the key that
+  superseded T's Insert at a store voting for both), that later apply writes the key back at this store alone, and
+  reports it (below).
 
 So a recovered commit vote that still holds a blind Insert of an absent key never applied it, and applies it (10.5c).
 The cost is one index entry per Tx with a blind KeyValue update, and a decode only for a key deletion soon after a
@@ -701,9 +703,8 @@ blind write of the same object; nothing on the ordinary commit path.
 A Tx that did not vote commit here held no key lock that kept a later deletion of its key out, so a deletion ordered
 after T may apply here first. Its apply of a blind Insert of a key absent before the apply reports the object in
 `objectCommitErrors` (`Tx.issueCommits`) when a committed Delete of that key, started at or after T's start, applied
-here (`Frontend.keyDeletions`, `keyDeletedSince`): a no-op over the absent key, or one that removed an older value (a
-Delete checked by the object revision alone passes whether or not T's Insert applied, as a blind Insert moves no
-revision). A deletion started before T's start is never ordered after T: where T's Insert applied first, the object
+here (`Frontend.keyDeletions`, `keyDeletedSince`): one that removed a value that superseded T's Insert, or a no-op
+over the absent key under a content lock (which lists only present keys). A deletion started before T's start is never ordered after T: where T's Insert applied first, the object
 timestamp is at least T's start, and the deletion's check requires its own timestamp to be at least that. The record
 keeps the latest deleting start per object and key, written by every apply that deletes keys (the keys are decoded
 only for an update flagged `deletesKeys`), and is kept while a transaction started before it may still apply here:
@@ -908,28 +909,24 @@ non-exclusive sibling. Repair's object-level proof is an `ExclusiveRevisionLock`
 
 ## Open weaknesses
 
-### Q-W16: A required-revision-only key Delete applied in lock order after an Insert of the key it precedes serially diverges the replica silently
-Verdict PLAUSIBLE. Priority 2. Effort S.
-Mechanism: `TransactionBuilder.refuseBlindWrites` and `RequirementsChecker.refuseBlindWrites` accept a key Delete
-checked only by the object's required revision. Take an Insert U of key k with no revision requirement (blind, or
-`DoesNotExist(k)` over an absent k), started before a Delete D of k checked only by `requiredRevision = R`. With
-Replication(3, 2), U's prepare reaches store C early and store A late. C votes commit for U and holds k's lock (K or
-N); D's prepare then meets it, a whole-object collision with a holder D does not build on (`Tx.buildsOn`), so C
-votes abort. A and B vote commit for D, D commits, and A applies it; U's prepare reaches A only after D's commit
-persisted there (R9), and A votes commit, so U commits with A and C. A applied D then U: k is present. At C, D is a
-committed non-voter whose locks collide with U's on an object U changes, so it waits in lock order
-(`Tx.awaitLockHolders`, R15) and applies after U: its re-check passes (U moves no revision, and the object timestamp
-`max(.., U.start)` is at most D's start), and it removes k. `Tx.issueCommits` reports nothing for a non-voter's
-Delete, and U applied normally at C. R15's argument assumes the store in both write quorums saw the holder first;
-A saw the newcomer first. Nothing in the production code issues such a Delete (TKVL, repair, amoebafs and vdisk
-deletes all carry a `KeyRevision` or a content lock, which fails after U's Insert), so the trigger needs a client
-that builds one directly.
-Consequence: C ends with the same revision (D's) and object timestamp as A but without k, with no ErrorTree mark:
-permanent replica divergence that a read can restore from either copy, and that repair never visits. B, if it
-applied U as a non-voter, reports it (`keyDeletedSince`), and that repair may install C's copy.
-Fix: require every key Delete outside an allocated object's initial content to carry a `KeyRevision` on its key or
-a content lock: drop the required revision from the Delete case of both `refuseBlindWrites` (object-level changes
-keep requiring one). No production caller changes. Every Delete then fails its re-check once an Insert of its key
-applied first, so a reversed lock order is reported and repaired. Restate R7, R15, 2.5, 9.3 and 9.4 accordingly,
-and re-examine `Frontend.keyDeletions`, whose documented cases are required-revision-only Deletes. No hot-path cost:
-a check per Delete operation the builder and checker already visit.
+### Q-W16: A key Delete after a blind Insert of its key that a later write superseded diverges the replica silently
+Verdict PLAUSIBLE. Priority 2. Effort M.
+Narrowed: both `refuseBlindWrites` now require a key Delete to carry a `KeyRevision` on its key or a content lock (a
+required revision alone no longer covers it), which closes the case of a Delete checked only by the object revision
+and of a `DoesNotExist` Insert (tested by `RequirementsCheckerSuite`, `TransactionBuilderSuite`). Residual mechanism:
+take a blind Insert U of key k (no requirement on k, or `MayExist(k)`), a write W of k started after U, and a Delete
+D of k checked by `KeyRevision(k, W)` (or a content lock taken over W's value). With Replication(3, 2), U's prepare
+reaches store C early and store A late. At C, U votes commit; W applies (as a non-voter in lock order after U, or
+before U's apply), so U's Insert is superseded (`insertWins`) and changes nothing. D's prepare meets U's lock at C and
+votes abort; A and B commit D, and A applies it. U's prepare then reaches A after D persisted: A votes commit (nothing
+is required of k) and U commits with A and C. A applies U over the absent k: k present with U's value. At C, D waits
+in lock order for U, re-checks against W's value (unchanged by U) and removes k. Neither A (a commit voter) nor C (a
+Delete whose check passed) reports anything. B, applying U as a non-voter after D, reports it (`keyDeletedSince`), and
+the repair reads A's and B's copy.
+Consequence: C lacks k with no ErrorTree mark while A holds it: permanent replica divergence of one key that repair
+never visits. No production caller issues a truly blind or `MayExist` Insert (`PutRequirement.Blind` has none; the
+missed-update marker and TKVL puts are checked), so the trigger needs a client building one directly.
+Fix options: refuse an Insert with no requirement on its key outside an allocation's initial content (removes
+blind Inserts; their last-writer-wins rule then matters only for re-applies), or report at apply a Delete applied in
+lock order after a holder whose Insert of the same key was superseded here, and a commit voter's Insert over a key
+that a Delete started at or after its start removed here (as `keyDeletedSince` does for non-voters).

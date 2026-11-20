@@ -53,10 +53,11 @@
   rule). A superseded Insert is a no-op, not a skip: no report and no fail-stop. The object timestamp is the max of its
   value and the transaction's. No tombstones, so `TransactionBuilder` refuses blind key deletes and blind object-level
   ops (`BlindKeyValueWrite`), and stores refuse them too (`RequirementsChecker.refuseBlindWrites`, `BlindWrite`, at vote
-  and apply re-check): unless the transaction allocates the object, a key Delete needs a `KeyRevision` on its key, a
-  required revision or a content lock, and a min/max/left/right change a required revision (a content lock does not move
-  the revision a repair proof locks; repair-process 1.2, Q8). A re-apply (a recovered commit vote, or one applying
-  through its UnackedCommits entry) never writes back a key deleted since: see Key deletion after a blind insert
+  and apply re-check): unless the transaction allocates the object, a key Delete needs a `KeyRevision` on its key or a
+  content lock (a required revision does not cover it: an Insert moves no revision), and a min/max/left/right change
+  a required revision (a content lock does not move the revision a repair proof locks; repair-process 1.2, Q8). A
+  re-apply (a recovered commit vote, or one applying through its UnackedCommits entry) never writes back a key deleted
+  since: see Key deletion after a blind insert
 - Allocations (transaction-requirements 9.4): an object in `txd.allocatingObjects` is loaded like any other (cache,
   `deleting`, backend read). Only a backend miss gives the fresh `Allocating` state (`Tx.allocationLoaded`). An
   existing state goes into `Tx.allocatedOver`, and every requirement on it fails with `ObjectExists`, at vote and at

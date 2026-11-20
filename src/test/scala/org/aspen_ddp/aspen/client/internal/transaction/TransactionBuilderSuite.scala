@@ -43,7 +43,8 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   private def kvDeletesKeys(ops: List[KeyValueOperation]): Boolean =
     val bldr = mkBuilder()
     bldr.replaySafe("test")
-    bldr.update(kvp, Some(rev1), None, Nil, ops)
+    val deleted = ops.collect { case d: Delete => KeyRevision(d.key, rev1) }
+    bldr.update(kvp, Some(rev1), None, deleted, ops)
     val (txd, _, _) = bldr.buildTranaction(Map(kvp.poolId -> Replication(3, 2)),
       Map(kvp.poolId -> None), Map())
     txd.requirements.collectFirst { case r: KeyValueUpdate => r.deletesKeys }.get
@@ -214,8 +215,10 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
     val b = mkBuilder(); b.update(kvp, None, None, List(KeyRevision(k2, rev1)), List(Delete(k1), Insert(k2, Array[Byte](1))))
     intercept[BlindKeyValueWrite](buildPin(b))
   }
-  test("a Delete under a required object revision is not blind") {
-    val b = mkBuilder(); b.update(kvp, Some(rev1), None, Nil, List(Delete(k1))); buildPin(b)
+  test("a Delete under only a required object revision is refused: an Insert of its key moves no revision") {
+    val b = mkBuilder(); b.update(kvp, Some(rev1), None, Nil, List(Delete(k1)))
+    intercept[BlindKeyValueWrite](buildPin(b))
+    val c = mkBuilder(); c.update(kvp, Some(rev1), None, List(KeyRevision(k1, rev1)), List(Delete(k1))); buildPin(c)
   }
   test("each blind object-level operation is refused") {
     for op <- List(SetMin(Key(Array[Byte](1))), SetMax(Key(Array[Byte](1))), SetLeft(Array[Byte](1)), SetRight(Array[Byte](1)),

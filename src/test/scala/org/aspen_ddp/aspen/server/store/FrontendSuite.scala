@@ -5819,7 +5819,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     lateInsert(Some(-1000), beforeVote = true) shouldBe Nil
   }
 
-  test("a non-voter's blind Insert of an absent key applied after a required-revision Delete of it reports the object (Q-W13)") {
+  test("a non-voter's blind Insert of an absent key applied after a content-locked Delete of it reports the object (Q-W13)") {
     val (frontend, backend, net) = lockFixture()
     // txid3 holds key 4's lock, so T (txid1) votes abort here; T commits elsewhere and its resolution is delayed
     prepare(frontend, net, lockTxd(txid3, List(insertK4)), insertK4Data).disposition shouldBe
@@ -5827,8 +5827,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     prepare(frontend, net, lockTxd(txid1, List(insertK4)), insertK4Data).disposition shouldBe
       TransactionDisposition.VoteAbort
     resolve(frontend, net, txid3, committed = false)
-    // D, built on the post-T state, deletes key 4 checked only by a required revision: a no-op here, where k4 is absent
-    val delete = KeyValueUpdate(kvPtr, Some(rev0), None, Nil, deletesKeys = true)
+    // D deletes key 4 under a content lock on the state here, where k4 is absent: a no-op
+    val delete = KeyValueUpdate(kvPtr, Some(rev0), Some(initialContentLock), Nil, deletesKeys = true)
     prepare(frontend, net, lockTxd(txid2, List(delete)), KeyValueOperation.encode(List(new Delete(k(4))), ida)(0))
       .disposition shouldBe TransactionDisposition.VoteCommit
     resolve(frontend, net, txid2, committed = true)
@@ -5859,9 +5859,15 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     kvKeys(backend) should contain (k(key))
     committedMessages(net).filter(_.transactionId == txid1).flatMap(_.objectCommitErrors)
 
-  /** txid2 deletes `key` checked by a required revision, started at `start`, committed here */
-  def deleteByRevision(frontend: Frontend, net: TestNet, key: Int, start: Option[HLCTimestamp] = None): Unit =
-    val delete = KeyValueUpdate(kvPtr, Some(rev0), None, Nil, deletesKeys = true)
+  /** A content lock on mkKVObjectState's contents: keys 1 to 3 at rev0 */
+  def initialContentLock: KeyValueUpdate.FullContentLock =
+    KeyValueUpdate.FullContentLock((1 to 3).map(n => KeyValueUpdate.KeyRevision(k(n), rev0)).toList)
+
+  /** txid2 deletes `key` under a content lock on mkKVObjectState's contents, started at `start`, committed here: a
+    * no-op for an absent key
+    */
+  def deleteUnderContentLock(frontend: Frontend, net: TestNet, key: Int, start: Option[HLCTimestamp] = None): Unit =
+    val delete = KeyValueUpdate(kvPtr, Some(rev0), Some(initialContentLock), Nil, deletesKeys = true)
     val txd = lockTxd(txid2, List(delete))
     prepare(frontend, net, start.fold(txd)(s => txd.copy(startTimestamp = s)),
       KeyValueOperation.encode(List(new Delete(k(key))), ida)(0)).disposition shouldBe TransactionDisposition.VoteCommit
@@ -5872,15 +5878,15 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   test("a non-voter's blind Insert reports nothing after a deletion of another key or one older than its start") {
-    nonVoterInsert(4, (frontend, _, net, _) => deleteByRevision(frontend, net, 5)) shouldBe Nil
+    nonVoterInsert(4, (frontend, _, net, _) => deleteUnderContentLock(frontend, net, 5)) shouldBe Nil
     nonVoterInsert(4, (frontend, _, net, txd) =>
-      deleteByRevision(frontend, net, 4, Some(HLCTimestamp(txd.startTimestamp.asLong - (1000L << 16))))) shouldBe Nil
+      deleteUnderContentLock(frontend, net, 4, Some(HLCTimestamp(txd.startTimestamp.asLong - (1000L << 16))))) shouldBe Nil
   }
 
   test("a non-voter's blind Insert of a key a Delete removed here since its start reports the object") {
-    // Key 2 is present until txid2's Delete, checked by the object revision alone, removes its older value
+    // Key 2 is present until txid2's Delete, under a content lock on the state here, removes its older value
     nonVoterInsert(2, (frontend, backend, net, _) =>
-      deleteByRevision(frontend, net, 2)
+      deleteUnderContentLock(frontend, net, 2)
       kvKeys(backend) should not contain k(2)) shouldBe List(oid2)
   }
 
@@ -5896,7 +5902,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
       (frontend, backend, net)
     nonVoterInsert(4, (frontend, _, net, _) =>
-      deleteByRevision(frontend, net, 4)
+      deleteUnderContentLock(frontend, net, 4)
       clock = clock + org.aspen_ddp.aspen.common.transaction.TransactionHorizon.Horizon.toMillis + 60_000L
       frontend.expiryHeartbeat()
       frontend.transactions.contains(txid1) shouldBe true, () => fixture()) shouldBe List(oid2)

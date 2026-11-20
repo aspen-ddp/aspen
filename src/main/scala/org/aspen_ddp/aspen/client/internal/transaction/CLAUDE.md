@@ -15,9 +15,10 @@
   `server/transaction/CLAUDE.md`). A refcount-0 object is `MissingObject` for every requirement. Design:
   `docs/superpowers/specs/2026-11-09-replay-pins-design.md`
 - Blind writes (`TransactionBuilder.refuseBlindWrites`, transaction-requirements 2.5), except in an allocated object's
-  initial content: a key Delete needs that key's `KeyRevision` (`Exists` is not enough), a required revision or a
-  content lock; a min/max/left/right change needs a required revision (a content lock does not move the revision a
-  repair proof locks; repair-process 1.2, Q8). It fails with `BlindKeyValueWrite`, even when replay-safe, and stores
+  initial content: a key Delete needs that key's `KeyRevision` (`Exists` is not enough) or a content lock (a
+  required revision is not enough either: an Insert moves no revision, transaction-requirements 2.5); a
+  min/max/left/right change needs a required revision (a content lock does not move the revision a repair proof
+  locks; repair-process 1.2, Q8). It fails with `BlindKeyValueWrite`, even when replay-safe, and stores
   refuse the same writes (`BlindWrite`). Blind Inserts are allowed: stores apply them last-writer-wins, but keep nothing
   to order a delete or an object-level change by
 - `TransactionBuilder.addAllocatingObject` adds the object's `AllocationFinalizationAction` itself, once per object, so

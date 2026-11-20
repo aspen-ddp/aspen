@@ -1141,10 +1141,15 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     assert(errs.isEmpty)
   }
 
+  /** A KeyRevision for each key `ops` delete, as a Delete needs (refuseBlindWrites) */
+  private def deleteRevisions(kvos: KVObjectState, ops: List[KeyValueOperation]): List[KeyValueUpdate.KeyRequirement] =
+    ops.collect { case d: Delete => KeyRevision(d.key, kvos.content(d.key).revision) }
+
   private def checkKVSized(kvos: KVObjectState, ops: List[KeyValueOperation], maxSliceSize: Option[Long]) =
     val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.KeyValue, kvos.encode())
     o.kvState = Some(kvos)
-    val req = KeyValueUpdate(kp1, Some(rev1), None, Nil, deletesKeys = ops.exists(_.isInstanceOf[Delete]))
+    val req = KeyValueUpdate(kp1, Some(rev1), None, deleteRevisions(kvos, ops),
+      deletesKeys = ops.exists(_.isInstanceOf[Delete]))
     val payload = KeyValueOperation.encode(ops, Replication(3, 2))(0)
     RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), HashMap(oid1 -> o), HashMap(oid1 -> payload),
       maxSliceSize)
@@ -1200,7 +1205,8 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.KeyValue, kvos.encode())
     o.kvState = Some(kvos)
     o.sliceReservations = reserved
-    val req = KeyValueUpdate(kp1, Some(rev1), None, Nil, deletesKeys = ops.exists(_.isInstanceOf[Delete]))
+    val req = KeyValueUpdate(kp1, Some(rev1), None, deleteRevisions(kvos, ops),
+      deletesKeys = ops.exists(_.isInstanceOf[Delete]))
     val payload = KeyValueOperation.encode(ops, Replication(3, 2))(0)
     RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), HashMap(oid1 -> o), HashMap(oid1 -> payload),
       Some(limit), applying = applying)._1
@@ -1498,10 +1504,16 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   // repair-process 1.2 (Q8): a blind Delete leaves no trace for a repair snapshot, and a blind object-level change does
   // not move the revision a repair proof locks. The store refuses them, as TransactionBuilder does
-  test("a key Delete with no KeyRevision on its key, and no required revision or content lock, is refused") {
+  test("a key Delete with no KeyRevision on its key and no content lock is refused") {
     KVTx(tx1, Nil, List(Delete(kk1))).check(kvObjectWithKey()) shouldBe Map(oid1 -> BlindWrite())
     // A KeyRevision on another key does not cover it
     KVTx(tx1, List(KeyRevision(kk9, rev1)), List(Delete(kk1))).check(kvObjectWithKey()) shouldBe
+      Map(oid1 -> BlindWrite())
+    // Nor does the object's required revision: an Insert of the key moves no revision, so a Delete applied after one
+    // would pass its re-check and remove the key unreported (transaction-requirements 9.3)
+    KVTx(tx1, Nil, List(Delete(kk1)), requiredRevision = Some(rev1)).check(kvObjectWithKey()) shouldBe
+      Map(oid1 -> BlindWrite())
+    KVTx(tx1, Nil, List(Delete(kk1)), requiredRevision = Some(rev1)).check(kvObjectWithKey(), applying = true) shouldBe
       Map(oid1 -> BlindWrite())
     // Refused at the apply re-check too
     KVTx(tx1, Nil, List(Delete(kk1))).check(kvObjectWithKey(), applying = true) shouldBe Map(oid1 -> BlindWrite())
@@ -1516,10 +1528,10 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       Map(oid1 -> kvData(List(SetMax(kk9)))), nanoTime = () => 0L)._1 shouldBe Map(oid1 -> BlindWrite())
   }
 
-  test("deletes and object-level operations pass with a required revision or an allocation, and deletes under a " +
-       "content lock") {
+  test("object-level operations pass with a required revision, deletes with their key's KeyRevision or a content " +
+       "lock, and both in an allocation") {
     val ops = List(Delete(kk1), SetMax(kk9), SetRight(Array[Byte](1)))
-    KVTx(tx1, Nil, ops, requiredRevision = Some(rev1)).check(kvObjectWithKey()) shouldBe Map()
+    KVTx(tx1, List(KeyRevision(kk1, rev1)), ops, requiredRevision = Some(rev1)).check(kvObjectWithKey()) shouldBe Map()
 
     val locked = KeyValueUpdate(kp1, None, Some(KeyValueUpdate.FullContentLock(List(KeyRevision(kk1, rev1)))), Nil,
       deletesKeys = true)

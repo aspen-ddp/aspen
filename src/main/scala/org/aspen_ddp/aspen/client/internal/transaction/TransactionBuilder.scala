@@ -302,20 +302,23 @@ class TransactionBuilder(
     * re-apply cannot regress a later write of the key (KVObjectState.insertWins). A Delete leaves no tombstone and
     * object-level parts carry no timestamp, so the same cannot be done for them. Unless it is the initial content of
     * an object this transaction allocates (transaction-requirements 2.5), an update must not delete a key without a
-    * KeyRevision on it, a required revision or a content lock, and must not change an object-level part without a
-    * required revision: only that moves the revision a repair proof locks (repair-process 1.2, Q8). Stores refuse the
-    * same writes (RequirementsChecker, BlindWrite).
+    * KeyRevision on it or a content lock, and must not change an object-level part without a required revision: only
+    * that moves the revision a repair proof locks (repair-process 1.2, Q8). A required revision does not cover a
+    * Delete: an Insert moves no revision, so a store that applied an Insert of the key first would pass the Delete's
+    * re-check and remove the key, unreported (transaction-requirements 9.3). Stores refuse the same writes
+    * (RequirementsChecker, BlindWrite).
     */
   private def refuseBlindWrites(kvu: KVUpdate): Unit =
-    if kvu.requiredRevision.isEmpty && !allocatingObjects.exists(_.id == kvu.pointer.id) then
-      val revisionChecked = kvu.requirements.collect { case r: KeyValueUpdate.KeyRevision => r.key }.toSet
+    if !allocatingObjects.exists(_.id == kvu.pointer.id) then
+      lazy val revisionChecked = kvu.requirements.collect { case r: KeyValueUpdate.KeyRevision => r.key }.toSet
       kvu.operations.foreach:
         case _: Insert =>
         case d: Delete =>
           if kvu.contentLock.isEmpty && !revisionChecked.contains(d.key) then
-            throw BlindKeyValueWrite(kvu.pointer, "Delete of a key with no KeyRevision")
+            throw BlindKeyValueWrite(kvu.pointer, "Delete of a key with no KeyRevision or content lock")
         case op =>
-          throw BlindKeyValueWrite(kvu.pointer, s"${op.getClass.getSimpleName} with no required revision")
+          if kvu.requiredRevision.isEmpty then
+            throw BlindKeyValueWrite(kvu.pointer, s"${op.getClass.getSimpleName} with no required revision")
 
   def update(
               pointer: KeyValueObjectPointer,

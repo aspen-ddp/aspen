@@ -250,9 +250,10 @@ The premises other subsystems take from this:
   holds its locks and reservation until it applies (transaction-requirements.md R13), and a recovered Tx that does not
   relock (an abort vote, no vote, a restored resolution without a commit vote) completes its load only after every
   relocking commit vote has relocked (`Frontend.recoveredTransactionLoaded`), so its apply waits for them in lock
-  order, and reads see the lock of a voter that has yet to apply. R15's argument assumes the store in both write
-  quorums saw the lock holder first; a Delete checked only by a required revision, applied in lock order after an
-  Insert of its key that it precedes serially, is a counterexample (Q-W16). A commit voter whose commit is held for its
+  order, and reads see the lock of a voter that has yet to apply. Where the store in both write quorums
+  saw the newcomer first, the order is reversed here; every key Delete carries a `KeyRevision` or a content lock, so
+  it fails after the holder's Insert and is reported, except after a blind Insert that a later write superseded here
+  (Q-W16). A commit voter whose commit is held for its
   turn keeps its locks after a `TxFinalized` takes it out of `Frontend.transactions` (`finalizationDeferred`); a
   lock-order waiter that then skips it (`Frontend.holdsLocks` is false) is still queued behind it on every object both
   change (`heldCommits`, `holdForTurn`), so it applies first, but a built-on prepare votes abort rather than wait

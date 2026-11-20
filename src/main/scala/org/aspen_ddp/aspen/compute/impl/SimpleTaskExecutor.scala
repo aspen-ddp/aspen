@@ -134,14 +134,19 @@ class SimpleTaskExecutor(val client: AspenClient,
       // A new KeyValue object's revision is not the allocating transaction's, so it is read
       client.readMetadata(taskPointer.kvPointer).map(m => (taskPointer, m.revision))
 
-  /** Empties a completed task's object for reuse. The write requires the object's revision as read, which pins it */
+  /** Empties a completed task's object for reuse. The write requires the object's revision as read, which pins it,
+    * and its contents as read: a key Delete needs a KeyRevision on its key or a content lock (transaction-requirements
+    * 2.5), since an Insert moves no revision
+    */
   private def deallocateTask(task: DurableTaskPointer): Unit =
     client.transactUntilSuccessful[Unit]: tx =>
       given Transaction = tx
 
       client.read(task.kvPointer).map: kvos =>
         val deletes = kvos.contents.keys.map(k => Delete(k)).toList
-        tx.update(task.kvPointer, Some(kvos.revision), None, Nil, deletes)
+        val contentLock = KeyValueUpdate.FullContentLock(
+          kvos.contents.iterator.map((k, vs) => KeyValueUpdate.KeyRevision(k, vs.revision)).toList)
+        tx.update(task.kvPointer, Some(kvos.revision), Some(contentLock), Nil, deletes)
         tx.result.foreach: _ =>
           synchronized:
             active -= task

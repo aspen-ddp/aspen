@@ -45,18 +45,16 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.2 [Q-W16] A required-revision-only key Delete applied in lock order after an Insert it precedes serially diverges.
-    PLAUSIBLE. Effort S. transaction-requirements.md.
-    refuseBlindWrites (builder and RequirementsChecker) accept a key Delete D checked only by requiredRevision.
-    Replication(3,2), Insert U of k with no revision requirement started before D: C votes commit on U, abort on D;
-    A, B commit D and A applies it; U then commits with A and C, so A ends D-then-U (k present). At C, D is a
-    committed non-voter, waits in lock order for U, re-checks clean (U moves no revision) and removes k. Nothing
-    reports a non-voter's Delete: C has A's revision and timestamp but lacks k, unmarked. R15's argument assumes the
-    store in both quorums saw the holder first. No production caller issues such a Delete (TKVL, repair, amoebafs,
-    vdisk all carry a KeyRevision or content lock); needs a client building one directly.
-    Fix: in both refuseBlindWrites, require every key Delete outside an allocated object's initial content to carry
-    a KeyRevision on its key or a content lock. Restate R7, R15, 2.5, 9.3, 9.4; re-examine Frontend.keyDeletions
-    (its documented cases are required-revision-only Deletes). No hot-path cost.
+2.2 [Q-W16] A key Delete after a blind Insert of its key that a later write superseded diverges the replica.
+    PLAUSIBLE. Effort M. transaction-requirements.md.
+    Narrowed: a key Delete now needs a KeyRevision on its key or a content lock (a required revision alone is
+    refused by both refuseBlindWrites; SimpleTaskExecutor.deallocateTask now takes a content lock). Residual: a truly
+    blind (or MayExist) Insert U of k superseded at store C by a later write W, then a Delete D checked against W's
+    value: C applies U (no-op), W, D in lock order and removes k; A applied D first and then U as a commit voter
+    over the absent k, so k is present there. Neither reports. No production caller issues a truly blind or MayExist
+    Insert. Fix options: refuse Inserts with no requirement on their key (outside an allocation's initial content),
+    or report a Delete applied in lock order after a superseded Insert of its key and a commit voter's Insert over a
+    key a Delete started since removed (keyDeletedSince for voters too).
 
 2.3 [X-W20] A Replication pool of width >= 256 breaks the per-store tree key range and aliases store ids.
     CONFIRMED. Effort S. cross-document-review.md.

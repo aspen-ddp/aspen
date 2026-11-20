@@ -37,9 +37,19 @@ final case class ObjectSizeLimitExceeded(objectPointer:ObjectPointer, newLength:
 /** Thrown when a transaction has no pin (see `Pins`: an update at a required revision, a version bump, a key update
   * that requires the key's revision while writing that key, or a refcount change) and was not marked with
   * `Transaction.replaySafe`. Replaying such a transaction after it committed would succeed a second time, so the
-  * builder refuses it.
+  * builder refuses it. `found` says, per requirement, why it is not a pin (`Pins.whyUnpinned`); the exception's message
+  * carries it with the ways to add a pin.
   */
-final case class UnpinnedTransaction(transactionId: TransactionId) extends TransactionCreationError
+final case class UnpinnedTransaction(transactionId: TransactionId, found: List[String] = Nil)
+  extends TransactionCreationError:
+  override def getMessage: String =
+    val held =
+      if found.isEmpty then "It has no requirement on any object."
+      else found.mkString("It has:\n  ", "\n  ", "")
+    s"Transaction $transactionId has no pin and is not marked replay-safe: a delayed replay of it after it commits " +
+      "could commit again. Add a pin: a data overwrite or version bump at the object's revision as read, a KeyValue " +
+      "update with a required revision, a KeyRevision on a key the same update inserts or deletes, or a refcount " +
+      "change; or, if a replay is provably harmless, mark it with Transaction.replaySafe(reason). " + held
 
 /** Thrown, outside an allocated object's initial content, for a KeyValue update that deletes a key with neither a
   * `KeyRevision` on it nor a content lock, changes min, max, left or right without a required revision, or Inserts a

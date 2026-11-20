@@ -176,17 +176,21 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   test("no pin: allocation only") {
     withPins:
       val b = mkBuilder(); b.addAllocatingObject(p1)
-      intercept[UnpinnedTransaction](buildPin(b))
+      intercept[UnpinnedTransaction](buildPin(b)).getMessage should include (
+        s"${p1.id}: allocated by the transaction (an allocation is not a pin)")
   }
   test("no pin: exclusiveLockRevision only") {
     withPins:
       val b = mkBuilder(); b.exclusiveLockRevision(p1, rev1)
-      intercept[UnpinnedTransaction](buildPin(b))
+      intercept[UnpinnedTransaction](buildPin(b)).getMessage should include (
+        s"${p1.id}: an ExclusiveRevisionLock (a lock is not a pin)")
   }
   test("no pin: DoesNotExist with an Insert") {
     withPins:
       val b = mkBuilder(); b.update(kvp, None, None, List(DoesNotExist(k1)), List(ins1))
-      intercept[UnpinnedTransaction](buildPin(b))
+      intercept[UnpinnedTransaction](buildPin(b)).getMessage should include (
+        s"${kvp.id}: the KeyValue update has no required revision and writes $k1 with no KeyRevision on any of them " +
+        "(DoesNotExist is not a pin)")
   }
   test("a Delete guarded only by Exists is a blind write") {
     withPins:
@@ -197,12 +201,16 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
     withPins:
       val b = mkBuilder()
       b.update(kvp, None, None, List(KeyRevision(k1, rev1), DoesNotExist(k2)), List(Insert(k2, Array[Byte](9))))
-      intercept[UnpinnedTransaction](buildPin(b))
+      intercept[UnpinnedTransaction](buildPin(b)).getMessage should include (
+        s"writes $k2 but has a KeyRevision only on $k1")
   }
   test("no pin: setRefcount to the same refcount") {
     withPins:
       val b = mkBuilder(); b.setRefcount(p1, rc1, rc1)
-      intercept[UnpinnedTransaction](buildPin(b))
+      val message = intercept[UnpinnedTransaction](buildPin(b)).getMessage
+      message should include (s"${p1.id}: the RefcountUpdate leaves the refcount at $rc1")
+      message should include ("has no pin and is not marked replay-safe")
+      message should include ("Transaction.replaySafe(reason)")
   }
 
   // Blind writes (todo 2.2): stores apply a blind Insert last-writer-wins, but keep no tombstone for a Delete and no

@@ -138,7 +138,7 @@ class TransactionBuilder(
     val kvOps = keyValueUpdates.map((p, kvu) => p.id -> kvu.operations)
     onBuilt.foreach(_(Built(txd, kvOps, replaySafeFlag)))
     if !replaySafeFlag && !Pins.declared(requirements) then
-      throw UnpinnedTransaction(transactionId)
+      throw UnpinnedTransaction(transactionId, Pins.whyUnpinned(requirements, kvOps, allocatingObjects.map(_.id)))
 
     var updates = Map[StoreId, TransactionData]()
 

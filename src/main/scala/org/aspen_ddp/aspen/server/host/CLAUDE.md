@@ -64,7 +64,9 @@
   persistence. TestNetwork does, in memory, and renews in `handleEvents` (`Host.Seams.joinCeilingStep`, 100 ms there).
   `TestNetwork.crashHost`/`restartHost` model a host whose ceiling outlives its process
 - A loading store asks for its CRL state with the non-blocking `readStoreState` from its executor
-  (`StoreRouter.readAndRecover`), holding its messages until it recovers, so no store thread blocks on a CRL
+  (`StoreRouter.readAndRecover`), holding its messages until it recovers, so no store thread blocks on a CRL. A
+  read failed by the CRL's own death or shutdown (`CrlFailed`, `CrlClosed`) is the device's failure: the store is
+  not fail-stopped but left, unrecovered and unmarked, for `DeviceShutdown.crlFailed` or the unload to close
 - Device management (the classes `DeviceControl` wires) runs on one control thread, `aspen-host-control`,
   with no locks. Rules (scaladoc of `HostThreading.scala`): the only `given ExecutionContext` is the control context;
   never block the control thread on a Future; other threads read control state only through the `@volatile`
@@ -152,8 +154,8 @@
   `CrlOpenAttempts` (3) device scans in a row, when the CRL is lost. Only a `ScanDevices` open counts
   (`checkForNewDevices(scan = true)`): host start, `CheckAllDevices` and nudges retry uncounted, so start-up's burst of
   opens cannot use up the allowance.
-- `Host.StoreFailStopped` (a store's CRL recovery threw, or its Frontend fail-stopped, `server/store/CLAUDE.md`) is
-  handled as a backend failure (`StoreRebuilds.handleFailStopped`), but only while that Store is still the one
+- `Host.StoreFailStopped` (a store's CRL read failed other than by the CRL's death or shutdown, its recovery threw,
+  or its Frontend fail-stopped, `server/store/CLAUDE.md`) is handled as a backend failure (`StoreRebuilds.handleFailStopped`), but only while that Store is still the one
   installed under its id: a late fail-stop of a closed or replaced store is ignored, so its directory is not marked
 - A backend fail-stop during a store's close marks it `rebuild-required` instead of closing it cleanly. A
   `crl_save.log` a transfer-out close wrote stays: its entries have left the device CRL, so it is the only copy of

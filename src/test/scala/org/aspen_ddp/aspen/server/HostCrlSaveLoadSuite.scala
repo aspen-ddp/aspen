@@ -13,7 +13,8 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription,
   TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlClosed, CrlFailed, StoreRecoveryState,
+  TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading, StoreLoader}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.{Frontend, Store}
@@ -184,6 +185,10 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       asked = true
       val held = StoreRecoveryState(super.getFullRecoveryState(storeId), getAppliedStubs(storeId))
       answer.future.map(_ => held)(using ExecutionContext.parasitic)
+    // Not through readStoreState, as the default is: only the store's recovery read is held
+    override def dropStore(storeId: StoreId): Future[Unit] =
+      deleteTransactions(storeId,
+        StoreRecoveryState(super.getFullRecoveryState(storeId), getAppliedStubs(storeId)).entryIds)
 
   atest("device-CRL recovery waits for the CRL without blocking and holds messages until it recovers"):
     given ExecutionContext = executionContext
@@ -268,6 +273,54 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     val backend = storeWithSaveFile()
     val host = newCrlHost(crl)
     assertRetired(host, host.loadStore(deviceId, backend, None), backend.path)
+
+  /** The device's CRL fails `crl`'s outstanding recovery read with `err`: the store is left installed, unmarked and
+   *  holding its messages, for the device's unload (DeviceShutdown.crlFailed) or the shutdown to close (CRL-W12) */
+  private def assertReadFailureLeavesStore(crl: SlowReadCRL, backend: MapBackend, storeDir: os.Path,
+                                           err: Throwable): Future[compatible.Assertion] =
+    given ExecutionContext = executionContext
+    val host = newCrlHost(crl)
+    val loaded = host.loadStore(deviceId, backend, None)
+    val other = TransactionId(new UUID(7, 6))
+    def reading: Boolean =
+      host.testingOnlyHandleEvents()
+      loaded.isCompleted && crl.asked
+    for
+      _ <- yieldUntil(reading)
+      store = storeOf(host).get
+      _ = crl.answer.failure(err)
+      _ = host.testingOnlyHandleEvents()
+      _ = host.receiveTransactionMessage(TxPrepare(crlStoreId, net.storeId0, overwriteTxd(other, 1),
+            ProposalId.initialProposal(1), List(ObjectUpdate(oid, DataBuffer(Array[Byte](2)))), true))
+      _ = host.testingOnlyHandleEvents()
+    yield
+      withClue("the store is still the one installed: "):
+        storeOf(host).exists(_ eq store) should be (true)
+      withClue("a CRL failure is the device's, not the store's: "):
+        os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be (false)
+      withClue("the store still holds its messages: "):
+        store.frontend.transactions.keySet should be (Set())
+
+  for (what, err) <- List("dies" -> (() => CrlFailed(new java.io.IOException("injected"))),
+                          "shuts down" -> (() => CrlClosed())) do
+    atest(s"a store whose device-CRL recovery read fails as its CRL $what is not marked for rebuild (CRL-W12)"):
+      val crl = new SlowReadCRL
+      crl.save(txid, commitVote(), () => ())
+      val (backend, storeDir) = storeInDir()
+      assertReadFailureLeavesStore(crl, backend, storeDir, err())
+
+    atest(s"a store loaded from its crl_save.log whose read fails as its CRL $what is not marked for rebuild (CRL-W12)"):
+      val backend = storeWithSaveFile()
+      assertReadFailureLeavesStore(new SlowReadCRL, backend, backend.path, err())
+
+  atest("a store whose device-CRL recovery read fails otherwise is not served, and is marked for rebuild"):
+    val crl = new SlowReadCRL
+    crl.save(txid, commitVote(), () => ())
+    val (backend, storeDir) = storeInDir()
+    val host = newCrlHost(crl)
+    val loaded = host.loadStore(deviceId, backend, None)
+    crl.answer.failure(new IllegalStateException("injected read failure"))
+    assertRetired(host, loaded, storeDir)
 
   atest("a prepare that arrives while the crl_save.log loads is handled after the recovered transactions lock"):
     given ExecutionContext = executionContext

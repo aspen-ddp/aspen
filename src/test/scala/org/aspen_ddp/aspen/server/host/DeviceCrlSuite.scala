@@ -42,7 +42,8 @@ import scala.concurrent.duration.{Duration, SECONDS}
  *  `completions` (the suite's serial context), as lockstep hosts need: run on the CRL thread, the vote they send
  *  would drain the test network's hosts there. A shutdown waits on `gate`, if set, before shutting `inner` down. */
 private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, gate: Option[CountDownLatch],
-                          completions: ExecutionContext) extends CrashRecoveryLog:
+                          completions: ExecutionContext, readHold: Option[Future[Unit]] = None)
+  extends CrashRecoveryLog:
   val firstSave: Promise[Unit] = Promise()
   val shutdownCalled: Promise[Unit] = Promise()
   val shutdownCalls = new AtomicInteger(0)
@@ -58,7 +59,16 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
     inner.saveAppliedStub(storeId, txid, HLCTimestamp.now, completionHandler)
   def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit = inner.deleteAppliedStub(storeId, txid)
   override def whenDurable(storeId: StoreId, handler: () => Unit): Unit = inner.whenDurable(storeId, handler)
+  /** Completed when a read of a store's state is first asked for, held or not */
+  val readAsked: Promise[Unit] = Promise()
   override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] =
+    readAsked.trySuccess(())
+    readHold match
+      // Asked of `inner` only once the hold completes: a read the store issued before its CRL died meets the death
+      case Some(hold) if !hold.isCompleted =>
+        hold.flatMap(_ => issueRead(storeId))(using ExecutionContext.parasitic)
+      case _ => issueRead(storeId)
+  private def issueRead(storeId: StoreId): Future[StoreRecoveryState] =
     val read = inner.readStoreState(storeId)
     readCalled.trySuccess(())
     val gate = synchronized:
@@ -115,13 +125,14 @@ private class RecordedCrl(val devicePath: os.Path, val inner: CrashRecoveryLog, 
     inner.shutdown()
 
 /** Opens real SimpleCRLs and records each one it opened. */
-private class RecordingCrlFactory(completions: ExecutionContext, gate: Option[CountDownLatch] = None)
+private class RecordingCrlFactory(completions: ExecutionContext, gate: Option[CountDownLatch] = None,
+                                  readHold: Option[Future[Unit]] = None)
   extends CrashRecoveryLogFactory:
   private val inner = SimpleCRL.DeviceFactory()
   private var crls: List[RecordedCrl] = Nil
 
   def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
-    val crl = new RecordedCrl(devicePath, inner.openCRL(devicePath, config, holdsStores), gate, completions)
+    val crl = new RecordedCrl(devicePath, inner.openCRL(devicePath, config, holdsStores), gate, completions, readHold)
     synchronized { crls = crls :+ crl }
     crl
 
@@ -193,8 +204,9 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     factories.clear()
     super.subFixtureTeardown()
 
-  private def newFactory(gate: Option[CountDownLatch] = None): RecordingCrlFactory =
-    val f = new RecordingCrlFactory(executionContext, gate)
+  private def newFactory(gate: Option[CountDownLatch] = None,
+                         readHold: Option[Future[Unit]] = None): RecordingCrlFactory =
+    val f = new RecordingCrlFactory(executionContext, gate, readHold)
     factories += f
     f
 
@@ -605,6 +617,31 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       host.control.discovery.disownedDeviceDirs should contain(deviceDir)
       rescanned should be(Nil)
       factory.opened.size should be(1)
+
+  atest("a store whose recovery read its CRL's death fails is closed with the device, unmarked (CRL-W12)"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    createCrl(deviceDir)
+    val hold = Promise[Unit]()
+    val factory = newFactory(readHold = Some(hold.future))
+    for
+      storeDir <- writeRocksStore(deviceDir, storeId)
+      host = newCrlHost(hostRoot, factory)
+      crl = factory.opened.head
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId) && crl.readAsked.isCompleted)
+      // An entry larger than a whole 1 MB stream: Stream.writeEntry's require kills the CRL thread
+      _ = crl.inner.save(TransactionId(new UUID(9, 6)),
+            recoveryState(storeId, TransactionId(new UUID(9, 6)), new Array[Byte](2 * 1024 * 1024)), () => ())
+      _ <- crl.failed
+      // The store's read meets the dead CRL before the device's unload has closed the store
+      _ = hold.success(())
+      _ <- pumpUntil(host, !host.control.devices.devices.contains(deviceA) && crl.shutdownCalls.get > 0)
+    yield
+      host.control.router.loaded.contains(storeId) should be(false)
+      host.control.router.isOffline(storeId) should be(true)
+      withClue("its state is intact in the CRL files, which a restart recovers: "):
+        os.exists(marker(storeDir)) should be(false)
 
   atest("unloading a device shuts its CRL down"):
     given ExecutionContext = executionContext

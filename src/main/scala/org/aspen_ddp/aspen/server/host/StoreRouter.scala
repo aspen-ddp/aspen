@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.{DurableFiles, Host}
-import org.aspen_ddp.aspen.server.crl.StoreRecoveryState
+import org.aspen_ddp.aspen.server.crl.{CrlClosed, CrlFailed, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.repair.StoreNotHosted
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot, Store}
 import org.aspen_ddp.aspen.server.store.backend.CompletionHandler
@@ -222,11 +222,18 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
    *  it on the executor if the store is still installed. Asked from the executor, the read queues behind every CRL
    *  save the tasks ahead of it issued, a replaced store's included (install). The store holds its transaction
    *  messages until it recovers, so it saves nothing in between. A failed read fail-stops it as a failed recovery
-   *  does */
+   *  does, unless the CRL itself died (CrlFailed) or was shut down (CrlClosed): that is the device's failure, not the
+   *  store's, whose state the CRL files still hold for a restart (crash-recovery-log 5.10). The store is left
+   *  holding its messages, unmarked, for the device's unload (DeviceShutdown.crlFailed) or the shutdown that closed
+   *  the CRL to close */
   private def readAndRecover(store: Store): Unit =
-    val failed: Throwable => Unit = err =>
-      logger.error(s"Store ${store.storeId} failed to read its transactions from its CRL: $err")
-      ctx.post(Host.StoreFailStopped(store, err, StoreRebuilds.RecoveryFailed))
+    val failed: Throwable => Unit =
+      case err @ (_: CrlFailed | _: CrlClosed) =>
+        logger.warn(s"Store ${store.storeId} could not read its transactions: its device's CRL is out of service. " +
+                    s"Left unrecovered for the device's unload to close: $err")
+      case err =>
+        logger.error(s"Store ${store.storeId} failed to read its transactions from its CRL: $err")
+        ctx.post(Host.StoreFailStopped(store, err, StoreRebuilds.RecoveryFailed))
     // The default readStoreState reads getFullRecoveryState inline, which may throw
     val read =
       try store.crl.readStoreState(store.storeId)

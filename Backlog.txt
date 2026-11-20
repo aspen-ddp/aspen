@@ -160,7 +160,7 @@ System-level protection against correlated "lost store" declarations
     of them through the system-level check below. Known today:
     - backend fail-stop on an I/O error (`StoreRebuilds.backendFailed`, FSIF's `onFatal`);
     - a store whose CRL transactions fail to recover (`Host.StoreFailStopped`, from `StoreRouter.recoverOrFail` and
-      `readAndRecover`);
+      `readAndRecover`, not a read failed by the CRL's own death or shutdown);
     - (2026-11-14, Todo 1.4) a commit voter that cannot apply the committed update it voted for (its in-memory apply
       throws; a failed apply re-check is logged and reported, or taken as applied for a recovered vote, instead), and a recovered commit vote whose object fails to load with
       anything but ObjectNotFound (`Frontend.failStop`). A bug in the requirement checker or applier would trip this

@@ -209,7 +209,10 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
    `readStoreState`. It does not block: the Future completes on the CRL thread and recovery is routed back to the
    executor. The store holds its transaction messages until `Frontend.recover` has recreated its transactions, so it
    saves nothing in between. A throw while reading or recovering fail-stops the store (`Host.StoreFailStopped`),
-  which marks it `rebuild-required`, a CRL that died or shut down under the read included (CRL-W12).
+   which marks it `rebuild-required`, except a read failed because the CRL itself died (`CrlFailed`) or was shut
+   down (`CrlClosed`). That is the device's failure, not the store's: the CRL files still hold the store's state for
+   a restart (5.10), so the store is left holding its messages, unmarked, for `DeviceShutdown.crlFailed` or the
+   unload that shut the CRL down to close.
 4. With a save file: its state is first charged to the device's admission, checked (`CrlAdmission.tryChargeLoaded`,
    section 6.1 A3); a state that does not fit now leaves the store offline with its file kept, retried at the device
    scans, and one that never can, even at the most streams any config allows (`StoreLoader.neverFits`, `maxAdmissionLimitBytes`),
@@ -1173,8 +1176,9 @@ indefinitely and `crl.shutdown()` with it (Backlog.txt, "Isolate every device's 
 
 **10.7 A dead CRL thread or writer.** Every pending and later Future fails with `CrlFailed`, no save completion runs,
 and `DeviceShutdown.crlFailed` unloads the device until restart (5.10, section 4). Rebuilds and transfers on the device
-fail their CRL calls and are resumed by the restart. No safety loss, but a store whose recovery read the death
-fails is fail-stopped and rebuilt (CRL-W12).
+fail their CRL calls and are resumed by the restart. No safety loss. A store whose recovery read the death fails is
+not fail-stopped: it stays unrecovered, holding its messages, until `crlFailed` closes it unmarked (3.3 step 3), and
+the restart recovers it.
 
 **10.8 The device is pulled.** Writes fail with an I/O error; the writer dies (10.7). Whatever was acknowledged is on
 the device, which holds a consistent post-crash CRL: that is what makes adoption possible.
@@ -1271,28 +1275,6 @@ at `writeHead`'s `require`, which only a bug can reach.
 ---
 
 ## Open weaknesses
-
-### CRL-W12: A CRL that dies while a store awaits its recovery read marks that store for rebuild
-Verdict CONFIRMED. Priority 3. Effort S.
-Mechanism: `StoreRouter.readAndRecover` fail-stops the store on any failed `readStoreState`
-(`Host.StoreFailStopped(.., StoreRebuilds.RecoveryFailed)`). SimpleCRL answers that read from memory, so it fails
-only with `CrlFailed` (the CRL died: a writer I/O error, a handler throw, W6) or `CrlClosed` (shutdown). At a death,
-`SimpleCRL`'s thread fails every pending tracked Future (`failPending`) before it completes `failed`. The read's
-parasitic callback posts `StoreFailStopped` first; `DeviceShutdown.crlFailed` is posted after it and closes the
-device's stores one at a time (`closeStoresToRelinquish`). A read issued after the death fails at once in `tracked`.
-`StoreRebuilds.handleFailStopped` finds the store still installed and calls `backendFailed`, which writes
-`rebuild-required` and has the reconcile flip the entry to Rebuilding. A store reloaded through `StoreRouter.crlLoaded`
-takes the same path. The window is wide at device load, when every store's read is issued; and 6.1 says a restart
-after a W6 failure may fail at W6 again under the same load.
-Consequence: stores whose transaction state is intact in the CRL files, which a restart recovers (5.10), are declared
-lost and rebuilt: margin lost for the length of each rebuild, from a condition that is not store damage. A load-driven
-W6 failure (unoffset stubs beyond the margin) can hit many devices at once, and each restart marks the stores that
-were loading. That makes a correlated declaration (systemic-loss-protection Q3 asks the general question;
-Backlog.txt's lost-store-declaration inventory lists `readAndRecover`).
-Fix: in `readAndRecover`'s failure handler, treat `CrlFailed` and `CrlClosed` as the device's failure, not the
-store's. Log, and leave the store holding its messages: `crlFailed`, or the shutdown that closed the CRL, closes it
-without marking it, and a restart recovers it. Keep the fail-stop for a failure of `Frontend.recover` itself
-(`recoverOrFail`).
 
 ### CRL-W13: A failed removal of `crl_save.log` after its load leaves the store installed and stalled
 Verdict CONFIRMED. Priority 4. Effort S.

@@ -53,15 +53,6 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-3.2 [CRL-W12] A CRL that dies while a store awaits its recovery read marks that store for rebuild.
-    CONFIRMED. Effort S. crash-recovery-log.md.
-    StoreRouter.readAndRecover fail-stops the store on any failed readStoreState; SimpleCRL answers from memory, so the
-    only failures are CrlFailed / CrlClosed. failPending fails the read before DeviceShutdown.crlFailed closes the
-    device's stores, so handleFailStopped finds the store installed and backendFailed writes rebuild-required
-    (crlLoaded likewise). Intact stores are declared lost, likeliest at device load and across devices under load.
-    Fix: in readAndRecover's failure handler treat CrlFailed and CrlClosed as the device's failure: log and leave the
-    store for crlFailed or shutdown to close unmarked. Keep the fail-stop for a throw from Frontend.recover itself.
-
 3.3 [X-W11] An Active entry whose store directory is missing on a loaded device is never served, rebuilt or reported.
     CONFIRMED. Effort S. cross-document-review.md.
     DeviceDiscovery.loadOwnedDevice offers only existing directories, every DeviceReconciler pass needs an offline

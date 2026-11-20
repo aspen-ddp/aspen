@@ -455,6 +455,8 @@ crl_save.log:  crl.dropStore, then loadStore(trs)
                entries dropped, the file kept)
                -> router.crlLoaded            ->  remove save file durably, readAndRecover(store)
                                                   crl.readStoreState(storeId)  (non-blocking Future)
+                                                  failed: fail-stop, unless CrlFailed / CrlClosed
+                                                    (the device's failure: left for its unload)
                                                   on success, on executor, if still installed:
                                                     Frontend.recover(state)
                                                       applied stubs loaded and charged

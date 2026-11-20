@@ -320,8 +320,9 @@ The premises other subsystems take from this:
   until a reload (RP-W10). The scan's reads of the trees have no deadline (the held-vote query has
   `Host.HeldVoteQueryDeadline`); every object stays under the inherited-vote lock until it answers, which it does
   within the write-threshold margin: the trees' reads complete with `r` stores of the pool above, its marks are
-  `MissedUpdateMarker` batches written to commit in that pool, and any failure retries the round. A rebuilt store's
-  own pool index of 255 makes the scan's key range empty (X-W20).
+  `MissedUpdateMarker` batches written to commit in that pool, and any failure retries the round. The scan's key range
+  `[poolIndex, poolIndex + 1)` is never empty: every IDA's width is at most `IDA.MaxWidth` (127), so the bound
+  never wraps, and no two stores of a pool share an id.
 
 ### 2.4 Repair and transactions on one object
 
@@ -506,20 +507,6 @@ Completed Rebuilds pass clears the marker, without saying when.
 Fix: in the PoolRepointed branch, clear a `rebuild-complete` marker with `clearRebuildCompleteMarker` before the load
 (the entry is Active by the outcome, which is what the Completed Rebuilds pass checks), or have `startOut` clear it
 before archiving, since a TransferringOut entry exists only after the flip committed. Transfer path only.
-
-### X-W20: A Replication pool of width 256 or more breaks the per-store tree range and aliases store ids
-Verdict CONFIRMED. Priority 2. Effort S.
-Mechanism: `Replication` bounds its width only from below (`IDA.scala`; the Reed-Solomon IDAs cap it at
-`ReedSolomon.MaxWidth`, 127), and pool creation names stores `StoreId(poolId, poolIndex.toByte)`
-(`BaseAspenClient.createStoragePool`). `StoreRepairer.scan` and `inheritedGrowthScan` take one store's ErrorTree and
-UnackedCommits entries as the key range `[poolIndex, (poolIndex + 1).toByte)`; for pool index 255 the bound wraps to
-`0x00`, below the minimum, so the range is empty (`KeyOrdering` compares unsigned). A width above 256 gives two stores
-one id.
-Consequence: in a pool of width 256 the store at index 255 is never repaired: its marks and UnackedCommits entries
-stay and their misses stay unapplied there (permanent divergence), and its inherited-growth scan guards nothing.
-Wider pools route two stores' traffic to one id. No realistic configuration is that wide, but nothing refuses one.
-Fix: require `width <= 255` in `Replication` (or in pool creation, for every IDA), or compute the upper bound as an
-open-ended range for index 255 (`foreachFrom`). Configuration check only.
 
 ### X-W21: A held commit finalized before it applies is not seen as a lock holder, so a prepare built on it votes abort
 Verdict CONFIRMED. Priority 5. Effort S.

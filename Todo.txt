@@ -45,13 +45,7 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.3 [X-W20] A Replication pool of width >= 256 breaks the per-store tree key range and aliases store ids.
-    CONFIRMED. Effort S. cross-document-review.md.
-    Replication has no width bound (Reed-Solomon caps at 127). For pool index 255, (poolIndex + 1).toByte wraps to 0,
-    so StoreRepairer.scan's and inheritedGrowthScan's key ranges are empty: store 255 is never repaired and its growth
-    scan guards nothing. Above 256, poolIndex.toByte in createStoragePool gives two stores one id. No realistic
-    configuration triggers it; cheap enough to do early.
-    Fix: reject width > 255 at IDA construction / pool creation (or open-ended range for index 255 and a 256 cap).
+(no open items)
 
 
 PRIORITY 3: systemic loss protection

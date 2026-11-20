@@ -26,6 +26,9 @@
 - Replication supports all of them too. Classic ReedSolomon does not: those operations fail with
   `RangeReadNotSupported` / `AppendNotSupported` / `RangeWriteNotSupported`
 - Store side of the deltas (`EncodedAppendDelta`): see `server/store/CLAUDE.md`
+- Every IDA's width is at most `IDA.MaxWidth` (127): pool indices are signed Bytes (`StoreId.poolIndex`), the
+  serialized IDA type stores width and thresholds as signed bytes, and the repair scans take a store's tree entries
+  as the key range `[poolIndex, poolIndex + 1)`. Each IDA's constructor refuses a wider pool
 
 ### Transaction outcomes
 - A commit fails with `TransactionAborted` (final: it did not and will not commit) or, past the transaction horizon

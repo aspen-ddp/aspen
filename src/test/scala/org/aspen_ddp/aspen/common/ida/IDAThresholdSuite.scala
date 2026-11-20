@@ -21,6 +21,15 @@ class IDAThresholdSuite extends AnyFunSuite with Matchers:
     for (w, wt) <- List((5, 1), (5, 2), (6, 2), (6, 3)) do
       an[IllegalArgumentException] should be thrownBy Replication(w, wt)
 
+  test("Replication width may not exceed IDA.MaxWidth, and the widest pool round-trips its serialized type"):
+    val widest = Replication(IDA.MaxWidth, majority(IDA.MaxWidth))
+    val bb = ByteBuffer.allocate(widest.getSerializedIDATypeLength)
+    widest.serializeIDAType(bb)
+    bb.flip()
+    IDA.deserializeIDAType(bb) should be(widest)
+    for width <- List(IDA.MaxWidth + 1, 255, 256, 300) do
+      an[IllegalArgumentException] should be thrownBy Replication(width, majority(width))
+
   test("Reed-Solomon read threshold must be a majority and write at least read"):
     for width <- 1 to 9 do
       for rt <- 1 to width do

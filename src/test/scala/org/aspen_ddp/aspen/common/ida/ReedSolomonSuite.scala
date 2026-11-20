@@ -454,7 +454,7 @@ class ReedSolomonSuite extends AnyFunSuite with Matchers:
     an[IllegalArgumentException] should be thrownBy ReedSolomon(5, 3, 2)
     an[IllegalArgumentException] should be thrownBy ReedSolomon(5, 3, 6)
 
-    ReedSolomon(ReedSolomon.MaxWidth, 64, 64).width should be(127)
+    ReedSolomon(IDA.MaxWidth, 64, 64).width should be(127)
 
   test("the IDA attributes are as expected"):
     val ida = ReedSolomon(5, 3, 4)

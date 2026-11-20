@@ -13,6 +13,18 @@ object IDA {
   val ReedSolomonCode: Byte = 1
   val RandomAccessReedSolomonCode: Byte = 2
 
+  /** Largest width of every IDA, and so of every storage pool.
+    *
+    * Encoding indices travel through the system as signed Bytes (StoreId.poolIndex) and are
+    * compared against the IDA width with signed arithmetic, and the serialized IDA type stores the
+    * width and thresholds as signed bytes, so every pool index must stay within [0, 127]. This also
+    * keeps each store's ErrorTree and UnackedCommits key range `[poolIndex, poolIndex + 1)` (the
+    * repair scans) non-empty, and is stricter than the Reed-Solomon library's 256-shard limit. For
+    * Reed-Solomon it further guarantees that the pad count, which is always in 1..restoreThreshold,
+    * fits within a single byte.
+    */
+  val MaxWidth: Int = 127
+
   /** Deserializes the IDA type and returns the matching IDA instance */
   def deserializeIDAType(bb: ByteBuffer): IDA = {
     val typeCode = bb.get()
@@ -214,6 +226,7 @@ case class Replication(width: Int, writeThreshold: Int) extends IDA with Appenda
   // restoreThreshold is 1 only because the data can be restored from a single store once width/2 + 1
   // stores agree on its metadata, so the effective read threshold is a majority.
   require(width >= 1, s"Replication width must be at least 1. Got $width")
+  require(width <= IDA.MaxWidth, s"Replication width ($width) may not exceed ${IDA.MaxWidth}")
   require(writeThreshold >= width / 2 + 1 && writeThreshold <= width,
     s"Replication writeThreshold ($writeThreshold) must fall within [${width / 2 + 1}, $width]")
 
@@ -302,15 +315,6 @@ case class Replication(width: Int, writeThreshold: Int) extends IDA with Appenda
 }
 
 object ReedSolomon:
-
-  /** Largest supported width.
-    *
-    * Encoding indices travel through the system as signed Bytes (StoreId.poolIndex) and are
-    * compared against the IDA width with signed arithmetic, so they must stay within [0, 127].
-    * This is stricter than the underlying library's 256-shard limit and it also guarantees that
-    * the pad count, which is always in 1..restoreThreshold, fits within a single byte.
-    */
-  val MaxWidth: Int = 127
 
   /** Constructing a codec builds and inverts a Vandermonde matrix, which is O(k^3). ReedSolomon
     * instances, on the other hand, are cheap and are created constantly - every decode of a
@@ -423,8 +427,8 @@ case class ReedSolomon(width: Int, restoreThreshold: Int, writeThreshold: Int) e
     s"Reed-Solomon restoreThreshold ($restoreThreshold) must be a majority: at least ${width / 2 + 1}")
   require(restoreThreshold <= width,
     s"Reed-Solomon restoreThreshold ($restoreThreshold) may not exceed width ($width)")
-  require(width <= ReedSolomon.MaxWidth,
-    s"Reed-Solomon width ($width) may not exceed ${ReedSolomon.MaxWidth}")
+  require(width <= IDA.MaxWidth,
+    s"Reed-Solomon width ($width) may not exceed ${IDA.MaxWidth}")
   require(writeThreshold >= restoreThreshold && writeThreshold <= width,
     s"Reed-Solomon writeThreshold ($writeThreshold) must fall within [$restoreThreshold, $width]")
 
@@ -603,8 +607,8 @@ case class RandomAccessReedSolomon(
     s"Random-Access Reed-Solomon restoreThreshold ($restoreThreshold) must be a majority: at least ${width / 2 + 1}")
   require(restoreThreshold <= width,
     s"Random-Access Reed-Solomon restoreThreshold ($restoreThreshold) may not exceed width ($width)")
-  require(width <= ReedSolomon.MaxWidth,
-    s"Random-Access Reed-Solomon width ($width) may not exceed ${ReedSolomon.MaxWidth}")
+  require(width <= IDA.MaxWidth,
+    s"Random-Access Reed-Solomon width ($width) may not exceed ${IDA.MaxWidth}")
   require(writeThreshold >= restoreThreshold && writeThreshold <= width,
     s"Random-Access Reed-Solomon writeThreshold ($writeThreshold) must fall within [$restoreThreshold, $width]")
   require(cellSize >= RandomAccessReedSolomon.TrailerSize,

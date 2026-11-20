@@ -41,7 +41,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Lost device CRL | Rebuild | A finished rebuild awaiting its flip (`rebuild-complete`) has never served, so it holds nothing in the device CRL and is not marked (`DeviceDiscovery.holdsOwnState`) |
 | Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit; a tree-learned resolution is reported `Unresolved` until finalized (`Tx.statusForExpiry`) |
 | Expiry tallies | Recovery | A reported `votedCommit` stands for a voter holding T's locks, or for a committed T (a tree-learned or not-owed resolution, whose locks are released) (2.1) |
-| Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a pass, or retried (2.2; X-W8) |
+| Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a pass, or retried (2.2) |
 | CRL admission | Host reconcile | A retained charge is released only once the records it covers have left the CRL or been counted again; the leftover drop releases only the charge it was issued for, unchanged since |
 | Systemic-loss protection | All of the above | Declarations of loss are independent and true (they are not checked; see that document) |
 
@@ -153,10 +153,11 @@ The premises other subsystems take from this:
   then loads the copy again. A failed
   `crl.loadStore` (`UnloadFailedStore`) is not retried, but it fails only with the CRL itself, whose failure unloads
   the device (`DeviceShutdown.crlFailed`). A store whose `config.yaml` cannot be read by `StoreLoader.tryLoadStore`
-  outside a retry, or whose load finds its executor slot still held (`HostThreading.AlreadyAssigned`), is left in
-  neither state (X-W8). This matters because `StoreCopies.release` deletes the superseded pending-delete copy once the
-  entry is Active, whether or not the new copy is served: a store left in neither state consumes one unit of the
-  pool's `w - t` margin until a restart.
+  (`awaitUnreadRetry`), or whose load finds its executor slot still held (`HostThreading.AlreadyAssigned`), is left
+  offline and in `storesAwaitingRetry` like a failed open, its `onServed` kept for the load that serves it. This
+  matters because `StoreCopies.release` deletes the superseded pending-delete copy once the entry is Active, whether
+  or not the new copy is served: a store left in neither state would consume one unit of the pool's `w - t` margin
+  until a restart.
 * A lost device CRL marks every store directory except those that held nothing in it (`DeviceDiscovery.holdsOwnState`):
   a store whose valid `crl_save.log` is its whole state, and a finished rebuild awaiting its flip (`rebuild-complete`),
   which `tryLoadStore` never serves, so its flip or the Completed Rebuilds pass loads it over the fresh CRL. A copy
@@ -366,27 +367,9 @@ Between a document, scaladoc or guide outside docs/safety and the code, open:
   (crash-recovery-log.md CRL-W10).
 * `server/store/backend/fsif/DESIGN.md` 4.6 says a failed open is retried only by a restart (systemic-loss-protection.md
   SL-W11).
-* `DeviceShutdown.reloadClosedStores` says a failed load leaves the store offline until a restart; a failed backend
-  open is retried (X-W8).
 
 ---
 
 ## Open weaknesses
 
-### X-W8: A store whose config cannot be read at load, or whose executor slot is still held, is left unserved and untracked
-Verdict PLAUSIBLE. Priority 4. Effort S. Concerns systemic-loss-protection.md and the host load paths.
-Mechanism: `StoreLoader.tryLoadStore` reads the store's `config.yaml` (`StoreConfig.loadStoreConfig`) inside a
-catch-all that only logs. A transient read error (EIO, EMFILE in a restart storm) on the device-load path
-(`DeviceDiscovery`), the Completed Transfers In and Completed Rebuilds passes (which remove their marker first, so
-they never select the store again), or `DeviceShutdown.reloadClosedStores` (offered once) leaves the store out of
-`loadedStores`, out of `offlineStores` on the device-load path, and out of `storesAwaitingRetry`. No pass or retry
-takes it up: every reconcile pass filters `offlineStores` by a marker, and the retry list never got an entry. The same
-holds for a LoadStore whose executor assignment fails with `HostThreading.AlreadyAssigned` (`StoreLoader.handleLoad`
--> `abandonLoad(replaced = false)`: offline, no retry), which needs a load racing the store's own unfinished close.
-`reloadClosedStores`' scaladoc says a failed load stays offline until a restart, which no longer holds for a failed
-backend open (retried).
-Consequence: the Active store is served by nobody until a restart, while `StoreCopies.release` has already deleted any
-superseded copy: one unit of the pool's `w - t` margin is used up.
-Fix: in `tryLoadStore`'s catch, and for `AlreadyAssigned`, record the store (its id parsed from the directory name)
-offline and in `storesAwaitingRetry`, whose `retryFailedLoads` already re-runs `tryLoadStore` and keeps the entry
-while the config read fails; correct the `reloadClosedStores` scaladoc.
+None.

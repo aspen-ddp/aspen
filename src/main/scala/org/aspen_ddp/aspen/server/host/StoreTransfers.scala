@@ -705,10 +705,9 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  in the caller, otherwise when its open, which runs off the control thread, has succeeded. A store whose open
    *  fails is not gossiped.
    *
-   *  If the load fails after the marker is gone, tryLoadStore's own catch logs it and the store
-   *  stays in offlineStores for the life of the process: this pass will not pick it up again,
-   *  since it keys off the marker that is now removed. The next restart loads it normally. That
-   *  is a far smaller failure than the permanent, silent one this pass exists to close.
+   *  If the load fails after the marker is gone, this pass will not pick it up again, since it
+   *  keys off the marker that is now removed: the store stays offline and the device scans retry
+   *  it (StoreLoader.storesAwaitingRetry), its gossip kept for the load that serves it.
    *
    *  Caller has established the tree entry and the marker.
    */

@@ -729,6 +729,8 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       assertAbandoned(fx, s0, sds, first)
       // The slot is the earlier holder's, so the failed load left it in place
       fx.onControl(fx.threading.assignedCounts.sum) should be(1)
+      // Retried at the device scans once the slot is free (X-W8)
+      fx.onControl(fx.ctx.loader.awaitingRetryHasCallback(s0)) should be(Some(false))
 
       fx.onControl(fx.threading.release(s0))
       val second = bootstrappedBackend(s0)

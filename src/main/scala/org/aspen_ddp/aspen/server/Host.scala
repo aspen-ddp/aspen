@@ -59,8 +59,9 @@ object Host:
   final case class StoreFailedOnClose(storeId: StoreId)
     extends Exception(s"Store $storeId failed on an I/O error while closing; it is marked for rebuild")
 
-  /** A store whose load failed with its data intact (out of space, a CRL that cannot admit its save file now, or any
-   *  other open failure but a lost state): retried once `scansLeft` more device scans have passed. Each failed retry
+  /** A store whose load failed with its data intact (out of space, a CRL that cannot admit its save file now, an
+   *  unreadable config, an executor slot an earlier close still holds, or any other open failure but a lost state):
+   *  retried once `scansLeft` more device scans have passed. Each failed retry
    *  doubles `waitScans`, up to the cap (LoadRetryCap in scans). `onServed` is the waiting load's tryLoadStore
    *  callback: the next open of the store (a retry or any other load) takes it over, and it is dropped with the entry
    *  if the store leaves the wait for any other reason. */

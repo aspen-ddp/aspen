@@ -683,6 +683,66 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.getStoreIds should contain(storeId)
       fsif(host).gossipedOnline should be(List(storeId))
 
+  // X-W8: a config read failure must not leave the store unserved and untracked until a restart
+  atest("a store whose config cannot be read is left offline and retried at the device scans until it loads"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    val cfg = os.read.bytes(storeDir / StoreConfig.configFilename)
+    os.write.over(storeDir / StoreConfig.configFilename, "not: [a store config")
+    load(host)
+    host.getStoreIds should not contain storeId
+    host.control.router.offlineStores should contain(storeId)
+    host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(false))
+
+    // Still unreadable: kept waiting
+    host.control.reconciler.scan()
+    host.testingOnlyHandleEvents()
+    host.getStoreIds should not contain storeId
+    host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(false))
+
+    os.write.over(storeDir / StoreConfig.configFilename, cfg)
+    // The failed retry doubled the wait: the first scan only counts it down
+    host.control.reconciler.scan()
+    host.testingOnlyHandleEvents()
+    host.getStoreIds should not contain storeId
+    host.control.reconciler.scan()
+    host.testingOnlyHandleEvents()
+    Future.successful:
+      host.getStoreIds should contain(storeId)
+      host.control.router.offlineStores should not contain storeId
+      host.control.loader.awaitingRetryHasCallback(storeId) should be(None)
+
+  atest("a reinstated store whose config cannot be read gossips StoreMoved once, when a retry serves it"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = deviceDir / storeId.directoryName
+    DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
+      storeDir / os.up / StoreCreation.CreatingDirectory)
+    os.write.over(storeDir / StoreTransfer.TransferOutMarkerFile, Array.emptyByteArray)
+    load(host) // skipped for its marker: offline
+    val cfg = os.read.bytes(storeDir / StoreConfig.configFilename)
+    os.write.over(storeDir / StoreConfig.configFilename, "not: [a store config")
+    fsif(host).deviceStates = Map(deviceA -> deviceState(deviceA,
+      Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+    host.control.reconciler.checkAll()
+    yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).map: _ =>
+      // The marker is gone, so only the retry can take the store up again
+      os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
+      host.control.router.offlineStores should contain(storeId)
+      host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(true))
+      fsif(host).gossipedOnline should be(Nil)
+
+      os.write.over(storeDir / StoreConfig.configFilename, cfg)
+      host.control.reconciler.scan()
+      host.testingOnlyHandleEvents()
+      host.getStoreIds should contain(storeId)
+      fsif(host).gossipedOnline should be(List(storeId))
+
   atest("a reinstated FSIF store whose first open is out of space gossips StoreMoved once, when a retry serves it"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)

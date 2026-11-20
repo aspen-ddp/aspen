@@ -340,7 +340,8 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  cancelled shutdown of it closed, once its entry is Active with no transfer named. A store whose
    *  directory has since gained a marker (rebuild-required, a transfer's) is left to the pass that
    *  owns that marker. One that is no longer offline here was loaded by something else. Each is
-   *  offered to tryLoadStore once; a load that fails leaves it offline until a restart loads it. */
+   *  offered to tryLoadStore once; a load that fails with its data intact leaves it offline and retried at the
+   *  device scans (StoreLoader.storesAwaitingRetry). */
   def reloadClosedStores(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     val deviceId = local.storageDeviceId
     closedForShutdown.get(deviceId).foreach: closed =>

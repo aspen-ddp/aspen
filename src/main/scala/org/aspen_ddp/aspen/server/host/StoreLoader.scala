@@ -33,8 +33,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   private def router = ctx.router
 
-  // Stores whose backend could not be opened with their data intact: their device is out of space, or the open
-  // failed for any reason but a lost state (an I/O error, a lock or resource error). Each is offline and unloaded,
+  // Stores whose load failed with their data intact: their device is out of space, the backend open failed for any
+  // reason but a lost state (an I/O error, a lock or resource error), the config could not be read, or no executor
+  // slot was free (HostThreading.AlreadyAssigned). Each is offline and unloaded,
   // and ScanDevices (every deviceScanPeriod, 10 s) tries the load again with an exponential backoff counted in
   // scans: next scan, then 2, 4, ... scans later, capped at LoadRetryCap. Each retry opens the store through
   // startOpen, never blocking the control thread. A store leaves this map when a load starts; a retry that fails the
@@ -115,7 +116,41 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         else
           startOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)
       catch
-        case t: Throwable => logger.warn(s"Failed to load store $potentialStoreFile. Error: $t")
+        case t: Throwable => awaitUnreadRetry(sds, potentialStoreFile, onServed, t)
+
+  /** A load that threw before any open started: its config could not be read (an I/O error, a resource limit, a
+   *  corrupt file) or a marker check failed. Unless the store is open or opening (an offer repeated over a served
+   *  store), it is left offline and put in storesAwaitingRetry, as a failed open is, so the device scans offer it to
+   *  tryLoadStore again with backoff. Without this, a load from a pass that removed its marker first (Completed
+   *  Transfers In, Completed Rebuilds) or that offers it once (device load, reloadClosedStores) would leave an Active
+   *  store unserved and untracked until a restart (cross-document-review 2.2). `onServed` is kept for the load that
+   *  serves it. A directory whose name is no store id is only logged. */
+  private def awaitUnreadRetry(sds: LocalStorageDeviceState, storePath: os.Path, onServed: Option[() => Unit],
+                               err: Throwable): Unit =
+    Try(StoreId(storePath.last)).filter(_.directoryName == storePath.last) match
+      case Failure(_) =>
+        logger.warn(s"Failed to load store $storePath. Error: $err")
+      case Success(storeId) if opening.contains(storeId) || router.get(storeId).isDefined =>
+        logger.warn(s"Failed to load store $storeId again over its open or opening copy: $storePath. Error: $err")
+      case Success(storeId) =>
+        val previous = storesAwaitingRetry.get(storeId)
+        val waitScans = previous.map(w => math.min(w.waitScans * 2, loadRetryCapScans)).getOrElse(1)
+        if previous.isDefined then
+          logger.debug(s"Store $storeId still cannot be loaded. Retrying in $waitScans device scans. Error: $err")
+        else
+          logger.warn(s"Store $storeId cannot be loaded: its config could not be read. Leaving it offline and " +
+                      s"retrying, with backoff. $storePath. Error: $err")
+        router.markOffline(storeId)
+        sds.offlineStores += storeId
+        storesAwaitingRetry += storeId -> LoadRetry(sds, storePath, waitScans, waitScans,
+          composeServed(previous.flatMap(_.onServed), onServed))
+
+  /** A waiting load's callback and a new load's, composed only when both are real callbacks, so retries without one
+   *  never nest */
+  private def composeServed(waiting: Option[() => Unit], current: Option[() => Unit]): Option[() => Unit] =
+    (waiting, current) match
+      case (Some(w), Some(c)) => Some(() => { w(); c() })
+      case _ => waiting.orElse(current)
 
   /** Whether the store's backend is being opened or created (startOpen) */
   private[host] def isOpening(storeId: StoreId): Boolean = opening.contains(storeId)
@@ -145,11 +180,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val storeId = storeCfg.storeId
     val previous = storesAwaitingRetry.get(storeId)
     storesAwaitingRetry -= storeId
-    // A load that failed for lack of space handed its callback to this open, which now runs it, once, if it serves
-    // the store. Composed only when both are real callbacks, so retries without one never nest
-    val servedCallback = (previous.flatMap(_.onServed), onServed) match
-      case (Some(waiting), Some(current)) => Some(() => { waiting(); current() })
-      case (waiting, current) => waiting.orElse(current)
+    // A load that failed with its data intact handed its callback to this open, which now runs it, once, if it
+    // serves the store
+    val servedCallback = composeServed(previous.flatMap(_.onServed), onServed)
     opening += storeId -> Nil
     openCounts += storeId -> (opensStarted(storeId) + 1)
     sds.loadedStores += storeId
@@ -357,8 +390,12 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         executor match
           case Failure(err) =>
             // HostThreading.AlreadyAssigned: an earlier close has not released its slot yet, and that slot is not
-            // this load's to free. assign made no placement, so there is nothing to release.
-            logger.error(s"Store $storeId cannot be loaded: no executor could be assigned to it. Error: $err")
+            // this load's to free. assign made no placement, so there is nothing to release. Retried at the next
+            // device scan, by when the close has normally released it
+            logger.error(s"Store $storeId cannot be loaded: no executor could be assigned to it. Leaving it offline " +
+                         s"and retrying at the device scans. Error: $err")
+            ctx.devices.devices.get(storageDeviceId).foreach: sds =>
+              storesAwaitingRetry += storeId -> LoadRetry(sds, backend.path, 1, 1)
             abandonLoad(storageDeviceId, backend, replaced = false, err, p)
           case Success(executor) =>
             // Everything up to install may throw (the Store constructor, the backend's setCompletionHandler). The

@@ -57,14 +57,6 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.1 [X-W8] A store whose config cannot be read at load, or whose executor slot is still held, is left unserved and
-    untracked. PLAUSIBLE. Effort S. cross-document-review.md.
-    StoreLoader.tryLoadStore's catch-all only logs a loadStoreConfig failure; AlreadyAssigned goes to abandonLoad with
-    no retry. Reached from device load, the Completed Transfers In and Completed Rebuilds passes (which remove their
-    marker first) and reloadClosedStores. The Active store stays unserved until a restart, using a unit of w - t.
-    Fix: record the store offline and in storesAwaitingRetry (retryFailedLoads already re-runs tryLoadStore); correct
-    the reloadClosedStores scaladoc.
-
 4.2 [RB-W14] A rebuild-complete removal whose unlink succeeded but whose directory sync failed leaves the store
     unserved until a restart. PLAUSIBLE. Effort S. rebuild-process.md.
     DurableFiles.remove unlinks, syncDirectory throws, clearRebuildCompleteMarker returns false and the copy is kept

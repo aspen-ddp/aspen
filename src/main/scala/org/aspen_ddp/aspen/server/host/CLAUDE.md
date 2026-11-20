@@ -29,7 +29,10 @@
   entry stays Initializing and the next device check creates it again. Any other failed open but a lost state (out of
   space, an I/O, lock or resource error) leaves the store offline, unmarked, and in `storesAwaitingRetry`: each
   device scan retries it with backoff (`StoreLoader.retryFailedLoads`, 1, 2, 4 ... scans, capped at
-  `Host.LoadRetryCap` 5 min), so an Active store is never left unserved and untracked until a restart.
+  `Host.LoadRetryCap` 5 min), so an Active store is never left unserved and untracked until a restart. A load that
+  throws before its open (an unreadable `config.yaml`, `StoreLoader.awaitUnreadRetry`) and one whose executor slot
+  an earlier close still holds (`HostThreading.AlreadyAssigned`) are left offline and retried the same way; a retry
+  keeps the waiting load's `onServed` (e.g. its `StoreMoved` gossip) for the open that serves it.
   `DeviceDiscovery` deletes `creating/` when it loads a device. Bootstrap (`cmdline`) creates its stores the same way (`DefaultBackendOpener.createStore`)
 - Store lifecycle: the control thread builds the `Store` and calls `router.install`, where ownership passes to the
   executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before

@@ -746,7 +746,12 @@ snapshot, so after the transaction committed, and by E1 reflects it. Any other c
 turned stale, so its entry stays for a pass that can end the guard. The release does not wait for the entry's
 completion gate (6.4), which concerns the entry's own misses, not the guard's transaction. The inherited-votes file
 stays while any guard does: a reload repeats the round and finds what is still guarded through the entries the guards
-kept. A repair that drops a guarded object (`repairDeletion`) ends no guard (RP-W10).
+kept. A guarded object whose deletion persists here, a committed refcount-zero update or a missed deletion repaired
+by `repairDeletion` (`Frontend.deleteObjectForRepair`), is never reconciled again (its reads fail), so its guard ends
+at the deletion instead (`inheritedGrowthDeleted`): a deleted object cannot grow, and the store can hold no copy of it
+lacking T's update. It is also dropped from what a later release guards, and a deletion that persists before the first
+round's scan answers is kept out of what the scan lists, since the entry the scan saw may be the one the deletion
+consumed. The work is three tests per deletion on a store never rebuilt.
 
 ---
 
@@ -907,21 +912,4 @@ its read threshold stalls the scan until the deadline.
 
 ## 14. Open weaknesses
 
-### RP-W10: A growth guard on a rebuilt store's KeyValue object that is deleted is never released, so the store keeps its inherited state and per-vote growth check until a reload
-Verdict CONFIRMED. Priority 5. Effort S.
-Mechanism: an entry of `Frontend.inheritedGrowthLocks` is removed only by `inheritedGrowthRepaired`, on a complete
-reconcile (10.3). A guarded object deleted before such a reconcile, by a transaction (a TKVL join deleting a node)
-or as a deletion the store missed, has its entry settled by a read that proves the deletion: `StoreRepairer`'s
-`repairListed` or `repairAbsent` calls `repairDeletion` (`Frontend.deleteObjectForRepair`), which bypasses
-`reconcileForRepair`, and no reconcile of the object can follow (its reads fail `InvalidObject`). An entry dropped
-that way between the scan's walk and `growthScanAnswered` leaves the same guard.
-Consequence: `holdsInheritedGrowthLocks` stays true, so every transaction the store votes on computes
-`RequirementsChecker.sliceGrowth` (`Tx`'s vote), the per-transaction cost the rare case was meant to confine to the
-window before repair, and `removeInheritedStateWhenDone` never removes the inherited-votes file. The store's next load
-then repeats the held-vote round: it votes abort on every object (`inheritedVoteLock` while `inheritedVotes` is None)
-and answers stale for every KeyValue repair until the round's growth scan, a walk of its whole range of both trees,
-answers. That round finds no entry for the deleted object and drops the guard. No data is at risk: the guard only
-refuses growth of an object that no longer exists.
-Fix: drop the object's guard, then `removeInheritedStateWhenDone()`, when `deleteObjectForRepair` completes and when a
-committed deletion of the object applies here (the refcount-zero commit). Each is behind the `holdsInheritedGrowthLocks`
-test, so a store never rebuilt pays one boolean test on a deletion only.
+None.

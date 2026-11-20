@@ -1546,6 +1546,65 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe false
   }
 
+  private def deleteForRepair(frontend: Frontend, oid: ObjectId): Unit =
+    val completion = Promise[Unit]()
+    frontend.deleteObjectForRepair(oid, ObjectPointer.EmptyArray, completion)
+    Await.result(completion.future, Duration(5, SECONDS))
+
+  test("a repaired missed deletion of a guarded object ends its growth guard") {
+    withInheritedVotes(): (frontend, query, dir) =>
+      query.autoScan = Some(Success(Set(oid2)))
+      frontend.retryHeldVoteQuery()
+      query.answer(Success(Nil))
+      frontend.inheritedGrowthLock(oid2) shouldBe true
+      deleteForRepair(frontend, oid2)
+      frontend.inheritedGrowthLock(oid2) shouldBe false
+      frontend.holdsInheritedGrowthLocks shouldBe false
+      os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe false
+  }
+
+  test("a committed deletion of a guarded object ends its growth guard") {
+    withInheritedVotes(): (frontend, query, dir) =>
+      query.autoScan = Some(Success(Set(oid2)))
+      frontend.retryHeldVoteQuery()
+      query.answer(Success(Nil))
+      withClue("a deletion grows nothing: "):
+        voteOn(frontend, txid1, List(RefcountUpdate(kvPtr, ObjectRefcount(1, 1), ObjectRefcount(2, 0)))) shouldBe
+          TransactionDisposition.VoteCommit
+      frontend.inheritedGrowthLock(oid2) shouldBe true
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false,
+        proof = false))
+      frontend.inheritedGrowthLock(oid2) shouldBe false
+      os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe false
+  }
+
+  test("an object deleted while the first round's growth scan runs is not guarded when it answers") {
+    withInheritedVotes(): (frontend, query, dir) =>
+      query.autoScan = None
+      frontend.retryHeldVoteQuery()
+      query.answer(Success(Nil))
+      // The scan walked the trees and listed the entry; the repair consumes it before the scan answers
+      deleteForRepair(frontend, oid2)
+      query.answerScan(Success(Set(oid2)))
+      frontend.inheritedVoteTransactions shouldBe Some(Set())
+      frontend.holdsInheritedGrowthLocks shouldBe false
+      os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe false
+  }
+
+  test("a scanned object deleted before its inherited transaction is released is not guarded at the release") {
+    withInheritedVotes(): (frontend, query, dir) =>
+      query.autoScan = Some(Success(Set(oid2)))
+      frontend.retryHeldVoteQuery()
+      query.answer(Success(List(HeldVote(inheritedTxid, ago(FiniteDuration(3, SECONDS)), Set(oid2)))))
+      frontend.inheritedGrowthLock(oid2) shouldBe true
+      deleteForRepair(frontend, oid2)
+      frontend.receiveTransactionMessage(TxResolved(storeId, StoreId(poolId, 1), inheritedTxid, committed = true,
+        late = false, proof = false))
+      frontend.inheritedVoteTransactions shouldBe Some(Set())
+      frontend.holdsInheritedGrowthLocks shouldBe false
+      os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe false
+  }
+
   test("a narrowed repair does not release a growth guard, and answers stale so the next pass is whole") {
     withInheritedVotes(): (frontend, query, _) =>
       query.autoScan = Some(Success(Set(oid2)))

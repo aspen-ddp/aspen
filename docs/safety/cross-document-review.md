@@ -316,13 +316,13 @@ The premises other subsystems take from this:
   every guarded object has an entry whatever T's outcome. A repair that cannot release a guard, or of a KeyValue
   object under the inherited-vote lock (every object until the round completes), answers stale, so the entry
   outlives the guard; the inherited-votes file stays while any guard does, and a reload repeats the round
-  (RebuiltVoterLockIntegrationSuite, FrontendSuite). A guarded object deleted before such a repair keeps its guard
-  until a reload (RP-W10). The scan's reads of the trees have no deadline (the held-vote query has
-  `Host.HeldVoteQueryDeadline`); every object stays under the inherited-vote lock until it answers, which it does
-  within the write-threshold margin: the trees' reads complete with `r` stores of the pool above, its marks are
-  `MissedUpdateMarker` batches written to commit in that pool, and any failure retries the round. The scan's key range
-  `[poolIndex, poolIndex + 1)` is never empty: every IDA's width is at most `IDA.MaxWidth` (127), so the bound
-  never wraps, and no two stores of a pool share an id.
+  (RebuiltVoterLockIntegrationSuite, FrontendSuite). A guarded object whose deletion persists (committed, or a
+  repaired missed deletion) has its guard end then, since no repair of it follows. The scan's reads of the trees
+  have no deadline (the held-vote query has `Host.HeldVoteQueryDeadline`); every object stays under the
+  inherited-vote lock until it answers, which it does within the write-threshold margin: the trees' reads complete
+  with `r` stores of the pool above, its marks are `MissedUpdateMarker` batches written to commit in that pool, and
+  any failure retries the round. The scan's key range `[poolIndex, poolIndex + 1)` is never empty: every IDA's width
+  is at most `IDA.MaxWidth` (127), so the bound never wraps, and no two stores of a pool share an id.
 
 ### 2.4 Repair and transactions on one object
 

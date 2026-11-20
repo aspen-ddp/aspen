@@ -67,15 +67,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.2 [RP-W10] A rebuilt store's growth guard on a KeyValue object that is then deleted is never released.
-    CONFIRMED. Effort S. repair-process.md.
-    inheritedGrowthLocks entries are removed only by inheritedGrowthRepaired on a complete reconcile; a deleted object
-    (TKVL join, missed deletion via repairDeletion / deleteObjectForRepair) is never reconciled again. Every vote then
-    computes RequirementsChecker.sliceGrowth (hot-path cost), the inherited-votes file is never removed, and each load
-    repeats the abort-everything round until the growth scan answers.
-    Fix: drop the guard and call removeInheritedStateWhenDone() when deleteObjectForRepair completes and when a
-    committed refcount-zero deletion applies, behind the holdsInheritedGrowthLocks test.
-
 5.3 [R-W10] After a lost TxFinalized, the store's own status-cache entry makes its recovery driver re-run T's actions.
     CONFIRMED. Effort S. transaction-recovery.md.
     Tx.resolved writes a non-finalized Committed into the host cache; with TxFinalized lost, the idle Tx's driver's

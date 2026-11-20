@@ -426,7 +426,8 @@ class Frontend(val storeId: StoreId,
   // from a snapshot taken after the guard was set (inheritedGrowthRepaired): that read began after T committed, so it
   // reflects T (repair-process.md E1). A repair that cannot release a guard, or of a KeyValue object under the
   // inherited-vote lock (every object until the first round completes), answers stale, so the entry stays for the
-  // repair that can: an entry consumed while the round runs could otherwise leave a guard no repair ever ends. Only
+  // repair that can: an entry consumed while the round runs could otherwise leave a guard no repair ever ends. A
+  // deleted object is never repaired again, so its guard ends when the deletion persists (inheritedGrowthDeleted). Only
   // KeyValue objects are guarded: a DataObject's updates form a revision chain each voter checked in full (R16). The
   // inherited-votes file stays while any guard does: a reload repeats the round, and finds what is still guarded by
   // the entries the guards keep.
@@ -437,6 +438,9 @@ class Frontend(val storeId: StoreId,
   /** The objects with entries against this store that the first round's scan found. An inherited transaction released
     * later guards only these: only they are sure to be repaired */
   private var inheritedGrowthScanned: Set[ObjectId] = Set()
+  /** Objects whose deletion persisted here before the first round's scan answered: the scan may list them, and no
+    * repair of them follows to end a guard (inheritedGrowthDeleted) */
+  private var inheritedGrowthDeletedEarly: Set[ObjectId] = Set()
   /** Counts repair snapshots (snapshotForRepair, RepairSnapshot.takenAt) */
   private var repairSnapshotSeq: Long = 0L
 
@@ -448,6 +452,20 @@ class Frontend(val storeId: StoreId,
 
   private def guardGrowth(oids: Iterable[ObjectId]): Unit =
     oids.foreach(oid => inheritedGrowthLocks += oid -> repairSnapshotSeq)
+
+  /** A deletion of `oid` persisted here: a committed refcount-zero update, or a repaired missed deletion. No repair of
+    * the object follows (its reads fail), so none would end its guard, and it can no longer grow: the guard ends now,
+    * and the object is guarded at no later release. Before the first round's scan answers, it is kept out of what the
+    * scan lists. Three tests on a store never rebuilt, on a deletion only */
+  private def inheritedGrowthDeleted(oid: ObjectId): Unit =
+    if inheritedVotes.isEmpty then
+      inheritedGrowthDeletedEarly += oid
+    else if inheritedGrowthScanned.nonEmpty || holdsInheritedGrowthLocks then
+      inheritedGrowthScanned -= oid
+      if inheritedGrowthLocks.contains(oid) then
+        inheritedGrowthLocks -= oid
+        logger.info(s"Store $storeId: object $oid is deleted, so no longer guarded against growth")
+        removeInheritedStateWhenDone()
 
   /** Removes the inherited-votes file once neither an inherited vote nor a growth guard is held */
   private def removeInheritedStateWhenDone(): Unit =
@@ -461,8 +479,10 @@ class Frontend(val storeId: StoreId,
     result match
       case Failure(err) =>
         logger.warn(s"Store $storeId: inherited-growth scan failed, retrying the held-vote round: $err")
-      case Success(objects) =>
+      case Success(listed) =>
         if inheritedVotes.isEmpty then
+          val objects = listed -- inheritedGrowthDeletedEarly
+          inheritedGrowthDeletedEarly = Set()
           if objects.nonEmpty then
             logger.info(s"Store $storeId: guarding ${objects.size} objects against growth until repaired " +
                         "(inherited growth)")
@@ -1982,6 +2002,7 @@ class Frontend(val storeId: StoreId,
               if f.deletes then
                 val n = deleting.getOrElse(c.objectId, 1) - 1
                 if n == 0 then deleting.remove(c.objectId) else deleting(c.objectId) = n
+                inheritedGrowthDeleted(c.objectId)
             case Right(err) =>
               // The state stays pinned and served, and a deletion keeps answering ObjectNotFound, while the store is
               // loaded: the store may have voted to commit at the write threshold, so it must neither lose the
@@ -2218,9 +2239,11 @@ class Frontend(val storeId: StoreId,
       deleting(objectId) = deleting.getOrElse(objectId, 0) + 1
       val done = Promise[Unit]()
       done.future.onComplete { result =>
-        post(() =>
+        post: () =>
           val n = deleting.getOrElse(objectId, 1) - 1
-          if n == 0 then deleting.remove(objectId) else deleting(objectId) = n)
+          if n == 0 then deleting.remove(objectId) else deleting(objectId) = n
+          if result.isSuccess then
+            inheritedGrowthDeleted(objectId)
         completion.complete(result)
       }(using scala.concurrent.ExecutionContext.parasitic)
       awaitAllocationsDurable(objectId): () =>

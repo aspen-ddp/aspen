@@ -139,7 +139,7 @@ discarded. A store path therefore never holds a partly initialized store, and `o
   `fsif-io-N`. Results are posted back to the serial executor. A store on `sharedIo` drains its serial executor on
   `sharedSerial`, `max(2, cpus)` threads named `fsif-serial-N`, so a device hung in fsync ties up io threads and
   not every store's serial work. Tests pass one deterministic EC for both.
-- **ENOSPC retries** are scheduled on `SharedRetryScheduler` (one `fsif-retry` thread).
+- **ENOSPC retries** are scheduled on `backend.SharedRetryScheduler` (one `backend-retry` thread, shared with RocksDB's read retry).
 - **Recovery runs synchronously in the constructor.** The host therefore runs the open or create on
   `DefaultBackendOpener.FsifOpenEc` (cached `fsif-open-N` threads), never on its control thread:
   `DefaultBackendOpener.open` returns a Future run on `FsifOpenEc`, and `StoreLoader.startOpen`, called on the

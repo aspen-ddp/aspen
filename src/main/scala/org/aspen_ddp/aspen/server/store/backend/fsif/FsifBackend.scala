@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.store.backend.fsif
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.util.UUID
-import java.util.concurrent.{Executors, ScheduledExecutorService, ThreadFactory, TimeUnit}
+import java.util.concurrent.{Executors, ThreadFactory}
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.mutable
@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, Ob
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitError, CommitState, CompletionHandler, Read,
-  RepairSlotOccupied, UpdateForm}
+  RepairSlotOccupied, RetryScheduler, SharedRetryScheduler, UpdateForm}
 
 /** A store backend that keeps every object slice in a fixed-size segment of one flat `data` file, located through an
   * in-memory index map that is journaled and checkpointed. See docs/superpowers/specs/2026-10-29-fsif-backend-design.md.
@@ -69,7 +69,7 @@ class FsifBackend(val storeId: StoreId,
                   io: ExecutionContext,
                   tuning: FsifTuning = FsifTuning(),
                   onFatal: Throwable => Unit = _ => (),
-                  scheduler: FsifBackend.RetryScheduler = FsifBackend.SharedRetryScheduler,
+                  scheduler: RetryScheduler = SharedRetryScheduler,
                   serialEc: Option[ExecutionContext] = None) extends Backend:
   import FsifBackend.*
 
@@ -1588,20 +1588,6 @@ class FsifBackend(val storeId: StoreId,
 
 object FsifBackend:
   private val Zero = ObjectId(new UUID(0, 0))
-
-  /** Runs a task once after a delay: the ENOSPC retry timer */
-  trait RetryScheduler:
-    def schedule(delay: FiniteDuration, task: Runnable): Unit
-
-  /** Host-wide retry timer: one daemon thread named fsif-retry */
-  object SharedRetryScheduler extends RetryScheduler:
-    private lazy val executor: ScheduledExecutorService =
-      Executors.newSingleThreadScheduledExecutor: r =>
-        val t = new Thread(r, "fsif-retry")
-        t.setDaemon(true)
-        t
-    def schedule(delay: FiniteDuration, task: Runnable): Unit =
-      executor.schedule(task, delay.toNanos, TimeUnit.NANOSECONDS)
 
   /** Draining: buffering, waiting for journal s to be durable. Header: buffering, header s+1 being written.
     * Applying: waiting for journal-s Deltas. Barrier: waiting for the records appended so far. Finishing: io for

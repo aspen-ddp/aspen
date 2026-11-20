@@ -8,18 +8,27 @@ import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
 import org.aspen_ddp.aspen.common.util.physicalMemory
-import org.rocksdb.{BlockBasedTableConfig, Cache, Env, LRUCache, Options, Priority, RocksDB, WriteBufferManager}
+import org.rocksdb.{BlockBasedTableConfig, Cache, Env, LRUCache, Options, Priority, RocksDB, RocksDBException, Status,
+  WriteBufferManager}
 import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.{Failure, Success}
-import scala.util.control.NonFatal
+import scala.concurrent.duration.*
+import scala.util.{Failure, Success, Try}
 import scala.language.implicitConversions
 
 object RocksDBBackend extends Logging {
 
   /** Thrown by `decodeDBValue` when a stored value does not have a valid encoding */
   class CorruptedObjectEncoding(msg: String) extends RuntimeException(msg)
+
+  /** Backoff before each retry of a read failing without a Corruption status: about 1.1 s in all, enough to ride out
+    * a start-up burst of EMFILE, ENOMEM or a transient EIO while every store of a host recovers at once */
+  val ReadRetryDelays: Seq[FiniteDuration] = Seq(10.millis, 100.millis, 1.second)
+
+  /** True for a RocksDB error that reports damaged data rather than a failure to read it */
+  def isCorruption(e: RocksDBException): Boolean =
+    Option(e.getStatus).exists(_.getCode == Status.Code.Corruption)
 
   val NullArray: Array[Byte] = new Array[Byte](0)
   val MetadataIndex:Byte = 0
@@ -209,7 +218,9 @@ object RocksDBBackend extends Logging {
 
 class RocksDBBackend(dbPath: os.Path,
                      override val storeId: StoreId,
-                     val executionContext: ExecutionContext) extends Backend {
+                     val executionContext: ExecutionContext,
+                     readRetryDelays: Seq[FiniteDuration] = RocksDBBackend.ReadRetryDelays,
+                     scheduler: RetryScheduler = SharedRetryScheduler) extends Backend {
 
   import RocksDBBackend._
   
@@ -256,39 +267,55 @@ class RocksDBBackend(dbPath: os.Path,
 
   override def rebuildFlush(): Unit = db.rebuildFlush()
 
-  override def read(pointer: ObjectPointer): Unit = {
-    val objectId = pointer.id
-    logger.debug(s"RocksDBBackend beginning load of object: $objectId")
+  /** Reads the stored value of a key. Overridable so tests may inject read failures. */
+  protected def getValue(key: Array[Byte]): Future[Option[Array[Byte]]] = db.get(key)
 
-    def fail(err: Throwable): Unit =
-      logger.error(s"RocksDBBackend failed to load object: $objectId. Error: $err")
-      chandler.foreach(_.complete(Read(storeId, objectId, Right(ReadError.CorruptedObject))))
+  /** Completes as `CorruptedObject` only on evidence of damage: a RocksDB Corruption status or a value that does not
+    * decode. Any other failure (an IOError, Busy, TryAgain or Incomplete status, EMFILE or ENOMEM surfacing as an
+    * exception, a throw while issuing) is retried after each of `readRetryDelays`, then reported as `CorruptedObject`
+    * too: a recovered commit vote fail-stops the store on it (D7), so one transient host condition must not. A read
+    * of a closed database is not retried.
+    */
+  override def read(pointer: ObjectPointer): Unit =
+    logger.debug(s"RocksDBBackend beginning load of object: ${pointer.id}")
+    attemptRead(pointer.id, readRetryDelays.toList)
 
-    try
-      db.get(tokey(objectId)).onComplete {
-        case Failure(err) => fail(err)
-        case Success(oresult) =>
-          chandler.foreach { handler =>
-            oresult match {
-              case None =>
-                logger.info(s"RocksDBBackend ObjectNotFound: $objectId")
-                handler.complete(Read(storeId, objectId, Right(ReadError.ObjectNotFound)))
-              case Some(value) =>
-                logger.debug(s"RocksDBBackend loaded object: $objectId")
-                try
-                  val (objectType, metadata, data) = decodeDBValue(value)
-                  val rs = ReadState(objectId, metadata, objectType, data, Set())
-                  handler.complete(Read(storeId, objectId, Left(rs)))
-                catch
-                  case e: RocksDBBackend.CorruptedObjectEncoding =>
-                    logger.error(s"RocksDBBackend found corrupted object $objectId: ${e.getMessage}")
-                    handler.complete(Read(storeId, objectId, Right(ReadError.CorruptedObject)))
-            }
-          }
-      }
-    catch
-      case NonFatal(err) => fail(err)
-  }
+  private def attemptRead(objectId: ObjectId, retries: List[FiniteDuration]): Unit =
+    def complete(result: Either[ReadState, ReadError.Value]): Unit =
+      chandler.foreach(_.complete(Read(storeId, objectId, result)))
+
+    def failed(err: Throwable): Unit = (err, retries) match
+      case (_: BufferedConsistentRocksDB.DBClosed, _) =>
+        logger.info(s"RocksDBBackend read of $objectId found the database closed")
+        complete(Right(ReadError.CorruptedObject))
+      case (e: RocksDBException, _) if isCorruption(e) =>
+        logger.error(s"RocksDBBackend found corrupted object $objectId: $e")
+        complete(Right(ReadError.CorruptedObject))
+      case (_, delay :: rest) =>
+        logger.warn(s"RocksDBBackend read of $objectId failed, retrying in $delay: $err")
+        scheduler.schedule(delay, () => attemptRead(objectId, rest))
+      case (_, Nil) =>
+        logger.error(s"RocksDBBackend failed to load object $objectId after ${readRetryDelays.size} retries: $err")
+        complete(Right(ReadError.CorruptedObject))
+
+    def decoded(oresult: Option[Array[Byte]]): Unit = oresult match
+      case None =>
+        logger.info(s"RocksDBBackend ObjectNotFound: $objectId")
+        complete(Right(ReadError.ObjectNotFound))
+      case Some(value) =>
+        Try(decodeDBValue(value)) match
+          case Success((objectType, metadata, data)) =>
+            logger.debug(s"RocksDBBackend loaded object: $objectId")
+            complete(Left(ReadState(objectId, metadata, objectType, data, Set())))
+          case Failure(e) =>
+            logger.error(s"RocksDBBackend found corrupted object $objectId: $e")
+            complete(Right(ReadError.CorruptedObject))
+
+    Try(getValue(tokey(objectId))) match
+      case Failure(err) => failed(err)
+      case Success(fget) => fget.onComplete:
+        case Failure(err) => failed(err)
+        case Success(oresult) => decoded(oresult)
 
   override def commit(state: CommitState, transactionId: TransactionId): Unit = {
     chandler.foreach { handler =>

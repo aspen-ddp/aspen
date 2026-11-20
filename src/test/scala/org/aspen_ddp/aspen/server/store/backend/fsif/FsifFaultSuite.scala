@@ -969,7 +969,7 @@ class FsifFaultSuite extends FileBasedTests:
 
 object FsifFaultSuite:
   /** Runs scheduled retries only when the test calls `tick()`, ignoring their delay */
-  final class ManualScheduler extends FsifBackend.RetryScheduler:
+  final class ManualScheduler extends org.aspen_ddp.aspen.server.store.backend.RetryScheduler:
     private val queue = new ConcurrentLinkedQueue[Runnable]()
     def schedule(delay: FiniteDuration, task: Runnable): Unit = queue.add(task)
     def pending: Int = queue.size

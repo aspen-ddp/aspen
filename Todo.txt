@@ -53,15 +53,6 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-3.1 [X-W14] A transient RocksDB read error at a recovered commit vote's object load is taken as corruption.
-    CONFIRMED. Effort S. cross-document-review.md.
-    RocksDBBackend.read maps every failure (IOError, Busy, TryAgain, Incomplete, ShutdownInProgress, a throw while
-    issuing, a decode error) to ReadError.CorruptedObject; Tx.objectLoadFailed fail-stops a recovered VoteCommit (D7)
-    and backendFailed marks the store rebuild-required. Likeliest at start-up (EMFILE, ENOMEM, transient EIO) when
-    many stores of a pool recover together: a correlated false declaration.
-    Fix: bounded retry with short backoff of non-Corruption exceptions in RocksDBBackend.read; map only a Corruption
-    status or a decode error to CorruptedObject.
-
 3.2 [CRL-W12] A CRL that dies while a store awaits its recovery read marks that store for rebuild.
     CONFIRMED. Effort S. crash-recovery-log.md.
     StoreRouter.readAndRecover fail-stops the store on any failed readStoreState; SimpleCRL answers from memory, so the

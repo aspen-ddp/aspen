@@ -467,20 +467,6 @@ Fix: wait only when the store is served or opening at B's path (`ctx.router.entr
 `local.devicePath / storeId.directoryName`, or `ctx.loader.isOpening`), as `retireForeignCopy` tests. Also check that
 `tryLoadStore`'s `router.markOffline(storeId)` on B's marked copy cannot mark A's served store offline.
 
-### X-W14: A transient RocksDB read error at a recovered commit vote's object load is taken as corruption and rebuilds the store
-Verdict CONFIRMED. Priority 3. Effort S.
-Mechanism: `RocksDBBackend.read` completes every failure (any `RocksDBException` status: IOError, Busy, TryAgain,
-Incomplete, ShutdownInProgress; a throw while issuing; a decode error) as `ReadError.CorruptedObject`.
-`Frontend.backendReadComplete` hands it to `Tx.objectLoadFailed`, which fail-stops a store whose writes are not frozen
-for a recovered `VoteCommit` with any error but `ObjectNotFound` (declaration D7): `Host.StoreFailStopped` ->
-`StoreRebuilds.backendFailed` marks `rebuild-required`. Start-up, when every recovery reads at once, is when EMFILE,
-ENOMEM or a transient EIO is likeliest.
-Consequence: an intact store is declared lost and rebuilt from one transient host condition, possibly several stores
-of one pool on a restarting host: margin lost for each rebuild, and a correlated declaration.
-Fix: in `RocksDBBackend.read`, retry a non-Corruption `RocksDBException` a few times with short backoff, and map only
-a Corruption status or a decode error to `CorruptedObject`; a persistent non-corruption error fail-stops as now. Failure
-path only.
-
 ### X-W15: A load's `onServed` gossip runs when its LoadStore is queued, before the store is served
 Verdict CONFIRMED. Priority 5. Effort S.
 Mechanism: `StoreLoader.handleBackendOpened` calls `serveOpened` (which only posts `LoadStore`) and then runs the

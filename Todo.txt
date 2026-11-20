@@ -53,17 +53,7 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-3.3 [X-W11] An Active entry whose store directory is missing on a loaded device is never served, rebuilt or reported.
-    CONFIRMED. Effort S. cross-document-review.md.
-    DeviceDiscovery.loadOwnedDevice offers only existing directories, every DeviceReconciler pass needs an offline
-    marker or a specific entry state, and entry/directory consistency is checked only at adoption (Unclean).
-    tryLoadStore skips a directory without config.yaml silently, retryFailedLoads drops a retry whose config vanished,
-    and an unreadable config is retried forever, logged at debug after the first warning. checkPoolsStayWritable
-    counts the store: one fault (a lost directory) silently and permanently costs a unit of margin, and the
-    entry keeps its CRL leftovers out of dropLeftoverCrlState.
-    Fix: a reconcile pass that, for such an entry (not loaded, opening, retiring or closed for shutdown), marks it
-    offline, drops its leftover device-CRL entries and calls StoreRebuilds.requestRebuild. Log a missing or
-    unreadable config at error, at most once per retry cap.
+(no open items)
 
 
 PRIORITY 4: liveness (hangs, stalls, livelocks)

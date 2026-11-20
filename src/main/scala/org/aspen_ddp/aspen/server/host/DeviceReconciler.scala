@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.Host
+import org.aspen_ddp.aspen.server.{Host, StoreConfig}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
@@ -68,8 +68,9 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       else Nil
     (loaded :+ m.deviceId).distinct.foreach(checkStorageDevice)
 
-  /** Drops the device-CRL entries of every store the device no longer holds: one its entry does not name, with no
-   *  directory on the device, not loaded and not being retired. Retiring a copy (StoreCopies.retire) drops them
+  /** Drops the device-CRL entries of every store the device no longer holds: one its entry does not name, or one in
+   *  `missing` (an Active entry with no store behind it, being rebuilt), with no directory on the device, not loaded
+   *  and not being retired. Retiring a copy (StoreCopies.retire) drops them
    *  before the copy leaves the store's path, so this is a safety net: for a directory removed by hand, or for
    *  entries a crash left behind when the drop came after the directory went. Left there, they would be copied forward forever, uncounted by admission, and
    *  recovered if the store ever came back. The CRL is what is read, not a list kept in memory, so a restart forgets
@@ -85,7 +86,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  charges its crl_save.log state under the same id (CrlAdmission.tryChargeLoaded) for records saved behind the drop,
    *  which the drop does not remove; its recovery releases the whole charge once it has counted them, so the records
    *  stay counted throughout (crash-recovery-log 6.1, A2). */
-  private def dropLeftoverCrlState(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+  private def dropLeftoverCrlState(local: LocalStorageDeviceState, remote: StorageDeviceState,
+                                   missing: Set[StoreId]): Unit =
     val deviceId = local.storageDeviceId
     val listed =
       try local.crl.storesWithEntries()
@@ -96,7 +98,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                      s"check. Error: $t")
       case Success(stores) =>
         def leftover(storeId: StoreId): Boolean =
-          !remote.stores.contains(storeId) && !local.loadedStores.contains(storeId) &&
+          (!remote.stores.contains(storeId) || missing.contains(storeId)) && !local.loadedStores.contains(storeId) &&
             !os.exists(local.devicePath / storeId.directoryName) && !crlDropsRunning.contains(storeId) &&
             !ctx.copies.isRetiring(storeId)
         // Only while the device is still loaded: an unloaded one's CRL is shut down
@@ -180,8 +182,32 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         // a marker into a retired directory. It stays offline (silent) until its copy has left its path.
         local.loadedStores -= storeId
         retireUnowned(local, storeId)
-      // Any entries a store transferred away left in the device CRL go too
-      dropLeftoverCrlState(local, remote)
+      //----------------------
+      // Missing Stores
+      //
+      // An Active entry with no store behind it: its directory, or the directory's config.yaml, is gone (a bad
+      // restore, a partial mount, a hand removal). No other pass sees such a store, since each starts from a
+      // directory, a marker or a transitional entry, and the pool counts it writable meanwhile: one fault would cost
+      // a unit of margin for good. It is silenced, its leftover device-CRL entries dropped below (a directory without
+      // a config keeps them: the rebuild's retire saves them into the copy), and a rebuild requested, whose
+      // Rebuilding pass retires whatever is at the path. A store served, opening or retiring has its directory, as
+      // does one a shutdown closed, so the first three are skipped only as a guard.
+      val missing = remote.stores.collect {
+        case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Active &&
+            !os.exists(local.devicePath / storeId.directoryName / StoreConfig.configFilename) &&
+            ctx.router.get(storeId).isEmpty && !local.loadedStores.contains(storeId) &&
+            !ctx.loader.isOpening(storeId) && !ctx.copies.isRetiring(storeId) =>
+          storeId
+      }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+      missing.foreach: storeId =>
+        logger.error(s"Store $storeId is Active on storage device ${local.storageDeviceId}, but " +
+                     s"${local.devicePath / storeId.directoryName} holds no store. Rebuilding it")
+        ctx.router.markOffline(storeId)
+        local.offlineStores += storeId
+        ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
+
+      // Any entries a store transferred away, or a missing one, left in the device CRL go too
+      dropLeftoverCrlState(local, remote, missing.toSet)
 
       //----------------------
       // Lost CRL State

@@ -32,7 +32,12 @@
   `Host.LoadRetryCap` 5 min), so an Active store is never left unserved and untracked until a restart. A load that
   throws before its open (an unreadable `config.yaml`, `StoreLoader.awaitUnreadRetry`) and one whose executor slot
   an earlier close still holds (`HostThreading.AlreadyAssigned`) are left offline and retried the same way; a retry
-  keeps the waiting load's `onServed` (e.g. its `StoreMoved` gossip) for the open that serves it.
+  keeps the waiting load's `onServed` (e.g. its `StoreMoved` gossip) for the open that serves it. An unreadable config
+  is logged at error once per retry cap. An Active entry on a loaded device with no `config.yaml` at its store path
+  (directory or config lost), not served, opening or retiring, is rebuilt by the reconcile's Missing Stores pass:
+  marked offline, `StoreRebuilds.requestRebuild`, and with no directory its device-CRL entries dropped as leftovers
+  (`dropLeftoverCrlState`'s `missing`); a configless directory keeps them for the rebuild's retire. Every load path
+  starts from a directory, so nothing else would notice it while the pool counted it writable.
   `DeviceDiscovery` deletes `creating/` when it loads a device. Bootstrap (`cmdline`) creates its stores the same way (`DefaultBackendOpener.createStore`)
 - Store lifecycle: the control thread builds the `Store` and calls `router.install`, where ownership passes to the
   executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before

@@ -614,6 +614,10 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
 
     for
+      // The device's other stores, which the TestNetwork serves elsewhere: directories here, so the reconcile does not
+      // take them for lost ones
+      sourceState <- state(sourceId)
+      _ = sourceState.stores.keysIterator.filter(_ != movingStore).foreach(writeStoreConfig(deviceDir, _))
       _ <- net.createSecondDevice()
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(movingStore, net.secondDeviceId)

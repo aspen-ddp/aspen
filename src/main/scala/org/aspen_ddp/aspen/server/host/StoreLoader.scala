@@ -117,6 +117,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           startOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)
       catch
         case t: Throwable => awaitUnreadRetry(sds, potentialStoreFile, onServed, t)
+    else if os.isDir(potentialStoreFile) && isStoreDirectoryName(potentialStoreFile) then
+      // Never a half-made store (creates, transfers and rebuilds move a store into place whole), so a store whose
+      // config was lost. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass
+      logger.error(s"Not loading $potentialStoreFile: it has no ${StoreConfig.configFilename}")
 
   /** A load that threw before any open started: its config could not be read (an I/O error, a resource limit, a
    *  corrupt file) or a marker check failed. Unless the store is open or opening (an offer repeated over a served
@@ -127,7 +131,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  serves it. A directory whose name is no store id is only logged. */
   private def awaitUnreadRetry(sds: LocalStorageDeviceState, storePath: os.Path, onServed: Option[() => Unit],
                                err: Throwable): Unit =
-    Try(StoreId(storePath.last)).filter(_.directoryName == storePath.last) match
+    storeIdOf(storePath) match
       case Failure(_) =>
         logger.warn(s"Failed to load store $storePath. Error: $err")
       case Success(storeId) if opening.contains(storeId) || router.get(storeId).isDefined =>
@@ -135,7 +139,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       case Success(storeId) =>
         val previous = storesAwaitingRetry.get(storeId)
         val waitScans = previous.map(w => math.min(w.waitScans * 2, loadRetryCapScans)).getOrElse(1)
-        if previous.isDefined then
+        if previous.exists(_.waitScans == loadRetryCapScans) then
+          // Once per cap interval: a config that stays unreadable leaves the store unserved
+          logger.error(s"Store $storeId still cannot be loaded: its config could not be read. Retrying in " +
+                       s"$waitScans device scans. $storePath. Error: $err")
+        else if previous.isDefined then
           logger.debug(s"Store $storeId still cannot be loaded. Retrying in $waitScans device scans. Error: $err")
         else
           logger.warn(s"Store $storeId cannot be loaded: its config could not be read. Leaving it offline and " +
@@ -144,6 +152,12 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         sds.offlineStores += storeId
         storesAwaitingRetry += storeId -> LoadRetry(sds, storePath, waitScans, waitScans,
           composeServed(previous.flatMap(_.onServed), onServed))
+
+  /** The store a directory's name identifies, if it is a store directory name */
+  private def storeIdOf(storePath: os.Path): Try[StoreId] =
+    Try(StoreId(storePath.last)).filter(_.directoryName == storePath.last)
+
+  private def isStoreDirectoryName(storePath: os.Path): Boolean = storeIdOf(storePath).isSuccess
 
   /** A waiting load's callback and a new load's, composed only when both are real callbacks, so retries without one
    *  never nest */
@@ -295,8 +309,12 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     storesAwaitingRetry.foreach: (storeId, wait) =>
       val deviceId = wait.sds.storageDeviceId
       if ! ctx.devices.devices.get(deviceId).exists(_ eq wait.sds) || router.get(storeId).isDefined ||
-         ! wait.sds.offlineStores.contains(storeId) || opening.contains(storeId) ||
-         ! os.exists(wait.storePath / StoreConfig.configFilename) then
+         ! wait.sds.offlineStores.contains(storeId) || opening.contains(storeId) then
+        storesAwaitingRetry -= storeId
+      else if ! os.exists(wait.storePath / StoreConfig.configFilename) then
+        // Nothing left to load. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass
+        logger.error(s"Store $storeId awaiting a load retry no longer has a ${StoreConfig.configFilename} at " +
+                     s"${wait.storePath}. Dropping the retry")
         storesAwaitingRetry -= storeId
       else if wait.scansLeft > 1 then
         storesAwaitingRetry += storeId -> wait.copy(scansLeft = wait.scansLeft - 1)

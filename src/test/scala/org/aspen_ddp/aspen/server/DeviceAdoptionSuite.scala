@@ -105,11 +105,9 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
     given ExecutionContext = executionContext
     client.getStoragePoolState(storeId.poolId).map(_.stores(storeId.poolIndex))
 
-  /** A store directory as the shutdown leaves it: plain, its state in the device's CRL. */
+  /** A store directory as the shutdown leaves it: plain (its config only), its state in the device's CRL. */
   private def writeClosedStore(deviceDir: os.Path, storeId: StoreId): os.Path =
-    val dir = deviceDir / storeId.directoryName
-    os.makeDir.all(dir)
-    dir
+    writeStoreConfig(deviceDir, storeId)
 
   /** A store directory as a network transfer out leaves it: a transfer-out marker and a CRL save file. */
   private def writeTransferringOutStore(deviceDir: os.Path, storeId: StoreId): os.Path =
@@ -155,6 +153,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
                                  owningHost: HostId): (os.Path, os.Path) =
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = Some(owningHost))
+    // The CRL its stores' state lives in, which every carried device that holds stores has
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
     DeviceMarkers.writeShutdownState(deviceDir, markerHost)
     (hostRoot, deviceDir)
 
@@ -299,7 +299,9 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
    *  `shutdown.state`. */
   private def writePulledDevice(owningHost: HostId): (os.Path, os.Path) =
     val hostRoot = newHostDir()
-    (hostRoot, writeDevice(hostRoot, "dev0", deviceA, owner = Some(owningHost)))
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = Some(owningHost))
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
+    (hostRoot, deviceDir)
 
   atest("a device pulled from its host without a shutdown is adopted"):
     given ExecutionContext = executionContext
@@ -528,7 +530,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
       _ = writeClosedStore(deviceDir, s0)
       d1 = deviceDir / s1.directoryName
-      _ = os.makeDir.all(d1)
+      _ = writeStoreConfig(deviceDir, s1)
       _ = os.write.over(d1 / StoreTransfer.TransferredInMarkerFile, "")
       host = newHost(hostRoot)
       _ <- resolve(host)
@@ -572,8 +574,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       _ = recorded(oldHost).fireShutdownWorkTimeouts()
       _ <- pumpUntil(!loadedDevices(oldHost).contains(deviceA))
       // The rebuild, past its last read, lands its store and finishes on the unloaded device.
-      d0Old = oldDir / s0.directoryName
-      _ = os.makeDir.all(d0Old)
+      d0Old = writeStoreConfig(oldDir, s0)
       _ = RebuildingStore.writeEmptyCrlState(d0Old, s0)
       _ = rebuilds.created.head.promise.success(())
       _ <- pumpUntil(os.exists(d0Old / StoreTransfer.TransferOutMarkerFile))
@@ -695,6 +696,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       hostRoot = newHostDir()
       host = newHost(hostRoot)
       deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = Some(oldHostId))
+      _ = os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
       _ = DeviceMarkers.writeShutdownState(deviceDir, oldHostId)
       _ = writeClosedStore(deviceDir, s0)
       _ = if closeLast then writeClosedStore(deviceDir, s1)

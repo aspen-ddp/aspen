@@ -43,7 +43,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Lost device CRL | Rebuild | A finished rebuild awaiting its flip (`rebuild-complete`) has never served, so it holds nothing in the device CRL and is not marked (`DeviceDiscovery.holdsOwnState`) |
 | Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit; a tree-learned resolution is reported `Unresolved` until finalized (`Tx.statusForExpiry`) |
 | Expiry tallies | Recovery | A reported `votedCommit` stands for a voter holding T's locks, or for a committed T (a tree-learned or not-owed resolution, whose locks are released) (2.1) |
-| Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a pass, or retried (2.2); one whose directory is missing is noticed by nothing (X-W11) |
+| Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a pass, or retried (2.2); one whose directory or config is missing is rebuilt (2.2) |
 | CRL admission | Host reconcile | A retained charge is released only once the records it covers have left the CRL or been counted again; the leftover drop releases only the charge it was issued for, unchanged since |
 | Systemic-loss protection | All of the above | Declarations of loss are independent and true (they are not checked; see that document) |
 
@@ -165,12 +165,17 @@ The premises other subsystems take from this:
   the device (`DeviceShutdown.crlFailed`). A store whose `config.yaml` cannot be read by `StoreLoader.tryLoadStore`
   (`awaitUnreadRetry`), or whose load finds its executor slot still held (`HostThreading.AlreadyAssigned`), is left
   offline and in `storesAwaitingRetry` like a failed open, its `onServed` kept for the load that serves it (a
-callback that already ran at backend open is not kept: it runs before the store is installed, X-W15). Nothing notices
-an Active entry whose store directory is missing on a loaded device, and a directory without a `config.yaml` is
-skipped silently (X-W11). This
+callback that already ran at backend open is not kept: it runs before the store is installed, X-W15). An Active
+entry on a loaded device with no `config.yaml` at its store path (the directory lost to a bad restore, a partial mount
+or a hand removal, or its config gone), not served, opening or retiring, is found by the reconcile's Missing Stores
+pass (`DeviceReconciler.reconcileDeviceState`): the store is marked offline, a rebuild requested
+(`StoreRebuilds.requestRebuild`), and, with no directory left, its device-CRL entries dropped as leftovers
+(`dropLeftoverCrlState`); a directory without a config keeps them for the rebuild's retire to save into the copy.
+`tryLoadStore` logs a store directory without a config at error, and an unreadable config is logged at error once per
+retry cap. This
   matters because `StoreCopies.release` deletes the superseded pending-delete copy once the entry is Active, whether
   or not the new copy is served: a store left in neither state would consume one unit of the pool's `w - t` margin
-  until a restart.
+  for good.
 * A lost device CRL marks every store directory except those that held nothing in it (`DeviceDiscovery.holdsOwnState`):
   a store whose valid `crl_save.log` is its whole state, and a finished rebuild awaiting its flip (`rebuild-complete`),
   which `tryLoadStore` never serves, so its flip or the Completed Rebuilds pass loads it over the fresh CRL. A copy
@@ -436,24 +441,6 @@ Between a document, scaladoc or guide outside docs/safety and the code, open: X-
 ---
 
 ## Open weaknesses
-
-### X-W11: An Active entry whose store directory is missing on a loaded device is never served, rebuilt or reported
-Verdict CONFIRMED. Priority 3. Effort S.
-Mechanism: `DeviceDiscovery.loadOwnedDevice` offers only directories that exist to `StoreLoader.tryLoadStore`, and
-every `DeviceReconciler.reconcileDeviceState` pass that loads or rebuilds a store needs an `offlineStores` member with
-a marker, an Initializing, TransferringIn or Rebuilding entry, or a shutdown's closed store. Entry-versus-directory
-consistency is checked only at adoption (`DeviceDiscovery.adoptionClass`, Unclean). A directory lost by a bad
-restore, a partial mount or a hand removal leaves an Active (or Offline) entry
-with nothing behind it. `tryLoadStore` also skips a directory without `config.yaml` with no log and no
-`offlineStores` entry, and `retryFailedLoads` drops a retry whose `config.yaml` vanished; an unreadable one is retried
-forever, logged at `debug` after the first warning.
-Consequence: the pool counts the store writable (`checkPoolsStayWritable`) while nothing serves it: a silent,
-permanent loss of one unit of margin from one fault, and the entry keeps the store's device-CRL entries out of
-`dropLeftoverCrlState` (a rebuilt copy's first load drops them).
-Fix: add a reconcile pass: an Active or Offline entry on a loaded device with no directory, not loaded, opening,
-retiring or closed for shutdown, is marked offline, its leftover device-CRL entries dropped, and a rebuild requested
-(`StoreRebuilds.requestRebuild`). Log a directory without a config, and a config retry at each cap interval, at error.
-Rare path only.
 
 ### X-W13: A transfer between two devices of one host onto a path holding an earlier tenancy's copy never starts
 Verdict CONFIRMED. Priority 4. Effort S.

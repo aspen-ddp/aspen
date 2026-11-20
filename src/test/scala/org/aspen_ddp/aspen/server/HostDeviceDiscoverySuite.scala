@@ -353,7 +353,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     host.control.reconciler.activeDeviceChecks should be(Set(deviceA))
 
     // The config appears and a later event loads the device while the lookup is outstanding.
-    writeDevice(hostRoot, "dev0", deviceA)
+    writeStoreConfig(writeDevice(hostRoot, "dev0", deviceA), storeId)
     host.control.reconciler.checkAll()
     loadedDevices(host).keySet should be(Set(deviceA))
 

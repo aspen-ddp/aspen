@@ -2082,6 +2082,64 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       leftInCrl should be(Set())
       heldOnDisk(deviceDir, storeId) should be(Set())
 
+  atest("an Active store whose directory is missing is silenced, its device-CRL entries dropped, and rebuilt (X-W11)"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      // The directory is lost (a bad restore, a hand removal) while the entry still reads Active
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      _ = os.remove.all(storeDir)
+      restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
+      crl = second.opened.head
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty && crl.dropDone.isCompleted)
+      state <- client.getStorageDeviceState(deviceA)
+      leftInCrl = held(crl, storeId)
+      silenced = restarted.control.router.isOffline(storeId)
+      _ = second.shutdownAll()
+    yield
+      rebuilds.created.map(_.storeId).toList should be(List(storeId))
+      state.stores.get(storeId).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      silenced should be(true)
+      leftInCrl should be(Set())
+
+  atest("an Active store whose directory lost its config is rebuilt, its copy retired with its CRL state (X-W11)"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      _ = os.remove(storeDir / StoreConfig.configFilename)
+      restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
+      crl = second.opened.head
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
+      state <- client.getStorageDeviceState(deviceA)
+      leftInCrl = held(crl, storeId)
+      pendingDir = deviceDir / RebuildingStore.PendingDeleteDirectory
+      retired = if os.exists(pendingDir) then os.list(pendingDir).toList else Nil
+      _ = second.shutdownAll()
+    yield
+      rebuilds.created.map(_.storeId).toList should be(List(storeId))
+      state.stores.get(storeId).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      os.exists(storeDir) should be(false)
+      retired should have size 1
+      os.exists(retired.head / RebuildingStore.LostCrlStateFile) should be(true)
+      leftInCrl should be(Set())
+
   atest("a leftover drop releases only the charge it was issued for, not that of a store landing meanwhile"):
     given ExecutionContext = executionContext
     val first = newFactory()

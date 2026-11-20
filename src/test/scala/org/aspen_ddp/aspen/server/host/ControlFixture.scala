@@ -5,7 +5,9 @@ import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, 
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.server.{DeviceMarkers, GossipRetransmitter, Host, StorageDeviceConfig, StorageDeviceManager}
+import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.server.{DeviceMarkers, GossipRetransmitter, Host, StorageDeviceConfig, StorageDeviceManager,
+  StoreConfig}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome, TransferOutcome}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
@@ -447,6 +449,16 @@ trait ControlFixture:
     os.write.over(deviceDir / StorageDeviceConfig.configFilename,
       StorageDeviceConfig(deviceId, sysId, crlFileSizeMb = Some(1)).yamlConfig)
     owner.foreach(DeviceMarkers.writeOwningHost(deviceDir, _))
+
+  /** A store directory for `storeId` holding only its config, as every real store directory holds one. The recording
+   *  tryLoadStore loads nothing, so an Active entry over a directory without a config is taken for a lost store by
+   *  the reconcile's Missing Stores pass and rebuilt. */
+  protected def writeStoreConfig(deviceDir: os.Path, storeId: StoreId): os.Path =
+    val dir = deviceDir / storeId.directoryName
+    os.makeDir.all(dir)
+    os.write.over(dir / StoreConfig.configFilename,
+      StoreConfig(storeId, StoreConfig.RocksDB(None), None, Replication(3, 2)).yamlConfig)
+    dir
 
   private final class Rig(val seams: RecordingSeams, val scheduler: ManualControlScheduler)
 

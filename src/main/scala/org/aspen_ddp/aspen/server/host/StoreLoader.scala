@@ -95,7 +95,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val storeCfgPath = potentialStoreFile / StoreConfig.configFilename
     // Every existence test here is FileStat's: a stat that fails is no absence. A marker taken as absent would load a
     // store it must keep offline, so a failed stat takes the unreadable-config retry like a failed read
-    //
     val hasConfig =
       try Right(FileStat.exists(storeCfgPath))
       catch case NonFatal(t) => Left(t)
@@ -105,7 +104,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         try
           val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath)
           val storeId = storeCfg.storeId
-          val blocker = StoreDirMarkers.blocker(potentialStoreFile)
+          import StoreDirMarkers.Marker.*
+          val blocker = StoreDirMarkers.firstPresent(potentialStoreFile,
+            RebuildRequired, TransferOut, TransferredIn, RebuildComplete)
           if blocker.isDefined then
             blocker.get match
               case StoreDirMarkers.Marker.RebuildRequired =>
@@ -554,7 +555,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 abandonLoad(storageDeviceId, backend, replacing.isDefined, err, p)
               // A crl_save.log state is charged, checked, before any of it is saved (crash-recovery-log 6.1).
               // Retained for the store, the charge is swapped for its recovery's own count (Frontend.recoverState),
-              // as what the device's open or its last close retained is: the store's records are never uncounted
+              // as what the device's open or its last close retained is: the store's records are never uncounted.
               // Charged here, after the build, so no later failure of the load leaves it charged: a failed
               // loadStore drops the store's entries and releases what is retained for it (handleUnloadFailed)
               case Success(entry) if !trs.forall(state => entry.store.frontend.admission.tryChargeLoaded(storeId,

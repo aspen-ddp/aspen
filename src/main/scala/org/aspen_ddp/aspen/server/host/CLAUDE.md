@@ -9,10 +9,10 @@
   (retire, release and rename-first delete of store copies) and `LocalDevices` (the loaded devices). `StoreRouter`,
   `StoreThreadPool`/`StoreMailbox`/`StoreBalancer` and `HostStoreView` are the store-side and cross-thread pieces
 - `StoreDirMarkers` is the single source for the marker files a store directory carries (`rebuild-required`,
-  `transferred-in`, `transferring-out`, `rebuild-complete`) and for which wins when several are present
-  (`StoreDirMarkers.blocker`, in that order). Its tests are FileStat's: `has` throws on a failed stat, `knownPresent`
+  `transferred-in`, `transferring-out`, `rebuild-complete`) and `firstPresent`, which stats a
+  caller's markers in the caller's priority order (`tryLoadStore` and `adoptionClass` each list their own). Its tests are FileStat's: `has` throws on a failed stat, `knownPresent`
   answers false for a pass that waits for a later one. `tryLoadStore`, `adoptionClass` and the marker tests go through it
-- `DeviceControl.markStoreOffline`/`clearStoreOffline` keep the router's offline mark and the device's
+- `DeviceControl.markStoreOffline` keeps the router's offline mark and the device's
   `offlineStores` together; `LocalDevices.isLoaded(sds)` says whether a device state is still the loaded one
 
 ### Host threading model

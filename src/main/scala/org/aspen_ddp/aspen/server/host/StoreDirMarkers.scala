@@ -4,11 +4,11 @@ import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 
-/** The marker files a store directory can carry, and the one place that says which wins when several are present.
- *  Every test is FileStat's: a stat that fails is never taken for an absence. */
+/** The marker files a store directory can carry. Every test is FileStat's: a stat that fails is never taken for an
+ *  absence. */
 object StoreDirMarkers:
 
-  /** A marker that keeps a store from being loaded. Declared in priority order: `blocker` returns the first present.
+  /** A marker that keeps a store from being loaded:
    *   - RebuildRequired: its CRL state is gone, so it awaits a rebuild
    *   - TransferredIn: it arrived from another host and awaits its pool update
    *   - TransferOut: it is marked for transfer out; its state travels in crl_save.log
@@ -28,6 +28,7 @@ object StoreDirMarkers:
   def knownPresent(storePath: os.Path, marker: Marker): Boolean =
     FileStat.existence(storePath / marker.fileName).contains(true)
 
-  /** The highest-priority marker in `storePath`, if any. Throws the stat's error when that cannot be told */
-  def blocker(storePath: os.Path): Option[Marker] =
-    Marker.values.find(has(storePath, _))
+  /** The first of `markers`, in the caller's priority order, that `storePath` carries. Stats them in that order,
+   *  stopping at the first present, and throws the stat's error when that cannot be told */
+  def firstPresent(storePath: os.Path, markers: Marker*): Option[Marker] =
+    markers.find(has(storePath, _))

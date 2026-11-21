@@ -322,7 +322,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     if !FileStat.isDir(storePath) then
       AdoptionClass.Unclean
     else
-      StoreDirMarkers.blocker(storePath) match
+      import StoreDirMarkers.Marker.*
+      StoreDirMarkers.firstPresent(storePath, RebuildRequired, TransferredIn, TransferOut) match
         case Some(StoreDirMarkers.Marker.RebuildRequired) =>
           AdoptionClass.CrlLost
         case Some(StoreDirMarkers.Marker.TransferOut) =>

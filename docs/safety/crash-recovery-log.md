@@ -205,8 +205,10 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
 1. The device's CRL is opened before any of its stores are offered for loading (`DeviceDiscovery.loadOwnedDevice`,
    `openDeviceCrl`), on the control thread.
 2. `StoreLoader.handleLoad` reads the store's `crl_save.log`, if any, before the `Store` exists. An unusable
-   one (`loadValidStoreState` returns `Left` for anything thrown, including transient errors) makes the store
-   permanently unservable (`StoreRebuilds.crlSaveFileLost`). Whether there is one is asked of `server.FileStat`: a
+   one (`loadValidStoreState` returns `Left` for a file missing, cut short, unparsable or another store's) makes the
+   store permanently unservable (`StoreRebuilds.crlSaveFileLost`). A read that fails without saying anything of the
+   content (`CrashRecoveryLog.isUnreadable`: an I/O or VM error other than a missing file or bytes that do not parse)
+   is thrown instead, and the load held back and retried as below. Whether there is one is asked of `server.FileStat`: a
    stat that fails is no absence, and the load is held back and retried with backoff (`awaitUnreadRetry`), as it is
    for an incarnation file that cannot be stat'd or read. Taken as absent, the store would recover from a device CRL
    holding none of its state, and the file, still there, would have the next load drop everything saved since.
@@ -1287,8 +1289,7 @@ at `writeHead`'s `require`, which only a bug can reach.
 - A hung device hangs its CRL and the host's shutdown of it (Backlog.txt, "Isolate every device's I/O").
 - A lost CRL rebuilds every store on the device from local evidence, including after three transient open failures;
   `crl.lost-*` is kept but never used (Backlog.txt, "System-level protection against correlated lost store
-  declarations", S13, S7/Q1). `loadValidStoreState` likewise treats any throw, transient or not, as a lost
-  `crl_save.log` (`crlSaveFileLost`), under the same Backlog item.
+  declarations", S13, S7/Q1).
 - An `ENOSPC` on a copy-on-write file system kills the CRL rather than freezing writes (Backlog.txt, "Full storage
   devices").
 - `CrlLock` does not fence two hosts mounting shared storage (systemic-loss-protection.md).

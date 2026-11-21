@@ -228,6 +228,23 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(CrashRecoveryLog.loadValidStoreState(savePath, storeId).isLeft)
   }
 
+  test("loadValidStoreState throws, rather than reports an unusable file, when the file cannot be read (SL-W18)") {
+    val savePath = tdir / "crl_save_file.log"
+    CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState(List(trsValidTxd)), savePath)
+    // Its stat succeeds and its open fails (EACCES): a read error that says nothing of its content
+    os.perms.set(savePath, "---------")
+    try
+      val err = intercept[java.io.IOException](CrashRecoveryLog.loadValidStoreState(savePath, storeId))
+      assert(CrashRecoveryLog.isUnreadable(err))
+    finally
+      os.perms.set(savePath, "rw-------")
+    assert(CrashRecoveryLog.loadValidStoreState(savePath, storeId) == Right(StoreRecoveryState(List(trsValidTxd))))
+    // A missing file and bytes that do not parse are what the file holds, on every read
+    assert(!CrashRecoveryLog.isUnreadable(new java.nio.file.NoSuchFileException("x")))
+    assert(!CrashRecoveryLog.isUnreadable(new com.google.protobuf.InvalidProtocolBufferException("x")))
+    assert(CrashRecoveryLog.isUnreadable(new OutOfMemoryError()))
+  }
+
   test("SimpleCRL Drop Transaction Data") {
     val queue = new LinkedBlockingQueue[String]()
 

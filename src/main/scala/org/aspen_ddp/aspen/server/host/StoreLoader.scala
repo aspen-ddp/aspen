@@ -407,15 +407,21 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val incarnation =
       if failed then Failure(new IllegalStateException("not read")) else
         Try(StoreIncarnationFile.load(backend.path, backend.storeId))
-    val savedState =
+    // The save file's content, or the error of a read that says nothing of it (CrashRecoveryLog.isUnreadable: EIO,
+    // EMFILE, out of memory), which holds the load back as a failed stat does rather than declare the state lost
+    val savedRead: Either[Throwable, Either[Exception, Option[StoreRecoveryState]]] =
+      if failed || !hasSaveFile.getOrElse(false) then
+        Right(Right(None))
+      else
+        try Right(CrashRecoveryLog.loadValidStoreState(backend.crlSaveFile, backend.storeId).map(Some(_)))
+        catch case t: Throwable => Left(t)
+    val savedState: Either[Exception, Option[StoreRecoveryState]] =
       if failed then
         // Failed-stop between its open and this event. Its BackendFailed found nothing to
         // unload, or will, so it is retired here.
         Left(new java.io.IOException(s"the backend of store ${backend.storeId} failed before it was served"))
-      else if hasSaveFile.getOrElse(false) then
-        CrashRecoveryLog.loadValidStoreState(backend.crlSaveFile, backend.storeId).map(Some(_))
       else
-        Right(None)
+        savedRead.getOrElse(Right(None))
 
     // Why the saved state can never fit its device's CRL, if it cannot
     val neverFitsReason = (savedState, deviceCrl) match
@@ -429,11 +435,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         router.clearLoading(backend.storeId)
         p.failure(err)
 
-      case _ if hasSaveFile.isFailure || incarnation.failed.toOption.exists(e =>
+      case _ if hasSaveFile.isFailure || savedRead.isLeft || incarnation.failed.toOption.exists(e =>
           !e.isInstanceOf[StoreIncarnationFile.IncarnationLost]) =>
         // Not known to be gone, only unread: left offline, its files untouched, and retried with backoff as an
         // unreadable config is. A reload over a served store leaves that store serving
-        val err = hasSaveFile.failed.toOption.orElse(incarnation.failed.toOption).get
+        val err = hasSaveFile.failed.toOption.orElse(savedRead.left.toOption).orElse(incarnation.failed.toOption).get
         val replaced = router.entry(backend.storeId).isDefined
         if replaced then
           logger.warn(s"Not reloading store ${backend.storeId}: its save file or incarnation file could not be read. " +

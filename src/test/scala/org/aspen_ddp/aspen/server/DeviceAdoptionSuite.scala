@@ -295,6 +295,32 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
         writeTransferringOutStore(dir / os.up, s)
         corrupt(Backend.crlSaveFile(dir), s)
 
+  atest("a transferring-out store whose save file cannot be read fails the adoption for a later scan (SL-W18)"):
+    given ExecutionContext = executionContext
+    val rebuilds = new RecordingRebuildFactory
+    for
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 1, registerOldHost = true): ss =>
+                  Map(ss(0) -> offline)
+      s0 = stores.head
+      (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
+      d0 = writeTransferringOutStore(deviceDir, s0)
+      // Its stat succeeds and its open fails (EACCES): a read error that says nothing of its content
+      _ = os.perms.set(Backend.crlSaveFile(d0), "---------")
+      host = newHost(hostRoot, storeRebuildFactory = rebuilds)
+      _ <- resolve(host)
+      whileUnreadable <- state(deviceA)
+      markedWhileUnreadable = os.exists(d0 / RebuildingStore.RebuildRequiredMarkerFile)
+      _ = os.perms.set(Backend.crlSaveFile(d0), "rw-------")
+      _ <- scanAndResolve(host)
+      st <- state(deviceA)
+    yield
+      whileUnreadable.hostId should be(oldHostId)
+      markedWhileUnreadable should be(false)
+      st.hostId should be(HostId.BootstrapHostId)
+      st.stores(s0).status should not be(StoreStatus.Rebuilding)
+      os.exists(d0 / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      rebuilds.created should be(empty)
+
   /** The device directory as pulled from its host without a shutdown: `owning-host` naming `owningHost`, and no
    *  `shutdown.state`. */
   private def writePulledDevice(owningHost: HostId): (os.Path, os.Path) =

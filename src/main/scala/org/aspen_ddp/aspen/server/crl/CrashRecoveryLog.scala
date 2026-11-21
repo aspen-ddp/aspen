@@ -110,9 +110,19 @@ object CrashRecoveryLog:
   class InvalidSaveFile(path: os.Path, reason: String)
     extends Exception(s"CRL save file $path is unusable: $reason")
 
+  /** Whether `t`, thrown reading a save file, leaves its content unknown rather than shows it unusable: an I/O error
+   *  or a VM error (EIO, EMFILE, ENOMEM, out of memory), which may clear on a later attempt. A missing file and bytes
+   *  that do not parse are no read failure: they are what the file holds, on every attempt */
+  def isUnreadable(t: Throwable): Boolean = t match
+    case _: java.nio.file.NoSuchFileException | _: com.google.protobuf.InvalidProtocolBufferException => false
+    case _: java.io.IOException | _: java.io.UncheckedIOException | _: VirtualMachineError => true
+    case _ => false
+
   /** Loads the save file at `saveFilePath` as `storeId`'s state. Left for any file that is
-   *  missing, unreadable, truncated, or whose header names a different store: in every such case
-   *  the transactions it held are not recoverable from it. */
+   *  missing, truncated, unparsable, or whose header names a different store: in every such case
+   *  the transactions it held are not recoverable from it. A file that could not be read (isUnreadable) says
+   *  nothing of its content, so the error is thrown instead, for the caller to retry rather than take the state
+   *  for lost (systemic-loss-protection D1-D4). */
   def loadValidStoreState(saveFilePath: os.Path,
                           storeId: StoreId): Either[InvalidSaveFile, StoreRecoveryState] =
     try
@@ -122,6 +132,7 @@ object CrashRecoveryLog:
       else
         Left(InvalidSaveFile(saveFilePath, s"it belongs to store $fileStoreId, not $storeId"))
     catch
+      case t: Throwable if isUnreadable(t) => throw t
       case t: Throwable => Left(InvalidSaveFile(saveFilePath, t.toString))
 
 

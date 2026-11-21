@@ -56,14 +56,6 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-3.1 [SL-W18] A transient read error of a valid crl_save.log or store config is taken for a lost state.
-    CONFIRMED. Effort S. systemic-loss-protection.md, crash-recovery-log.md.
-    CrashRecoveryLog.loadValidStoreState maps every Throwable (EIO, EMFILE, OOM) to InvalidSaveFile, so D3
-    (StoreLoader.handleLoad -> crlSaveFileLost), D1/D2 (DeviceDiscovery.holdsOwnState) and D4
-    (adoptionClass -> adoptDevice) declare stores lost whose only state is that file. Fix: distinguish an
-    unreadable file (isTransient) from an invalid one, holding the load back through awaitUnreadRetry as an
-    unreadable incarnation file is.
-
 3.2 [SL-W19] A failed read of an FSIF compaction move fail-stops the store, whatever the error.
     CONFIRMED. Effort S. systemic-loss-protection.md, cross-document-review.md section 5,
     server/store/backend/fsif/DESIGN.md (4.2, L18).

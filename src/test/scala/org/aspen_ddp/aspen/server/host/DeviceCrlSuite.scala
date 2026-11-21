@@ -783,6 +783,44 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       host.control.router.loaded.contains(storeId) should be(true)
       os.exists(Backend.crlSaveFile(saved)) should be(false)
 
+  // A read that fails says nothing of the file's content: deciding which stores hold their own state is left for the
+  // next scan, before any store is marked
+  for what <- List("save file", "store config") do
+    atest(s"a lost device CRL whose store's $what cannot be read is left for the next scan, marking nothing (SL-W18)"):
+      given ExecutionContext = executionContext
+      val inner = newFactory()
+      // Corrupt until it has been kept aside: the replacement opens
+      val corruptUntilReplaced = new CrashRecoveryLogFactory:
+        def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog =
+          if !os.list(devicePath).exists(_.last.startsWith("crl.lost-")) then
+            throw CrlCorrupt("corrupt")
+          inner.openCRL(devicePath, config, holdsStores)
+        def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit =
+          inner.createCRL(devicePath, config, dir)
+      for
+        (hostRoot, deviceDir, saved) <- activeStoreDevice()
+        // Its whole state is in its own save file
+        _ = CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState(), Backend.crlSaveFile(saved))
+        inCrl = writeStoreDir(deviceDir, StoreId(poolId, 1.toByte))
+        // Its stat succeeds and its open fails (EACCES)
+        unreadable = if what == "save file" then Backend.crlSaveFile(saved) else saved / StoreConfig.configFilename
+        _ = os.perms.set(unreadable, "---------")
+        host = newCrlHost(hostRoot, corruptUntilReplaced)
+        _ = host.control.reconciler.scan()
+        loadedWhileUnreadable = host.control.devices.devices.contains(deviceA)
+        lostWhileUnreadable = os.list(deviceDir).count(_.last.startsWith("crl.lost-"))
+        markedWhileUnreadable = List(saved, inCrl).map(dir => os.exists(marker(dir)))
+        _ = os.perms.set(unreadable, "rw-------")
+        _ = host.control.reconciler.scan()
+        _ <- pumpUntil(host, host.control.router.loaded.contains(storeId) && !os.exists(Backend.crlSaveFile(saved)))
+      yield
+        loadedWhileUnreadable should be(false)
+        lostWhileUnreadable should be(0)
+        markedWhileUnreadable should be(List(false, false))
+        os.list(deviceDir).count(_.last.startsWith("crl.lost-")) should be(1)
+        List(saved, inCrl).map(dir => os.exists(marker(dir))) should be(List(false, true))
+        host.control.router.loaded.contains(storeId) should be(true)
+
   /** A factory over `inner` whose first open finds the CRL corrupt */
   private def corruptOnFirstOpen(inner: RecordingCrlFactory): CrashRecoveryLogFactory =
     val calls = new AtomicInteger(0)
@@ -1553,6 +1591,37 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       fileKept should be(true)
       recoveredFromFile should be(true)
       os.exists(Backend.crlSaveFile(storeDir)) should be(false)
+
+  atest("a store whose save file cannot be read at its load is held back and retried, never declared lost (SL-W18)"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    val fileTx = TransactionId(new UUID(9, 45))
+    val fileState = StoreRecoveryState(List(recoveryState(storeId, fileTx, Array[Byte](4, 5))))
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      saveFile = Backend.crlSaveFile(storeDir)
+      // Its whole state is in its save file (an arrived transfer), whose stat succeeds and whose open fails (EACCES)
+      _ = CrashRecoveryLog.saveStoreState(storeId, fileState, saveFile)
+      _ = os.perms.set(saveFile, "---------")
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.loader.awaitingRetryHasCallback(storeId).isDefined)
+      servedWhileUnreadable = host.control.router.loaded.contains(storeId)
+      awaiting = host.control.loader.awaitingRetryHasCallback(storeId)
+      marked = os.exists(marker(storeDir))
+      _ = os.perms.set(saveFile, "rw-------")
+      _ = host.control.reconciler.scan()
+      // Recovered once the CRL holds the file's state, after its install
+      _ <- pumpUntil(host, host.control.router.loaded.get(storeId).exists(_.frontend.transactions.contains(fileTx)))
+      store = host.control.router.loaded(storeId)
+      recoveredFromFile = store.frontend.transactions.contains(fileTx)
+      _ <- store.backend.close()
+      _ = factory.shutdownAll()
+    yield
+      servedWhileUnreadable should be(false)
+      awaiting should be(defined)
+      marked should be(false)
+      recoveredFromFile should be(true)
+      os.exists(marker(storeDir)) should be(false)
 
   atest("a store whose incarnation file is missing is rebuilt, never given a fresh incarnation (SL-W15)"):
     given ExecutionContext = executionContext

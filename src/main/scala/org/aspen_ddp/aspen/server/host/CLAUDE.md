@@ -161,8 +161,12 @@
   directory disowned in memory. The adopter nudges it with `CheckStorageDevice`
 - `crl_save.log`, `transferring-out` and `transferred-in` are for network transfers only: a transfer out closes the
   store with `extractCrl`, copying its state from the device CRL into `crl_save.log` to travel with it. Such a file is
-  then the only copy of that state: if it fails to load (missing, truncated, or naming another store) the store is
-  never served. It gets a `rebuild-required` marker, its entry is flipped to Rebuilding by the reconcile, and the
+  then the only copy of that state: if it fails to load (missing, truncated, unparsable, or naming another store) the
+  store is never served. A read that fails without saying anything of the content (`CrashRecoveryLog.isUnreadable`:
+  EIO, EMFILE, out of memory; `loadValidStoreState` throws it rather than return `Left`) is never taken for that:
+  `handleLoad` retries through `awaitUnreadRetry`, `holdsOwnState` (which reads the store config the same way) throws
+  before any store is marked, `adoptionClass` fails the adoption for the next scan, and `StoreTransfers` neither
+  resumes nor discards a promoted copy it cannot read. It gets a `rebuild-required` marker, its entry is flipped to Rebuilding by the reconcile, and the
   copy is retired (below) before the rebuild. Adoption of a device does the same for a `transferring-out` store
   without a valid save file instead of refusing the device, and adopts any `rebuild-required` directory as Rebuilding
   whatever its other markers. A network transfer validates the staged copy's save file before promotion and retries on

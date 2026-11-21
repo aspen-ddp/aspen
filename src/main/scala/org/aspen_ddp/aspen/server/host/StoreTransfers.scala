@@ -127,7 +127,11 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     Try(FileStat.exists(saveFile)) match
       case Failure(err) => Future.failed(err)
       case Success(true) =>
-        CrashRecoveryLog.loadValidStoreState(saveFile, storeId) match
+        // A file that cannot be read (CrashRecoveryLog.isUnreadable) fails the close as an invalid one does
+        val valid =
+          try CrashRecoveryLog.loadValidStoreState(saveFile, storeId)
+          catch case t: Throwable => Left(t)
+        valid match
           case Left(err) => Future.failed(err)
           case Right(_) => sds.crl.dropStore(storeId).flatMap(_ => released())
       case Success(false) =>
@@ -445,22 +449,30 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         // copy then released, as promotion refuses for a staged copy. Until the pool update
         // commits the source still holds the state, so either is discarded and the transfer
         // started over.
+        // A save file that cannot be read (CrashRecoveryLog.isUnreadable) says nothing of the copy: it is neither
+        // resumed nor discarded, and the next check reads it again.
         val promotedMarker = finalPath / StoreTransfer.TransferredInMarkerFile
         val staleKept = os.exists(promotedMarker) &&
           locally:
             val markerId = try os.read(promotedMarker).trim catch case _: Throwable => ""
-            val unusable =
+            val unusable: Either[Throwable, Option[String]] =
               if !transferId.exists(_.toString == markerId) then
-                Some(s"it belongs to transfer '$markerId', not to the current transfer $transferId")
+                Right(Some(s"it belongs to transfer '$markerId', not to the current transfer $transferId"))
               else if os.exists(finalPath / RebuildingStore.RebuildRequiredMarkerFile) then
-                Some("it is marked rebuild-required")
+                Right(Some("it is marked rebuild-required"))
               else
-                CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(finalPath), storeId) match
-                  case Right(_) => None
-                  case Left(err) => Some(s"its CRL save file is no longer usable: $err")
+                try
+                  CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(finalPath), storeId) match
+                    case Right(_) => Right(None)
+                    case Left(err) => Right(Some(s"its CRL save file is no longer usable: $err"))
+                catch case t: Throwable => Left(t)
             unusable match
-              case None => false
-              case Some(why) =>
+              case Left(err) =>
+                logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: the CRL save file of " +
+                             s"its arrived copy at $finalPath could not be read. Retrying at a later check: $err")
+                true
+              case Right(None) => false
+              case Right(Some(why)) =>
                 logger.warn(s"Discarding the arrived copy of store $storeId on device $toDeviceid: $why")
                 // Rename-first: a failure leaves the copy whole behind its marker. The source still owns the store
                 if StoreCopies.delete(devicePath, finalPath, s"an unusable arrived copy of store $storeId") then
@@ -468,12 +480,14 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                   ctx.router.clearOfflineUnlessHeld(storeId)
                   false
                 else
+                  logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: the unusable arrived " +
+                               s"copy at $finalPath could not be deleted. Retrying at a later check")
                   true
 
-        // A stale copy that could not be deleted must not be resumed: the next check tries again
+        // A copy that is unusable but could not be deleted, or could not be checked, must not be resumed: the next
+        // check tries again
         if staleKept then
-          logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: the unusable arrived copy at " +
-                       s"$finalPath could not be deleted. Retrying at a later check")
+          ()
 
         // A copy promoted by an earlier attempt -- normally one that crashed before its metadata
         // step finished -- needs no bytes, only that step.
@@ -545,10 +559,12 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
 
               // The copy's CRL save file is checked while the source still holds the state: once
               // the pool update commits, the source deletes its copy and the file is the only one
-              // left. The source always writes it when closing the store, so a missing file is as
-              // bad as a damaged one.
+              // left. The source always writes it when closing the store, so a missing file is as bad as a damaged
+              // one, and one that cannot be read (CrashRecoveryLog.isUnreadable) is not promoted either: the source
+              // still holds the state, so the transfer restarts
               val crlValid =
-                CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(stagedPath), storeId) match
+                (try CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(stagedPath), storeId)
+                 catch case t: Throwable => Left(t)) match
                   case Right(_) => true
                   case Left(err) =>
                     logger.error(s"The transferred copy of store $storeId has an unusable CRL save " +

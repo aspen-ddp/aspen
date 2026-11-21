@@ -15,6 +15,7 @@ import scribe.Logging
 import java.util.UUID
 import scala.concurrent.Future
 import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 
 /** How one store an adoption serves (an Offline or Active entry) was left, as adoptionClass reads it from its
  *  directory. */
@@ -309,8 +310,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *    before the file reached the platter, or later damage -- and the host that wrote it no longer
    *    holds it either: refusing the device would not bring it back, so it is CrlLost and adopted as
    *    Rebuilding. The save file is parsed, not just found: loadValidStoreState rejects a file cut
-   *    short, and one whose header names another store. A store rebuilt during or after the
-   *    shutdown (keepRebuiltStoreOffline) carries the marker with an empty save file: Clean.
+   *    short, and one whose header names another store. One it cannot read (CrashRecoveryLog.isUnreadable)
+   *    throws, failing the adoption for the next scan to retry, rather than be taken for lost. A store rebuilt
+   *    during or after the shutdown (keepRebuiltStoreOffline) carries the marker with an empty save file: Clean.
    *  - Any other directory: Clean. The shutdown closed it, or a crash or a pulled drive stopped it,
    *    with its state in the device CRL, which the adopting host opens before loading it.
    */
@@ -617,7 +619,14 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
               case _ =>
                 logger.error(s"Failed to recover the CRL of storage device $devicePath. Its stores must be rebuilt: $t")
             true
-    storeDirs.filterNot(holdsOwnState).foreach(ctx.rebuilds.markRebuildRequired)
+    // Decided for every store before any is marked: a read that fails leaves all of them as they are
+    val toMark =
+      try storeDirs.filterNot(holdsOwnState)
+      catch case t: Throwable =>
+        logger.error(s"The CRL of storage device $devicePath is lost, but a store's save file or config could not " +
+                     s"be read to tell whether it holds its own state. Retrying on the next scan: $t")
+        throw t
+    toMark.foreach(ctx.rebuilds.markRebuildRequired)
     if os.exists(crlDir) then
       DurableFiles.move(crlDir, devicePath / s"crl.lost-${UUID.randomUUID()}")
     // A fresh CRL, which the stores now marked recover nothing from. Created apart and renamed into place only once
@@ -641,17 +650,23 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  Either its whole transaction state is in its own crl_save.log, which validates as that store's (an arrived
    *  transfer, a transfer out's source, a rebuilt store kept offline): its load drops whatever the device CRL holds
    *  for it and loads the file (StoreLoader.awaitCrlLoad). A directory whose config cannot be read, or whose file is
-   *  missing, cut short or another store's, does not hold its state that way. Or it carries rebuild-complete: a
+   *  missing, cut short or another store's, does not hold its state that way; one whose config or save file could
+   *  not be read (CrashRecoveryLog.isUnreadable) is not known either way, so the read's error is thrown, leaving the
+   *  device unloaded for the next scan before any store is marked. Or it carries rebuild-complete: a
    *  finished rebuild awaiting its flip, which has never served (StoreLoader.tryLoadStore leaves it offline), so its
    *  transaction state is empty. Its rebuild or the reconcile's Completed Rebuilds pass flips and loads it as it
    *  would have over the old CRL; one finished for an earlier episode is retired by retireForeignCopy as before. A
    *  failed stat throws (FileStat), leaving the device unloaded for the next scan. */
   private def holdsOwnState(storeDir: os.Path): Boolean =
     val saveFile = Backend.crlSaveFile(storeDir)
+    def configuredStoreId: Option[StoreId] =
+      try Some(StoreConfig.loadStoreConfig(storeDir / StoreConfig.configFilename).storeId)
+      catch
+        case t: Throwable if CrashRecoveryLog.isUnreadable(t) => throw t
+        case NonFatal(_) => None
     FileStat.exists(storeDir / RebuildingStore.RebuildCompleteMarkerFile) ||
-      FileStat.exists(saveFile) &&
-        Try(StoreConfig.loadStoreConfig(storeDir / StoreConfig.configFilename).storeId).toOption.exists: storeId =>
-          CrashRecoveryLog.loadValidStoreState(saveFile, storeId).isRight
+      FileStat.exists(saveFile) && configuredStoreId.exists: storeId =>
+        CrashRecoveryLog.loadValidStoreState(saveFile, storeId).isRight
 
   /** The load half of tryLoadDevice, run only once the device is known to be ours. */
   private def loadOwnedDevice(storageDevicePath: os.Path,

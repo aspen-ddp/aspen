@@ -4,8 +4,8 @@ machine on the store's executor; its mutable state is shared by every phase, so 
 headers: CRL saves, expiry, stuck/late reporting, locks and collision waits, object loading, voting, applying a commit
 (`doCommit`, `issueCommits`, with `blindReinsertObjects` and `checkVoteCommitApplied` as its pure-ish steps), Paxos
 messages, finalization/late commits/UnackedCommits. It was not split into files because each phase reads and writes
-the same flags. `TransactionDriver` is the per-transaction proposer/learner that tallies votes, runs Paxos and starts
-the finalizer (`SimpleTransactionDriver` is its factory with the retransmit backoff and failed-driver timing); `ExpiryTally` is the pure expiry decision
+the same flags. `TransactionDriver` is the per-transaction proposer/learner that tallies votes, runs Paxos and delegates
+the finalization actions to its `FinalizerRunner` (creation, the failure backoff and restart, the stores failed finalizers handed off, under the driver's own lock) (`SimpleTransactionDriver` is its factory with the retransmit backoff and failed-driver timing); `ExpiryTally` is the pure expiry decision
 over peers' status replies; `TransactionFinalizer` is the finalizer interface; `TransactionStatusCache` is the host's
 outcome cache; `StuckReportThrottle` is the shared age/repeat throttle behind `Tx.reportIfStuck` and
 `TransactionDriver.reportIfStuck`; `AbortVoteReport` and `FinalizationStallReport` are the periodic log summaries.
@@ -31,11 +31,11 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   applied blind Insert wrote, so its recovered commit vote cannot Insert them again (10.5c;
   `Frontend.awaitBlindInsertsDurable`). See `server/store/CLAUDE.md`, Deletion after allocation and Key deletion after
   a blind insert
-- Finalization failure path (`TransactionDriver.startFinalizer`): a finalizer that cannot be created, or whose
+- Finalization failure path (`FinalizerRunner`, owned by the driver): a finalizer that cannot be created, or whose
   `complete` fails, is logged at error and started again from scratch after a backoff (1 s doubling to 60 s) until
   one completes, the driver finalizes another way, or it shuts down. Never finalize without the actions: the marker's
   entries are what repair and owed stores rely on. TxFinalized's `owed` includes the planned stores of failed
-  finalizers (`failedHandedOff`). An action that gives up must fail its `complete`, never leave it pending
+  finalizers (`FinalizerRunner.failedHandedOff`). An action that gives up must fail its `complete`, never leave it pending
   An action whose type cannot be created (user jar missing, version skew) is a failed action: the marker still runs,
   and the transaction stays unfinalized, alarmed, until a driver that has the type finalizes it (transaction-recovery
   10.3)

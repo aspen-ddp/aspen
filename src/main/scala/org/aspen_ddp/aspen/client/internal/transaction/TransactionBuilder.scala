@@ -308,24 +308,19 @@ class TransactionBuilder(
     */
   private def refuseBlindWrites(kvu: KVUpdate): Unit =
     if !allocatingObjects.exists(_.id == kvu.pointer.id) then
-      lazy val revisionChecked = kvu.requirements.collect { case r: KeyValueUpdate.KeyRevision => r.key }.toSet
-      lazy val keyChecked = KeyValueUpdate.checkedKeys(kvu.requirements)
-      kvu.operations.foreach:
-        case i: Insert =>
-          if kvu.requiredRevision.isEmpty && kvu.contentLock.isEmpty && !keyChecked.contains(i.key) then
-            throw BlindKeyValueWrite(kvu.pointer, s"Insert of ${i.key} has no requirement that checks the key. Add " +
-              s"KeyRevision, Exists or DoesNotExist on ${i.key}, a required revision or a content lock " +
-              "(MayExist, WithinRange and KeyObjectRevision do not check it, nor does a requirement on another key)")
-        case d: Delete =>
-          if kvu.contentLock.isEmpty && !revisionChecked.contains(d.key) then
-            throw BlindKeyValueWrite(kvu.pointer, s"Delete of ${d.key} has neither a KeyRevision on the key nor a " +
-              s"content lock. Add KeyRevision(${d.key}, <revision read>) or a content lock (a required revision, " +
-              "Exists or a KeyRevision on another key is not enough)")
-        case op =>
-          if kvu.requiredRevision.isEmpty then
-            throw BlindKeyValueWrite(kvu.pointer, s"${op.getClass.getSimpleName} changes an object-level field " +
-              "(min, max, left or right) without a required revision. Add the object's revision as read (a content " +
-              "lock is not enough)")
+      BlindWrites.violation(kvu.requiredRevision, kvu.contentLock, kvu.requirements, kvu.operations).foreach:
+        case BlindWrites.Violation.UncheckedInsert(key) =>
+          throw BlindKeyValueWrite(kvu.pointer, s"Insert of $key has no requirement that checks the key. Add " +
+            s"KeyRevision, Exists or DoesNotExist on $key, a required revision or a content lock " +
+            "(MayExist, WithinRange and KeyObjectRevision do not check it, nor does a requirement on another key)")
+        case BlindWrites.Violation.UncheckedDelete(key) =>
+          throw BlindKeyValueWrite(kvu.pointer, s"Delete of $key has neither a KeyRevision on the key nor a " +
+            s"content lock. Add KeyRevision($key, <revision read>) or a content lock (a required revision, " +
+            "Exists or a KeyRevision on another key is not enough)")
+        case BlindWrites.Violation.UnrevisionedObjectChange(op) =>
+          throw BlindKeyValueWrite(kvu.pointer, s"${op.getClass.getSimpleName} changes an object-level field " +
+            "(min, max, left or right) without a required revision. Add the object's revision as read (a content " +
+            "lock is not enough)")
 
   def update(
               pointer: KeyValueObjectPointer,

@@ -18,7 +18,7 @@
   floor refuse a prepare for a transaction a store may have forgotten (paxos-transactions 10.10; the details are in
   `server/transaction/CLAUDE.md`). A refcount-0 object is `MissingObject` for every requirement. Design:
   `docs/superpowers/specs/2026-11-09-replay-pins-design.md`
-- Blind writes (`TransactionBuilder.refuseBlindWrites`, transaction-requirements 2.5), except in an allocated object's
+- Blind writes (`TransactionBuilder.refuseBlindWrites`; the rule lives in `common.transaction.BlindWrites`, shared with the stores; transaction-requirements 2.5), except in an allocated object's
   initial content: a key Delete needs that key's `KeyRevision` (`Exists` is not enough) or a content lock (a
   required revision is not enough either: an Insert moves no revision, transaction-requirements 2.5); a
   min/max/left/right change needs a required revision (a content lock does not move the revision a repair proof

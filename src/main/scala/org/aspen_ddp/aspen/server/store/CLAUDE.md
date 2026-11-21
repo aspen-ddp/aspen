@@ -60,7 +60,7 @@
   last-writer-wins on (transaction timestamp, revision) (`KVObjectState.insertWins`; `growth` and `encodedSizeAfter` use the same
   rule). A superseded Insert is a no-op, not a skip: no report and no fail-stop. The object timestamp is the max of its
   value and the transaction's. No tombstones, so `TransactionBuilder` refuses blind key deletes and blind object-level
-  ops (`BlindKeyValueWrite`), and stores refuse them too (`RequirementsChecker.refuseBlindWrites`, `BlindWrite`, at vote
+  ops (`BlindKeyValueWrite`), and stores refuse them too (`RequirementsChecker.refuseBlindWrites`, `BlindWrite`, the one rule in `common.transaction.BlindWrites`, at vote
   and apply re-check): unless the transaction allocates the object, a key Delete needs a `KeyRevision` on its key or a
   content lock (a required revision does not cover it: an Insert moves no revision), a min/max/left/right change a
   required revision (a content lock does not move the revision a repair proof locks; repair-process 1.2, Q8), and a key

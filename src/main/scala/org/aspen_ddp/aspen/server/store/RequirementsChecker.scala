@@ -52,32 +52,14 @@ object RequirementsChecker extends Logging {
         throw ObjectErr(oid, TransactionCollision(other))
       }
 
-    /** The store's copy of TransactionBuilder.refuseBlindWrites. Unless the transaction allocates the object (its
-      * initial content), a key Delete needs a KeyRevision on its key or a content lock, a change of min, max, left or
-      * right needs a required revision, and a key Insert needs a required revision, a content lock or a requirement
-      * that checks its key (KeyValueUpdate.checkedKeys). An unconditioned Insert passes at a store that applied a
-      * later Delete of its key first and is a no-op at one that applied a later write of it first, so the two orders
-      * diverge unreported (transaction-requirements R15). A blind Delete leaves no tombstone and object-level parts carry no
-      * timestamp, so neither can be ordered against other writes, and repair cannot see them: a no-op blind Delete
-      * leaves no trace for its snapshot and an object-level change that does not move the revision escapes a repair
-      * proof's revision lock (repair-process 1.2, Q8; transaction-requirements 2.5). A required revision does
-      * not cover a Delete: an Insert of the key moves no revision, so a Delete applied after it here, in lock order
-      * or as a non-voter, would pass its re-check and remove the key unreported (transaction-requirements 9.3, R15).
-      * Enforced here too so a client that bypasses the builder cannot issue one
+    /** The blind-write rule (common.transaction.BlindWrites), enforced here too so a client that bypasses
+      * TransactionBuilder cannot issue a blind write
       */
     def refuseBlindWrites(r: KeyValueUpdate, ops: List[KeyValueOperation]): Unit =
       val oid = r.objectPointer.id
-      if !allocating.contains(oid) then
-        lazy val revisionChecked = r.requirements.iterator.collect { case kr: KeyValueUpdate.KeyRevision => kr.key }.toSet
-        lazy val keyChecked = KeyValueUpdate.checkedKeys(r.requirements)
-        ops.foreach {
-          case i: Insert =>
-            if r.requiredRevision.isEmpty && r.contentLock.isEmpty && !keyChecked.contains(i.key) then
-              throw ObjectErr(oid, BlindWrite())
-          case d: Delete =>
-            if r.contentLock.isEmpty && !revisionChecked.contains(d.key) then throw ObjectErr(oid, BlindWrite())
-          case _ => if r.requiredRevision.isEmpty then throw ObjectErr(oid, BlindWrite())
-        }
+      if !allocating.contains(oid) &&
+        BlindWrites.violation(r.requiredRevision, r.contentLock, r.requirements, ops).isDefined then
+        throw ObjectErr(oid, BlindWrite())
 
     /** Object-level locks: lockedToTransaction and a KV object's content lock. Every requirement collides with them */
     def checkObjectLocks(oid: ObjectId, os: ObjectState): Unit =

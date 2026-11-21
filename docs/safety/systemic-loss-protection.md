@@ -129,8 +129,9 @@ These are facts about the current code. They define the problem; none of them is
   FSIF (`FsifBackend.assemble`, fsif/DESIGN.md 2.6) a CRC mismatch or no valid header, or a backend already
   fail-stopped. Any other failure (an IOError, Busy or TryAgain status, EIO, EMFILE or ENOMEM, a rejected io task, a
   throw while issuing) is retried after each of `RetryScheduler.ReadRetryDelays` (about 1.1 s in all), so only a
-  failure that outlasts them declares. Every FSIF error other than ENOSPC in a write, force, checkpoint or compaction, and
-  any internal exception in its serial executor, fail-stops the backend. Persistent and version causes are handled
+  failure that outlasts them declares. Every FSIF error other than ENOSPC in a write, force, checkpoint or compaction
+  write, any failure of a compaction move's read (`Compaction.copied`, a rejected io task included; SL-W19), and any
+  internal exception in its serial executor, fail-stops the backend. Persistent and version causes are handled
   the same way as damage. A commit vote whose apply re-check fails does not declare (section 4.6). The existence
   checks that decide D1 (`<device>/crl` present, and which children are store directories), D13 (`config.yaml` at a
   store path) and D14 (the `incarnation` file) take only a stat that answers absent for absence (`server.FileStat`):
@@ -157,7 +158,10 @@ These are facts about the current code. They define the problem; none of them is
   removed from its set and host) and moves every store to Rebuilding elsewhere. The command is for a drive that has
   physically failed and whose data is already gone. A pool-health guard could save nothing there and would only delay
   rebuilding the data elsewhere, so it has none. A device that may still hold its data goes through
-  `shutdownStorageDevice`, which refuses when a pool would drop below its write threshold.
+  `shutdownStorageDevice`, which refuses when a pool would drop below its write threshold. Nothing checks that the
+  device is no longer served: the command is also the way to move a rebuild off suspect media (rebuild-process 4.1),
+  and a host still serving the device keeps answering for its stores until it reconciles the device, which the
+  tombstone's single nudge may not trigger for up to an hour (rebuild-process RB-W19).
 
 ### Protections that would be needed (tracked in Backlog.txt)
 
@@ -180,7 +184,7 @@ is not a retention period (section 4.4). It satisfies none of the others.
 
 ### 4.1 Declarations (decide that a store is lost)
 
-Each automatic declaration D1-D11 writes the durable `rebuild-required` marker
+Each automatic declaration D1-D11 and D14 writes the durable `rebuild-required` marker
 (`StoreRebuilds.writeRebuildRequiredMarker`) into the store directory and leaves the store offline. D13 finds no
 store to mark: it silences the store and requests the flip directly.
 
@@ -188,10 +192,10 @@ store to mark: it silences the store and requests the flip directly.
 |---|---|---|---|---|
 | D1 | `<device>/crl` absent from, or without stream files on (`CrlMissing`), a device that holds store directories (directories directly under the device holding a store config) | `DeviceDiscovery.openDeviceCrl`, at every load of the device | marker on **every** store directory of the device except one that held nothing in the CRL (`holdsOwnState`): one whose `crl_save.log` validates as its own (an arrived transfer, a transfer out's source, a rebuilt store kept offline), which loads from that file over the fresh CRL as it would over the old one (`StoreLoader.awaitCrlLoad` drops its device-CRL entries and loads the file), or a finished rebuild awaiting its flip (`rebuild-complete`), which has never served (`StoreLoader.tryLoadStore` leaves it offline), so its rebuild flips it, or the Completed Rebuilds pass loads it, as over the old CRL; an existing `crl/` renamed to `crl.lost-<uuid>`; a fresh empty CRL created in `crl.creating/` and renamed to `crl/` durably once finished, then opened. The replacement is sized by the device config as it is now (`CrashRecoveryLogFactory.createCRL`), not by the lost CRL's recorded sizing. A crash or failure of the creation leaves no `crl/` (the next load sweeps `crl.creating/` and runs D1 again, which re-marks idempotently and moves nothing aside). A config that cannot size it fails the creation with `CrlConfigInvalid`, after the stores are marked: the device stays unloaded, retried at each scan, until the config is fixed. A device without room for it stays unloaded (Backlog.txt, "System-level protection against correlated lost store declarations") | a partial restore or mount (one that copies directories but not the large stream files included); a path or layout change in a release; a transient read error of a store's valid `crl_save.log` or of its store config (`holdsOwnState` false); never a failed stat of `<device>/crl`, which throws and leaves the device for the next scan (`FileStat`). An emptied `crl/` (neither sizing file nor stream files) under a config that cannot size a new CRL is refused instead (`CrlConfigInvalid`, which the open raises before its `CrlMissing` check); an absent `crl/` is declared without an open |
 | D2 | CRL open throws a non-transient error (`CrlCorrupt`, `BrokenEntryChain`, anything not `isTransient`), or a transient one on the `CrlOpenAttempts`th device scan in a row, on a device that holds stores | `DeviceDiscovery.openDeviceCrl` | as D1 | a CRL format or recovery change; a bug in the CRL writer that the next recovery rejects; a persistent I/O condition (EMFILE in a restart storm, a flaky controller) outlasting two scan periods (about 20 s; opens outside a scan do not count) |
-| D3 | `crl_save.log` present but `loadValidStoreState` rejects it (truncated, unparsable, another store's, any `Throwable`), or its state can never fit the device's CRL (`StoreLoader.neverFits`: a transaction above `maxTransactionBytes`, or the whole above the admission limit at the most streams any config allows, `maxAdmissionLimitBytes`, plus that bound: neither follows the device config, so a lowered or invalid `crl-max-streams` declares nothing) | `StoreLoader.handleLoad` then `StoreRebuilds.crlSaveFileLost`/`retireUnserved` | closed unserved, marked, offline, device checked | a save-file format change: every store whose directory holds a save file; a transient read error; a change to `CrlAdmission.recoveredBytes` or the CRL bounds in a release (never-fits); a transfer onto a device with a smaller CRL (Backlog, "Transfers do not check the destination's CRL room"), or a store D1/D2 spared whose save file meets a replacement CRL sized smaller by a changed config. A crash between the save and `deleteTransactions` leaves the same entries in the device CRL, and the retire saves those beside the file (`lost-crl-entries.log`). A state that does not fit *yet*, including one that fits only once the CRL grows, is not declared: the store waits offline, asking the CRL to grow, retried at each device scan |
+| D3 | `crl_save.log` present but `loadValidStoreState` rejects it (truncated, unparsable, another store's, any `Throwable`), or its state can never fit the device's CRL (`StoreLoader.neverFits`: a transaction above `maxTransactionBytes`, or the whole above the admission limit at the most streams any config allows, `maxAdmissionLimitBytes`, plus that bound: neither follows the device config, so a lowered or invalid `crl-max-streams` declares nothing) | `StoreLoader.handleLoad` then `StoreRebuilds.crlSaveFileLost`/`retireUnserved` | closed unserved, marked, offline, device checked | a save-file format change: every store whose directory holds a save file; a transient read error (SL-W18); a change to `CrlAdmission.recoveredBytes` or the CRL bounds in a release (never-fits); a transfer onto a device with a smaller CRL (Backlog, "Transfers do not check the destination's CRL room"), or a store D1/D2 spared whose save file meets a replacement CRL sized smaller by a changed config. A crash between the save and `deleteTransactions` leaves the same entries in the device CRL, and the retire saves those beside the file (`lost-crl-entries.log`). A state that does not fit *yet*, including one that fits only once the CRL grows, is not declared: the store waits offline, asking the CRL to grow, retried at each device scan |
 | D4 | Adoption: an Offline or Active store whose directory has `transferring-out` without a valid save file, or has `rebuild-required` | `DeviceDiscovery.adoptionClass` (`CrlLost`); `DeviceMetadata.adoptDevice` writes the marker in its prepare closure and the entry Rebuilding in the adoption transaction | adopted as Rebuilding | a save-file read path that fails on the adopting host's version, or a transient read error (`loadValidStoreState` takes any `Throwable` for an unusable file); it inherits any false mark the previous host wrote. A marker left by an adoption transaction that does not commit is harmless when the classification is right, as the state is lost whatever the outcome; one written on a transient read error stays a false mark |
 | D5 | `BackendStateLost` at backend open: FSIF `StoreLost` (missing directory or blank files, no valid index, journal sequence or corruption checks, replay bounds; `FsifRecovery`, fsif/DESIGN.md 4.1), RocksDB `RocksDBStateLost` (`CURRENT` missing) | `StoreLoader.handleBackendOpened` | marked, offline, device checked | a format or validation change in a release; an incomplete mount or restore. An open never creates: stores are created atomically (`StoreCreation`), so a store path holds nothing or a complete store, and a missing or blank backend is declared rather than silently served empty |
-| D6 | Backend fail-stop while served (`Host.BackendFailed`; FSIF `onFatal`, fsif/DESIGN.md 4.2) | `StoreRebuilds.handleBackendFailed`/`backendFailed` | marked, then `closeUnloaded(dropDurably = false)`: its device-CRL entries stay live until the discard saves them | any I/O error FSIF treats as fatal; any internal exception in its serial executor; an ENOSPC that the classifier fails to recognize |
+| D6 | Backend fail-stop while served (`Host.BackendFailed`; FSIF `onFatal`, fsif/DESIGN.md 4.2) | `StoreRebuilds.handleBackendFailed`/`backendFailed` | marked, then `closeUnloaded(dropDurably = false)`: its device-CRL entries stay live until the discard saves them | any I/O error FSIF treats as fatal, including any failed read of a compaction move, transient or not (SL-W19); any internal exception in its serial executor; an ENOSPC that the classifier fails to recognize |
 | D7 | Store fail-stop (`Host.StoreFailStopped`): its CRL read failed other than by the CRL's own death or shutdown (`CrlFailed`, `CrlClosed`: the device's failure, left to `DeviceShutdown.crlFailed`), or its recovery failed (`StoreRouter.readAndRecover`, `recoverOrFail`), or `Frontend.failStop` (a commit voter whose apply throws, `Tx.issueCommits`; a recovered commit vote whose object fails to load with other than ObjectNotFound on a store whose writes are not frozen, `Tx.objectLoadFailed`; for RocksDB a Corruption status, an undecodable value, or a read failure outlasting `RetryScheduler.ReadRetryDelays`; for FSIF a CRC mismatch, no valid header, or a read failure outlasting the same delays) | `StoreRebuilds.handleFailStopped` then `backendFailed`, only while that Store is still the one installed | as D6 | a decoding change in `TransactionRecoveryState`; a bug in an applier or requirement checker, which fires on **every replica of the object** in the same transaction |
 | D8 | Backend failed before it was served: at `LoadStore` (`hasFailed`), opened but not served, or failed after it stopped being served (not replaced, directory on a loaded device) | `StoreLoader.handleLoad` then `retireUnserved`; `StoreLoader.handleBackendOpened`; `StoreRebuilds.backendFailed` | marked, offline | as D6 |
 | D9 | Backend fail-stop during a clean close (`ShutdownStore`) | `StoreLoader.handleClose` then `StoreRebuilds.failedOnClose` | marked; a transfer-out close's `crl_save.log` kept, saved as the copy's lost CRL state by its retire (X2) | as D6, and any close-path bug |
@@ -232,8 +236,8 @@ retained, or are a derived copy of data that still exists elsewhere.
 | X5 | Reconcile "Deleted Stores" pass: an offline store whose entry is absent from the device's tree state (a completed transfer out, a re-placed rebuild) is retired (X2); it stays offline until its path is clear. A served store the entry does not list (a copy put back by hand) is first taken out of service as a failed backend is (`StoreRebuilds.retireUnlistedServed`) | `DeviceReconciler.reconcileDeviceState` | Recoverable | the copy and its CRL state in `pending-delete/` until X3 |
 | X6 | `dropLeftoverCrlState`: device-CRL entries of stores with no directory (a stat that answers absent), no retire running and not loaded, whose entry is absent from the device (a safety net: a retire drops them before the copy leaves its path) | `DeviceReconciler.dropLeftoverCrlState` | **Destructive** for those entries, once no entry on the device names the store | nothing local |
 | X7 | `UnloadFailedStore`: entries dropped from the device CRL after a failed `crl.loadStore` | `StoreLoader.handleUnloadFailed` | Recoverable | the save file holds the full state |
-| X8 | Entries deleted from the device CRL after a transfer out's save file is durable | `StoreLoader.handleClose`, `StoreTransfers.extractUnloaded` | Recoverable (moved) | the save file, which a retire keeps as the copy's lost CRL state |
-| X9 | Derived copies deleted (copies that never were the owner's): rebuilt copy on `RebuildOutcome.Discard` and an arrived copy on `TransferOutcome.SourceRestored` or `Aborted` (`LocalDevices.discardStoreDirectory`, via `StoreTransfers.discardArrivedTransferIn` for the latter), and a promoted copy whose pool update has not committed and which is stale (its `transferred-in` marker names another transfer) or unusable (marked `rebuild-required`, or its save file no longer validates) (`StoreTransfers.startIn`), all rename-first; rebuild staging (first pass `createStaging`, staging `BackendStateLost`, a finished rebuild's `cleanupStaging`, `abandonUnlisted`); transfer staging: a staged copy with an unusable save file, one landed after its attempt was dropped, an abandoned one (`StoreTransfers.startIn`, `dropAbandonedTransferIn`), a partial receive (`StoreTransferManager.receive`, `removeOwnedDirectory`); `transferring-in` staging and `creating/` at device load (`DeviceDiscovery.loadOwnedDevice`) | as listed | Derived | peers, or the transfer source |
+| X8 | Entries deleted from the device CRL after a transfer out's save file is durable; for a closed store that already has a valid save file, its device-CRL entries dropped (`dropStore`) and the file shipped unchanged | `StoreLoader.handleClose`, `StoreTransfers.extractUnloaded` (on the transfer's source device only) | Recoverable (moved); the dropped entries are derived (a copy of part of the file, or an earlier tenancy's leftover). Whether a save file is there is taken from `os.exists`, which answers false on a failed stat (SL-W20) | the save file, which a retire keeps as the copy's lost CRL state |
+| X9 | Derived copies deleted (copies that never were the owner's): rebuilt copy on `RebuildOutcome.Discard` and an arrived copy on `TransferOutcome.SourceRestored` or `Aborted` (`LocalDevices.discardStoreDirectory`, via `StoreTransfers.discardArrivedTransferIn` for the latter), and a promoted copy whose pool update has not committed and which is stale (its `transferred-in` marker names another transfer) or unusable (marked `rebuild-required`, or its save file no longer validates) (`StoreTransfers.startIn`), all rename-first; rebuild staging (first pass `createStaging`, staging `BackendStateLost`, a finished rebuild's `cleanupStaging`, `abandonUnlisted`); transfer staging: a staged copy with an unusable save file, one landed after its attempt was dropped, an abandoned one (`StoreTransfers.startIn`, `dropAbandonedTransferIn`), a receive's clearing of its staging path and a partial receive (`StoreTransferManager.receive`, `removeOwnedDirectory`); `transferring-in` staging and `creating/` at device load (`DeviceDiscovery.loadOwnedDevice`) | as listed | Derived | peers, or the transfer source |
 | X10 | Tombstone: device removed from its set and host, ids zeroed, stores rebuilt elsewhere | `FailedStorageDeviceDurableTask` | One-way **metadata** change; the media is untouched | the physical data. The old host retires the device under a durable `failed` marker (`DeviceShutdown.retireFailedDevice`, also written by `DeviceDiscovery.handleOwnershipResolved`), and `tryLoadDevice` never loads or claims a device with it |
 | X11 | CRL stream files removed: by a growth that fails at runtime, its own `<n>.crl.tmp` and unlisted `<n>.crl` (`SimpleCRL.attemptGrowth`); when the CRL is opened, an uncommitted growth's `<n>.crl` or `<n>.crl.tmp` (`SimpleCRL.removeUncommittedGrowth`), and an unfinished creation: when every remaining `*.crl.tmp` is a listed stream's `<n>.crl.tmp` with no `<n>.crl` beside it, and the device holds no stores, every `*.crl.tmp` and every stream file, the CRL then created afresh (`SimpleCRL.createStreamsIfNew`). Any other `*.crl.tmp` is `CrlSizingMismatch` and nothing is removed | `SimpleCRL.apply` | Derived: neither holds an entry. Leftovers are taken for an unfinished creation only on a device holding no store directory; the fresh CRL of D1/D2 is created apart, in `crl.creating/`, whose leftovers device load and each creation remove (`DeviceDiscovery.openDeviceCrl`, `loadOwnedDevice`) | nothing; no store is marked |
 | X12 | Load from a save file: the store's device-CRL entries dropped, durably, before its `crl_save.log` state is saved into the device CRL; the file removed, durably, once the CRL holds it and before the store recovers | `StoreLoader.awaitCrlLoad`, `StoreRouter.crlLoaded` | Derived: the file is the store's whole state (it has served nowhere since it was written), so the dropped entries are a copy of part of it or an earlier tenancy's leftover | the file, then its entries in the device CRL. A failed save keeps the file (X7); a store closed before the removal keeps it too, and its next load repeats the drop. A failed removal unloads the store with its entries kept and retries its load, which removes the file durably, forcing the directory even if the file is gone, before it recovers |
@@ -243,7 +247,7 @@ retained, or are a derived copy of data that still exists elsewhere.
 
 A store has one owner: the device its pool names. Ownership moves by a transfer or a rebuild and takes effect when the
 new device's entry becomes Active. Every other copy of the store may then go, and only then. So every store declared
-lost through D1-D11 keeps its last local copy until the store is Active on its owner device. The marked directory stays
+lost through D1-D11 or D14 keeps its last local copy until the store is Active on its owner device. The marked directory stays
 at its path, offline, until its retire (X2) moves it, with its saved CRL state, into `pending-delete/`. The same holds
 for a copy whose rebuild was re-placed onto another device and for a transfer out's source, both retired by X5, and
 for an earlier tenancy's copy at the path of a store transferring back onto the device, retired by the transfer in. A
@@ -265,8 +269,10 @@ What is not retained, or not for long:
   slices of the accepted objects it held. The acceptance is the operator's release, and the command says so.
 * `crl.lost-<uuid>` is retained, but nothing ties it to the pending-delete copies whose entries it holds, and nothing
   reads it.
-* A D13 store with no directory at its path loses its device-CRL entries in the reconcile that declares it (X6), long
-  before the store is Active anywhere. A directory that reappears during the rebuild is retired by D10 without them.
+* A D13 store with no directory at its path keeps its device-CRL entries only while an entry on the device names it.
+  The rebuilt copy's first load on the device drops them (its empty `crl_save.log`), and a re-placement that moves
+  the entry off the device leaves them to X6, both without any check that the declaration was isolated. A directory
+  that reappears during the rebuild is retired by D10, which saves them into the copy.
 * No code path reinstates a retained copy. Section 4.5 gives the manual procedure and its preconditions.
 
 ### 4.5 Manual reinstatement of a falsely declared store
@@ -309,9 +315,11 @@ brings it up to date.
      commit vote whose apply failed is in it with its update. A store fail-stopped for D6/D7 may really lack an update
      it voted to commit, and that vote's state is what re-applies it at recovery, so the file must not be thinned.
      D5 needs a release whose backend opens the files: the backend refusing them is the declaration.
-   - D13 (no store at the path): a directory that comes back without its config kept its entries, and its D10
-     retire saved them into `lost-crl-state.log`. One that was missing altogether had its entries dropped (X6): its
-     state is gone, so it is not reinstatable.
+   - D13 (no store at the path): a directory that comes back is retired by D10, which saves its entries into
+     `lost-crl-state.log`. While none is back, the entries are still in the device CRL, until the rebuilt copy's first
+     load drops them or a re-placement leaves them to X6; they must be read out of the device CRL before either, by
+     code that can (none exists). After either, the state is gone: not reinstatable.
+   - D14 (incarnation file absent): the copy's identity is gone, so precondition 2 cannot hold: not reinstatable.
 4. **The cause is gone.** The fixed release is running, or the transient condition (a mount, a restore) is corrected.
    Otherwise the store is declared again at load, which is harmless but pointless.
 
@@ -374,7 +382,8 @@ These look like loss, or take a store or device out of service, but write no mar
 * **A failed CRL at runtime** (`CrashRecoveryLog.failed`, `DeviceShutdown.crlFailed`): the device's stores are closed
   without extraction and the device is unloaded until the host restarts, its files untouched (SC2).
 * **A failed `crl.loadStore`** of a valid save file (`UnloadFailedStore`, X7): offline, the file kept, not marked,
-  and not retried before the host restarts.
+  and not retried in this process. It fails only with the CRL (`SimpleCRL.tracked`: `CrlFailed`, or `CrlClosed` for
+  a device unloading), so the whole device is out of service with it and the store loads at the device's next load.
 * **A failed Store build** in `StoreLoader.handleLoad` (the `Store` constructor, the object cache or the backend's
   completion handler throws, for example with EMFILE): `abandonLoad` closes the backend and leaves the store offline
   and unmarked, and `awaitBuildRetry` puts it in `storesAwaitingRetry`, so each device scan retries it with backoff
@@ -420,7 +429,8 @@ These are places where one software change or environmental fault produces decla
   the third device scan in a row whose open fails with an `isTransient` error. The host start's opens (the
   constructor's discovery and the `CheckAllDevices` posted right after it) and nudges do not count, so the first
   counted failure is at the first 10 s scan and the declaration at the third: a condition must outlast about 20 s, two
-  scan periods, to be declared. The save-file load (`loadValidStoreState`) declares at once on any `Throwable`.
+  scan periods, to be declared. The save-file load (`loadValidStoreState`) declares at once on any `Throwable` (SL-W18), and an
+  FSIF compaction move's failed read, a rejected io task included, fail-stops its store at once (SL-W19).
 * **SC6 Incomplete mount or restored backup.** `crl/` absent, or present without stream files, while store
   directories exist is D1, with no retry. Absent FSIF files or a missing RocksDB `CURRENT` is D5. Store directories
   or configs missing beside Active entries are D13 at the first reconcile; their device-CRL entries stay, so a
@@ -546,4 +556,56 @@ with its copies retained in `pending-delete/` or at their paths, and nothing to 
 
 ## Open weaknesses
 
-None.
+### SL-W18: A transient read error of a valid crl_save.log or store config is taken for a lost state
+Verdict CONFIRMED. Priority 3. Effort S.
+Mechanism: `CrashRecoveryLog.loadValidStoreState` catches every `Throwable` from `loadStoreState` (`os.read.channel`,
+`FileChannel.read`) and returns `InvalidSaveFile`, so an EIO, EMFILE, ENOMEM or `OutOfMemoryError` reading a valid
+file reads the same as a truncated or foreign one. Its callers declare on it: `StoreLoader.handleLoad` sends the store
+to `StoreRebuilds.crlSaveFileLost` (D3); `DeviceDiscovery.holdsOwnState` (whose `Try(StoreConfig.loadStoreConfig)`
+also turns a failed config read into false) marks the store in D1/D2 although its whole state is the file; and
+`DeviceDiscovery.adoptionClass` classes a `transferring-out` store `CrlLost`, so `DeviceMetadata.adoptDevice` marks it
+and adopts it Rebuilding (D4). The same load already holds back on an unreadable `incarnation` file or a failed stat
+(`StoreLoader.awaitUnreadRetry`), and the device CRL open retries a transient error (`DeviceDiscovery.isTransient`);
+the save-file read alone declares at once.
+Consequence: a store whose only copy of its transaction state is its save file (an arrived transfer before its first
+load, a transfer out's source, a D1/D2 survivor) is retired and rebuilt on a passing I/O or resource condition. A
+restart storm with descriptor or memory exhaustion (SC5) does it to every such store loading at that moment, and to
+every transfer-out source on a device whose CRL is declared lost. The retired file survives only until X3.
+Fix: have `loadValidStoreState` distinguish an unreadable file (an `isTransient` error other than
+`NoSuchFileException`) from an invalid one, with `holdsOwnState` reading the config the same way. `handleLoad` then
+takes `awaitUnreadRetry`, `holdsOwnState` throws (the device is left for the next scan, as for a failed stat), and
+`adoptionClass` fails the adoption for the next scan to retry.
+
+### SL-W19: A failed read of an FSIF compaction move fail-stops the store, whatever the error
+Verdict CONFIRMED. Priority 3. Effort S.
+Mechanism: `Compaction.start` reads the slot being moved through `runIo(IoKind.MoveRead)`; `Compaction.copied` calls
+`host.failStop` on any `Failure`, and `runIo` turns a rejected io task into one. `FsifBackend.failStop` calls
+`onFatal`, which posts `Host.BackendFailed`, and `StoreRebuilds.backendFailed` marks the served store
+`rebuild-required` (D6). Nothing has been written at that point: the move's target slot was never mapped, and
+`Compaction.cancel` already abandons a move before its Map is appended. A client read of the same slot, by contrast,
+is retried over `RetryScheduler.ReadRetryDelays` and reports `CorruptedObject` only on evidence of damage
+(`FsifBackend.assemble`).
+Consequence: a transient read error, descriptor or memory exhaustion, or an io executor that rejects a task declares
+the store lost. Compaction is background work that runs on every FSIF store, so a host-wide condition (EMFILE, ENOMEM,
+a saturated or shutting-down io executor, a flaky controller on a shared device) fail-stops every store that has a
+move in flight, all at once.
+Fix: on a failed move read, cancel the move (release the target slot as `cancel` does) and let a later compaction
+retry it, keeping fail-stop for write and force failures; report damage only as the client read path does (no valid
+header, CRC mismatch), and then as `CorruptedObject` to repair rather than a fail-stop.
+
+### SL-W20: A transfer out of a closed store can write device-CRL entries over its valid save file
+Verdict PLAUSIBLE. Priority 1. Effort S.
+Mechanism: `StoreTransfers.extractUnloaded` decides with `os.exists(saveFile)` and `os.isDir(storeDir)`, which answer
+false on any stat error, not with `server.FileStat`. A closed store with a valid `crl_save.log` (its whole state) may
+also have device-CRL entries: a crash during an earlier load after `awaitCrlLoad`'s drop and part of `loadStore`, or
+an earlier tenancy's leftovers, while the store waits offline (`storesAwaitingRetry`: no CRL room yet, a failed
+build). If the stat of the file fails when the transfer out arrives, the `else` branch reads those entries
+(`readStoreState`) and `CrashRecoveryLog.saveStoreState` writes them over the valid file, then `deleteTransactions`
+removes them from the device CRL. The transfer then ships a file that validates.
+Consequence: the store's real transaction state (pending votes, Paxos acceptor state, locks, applied stubs) is
+replaced by a part of it or by another tenancy's stale state, with no declaration: the destination loads it as whole.
+An acceptor that forgot a promise or an accepted value can let a transaction decide both ways, and a stale commit vote
+can apply again. Triggers need a crash or retried load, a transfer out of the waiting store, and a stat that fails
+where the directory stat just succeeded, so they are rare.
+Fix: use `FileStat.isDir` and `FileStat.exists` in `extractUnloaded` and fail the extraction when either throws (the
+receiver's retransmitted request retries it), as `StoreCopies.retire` fails rather than report a clear path.

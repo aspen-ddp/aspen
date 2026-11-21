@@ -82,9 +82,11 @@ against free space.
 ### 2.2 Host-local store state (directory and markers)
 
 The host decides from files, not from the tree (`StoreLoader.tryLoadStore`). Markers are checked in this order:
-`rebuild-required`, `transferring-out`, `transferred-in`, `rebuild-complete`; any of them leaves the store offline in
-the router and in the device's `offlineStores`. A directory carrying `rebuild-required` is therefore treated as lost
-whatever else it carries.
+`rebuild-required`, `transferring-out`, `transferred-in`, `rebuild-complete` (each a `FileStat` test: a stat that
+fails holds the load back for a retry, `awaitUnreadRetry`); any of them leaves the store in the device's
+`offlineStores` and offline in the router, unless the store is served or opening from another device of this host
+(`StoreLoader.keepMarkedCopyOffline`). A directory carrying `rebuild-required` is therefore treated as lost whatever
+else it carries.
 
 | Local state | Evidence on disk | Router | Messages for the store |
 |---|---|---|---|
@@ -152,7 +154,7 @@ write the entry straight to Rebuilding.
 | T11 | transfer out requested for a marked store | `StoreTransfers.returnLostTransferToRebuild` | transfer aborted, entry back to Active, then R1 |
 | T12 | a directory at a Rebuilding store's path that carries neither `rebuild-complete` of the entry's episode nor `rebuild-required` | `StoreRebuilds.retireForeignCopy` | marked (a served one is first fail-stopped through `backendFailed`), then discarded like any lost copy |
 | T13 | operator declares the device dead | `fail-storage-device`, `FailedStorageDeviceDurableTask` | tombstone, then R3 per store |
-| T14 | an Active entry on a loaded, Operational device with no `config.yaml` at the store's path (the config's stat answers absent, `FileStat`: the directory or its config is gone; a stat that fails is no absence, and the store is skipped until one answers), the store neither served, in `loadedStores`, opening nor retiring | the reconcile's Missing Stores pass (`DeviceReconciler.reconcileDeviceState`, before Lost CRL State) | router offline, added to `offlineStores`, `requestRebuild` (R1). The store's device-CRL entries stay: nothing durable records the declaration, and the directory may come back (a restore or mount finishing late) before the flip commits, when a restart's device load serves it as the store it is, with its state. Once the entry is Rebuilding, `retireForeignCopy` (T12) retires a directory that is back (or a configless one), saving them into the copy; the rebuilt copy's empty `crl_save.log` drops whatever is left at its first load (5.6); a re-placement's entry leaving the device makes them leftovers for `dropLeftoverCrlState`. `tryLoadStore` only logs a configless store directory, so no other path notices such a store while its pool counts it writable |
+| T14 | an Active entry on a loaded, Operational device with no `config.yaml` at the store's path (the config's stat answers absent, `FileStat`: the directory or its config is gone; a stat that fails is no absence, and the store is skipped until one answers), the store neither served, in `loadedStores`, opening nor retiring | the reconcile's Missing Stores pass (`DeviceReconciler.reconcileDeviceState`, before Lost CRL State) | router offline, added to `offlineStores`, `requestRebuild` (R1). The store's device-CRL entries stay: nothing durable records the declaration, and the directory may come back (a restore or mount finishing late) before the flip commits, when a restart's device load serves it as the store it is, with its state. Once the entry is Rebuilding, `retireForeignCopy` (T12) retires a directory that is back (or a configless one), saving them into the copy; the rebuilt copy's empty `crl_save.log` drops whatever is left at its first load (5.6); a re-placement's entry leaving the device makes them leftovers for `dropLeftoverCrlState`. `tryLoadStore` only logs a configless store directory, so no other path notices such a store while its pool counts it writable. Without a restart, a directory back before the flip commits stays offline (no pass loads an unmarked `offlineStores` member with an Active entry) and is retired once the flip commits; a flip that fails permanently leaves it so (RB-W18) |
 | T15 | the store's `incarnation` file known absent at load (its stat answers absent; every store directory gets one at creation, `StoreCreation`, or at a rebuild's `finish`) | `StoreLoader.handleLoad` ► `retireUnserved` | marker, offline: the store's identity is lost, so it is rebuilt as a new incarnation rather than given a fresh one over its data and CRL state |
 
 The marker written in adoption's prepare closure (T9, T10) is correct whatever the transaction's outcome: the set of
@@ -163,8 +165,9 @@ unmarked and in `StoreLoader.storesAwaitingRetry`, retried at the device scans w
 4 ... scans, capped at `Host.LoadRetryCap`, 5 min); a `crl_save.log` state that fits only after the CRL grows, a
 `config.yaml` that cannot be read (`StoreLoader.awaitUnreadRetry`), a stat of the config, a marker, the
 `crl_save.log` or the `incarnation` file that fails (`server.FileStat`: absence is only a stat that answers absent), an
-`incarnation` file that cannot be read or parsed (never replaced), and an executor slot an earlier close still holds
-(`HostThreading.AlreadyAssigned`) wait the same way, so a load from a pass that removed its marker first (Completed
+`incarnation` file that cannot be read or parsed (never replaced), an executor slot an earlier close still holds
+(`HostThreading.AlreadyAssigned`), and a Store that fails to build in `handleLoad` (`StoreLoader.awaitBuildRetry`,
+its backoff kept in `buildRetryWaits` until an install) wait the same way, so a load from a pass that removed its marker first (Completed
 Rebuilds) is retried, not dropped; a failed `crl_save.log` load by a **transfer-in**
 destination restarts the transfer, since the source still holds the state. Nothing declares a *device* Failed
 automatically; only `fail-storage-device` does.
@@ -232,7 +235,9 @@ which any store copy that is no longer its owner's leaves its store path):
 4. the directory renamed to `pending-delete/<dir>-<uuid>` durably (`DurableFiles.move`), only if the device is still
    the one loaded (a device unloaded meanwhile reports the path not clear and is retired at its next load);
 
-and then starts the rebuild in the same control-thread callback, for the episode the triggering reconcile read.
+and then starts the rebuild in the same control-thread callback, for the episode the triggering reconcile read,
+without reading the tree again. An entry that left the device or changed episode during the retire is harmless: the
+next reconcile's `abandonUnlisted` cancels the rebuild, and a flip it still reaches is `Discard` or `Superseded`.
 
 While the retire runs, the store holds a rebuild slot through `droppingCrlState`, and the slot passes straight to the
 rebuild, so one reconcile cannot discard every marked store on a device at once. A failure at any step frees the slot
@@ -380,7 +385,9 @@ and still counts. The latter needs T to start inside the window between that pee
 `retryFailures` re-reads each failed object's allocation-tree entry (untimed, `allocationTree.get`): absent means
 deleted since, skipped; present is decoded, read (timed) and restored again, all concurrently. Anything still failing
 either fails the pass ("incomplete", naming `accept-rebuild-loss`, after a best-effort checkpoint) or, with
-`acceptLoss`, is recorded (5.5). It runs only when the abort latch is clear after the sweep.
+`acceptLoss`, is recorded (5.5). It runs only when the abort latch is clear after the sweep. A retry's failure is
+recorded as a failed object whatever its cause: an out-of-space write here latches nothing and logs no
+`REBUILD OUT OF SPACE` (RB-W20).
 
 ### 5.5 Accepted loss
 
@@ -576,7 +583,10 @@ mute, not on the failure budget:
   round left such an entry, written by its finalizer before TxFinalized. Every object of that list is guarded at once,
   and the objects of a still-unresolved reported T from its release: the Frontend votes abort (`InheritedGrowthLock`)
   on an update that grows a guarded object until a whole-object repair completes from a snapshot taken after the guard
-  (cross-document-review.md 2.3). A failed scan leaves every object locked and repeats the round.
+  (cross-document-review.md 2.3), or until the object's deletion persists here (a refcount-zero commit's backend
+  success or a completed repair delete, `Frontend.inheritedGrowthDeleted`), since no repair of a deleted object
+  follows; a deletion persisted before the first round's scan answers is left out of what the scan lists. A failed
+  scan leaves every object locked and repeats the round.
 
 ---
 
@@ -620,8 +630,9 @@ unfinalized (its stores keep it) until its marks land.
 ### 8.2 Processing
 
 Entries are processed only for repairable stores (served, and neither offline, rebuilding nor transferring out,
-`HostStoreView.of`), and only while the store's pool entry names the scanning host (`StoreRepairer`), so a superseded
-copy never consumes the current copy's entries. Entries written during the rebuild therefore wait until the rebuilt
+`HostStoreView.of`), and only while the store's pool entry names the scanning host and the device the store is loaded
+from there (`StoreRepairer.OwnershipFence`, failing closed), so a superseded copy never consumes the current copy's
+entries. Entries written during the rebuild therefore wait until the rebuilt
 store is loaded, and are then reconciled by its repair scans ([repair-process.md](repair-process.md)):
 
 * allocation-tree entry present: reconcile the store's copy with a full read and delete the entry once complete;
@@ -698,6 +709,7 @@ is never repaired (5.2's locked copies are marked for this reason).
 | after the flip, before the marker's removal | final path with `rebuild-complete`, entry Active | loaded offline; the reconcile's Completed Rebuilds pass removes the marker and loads it |
 | flip fails permanently | final path, entry Rebuilding | logged; backoff re-check re-enters `start`, which flips again |
 | device shutdown mid-walk | staging + checkpoint, entry Rebuilding | `cancelFor` latches the cancel; the shutdown waits up to `shutdownWorkTimeout` (60 s); resume after restart or adoption |
+| device CRL fails mid-rebuild (`DeviceShutdown.crlFailed`) | device unloaded; the rebuild is not cancelled (it uses no CRL) | a pass that finishes flips as usual (`Adopt` clears the marker; its load finds no device), and the host's restart loads the copy, or resumes a failed pass from its checkpoint |
 | device adopted elsewhere mid-rebuild | staging + checkpoint on the moved disk | the new owner's reconcile sees Rebuilding (`adoptDevice` leaves it, episode and all) and resumes |
 | host down mid-walk or awaiting the flip; store re-placed away (and maybe back) | staging + checkpoint, or a final path with `rebuild-complete`, of the earlier episode | not Rebuilding here: `abandonUnlisted` deletes the staging copy. Rebuilding here under a new episode: the checkpoint counts as none (fresh staging, full walk) and a finished copy is retired to `pending-delete/` |
 
@@ -730,7 +742,7 @@ is never repaired (5.2's locked copies are marked for this reason).
 * **B13 The tombstone is one-way and is the work list.**
 * **B14 Every transaction that changes the pool's objects during the rebuild marks the store**, except writes to the
   bootstrap pool's own ErrorTree/UnackedCommits nodes (8.3).
-* **B15 Missed-update processing waits until the store is repairable and named by its pool entry.**
+* **B15 Missed-update processing waits until the store is repairable and its pool entry names its host and device.**
 * **B16 A rebuilt copy is discarded if its device is Failed or its entry has left it.**
 * **B17 Rebuilding survives shutdown, adoption and restart.**
 * **B18 Work belongs to one episode.** A rebuild resumes only a checkpoint of its entry's episode, takes only a
@@ -740,6 +752,9 @@ is never repaired (5.2's locked copies are marked for this reason).
   (`DeviceShutdown.retireFailedDevice`: a durable `failed` marker, then unloaded like a relinquished device), and no
   host loads a device carrying the marker. Residual: until its first reconcile, a restarted or partition-healed old
   host may still answer peers holding a stale store-to-host mapping (the no-fencing trade-off accepted for adoption).
+  A running old host reconciles the device on the tombstone's one best-effort nudge or at its periodic check (1 h);
+  peers map the store to it until the rebuilt copy's flip gossips `StoreMoved`, so the window spans the rebuild
+  (RB-W19).
 * **B20 A rebuilt store never joins a transaction its old incarnation may have joined** (6.4), up to the clock-skew
   residual.
 * **B21 A rebuilt store grants no commit vote over a lock its old incarnation's vote may still back** (6.4, inherited
@@ -849,4 +864,66 @@ transfer's promotion fail and retry; its flip then reads TransferringIn and gets
 
 ## Open weaknesses
 
-None.
+### RB-W18: A missing store whose directory returns while its rebuild request fails is left unserved
+Verdict PLAUSIBLE. Priority 4. Effort S.
+Mechanism: the Missing Stores pass (`DeviceReconciler.reconcileDeviceState`) finds an Active entry whose config stats
+absent, marks the store offline in the router, adds it to `offlineStores` and calls `StoreRebuilds.requestRebuild`.
+Its directory comes back (a restore or mount finishing late) and the request's transaction fails with anything but a
+collision (`StopRetrying.collisionRetry`), which is logged and left for "a later reconcile". The next reconcile's
+Missing Stores pass skips the store, whose config now stats present; Lost CRL State needs a `rebuild-required`
+marker, Abandoned Transfers Out a `transferring-out` marker, Completed Transfers In and Completed Rebuilds their
+markers, Cancelled Shutdown a `closedForShutdown` record. No pass loads an unmarked `offlineStores` member with an
+Active entry, and nothing requests the rebuild again.
+Consequence: the store stays offline and unserved until the host restarts, while its pool counts it writable: one
+unit of the write-threshold margin lost to a transient metadata failure, the case the Missing Stores pass exists to
+prevent.
+Fix: keep a host-local record of the stores the Missing Stores pass declared, and while one's entry is still Active
+on the device and the store is neither served, opening nor retiring, request its rebuild again at each reconcile
+(`requestRebuild` needs no marker, and the Rebuilding pass's `retireForeignCopy` retires a returned copy with its
+CRL state saved). Loading the returned copy instead would also be safe, since its device-CRL entries were kept.
+
+### RB-W19: A running host keeps serving a tombstoned device's stores through their rebuild elsewhere
+Verdict PLAUSIBLE. Priority 1. Effort M.
+Mechanism: `FailedStorageDeviceDurableTask.tombstone` sends the former host a single best-effort `CheckStorageDevice`.
+A host that misses it (partitioned at that moment, or the message lost) reconciles the device, and retires it
+(`DeviceShutdown.retireFailedDevice`), only at its periodic check (`Main.CheckStorageDevicesPeriod`, 1 h) or a
+restart; the drain sends nudges only to destinations. Meanwhile the drain (`DefaultPollPeriod`, 2 min) moves the
+store Rebuilding to another device. Peers route by the store-to-host mapping their `MetadataManager` caches, changed
+only by `StoreMoved` gossip, which comes at the rebuilt copy's flip; the `StoreOffline` the new host gossips at the
+rebuild's start changes availability, not the mapping, and no host reacts to gossip about a store it serves. So for
+the whole rebuild, peers' prepares, commits and reads for that index reach the old host, which still serves its
+copy with full acceptor state. A commit it applies and acknowledges after the walk read the object leaves the rebuilt
+copy stale with no ErrorTree mark (its finalizer saw the store acknowledge); after the flip, until the old host's
+check, peers that have not yet applied `StoreMoved` still reach the old copy, a second acceptor for the same store
+index next to the rebuilt one.
+Consequence: a rebuilt copy silently missing committed updates (permanent divergence, consuming the margin of every
+object it touches), and, past `acceptor-since`, two acceptor states for one store index. The old copy's commit votes
+count toward `t` while its copy is already being replaced, so an update it acknowledged during the rebuild is held,
+once it is retired, by only `t - 1` durable copies: in a pool with `t = r` (Replication(3,2), and every pool whose
+data tolerance is zero) that is below the read threshold, and a later read restores the earlier revision from the
+non-voters and the rebuilt copy, silently losing the committed update. No store failure is involved, only an
+operator command and a lost message, so this is margin loss from asynchrony, not a failure beyond the margin.
+`fail-storage-device` on a device that is still running (suspect media, 4.1) is a supported use; systemic-loss S10
+states the residual.
+Fix: on the rare path only. Have a host that receives `StoreOffline` or `StoreMoved` gossip for a store it serves
+check that store's device (`DeviceReconciler.checkStorageDevice`), which reads the tombstone and retires the device;
+and have the drain re-send the tombstone's nudge to the former host (recorded in the task's state) on every pass
+until the store map is empty. Those shorten the window but do not close it, since the drain may move a store before
+any nudge lands. To close it for a host that is up and reachable, have `retireFailedDevice` record that it retired
+the device (in the tombstone's device state, which hosts already poll) and have the drain move no store before that
+record exists or the former host is known down; an unreachable but serving host is then the accepted no-fencing
+residual (B19), bounded by the drain's own wait.
+
+### RB-W20: An out-of-space write in `retryFailures` is recorded as an unreadable object
+Verdict CONFIRMED. Priority 5. Effort S.
+Mechanism: `RebuildingStore.retryFailures` runs each retry through `attemptRestore`; any failure, including a
+`Backend.rebuildWrite` that throws ENOSPC or EDQUOT, is caught by its `recover` and put back in `failed`. Unlike the
+walk (`restoreObject`), the sweep (`restorePending`) and `finish`, nothing calls `isOutOfSpace`/`latchOutOfSpace`.
+The pass then either fails "incomplete", naming `accept-rebuild-loss` as the remedy (the trailing
+`checkpointBestEffort` classifies only a failure of its own flush or save), or, with `acceptLoss` set, has
+`recordAcceptedLoss` mark the objects and logs `REBUILD ACCEPTED LOSS` for objects the pool can supply.
+Consequence: a destination that fills during the retries gets the wrong operator alert and remedy (no
+`REBUILD OUT OF SPACE`, so no re-placement prompt), and an acceptance given for genuinely unreadable objects also
+promotes the store without slices that were readable, leaving them to repair onto the same full device.
+Fix: in `retryFailures`' `recover`, latch an out-of-space error with `latchOutOfSpace`, and check the abort latch
+after the retries, before `lossAccepted`, failing the pass with the latched cause.

@@ -87,7 +87,7 @@ retransmit 1 s. `TestNetwork` builds recovery drivers with 10 ms / 100 ms.
 | Transaction horizon | 20 s | `TransactionHorizon.Horizon` | Forget floor's time leg (on `startTimestamp` against the host's wall clock) |
 | `MaxStartLead` | 2 s | `TransactionHorizon.MaxStartLead` | A store mutes an unknown transaction started further ahead of its clock; added to the load floor |
 | Expiry margin | 8 s | `Frontend.expiryMargin` (`MaxStartLead` + `txHeartbeatTimeout` + one heartbeat) | A Tx unfinalized past horizon + margin (28 s) queries its peers: at once, then after 1, 2, 4 and every 8 heartbeats; the same point freezes its acceptor (`Tx.frozen`) |
-| Driver retransmit | `maxDelay` (3 s) | `SimpleTransactionDriver.sendPeerMessages` | Re-sends prepares (to stores not yet answered), accepts (with prepares every third send) or `TxResolved` (to stores not known resolved). Contention backoff `nextRound`: random in `[0, backoff)`, doubling to `maxDelay` |
+| Driver retransmit | `maxDelay` (3 s) | `SimpleTransactionDriver.sendPeerMessages` | Re-sends prepares to every data store while the round has no Accept; once it has one, accepts to the acceptors not yet accepted, with prepares to the stores not yet answered this round every third send; once resolved, `TxResolved` to stores not known resolved. Contention backoff `nextRound`: random in `[0, backoff)`, doubling to `maxDelay` |
 | `TransactionDriver.heartbeat` | every store heartbeat | `TransactionDriver.heartbeat` | `TxHeartbeat` to all data stores while unfinalized (none on the first tick), `TxFinalized` while finalized |
 | `errorTimeout` | 2 s | `MissedUpdateFinalizationAction.errorTimeout` | Marker waits this long after it executes for `TxCommitted`s before marking |
 | Finalizer restart | 1 s doubling to 60 s | `TransactionDriver.finalizerRetryDelay` | Backoff of a failed finalizer |
@@ -179,12 +179,16 @@ answers in this order:
    after the Tx the prepare creates and any driver started for it exist, so all of them learn it. A non-late one a
    driver treats as resolution (`onResolution(sendResolutionMessage = false)`) and, for a commit, runs the finalizer
    itself. If the store holds no Tx and the transaction is above its floor, the Frontend creates one marked
-   `outcomeDecided` (no locks; status queries get the cached outcome); below the floor it refuses the prepare. The
+   `outcomeDecided` (no locks; status queries get the cached outcome); below the floor it refuses the prepare, except
+   that a rebuilt store creates a muted Tx, which takes no part, for a transaction started before its acceptor
+   (`Frontend.receivePrepare`, `acceptorSince`). The
    entry may be the store's own: a Tx resolved committed records a non-finalized `Committed` (`Tx.resolved`). So the
    store sends itself nothing when its own Tx for T is already resolved: that resolution is no news to its driver,
    and the idle driver a store starts after its `TxFinalized` was lost would take it as a non-late commit and run T's
    finalization actions again. That driver learns the outcome from its peers instead: late from their finalized relay
-   (`TxFinalized(late)`, then `resolveLate`), or by Paxos while they still hold T.
+   (`TxFinalized(late)`, then `resolveLate`), or by Paxos while they still hold T. The rule covers only the self-send:
+   the relay to the sender goes whatever this store holds, so a sibling store of T on the same host, which shares
+   the cache, still answers that driver with the non-late entry (R-W12).
 3. **Live `Tx`** (`Tx.receivePrepare`): it answers with its fixed vote and an acceptor promise, sent only after the
    CRL save of that state completes (or after its objects load, then the save). A Tx that already applied the commit
    also resends `TxCommitted` to the proposer.
@@ -353,8 +357,9 @@ up and fails every entry of the batch. The marker transaction is `replaySafe` (m
   acceptor forgets T. The value is T's start timestamp plus the object's type and store pointer, which repair compares
   against and rebuilds the pointer from (`encodeErrorEntry`).
 * **Owed voters have entries.** Every store whose counted commit vote may be saved and which sent no `TxCommitted` has
-  an UnackedCommits entry keyed `UnackedCommitEntry.key(store, txid)`, written in the same pool batch as its ErrorTree
-  marks. Entries are one per (store, transaction), never merged: the recovered-vote lookup names that key.
+  an UnackedCommits entry keyed `UnackedCommitEntry.key(store, txid)`, queued in the same pool's marker queue as its
+  ErrorTree marks (the same or a later batch of that pool, `nextBatch`), both durable before the action completes.
+  Entries are one per (store, transaction), never merged: the recovered-vote lookup names that key.
 * **Coverage argument.** For each changed object the counted voters reach its write threshold; each either sent
   `TxCommitted` or has an entry, through which a recovered or expiring voter applies T, and repair leaves the entry
   alone while the store may still hold or join T. A `TxCommitted` naming no changed object means its backend commits
@@ -373,9 +378,9 @@ up and fails every entry of the batch. The marker transaction is `replaySafe` (m
   stub suppresses (5.4).
 * **Dependency inversion.** Finalization of any transaction in which a store is silent for `errorTimeout` depends on
   a successful write to that pool's ErrorTree/UnackedCommits trees, which needs a write quorum of the metadata pool
-  holding them. Meanwhile every store keeps T's CRL state and admission, and no `finalized` cache entry exists. Marker
-  batches run in a higher CRL admission lane than what they finalize (`AdmissionTier`), so data-pool load cannot
-  block them.
+  holding them. Meanwhile every store keeps T's CRL state and admission, and no `finalized` cache entry exists. The
+  trees live in metadata pools (bootstrap pool for the metadata pools' own), whose stores admit in a higher CRL lane
+  than data pools' (`AdmissionTier.forPool`), so data-pool load cannot block the marker batches.
 
 ### 5.4 Applied stubs and `TxFinalized.owed`
 
@@ -594,7 +599,8 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   (transaction-requirements.md 9.4, 10.5c). A non-voter's Insert of a key no such deletion reached reports nothing, so
   the routine non-voter of pipelined inserts keeps its transaction's finalizer on the clean fast path. These reports
   reach a finalizer only while T's marker has not yet written: an apply after T's finalization relies on the store's
-  ErrorTree mark instead, which no repair of an object T changes consumes before T has applied there (7.3).
+  ErrorTree mark instead, which no repair of an object T changes consumes before T has applied there (7.3). A
+  recovered non-voter that acknowledged T before its crash has no such mark (cross-document-review X-W24).
 * The CRL's drop of applied object data (`Tx.allObjectCommitsComplete`, `CrashRecoveryLog.dropTransactionObjectData`)
   is in memory only, so a crash can recover a Tx with data it already applied. For allocations this matters: a
   deletion of an object an unconcluded Tx allocated here waits (`Frontend.awaitAllocationsDurable`) until that Tx's
@@ -657,7 +663,8 @@ state, and Paxos, safe with offline acceptors, never chooses abort once commit w
   rebuilt since its vote, so the vote that counted is lost and this incarnation's copy comes from its rebuild.
 * **Lookup failure or no answer**: a failed lookup is retried at heartbeat; the Tx keeps holding aborts (and its
   locks) meanwhile, and is driven. Each lookup has its own request id: an entry found by any of them is taken, while
-  no entry counts only from a lookup started after the latest held abort or late commit (`firstCounting`); a
+  no entry counts only from a lookup started at or after the latest request for one (`firstCounting`, moved by the
+  load, the first held abort, a held late commit and an expiry discard decision; later aborts do not move it); a
   non-counting absent answer of the latest lookup starts another. The lookup is an untimed read of the tree through
   the host's client, so one still unanswered is never re-issued (one past `UnackedLookupTimeout` is logged once):
   through a metadata outage each Tx keeps at most one read in flight. Its answer cannot be lost: lookups start only
@@ -721,7 +728,7 @@ lookup that finds no entry.
 
 ```
  created (leader on a client prepare | any store on an idle Tx | expiry commit | a primary or learn-only store)
-   -> PREPARE: TxPrepare(proposalId) to stores that have not answered (every maxDelay)
+   -> PREPARE: TxPrepare(proposalId) to every data store (every maxDelay; post-proof round: those not yet answered)
    -> votes per object (commit-certain / abort-certain / undecided); proof: never abort, post-proof round
    -> local proposal fixed; ACCEPT to primary-pool stores (+ prepares every third send); learn-only: no Accept
    -> learner: Accepted quorum   ==> resolved(c)         [or TxResolved / TxFinalized from a peer]
@@ -857,9 +864,10 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
   `TxResolved`+`TxFinalized(late)`; the driver resolves late, finalizes with no actions, and a commit voter that
   already applied looks its entry up only for its stub. The store's own host entry, a non-finalized `Committed` unless
   a store of T on the same host saw `TxFinalized`, does not answer the driver's prepare to its own store: the relay
-  sends no self `TxResolved` while the store's own Tx is resolved, so no finalization action runs again. If the
-  caches' window passes, nothing is re-decided: the Tx ends by expiry,
-  concluding its known outcome once more than `w - t` primary acceptors no longer hold T.
+  sends no self `TxResolved` while the store's own Tx is resolved. A sibling store of T on that host still relays the
+  entry, non-late, to the driver's prepare, which then re-runs T's actions until the late answer cancels it (R-W12).
+  If the caches' window passes, nothing is re-decided: the Tx ends by expiry, concluding its known outcome once more
+  than `w - t` primary acceptors no longer hold T.
 * **Clock skew**: no clock decides replay. Clocks remain in the forget floor's time leg (a step back of more than about
   8 s can let a store rejoin T, paxos-transactions.md), in the `acceptorSince` and `MaxStartLead` mutes, and in repair's
   age gate.
@@ -895,4 +903,28 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-None.
+### R-W12: a sibling store on the same host relays a stale non-finalized commit, re-running T's finalization actions
+Verdict CONFIRMED. Priority 5. Effort S.
+Mechanism: the status cache is one per host (`TransactionStatusCache`, shared by the host's stores). A Tx resolved
+committed records a non-finalized `Committed` there (`Tx.resolved`), and a recovered Tx whose saved status is
+`Committed` seeds it from its constructor. Let S and S2 be stores of T on host H (two pools of T, or one store that
+never got a Tx for T), and let the `TxFinalized` of T to both be lost (one burst of loss to H; the finalizing driver's
+heartbeat re-sends it only until its own store gets it), or let H restart after T was finalized elsewhere with S's
+saved status `Committed`. S's idle Tx gets a driver (`Store.heartbeat`); its prepare to S2 reaches
+`Store.handleTransactionMessage`, whose relay of a non-finalized entry sends `TxResolved(committed, late = entry.late
+= false)` to the sender whenever `msg.from != msg.to`, whatever S2 holds: the rule that suppresses the relay while
+the store's own Tx is resolved (`frontend.transactions.get(txid).forall(_.knownOutcome.isEmpty)`) guards only the
+self-send. After a restart S2 is below its load floor and refuses the prepare, but the relay precedes the Frontend.
+S's driver takes the message as resolution (`TransactionDriver.receiveTxResolved` ->
+`onResolution(sendResolutionMessage = false)`) and starts a finalizer, whose actions execute at once
+(`RegisteredTransactionFinalizerFactory.Finalizer`); the remote peers' finalized relay (`TxFinalized(late)`) arrives after the same-host answer and `resolveLate` cancels it.
+Consequence: T's non-marker finalization actions run again after T was finalized and forgotten, against
+`resolveLate`'s premise that no action runs once an acceptor forgot T; if no late answer comes within `errorTimeout`
+(remote peers unreachable), the marker writes ErrorTree marks for every store of T and voter-unknown UnackedCommits
+entries for every store but S, and the `TxFinalized` that follows has every store write a stub. The shipped actions
+tolerate a late re-run: no safety effect.
+Fix: in the relay, do not send a non-finalized entry to a sender on the same host (the router knows the host's
+stores): it shares the cache, so the relay tells it nothing its own store's relay did not already decide under the
+self-send rule. The paxos-transactions 10.2 takeover (a leader whose host recorded another host's resolution) is the
+self-send and is unchanged. One local-store lookup on the relay of a resolved, unfinalized entry; nothing on the hot
+path.

@@ -332,8 +332,11 @@ under when lower (`JoinCeiling.boundAtLoad`), and at least an arrival from anoth
 `RebuildingStore.AcceptorSinceMargin` (10 s); a load within that margin of the arrival uses the load plus the margin.
 At or above the floor, a replayed prepare could still create a Tx for T at the store after the scan's
 `holdsTransaction` check, apply T after the reconcile, and the entry would be deleted under that apply. Below it the
-store refuses every prepare for a transaction it does not hold (`Frontend.receivePrepare`), and a store never rejoins
-a transaction it forgot. The wait is at most the horizon plus `MaxStartLead` (2 s) plus clock skew (the margin is
+store refuses every prepare for a transaction it does not hold (`Frontend.receivePrepare`, `refusePrepare`), and a
+store never rejoins a transaction it forgot. The one Tx created below the floor is a rebuilt store's muted Tx for a
+transaction started before its acceptor (`acceptorSince`, `Frontend.createTx`): it takes no part and applies nothing
+(`Tx.muted`), at most proving the commit to its driver, and it is forgotten once its objects load unless proven
+committed (`Frontend.forgetMuted`); while it exists, `holdsTransaction` skips the UnackedCommits entry. The wait is at most the horizon plus `MaxStartLead` (2 s) plus clock skew (the margin is
 shorter than the horizon). For an ErrorTree entry the check uses
 `missedTimestamp`, the newest merged miss; older merged misses started earlier and are below the floor too.
 
@@ -398,8 +401,9 @@ commit for their turn (`heldCommits`). `lockWaitingCommits` lists committed tran
 finalized before it applies here relies on the store's ErrorTree mark for its object, and a completed pass would
 consume it: its later blind Insert of an absent key could then write back a key a later transaction deleted. `commitFailed` includes objects poisoned by `poisonObject`.
 
-A rebuilt store also answers stale, before any of this, for a KeyValue object under its inherited-vote lock (every
-object until its first held-vote round completes), and turns a complete result into a stale one for an object it
+A rebuilt store also answers stale, before any of this, for a KeyValue object under its inherited-vote lock
+(`Frontend.inheritedVoteLock`: every object until its first held-vote round completes, then the objects of inherited
+transactions not yet released), and turns a complete result into a stale one for an object it
 guards against growth unless the pass is whole-object and its snapshot was taken after the guard was set
 (`RepairSnapshot.takenAt`), when the guard ends (`Frontend.inheritedGrowthRepaired`; 10.3,
 cross-document-review.md 2.3). The entry so outlives the guard, which only a repair can end. A stale result defers
@@ -636,9 +640,12 @@ unproven. A committed proof means a write threshold of stores agreed with the re
 none held a conflicting lock (the requirements take the same locks a real write would). Any other committed write of
 that part needed a vote from a store in the proof's set, which would have collided or mismatched, so the read was
 current on it at proof time. The scan then reconciles from the same read with `snapshot.proven` set: the read's locks
-on proven parts are ignored, the store's own locks still defer, and the snapshot check still applies.
+on proven parts are ignored, the store's own locks still defer, and the snapshot check still applies. A DataObject's
+object level is its refcount and its data revision, but its proof requires only the refcount: a `DataUpdate` that
+committed after the read leaves the refcount as it was and does not fail it, so the data revision is not proven
+(RP-W11).
 
-The object-level proof compares the revision only, which suffices because every min/max/left/right change moves the
+The KeyValue object-level proof compares the revision only, which suffices because every min/max/left/right change moves the
 revision (Q8). Every requirement on a refcount-0 or missing object fails `MissingObject`
 (`RequirementsChecker.loaded`), so no proof revives a deleted object: a proof from a pre-deletion read aborts, the entry
 stays, and the next pass's read proves the deletion.
@@ -912,4 +919,27 @@ its read threshold stalls the scan until the deadline.
 
 ## 14. Open weaknesses
 
-None.
+### RP-W11: A DataObject's object-level proof proves the refcount only, yet its reconcile treats the data as proven
+Verdict PLAUSIBLE. Priority 2. Effort S.
+
+Mechanism: for a DataObject whose read reports the object level locked, `StoreRepairer.prove` runs only
+`RepairProofs.proveRefcount` (`RefcountUpdate(required = rc, new = rc)`), and a commit sets
+`ReadLocks.objectLevel = true`. `Frontend.reconcileSettled` then ignores the read's object-level lock for the whole
+object level, and `Reconcile.planData` compares revisions with `locks.objectLevel` false. The refcount requirement
+(`RequirementsChecker.checkRefcount`) does not check the revision, so a `DataUpdate` D that committed and applied at
+the proof's voters does not fail the proof. Example, replication `w = 5`, `t = r = 3`: D commits with voters A, B, E;
+A and B apply it, E is slow to apply and holds D's object lock (a commit waiting in lock order, say); S and S' miss D,
+and S's ErrorTree entry holds D's mark (`missedTimestamp` = D's start). A `RefcountUpdate` R started after D commits
+on A, B, S' (Q6: it checks no object timestamp). Every read then restores the pre-D revision from E, S', S (A and B
+alone cannot reach `r`), reports E's lock, and carries R's start as its timestamp (the maximum over the matching
+stores, S' included), so it passes the completion gate (`repairUpdate`, M14). Once the entry has been lock-deferred
+`proofAfterDeferrals` passes, the refcount proof commits on A, B, S', and the reconcile installs R's refcount at S,
+leaves its data at the pre-D revision (equal to the read's), and returns complete. `deleteIfStillOwned` removes the
+entry, whose revision no later mark moved.
+Consequence: S keeps a DataObject copy without D's data and no entry names it, a permanent replica divergence that
+costs the object one store of margin (reads stay correct through the other copies). Needs a DataUpdate voter that
+stays locked for about ten passes together with a later refcount-only update applied by a non-voter.
+Fix: prove a DataObject's object level with its revision too: run `ExclusiveRevisionLock(read.revision)` (as
+`RepairProofs.proveObjectLevel` does for KeyValue objects, generalised to any `ObjectState`) after the refcount proof,
+and treat the object level as proven only if both commit. The lock collides with any data write's lock, and its
+`checkRevision` fails at every store that applied a later DataUpdate.

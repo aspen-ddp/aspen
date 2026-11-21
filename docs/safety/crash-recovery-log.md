@@ -206,7 +206,10 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
    `openDeviceCrl`), on the control thread.
 2. `StoreLoader.handleLoad` reads the store's `crl_save.log`, if any, before the `Store` exists. An unusable
    one (`loadValidStoreState` returns `Left` for anything thrown, including transient errors) makes the store
-   permanently unservable (`StoreRebuilds.crlSaveFileLost`).
+   permanently unservable (`StoreRebuilds.crlSaveFileLost`). Whether there is one is asked of `server.FileStat`: a
+   stat that fails is no absence, and the load is held back and retried with backoff (`awaitUnreadRetry`), as it is
+   for an incarnation file that cannot be stat'd or read. Taken as absent, the store would recover from a device CRL
+   holding none of its state, and the file, still there, would have the next load drop everything saved since.
 3. With no save file, `StoreRouter.recoverDeferred` -> `readAndRecover` runs on the store's executor and calls
    `readStoreState`. It does not block: the Future completes on the CRL thread and recovery is routed back to the
    executor. The store holds its transaction messages until `Frontend.recover` has recreated its transactions, so it
@@ -270,8 +273,8 @@ piece leaves the image when that save's entry is built (5.3: a form's build unpi
 |-----------|-----------|--------|
 | Planned device shutdown | stores close with `extractCrl = false`, records stay live; then `crl.shutdown()` | `DeviceShutdown.closeForShutdown`, `shutDownCrl` |
 | Transfer out, store open | on the executor after `closing`: `readStoreState`; `saveStoreState` to `crl_save.log` (tmp, fsync, rename, directory fsync); `store.close()`; then `deleteTransactions(state.entryIds)` and the retained admission released | `StoreLoader.handleClose(extractCrl = true)` |
-| Transfer out, store closed | on the transfer's source device only (the device the pool entry names, whose directory ships; another device of the host may hold an earlier copy of the store, whose entries are its retire's); with a valid `crl_save.log`: the file ships unchanged and `dropStore` removes the device CRL's entries (a copy of part of the file or an earlier tenancy's leftovers, 3.3 step 4), releasing the charge retained when the drop was issued; without one: `readStoreState`, saved, then `deleteTransactions`. An unusable save file fails before anything is read; an open started during the read or drop (`opensStarted`) fails it after | `StoreTransfers.extractUnloaded` |
-| Retire of a copy no longer its store's owner (a lost store before its rebuild, a transfer out's source, a re-placed rebuild's source, an earlier tenancy's copy at the path of a store transferring in) | marker `rebuild-required` durable; `lost-crl-state.log` kept if present, else the copy's `crl_save.log` renamed to it (any entries `readStoreState` still returns saved first as `lost-crl-entries.log`), else `readStoreState` saved to it; `dropStore`; directory renamed into pending-delete | `StoreCopies.retire` (from `StoreRebuilds.discardLostStore`, `StoreTransfers.retireEarlierTenancy` and the Deleted Stores pass) |
+| Transfer out, store closed | on the transfer's source device only (the device the pool entry names, whose directory ships; another device of the host may hold an earlier copy of the store, whose entries are its retire's); with a valid `crl_save.log`: the file ships unchanged and `dropStore` removes the device CRL's entries (a copy of part of the file or an earlier tenancy's leftovers, 3.3 step 4), releasing the charge retained when the drop was issued; without one: `readStoreState`, saved, then `deleteTransactions`, then all that is retained for the store released (`releaseRetained(storeId)`). An unusable save file fails before anything is read; an open started during the read (no save file) or the drop (`opensStarted`) fails it after. The check is not made again after the deletion, nor before `startOut` writes the `transferring-out` marker (CRL-W17) | `StoreTransfers.extractUnloaded`, `closeForTransferOut` |
+| Retire of a copy no longer its store's owner (a lost store before its rebuild, a transfer out's source, a re-placed rebuild's source, an earlier tenancy's copy at the path of a store transferring in) | a path whose stat fails (`server.FileStat`) fails the retire, retried at a later check, rather than report it clear; marker `rebuild-required` durable; `lost-crl-state.log` kept if present, else the copy's `crl_save.log` renamed to it (any entries `readStoreState` still returns saved first as `lost-crl-entries.log`), else `readStoreState` saved to it; `dropStore`; directory renamed into pending-delete | `StoreCopies.retire` (from `StoreRebuilds.discardLostStore`, `StoreTransfers.retireEarlierTenancy` and the Deleted Stores pass) |
 | Store no longer on the device (safety net: a retire drops first) | `storesWithEntries`; for each store not in the device's tree entry, not loaded, with no directory (a stat that answers absent, `server.FileStat`: one that fails keeps them), no drop and no retire running: `dropStore` | `DeviceReconciler.dropLeftoverCrlState` |
 | Store whose `loadStore` of its `crl_save.log` failed (the file stays) | `dropStore` | `StoreLoader.handleUnloadFailed`, `closeUnloaded(dropDurably = true)` |
 
@@ -358,7 +361,11 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   CRL (`DeviceDiscovery.holdsOwnState`): its `crl_save.log` validates as its own, so its whole state is that file (3.3,
   step 4: a store with a save file has served nowhere since it was written, and its load drops what the device CRL
   holds for it), or it carries `rebuild-complete`, a finished rebuild awaiting its flip that has never served
-  (`StoreLoader.tryLoadStore` leaves it offline), so its flip and load proceed as over the old CRL. `crl/` is moved to
+  (`StoreLoader.tryLoadStore` leaves it offline), so its flip and load proceed as over the old CRL. Every existence
+  test on this path is `server.FileStat`'s: a child directory whose `config` cannot be stat'd counts as a store
+  directory (missing it could take an emptied `crl/` for a new CRL), and a failed stat of a child, of `crl/` or of
+  what `holdsOwnState` tests throws before anything is marked, leaving the device unloaded for the next scan,
+  uncounted by `CrlOpenAttempts`. `crl/` is moved to
   `crl.lost-<uuid>` (kept deliberately, Backlog.txt); the device directory is forced; a fresh CRL is created in
   `crl.creating/` (`CrashRecoveryLog.replacementCrlDir`, `CrashRecoveryLogFactory.createCRL`, `SimpleCRL.create`: an
   empty directory, every file forced, nothing opened), renamed to `crl/` durably once finished (`DurableFiles.move`),
@@ -1039,7 +1046,10 @@ that is, at most about `S/656` unoffset stubs outstanding: 102491 at 4 streams o
 this leaves are the unoffset stubs, and the room for them is the `S/16` reserve plus what `EntryOverheadReserve` keeps
 beyond the `n − 1` evacuation headers. The limit is `15S/16` at 4 streams, above the `S/2` floor. A ring of 3 streams
 (accepted by `SimpleCRL.apply`, refused by `CrlSizingDefaults.resolve`) is covered by the same proof: limit `7S/16`,
-2 rotations, room for 1792 unoffset stubs at 1 MiB.
+2 rotations, room for 1792 unoffset stubs at 1 MiB. The room shrinks by 118 bytes per stream: it is negative, even
+with no unoffset stub, once `118 · (n − 1) > S/16 + 8192`, which a ring grown past 625 streams of 1 MiB reaches, and
+which `CrlSizingDefaults.resolve` does not refuse (CRL-W18). The default stream size (at least 64 MiB) keeps it positive
+at every ring size up to `MaxMaxStreams`.
 
 **What is not proven.** `N` has no structural bound: an unoffset stub cannot be refused (the store must remember that
 it holds the transaction's update), and a device that drops prepares under load is exactly the one that later receives
@@ -1179,7 +1189,8 @@ drive breaks the backends too; it is an operational requirement (AS1).
 stream (6.1, Lemma A) and every other entry is at most half a stream (W1), so `Stream.writeEntry`'s `require` is
 reached only by a bug. A lone record larger than a stream, which admission's Oversized keeps out, fails the CRL at
 once (`writeHead`). With live bytes within 6.1's bound every head is written within `n − 1` rotations (10.18).
-Past the bound, which only unoffset stubs beyond 6.1's margin can reach, the head is still not written after `n − 1`
+Past the bound, which only unoffset stubs beyond 6.1's margin can reach (or admission itself, for the small-stream
+rings of CRL-W18), the head is still not written after `n − 1`
 rotations and the CRL fails (W6, 10.7) rather than rotating on: the unwritten entries were never acknowledged, so the
 files hold a consistent CRL and a restart recovers it. Their deletions are lost with them, so the recovered live set
 may be larger than before the failure; the reloaded stores delete those records again as their transactions
@@ -1296,4 +1307,45 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-None.
+### CRL-W17: A closed store opened after its transfer-out extraction's check is shipped while it serves
+Verdict PLAUSIBLE. Priority 1. Effort S.
+Mechanism: `StoreTransfers.closeForTransferOut` finds the store neither loaded nor opening and runs `extractUnloaded`.
+Without a `crl_save.log` it checks `openedMeanwhile` (`StoreLoader.opensStarted`) once, when `readStoreState` answers,
+then writes the save file and issues `deleteTransactions`; with one it checks after `dropStore`. Nothing keeps the
+store closed until `startOut`'s `fclosed.foreach`, a later control task, writes `StoreTransfer.TransferOutMarkerFile`,
+and that callback checks only shutdown and `rebuild-required`, not `ctx.router.loaded`, `isOpening` or `opensStarted`.
+A closed store with live device-CRL entries is typically in `StoreLoader.storesAwaitingRetry` (a failed open: ENOSPC,
+an I/O or lock error, a build failure), and `retryFailedLoads` at a device scan calls `tryLoadStore`, which sees no
+marker yet and `startOpen`s it. An open in the no-save-file branch's deletion window (one CRL write) or in either
+branch's task hop: `handleLoad` finds the just-written save file, `tryChargeLoaded` merges its charge into what is
+retained, the store installs, `awaitCrlLoad` drops and loads, and `StoreRouter.crlLoaded` removes the file and
+recovers it. Then (1) the no-save-file branch's `releaseRetained(storeId)` releases the loaded charge too, leaving the
+loaded records uncounted until the recovery's own count (an A2 gap of the store's state size); (2) `fclosed` succeeds,
+the marker is written beside a loaded store, and `beginTransferOut` archives the directory of a store that is voting
+and committing, with or without the `crl_save.log` depending on whether the archive read it before `crlLoaded` removed
+it.
+Consequence: if the archive carries the file, the destination validates it (`loadValidStoreState`) and can be promoted
+holding a CRL state that lacks every promise, vote and commit the source made after its load, and a backend copied
+while it changed: acceptor amnesia (a split decision) and committed updates the destination never holds, with no
+UnackedCommits entry to repair them (the source acknowledged them). Without the file the destination refuses it and a
+retransmit closes the now loaded store with extraction, which heals it. (1) alone is liveness: Lemma C's bound can be
+exceeded by the store's state, past the margin into W6.
+Fix: make the open check and the marker write one control task: in `fclosed.foreach`, skip (log; the retransmit
+retries) unless the store is neither loaded nor opening and `opensStarted` is unchanged since `closeForTransferOut`
+began; in the no-save-file branch check `openedMeanwhile` again after the deletion and release with the identity-checked
+`releaseRetained(storeId, charge)` read before the read, as the save-file branch does.
+
+### CRL-W18: The admission limit's proof fails for small streams in a large ring
+Verdict PLAUSIBLE. Priority 4. Effort S.
+Mechanism: `SimpleCRL.limitAt` is `(n − 2) · S/2 − S/16`, so Lemma C gives `F ≤ (n − 1) · S/2 − S/16 − 8192 + 41 · N`,
+while Lemma B needs `F ≤ (n − 1) · S/2 − 118 · (n − 1)` (6.1, "The limit"). With no unoffset stub this holds only while
+`118 · (n − 1) ≤ S/16 + 8192`. `CrlSizingDefaults.resolve` accepts `crl-max-file-size-mb` from 1 and `crl-max-streams`
+up to `MaxMaxStreams` (1024) with no relation between them, and `GrowthPolicy` grows to that cap: 1 MiB streams break
+the inequality past 625 streams, and any `S` below about 1.72 MiB does before 1024. `maxAdmissionLimitBytes`
+(`StoreLoader.neverFits`) admits loaded states against the same formula at 1024 streams.
+Consequence: within the admission limit, a head can fail to be placed in `n − 1` rotations when the image packs the
+streams closely; W6 then fails the CRL and the device is unloaded until restart, where it may fail again. No state is
+lost (W6 is fail-stop), but the "nothing within admission reaches W6" guarantee does not hold for such configs.
+Fix: charge the evacuation headers in the limit, `(n − 2) · S/2 − S/16 − 118 · (n − 1)`, which makes the inequality
+independent of `S` and `n`; or have `resolve` refuse, and `resolveExisting`/`GrowthPolicy` cap, a `crl-max-streams`
+with `118 · (crl-max-streams − 1) > S/16 + 8192`.

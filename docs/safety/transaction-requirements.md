@@ -100,8 +100,8 @@ branch of `RequirementsChecker.check`:
 | `KeyRevision(k, rev)` | key present (`KeyExistenceError`), no other K on it and no other C, revision == rev, key timestamp <= tx timestamp (`KeyTimestampError`) | K on k | |
 | `KeyObjectRevision(k, rev)` | object revision == rev; no timestamp check | X | whole-object |
 | `WithinRange(k, ordering)` | k within `[min, max]` (`WithinRangeError`) | R (`kvs.rangeLocks`, a set: many holders) | checks no key lock |
-| `Exists(k)` | key present, no other K, no other C | K | |
-| `MayExist(k)` | present: no other K or C; absent: no other N | K if present, else N | |
+| `Exists(k)` | key present, no other K, no other C | K | no production caller |
+| `MayExist(k)` | present: no other K or C; absent: no other N (C through `getState`) | K if present, else N | no production caller |
 | `DoesNotExist(k)` | absent (`KeyExistenceError` if present), no other N | N (`absentKeyLocks(k)`) | |
 | `TimestampEquals/LessThan/GreaterThan(k, ts)` | present, key timestamp ==, <, > ts, no other K or C | K | no production caller |
 | `Insert(k, v)` | written-key lock check (step 7); needs a check on k, a required revision or a content lock (step 3) | `RequirementsLocker.plannedLocks` from `KVWrites.keys`: K if present, else N | |
@@ -124,7 +124,7 @@ object-level operations set or clear `min/max/left/right`. Then `state.data := k
 
 Last-writer-wins makes Inserts of one key checked only for presence (`Exists`, the timestamp requirements) converge
 whatever order a store applies them in; such an Insert passes its check over a later write of its key and is then a
-no-op. An Insert checked by `KeyRevision`, `DoesNotExist` or a required revision always wins in practice: its check
+no-op. An Insert checked by `KeyRevision`, `DoesNotExist`, a content lock or a required revision always wins in practice: its check
 rejects a key written later, and the client's HLC places it after the state it read. Deletes and object-level fields
 carry no timestamp, so they cannot be ordered this way; that is why unchecked ones are refused (section 2.5).
 
@@ -460,9 +460,12 @@ through them:
 
 | IDA | Constraint | Consequence |
 |---|---|---|
-| `Replication(width, t)` | `t >= width/2 + 1` | `2t > width` |
-| `ReedSolomon(width, k, t)` | `k >= width/2 + 1`, `t >= k` | `2t > width` |
+| `Replication(width, t)` | `1 <= width <= IDA.MaxWidth` (127), `width/2 + 1 <= t <= width` | `2t > width` |
+| `ReedSolomon(width, k, t)` | `width <= IDA.MaxWidth`, `width/2 + 1 <= k <= width`, `k <= t <= width` | `2t > width` |
 | `RandomAccessReedSolomon(width, k, t, ..)` | same | same |
+
+The width bound keeps every store index within the signed-byte pool index of a `StoreId`, so the tallies' `0 until
+width` loops address every store of the pool.
 
 Edge cases:
 
@@ -716,8 +719,13 @@ over the absent key under a content lock (which lists only present keys). A dele
 timestamp is at least T's start, and the deletion's check requires its own timestamp to be at least that. The record
 keeps the latest deleting start per object and key, written by every apply that deletes keys (the keys are decoded
 only for an update flagged `deletesKeys`), and is kept while a transaction started before it may still apply here:
-above the forget floor, or while a Tx started at or before it is held (a held Tx applies below the floor too); it is
-pruned at `expiryHeartbeat`. A deletion that reached the store through repair is covered by `repairInstalls` (below).
+above the forget floor, or while a Tx in `transactions` started at or before it is held (a held Tx applies below the
+floor too); it is pruned at `expiryHeartbeat`. A commit held here past its TxFinalized (in lock order or for its turn,
+`Frontend.deferredFinalizations`) is not in `transactions` and keeps no record alive, so its apply may miss a pruned
+deletion. It needs no report: it was finalized before it applied here, so no TxCommitted reached the finalizer within
+`errorTimeout` and the finalizer marked this store, and that mark's repair finds the object unsettled while the
+commit is held or queued (`settledForRepair`, repair-process 8.2; a commit held for its adopted object data is not,
+cross-document-review X-W23) and installs the current state after it applies. A deletion that reached the store through repair is covered by `repairInstalls` (below).
 The finalizer marks the store, and the mark's repair installs the object's current state. A non-voter is not counted
 toward the write threshold, so the report costs a repair pass, not margin. A non-voter's Insert of a key no deletion
 reached reports nothing, so the routine non-voter of pipelined inserts into one leaf (its vote withheld behind an
@@ -831,7 +839,8 @@ missing update: `MissingObjectUpdate` at the re-check. The update was applied be
 recovered vote takes it as applied (8.5).
 
 (c) A recovered commit vote re-applies its update when its outcome is learned. Revision, refcount and `KeyRevision`
-requirements fail on a store that applied a later chained write, and the vote takes the object as applied (8.5). An
+requirements fail on a store that applied a later chained write (a refcount only because every shipped refcount
+change advances `ObjectRefcount.updateSerial`, which nothing enforces: cross-document-review X-W27), and the vote takes the object as applied (8.5). An
 `Exists`-checked Insert over a present key re-applies harmlessly (last writer wins). A `DoesNotExist` or blind Insert of a key now
 absent passes its re-check again, and applies: T never applied it. Had T applied it and a later transaction deleted the
 key, the deletion would have reached the backend only once T's CRL state no longer held the update
@@ -920,4 +929,15 @@ non-exclusive sibling. Repair's object-level proof is an `ExclusiveRevisionLock`
 
 ## Open weaknesses
 
-None.
+### Q-W17: The blind-insert index's scaladoc still describes unchecked Inserts
+Verdict CONFIRMED. Priority 7. Effort S.
+Mechanism: `Frontend.BlindInsertRecord`'s scaladoc says the indexed transactions "may Insert keys blindly
+(`KeyValueUpdate.DoesNotExist`, `MayExist` or no requirement on the key)". Both `refuseBlindWrites` copies
+(`TransactionBuilder`, `RequirementsChecker.check`) refuse an Insert with only `MayExist` or no requirement on its key;
+what `registerBlindInserts` indexes, by shape, is every `KeyValueUpdate` without a required revision, whose Inserts are
+checked by `KeyRevision`, `Exists`, `DoesNotExist`, a timestamp requirement or a content lock (2.5, 9.4).
+Consequence: none at run time; a reader of the code is told that unchecked Inserts exist and that a `KeyRevision`- or
+content-lock-checked Insert is not covered, which is the case 10.5c depends on (a content-locked Insert of a key that
+was absent passes its re-check again once a later Delete restores the content).
+Fix: reword the scaladoc: a transaction whose KeyValue update of an object here has no required revision, so a
+recovered commit vote's re-check of its Inserts may pass again after a later deletion of their keys.

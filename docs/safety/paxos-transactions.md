@@ -41,7 +41,8 @@ their own lock and run on timer threads.
 ### 1.2 Identifiers and values
 
 * `ProposalId(number: Int, peer: Byte)`, ordered by number then peer (`common/paxos/ProposalId`). `peer` is the
-  proposing store's pool index (`TransactionDriver.proposer`). The client's prepare carries
+  proposing store's pool index (`TransactionDriver.proposer`), which fits a non-negative byte because every IDA's
+  width is at most `IDA.MaxWidth` (127). The client's prepare carries
   `ProposalId.initialProposal(designatedLeaderUID) = (1, L)`.
 * Paxos values are `Boolean` (true = commit). Store votes are `TransactionDisposition` {`Undetermined`, `VoteCommit`,
   `VoteAbort`}; outcomes are `TransactionStatus` {`Unresolved`, `Committed`, `Aborted`}.
@@ -220,8 +221,8 @@ its entry (`notOwedHere`): `Tx.doCommit` applies nothing and reports T's changed
 **P12 Commit-vote locks.** From the moment a store votes commit until it learns the outcome, T's requirements hold
 locks on the store's object states (`Tx.lock`), and a vote that grows a KeyValue object reserves that growth with them
 (`ObjectState.sliceReservations`, counted by every other size check), including after a restart: a recovered commit
-vote re-takes them, and the Frontend holds all transaction messages until every recovered vote has loaded its objects
-(`Frontend.recoverTransactions`, `recoveredTransactionLoaded`, `holding`); a recovered Tx that does not relock completes
+vote re-takes them, and the Frontend holds all transaction messages until every recovered transaction with objects
+here has loaded them and completed its load (`Frontend.recoverTransactions`, `recoveredTransactionLoaded`, `holding`); a recovered Tx that does not relock completes
 its load only after every recovered commit vote has relocked, so lock order (9.1) sees every holder. A recovered commit
 vote whose saved status restores Committed relocks too, and holds its locks and reservation until it applies. A Tx
 created after its outcome is known (`Tx.outcomeDecided`), a restored abort, and a recovered Tx without a commit vote
@@ -398,11 +399,13 @@ decided in `Tx.determineDisposition`, in this order:
    stores.
 6. Otherwise `RequirementsChecker.check`. If every failure is a collision with a lock holder this transaction builds on
    (`Tx.awaitableHolders`: it requires the revision the holder writes, and the holder still holds its locks), the vote
-   is withheld for up to `Tx.CollisionWait`. Otherwise `VoteCommit` (no errors) or `VoteAbort`; an abort whose cause is
-   only that objects already show T proves the commit instead (6.3). Growing KeyValue updates are checked against
-   `Frontend.maxKVSliceSize`, and on a rebuilt store that guards an object against inherited growth
-   (`Frontend.inheritedGrowthLock`) a growing update of it votes abort (`InheritedGrowthLock`), never waited out; an
-   update that grows nothing passes (10.10, the rebuilt store's inherited votes).
+   is withheld for up to `Tx.CollisionWait`. Otherwise `VoteCommit` (no errors) or `VoteAbort`. Growing KeyValue
+   updates are checked against `Frontend.maxKVSliceSize`, and on a rebuilt store that guards an object against
+   inherited growth (`Frontend.inheritedGrowthLock`) a growing update of it votes abort (`InheritedGrowthLock`), never
+   waited out; an update that grows nothing passes (10.10, the rebuilt store's inherited votes).
+
+Every abort decided at steps 2-6 (`Tx.decideDisposition`), whatever its cause, proves the commit instead when the
+outcome is unknown here, the acceptor is memoryless and some loaded object already shows T (6.3).
 
 "Withheld" means no response at all, which Paxos allows; drivers and the client retransmit. A withheld Tx holds no
 locks, so waits cannot form cycles. `lock()` runs right after the vote is decided and before it is durable; that is
@@ -537,8 +540,9 @@ failing that, the driver waits. Properties:
   The driver re-sends the current prepares or Accept every `maxDelay`, sending prepares before every third Accept so
   that stores that forgot the Tx answer again (a `TxAccept` for an unknown Tx is ignored). Once resolved it re-sends
   `TxResolved` to stores not in `knownResolved`.
-* In a later round the tally is skipped; the round's first prepare quorum queues the Accept at once
-  (`acceptQueuedThisRound`), and later promises of the round queue no second batch.
+* Once a local proposal is set, a later round skips the tally: the round's first prepare quorum queues the Accept at
+  once (`acceptQueuedThisRound`), and later promises of the round queue no second batch. A round whose tally stayed
+  undecided tallies again in the next round.
 
 ### 7.4 Learner and resolution
 
@@ -725,7 +729,13 @@ repair, no safety effect.
   driver exist, so the new Tx resolves from it and the store's own driver learns it. The designated leader drives such
   a T on purpose: its deciding driver may have died on another host, and its own copy resolves the new driver at once.
   The same relay is sent whenever a resolved entry exists, also to a store that holds a Tx (a duplicate there), and
-  also below the floor, where the Frontend then refuses the prepare and the leader starts no driver. A non-finalized
+  also below the floor, where the Frontend then refuses the prepare and the leader starts no driver. The copy to
+  itself is withheld while the store's own Tx for T knows its outcome (`Tx.knownOutcome`): the entry may be that
+  Tx's own (`Tx.resolved`), and its idle driver, started after a lost `TxFinalized`, would take it as a non-late
+  resolution and re-run T's finalization actions. That driver learns from its peers instead (late from their
+  finalized relay, or by Paxos while they hold T) and from its own Tx's answer (a promise with its accepted value, or
+  a deleted abort's `TxResolved(false)`). For a finalized entry the copy to itself always goes, late if committed,
+  beside the `TxFinalized` to the sender (previous bullet). A non-finalized
   `Committed` entry stems only from a Paxos, relayed or expiry-commit resolution, never from a tree-learned one, whose
   saved status, and status replies until finalized (`Tx.statusForExpiry`), are `Unresolved` (6.4,
   transaction-recovery.md 7.2), so neither a relay nor a peer's expiry adoption spreads a non-late commit known only
@@ -1199,4 +1209,23 @@ transaction eventually resolves without operator action given a healthy quorum.
 
 ## Open weaknesses
 
-None.
+### P-W9: A held late commit that then resolves by a non-late commit never expires
+Verdict CONFIRMED. Priority 4. Effort S.
+Mechanism: an undecided commit vote reached by a late commit sets `lateCommitHeld` and looks up its UnackedCommits
+entry (`Tx.lateCommit`). If a non-late `TxResolved(commit)` arrives before the lookup answers (a second driver still
+running its finalizer re-sends `TxResolved` to stores not in its `knownResolved`, `SimpleTransactionDriver`
+`sendPeerMessages`; or a peer's expiry commit, `Frontend.decideExpiry`), `Tx.receiveResolved` calls
+`resolved(true)`, which applies the commit but leaves `lateCommitHeld` set and `ofinalized` empty. The lookup's answer
+is then dropped (`Tx.awaitsUnackedLookup` requires `lateCommitHeld && oresolution.isEmpty`,
+`Frontend.unackedLookupComplete`), but `Tx.mayExpire` still requires `!lateCommitHeld`, so `Frontend.expiryHeartbeat`
+never starts an expiry round and `Tx.concludeKnownOutcome` never runs. The Tx now ends only by a `TxFinalized`, or by
+its idle driver (`Store.heartbeat`) learning a late outcome from its peers' finalized relays. If the non-late source's
+`TxFinalized` is lost and the re-drive comes after the peers' status-cache entries expired, the peers refuse it below
+their floors, the store's own relay to itself is withheld (its Tx knows the outcome, 10.2), and nothing more happens.
+Consequence: liveness and hygiene only, not safety (the apply itself is the ordinary non-late path, P11): the Tx, its
+CRL record and admission, and a driver that `Store.removeExpiredDrivers` never removes (a Tx is held) live until the
+store reloads, the driver re-sending prepares every `maxDelay` to stores that refuse them.
+Fix: make `Tx.mayExpire` use the same condition as `awaitsUnackedLookup`, `!(lateCommitHeld && oresolution.isEmpty)`
+(or clear `lateCommitHeld` in `Tx.resolved`), so the resolved Tx expires and concludes its known outcome
+(`concludeKnownOutcome` -> `lateCommit` -> forget-lookup). Test: a held late commit that receives a non-late
+`TxResolved(commit)` before its lookup answers, with every peer past its floor, is forgotten past expiry.

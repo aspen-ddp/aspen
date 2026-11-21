@@ -1,7 +1,7 @@
 TODO
 ====
 
-Safety work list (from docs/safety/*, seventh pass, built 2026-11-20 against b48f4ee7 + working tree)
+Safety work list (from docs/safety/*, eighth pass, built 2026-11-20 against d4a79bfd + working tree)
 ----------------------------------------------------------------------------------------------------
 
 Every open weakness in docs/safety/* (the "## Open weaknesses" section at the end of each document) is listed below
@@ -39,13 +39,51 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-(no open items)
+1.1 [CRL-W17, SL-W20] A transfer out of a closed store can ship a copy that is serving, or overwrite its valid save file.
+    PLAUSIBLE (both). Effort S. crash-recovery-log.md, systemic-loss-protection.md, cross-document-review.md.
+    CRL-W17: StoreTransfers.extractUnloaded checks opensStarted once, and startOut's fclosed.foreach writes the
+    transferring-out marker in a later control task without re-checking router.loaded / isOpening / opensStarted;
+    StoreLoader.retryFailedLoads can open a store waiting in storesAwaitingRetry in between, so the live directory
+    is archived and the destination promoted without the source's later promises, votes and commits. The
+    no-save-file branch's argument-less releaseRetained also drops a loaded store's charge (A2).
+    SL-W20: extractUnloaded tests crl_save.log with os.exists, false on a failed stat, so a closed store holding a
+    valid save file plus leftover device-CRL entries gets the leftovers written over its whole state, then deleted.
+    Fix: do the open check and the marker write in one control task and re-check after the deletion; release the
+    identity-checked charge; FileStat for the save file, a failed stat failing the extraction.
+
+1.2 [RB-W19] A running host keeps serving a tombstoned device's stores through their rebuild elsewhere.
+    PLAUSIBLE. Effort M. rebuild-process.md, systemic-loss-protection.md (S10), cross-document-review.md.
+    FailedStorageDeviceDurableTask.tombstone nudges the former host once, best-effort; a running host that misses it
+    serves until its hourly check, and peers (MetadataManager) keep routing to it until the flip's StoreMoved. With
+    t = r a commit the old copy voted for during the rebuild ends with t-1 < r copies: lost committed data from
+    asynchrony alone. The rebuilt acceptor's acceptor-since / inheritedVotesAfter also assume the old incarnation
+    stopped. Design question first: the no-fencing rule covers restarted or partition-healed hosts, not a running
+    reachable one. Fix (rare path only): a host receiving StoreOffline/StoreMoved for a store it serves checks its
+    device; the drain waits for the old host to record the device retired, or for that host to be known down.
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-(no open items)
+2.1 [RP-W11] A DataObject's object-level repair proof proves the refcount only, yet reconcile treats the data as proven.
+    PLAUSIBLE. Effort S. repair-process.md, cross-document-review.md 2.4.
+    StoreRepairer.prove runs only RepairProofs.proveRefcount for a DataObject and sets ReadLocks.objectLevel; a
+    DataUpdate committed after the read does not fail checkRefcount, so reconcile installs only the refcount over a
+    stale revision and deletes the entry carrying the update's mark: the store is left permanently without it.
+    Fix: also prove ExclusiveRevisionLock(read.revision) for a DataObject (generalise proveObjectLevel); object level
+    proven only if both commit. Update server/repair/CLAUDE.md and RepairProofs' scaladoc.
+
+2.2 [X-W23, X-W24] A commit applied after T's finalization with no ErrorTree mark left for the store.
+    PLAUSIBLE (both). Effort S each. cross-document-review.md, transaction-requirements.md 9.4,
+    transaction-recovery.md 7.4.
+    X-W23: a non-voter's commit waiting for data adopted from a late client prepare (commitAwaitsData /
+    adoptedDataUnsaved), deferred by a TxFinalized during that save, is in neither heldCommits nor
+    lockWaitingCommits, so settledForRepair lets repair consume its mark; its later blind Insert can write back a key
+    a later transaction deleted. Fix: count a commit held for adopted data as unsettled, as heldCommits is.
+    X-W24: a recovered non-voter that applied and acknowledged T before a crash (so no mark) re-applies T on a
+    non-late commit after T's finalization (sources: R-W12's relay, P-W9's path, a second driver); a key deleted
+    since comes back, its report reaching no finalizer. Fix: a recovered Tx without a commit vote applies nothing
+    on a commit and reports every changed object.
 
 
 PRIORITY 3: systemic loss protection
@@ -53,7 +91,22 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-(no open items)
+3.1 [SL-W18] A transient read error of a valid crl_save.log or store config is taken for a lost state.
+    CONFIRMED. Effort S. systemic-loss-protection.md, crash-recovery-log.md.
+    CrashRecoveryLog.loadValidStoreState maps every Throwable (EIO, EMFILE, OOM) to InvalidSaveFile, so D3
+    (StoreLoader.handleLoad -> crlSaveFileLost), D1/D2 (DeviceDiscovery.holdsOwnState) and D4
+    (adoptionClass -> adoptDevice) declare stores lost whose only state is that file. Fix: distinguish an
+    unreadable file (isTransient) from an invalid one, holding the load back through awaitUnreadRetry as an
+    unreadable incarnation file is.
+
+3.2 [SL-W19] A failed read of an FSIF compaction move fail-stops the store, whatever the error.
+    CONFIRMED. Effort S. systemic-loss-protection.md, cross-document-review.md section 5,
+    server/store/backend/fsif/DESIGN.md (4.2, L18).
+    fsif Compaction.copied fail-stops on any move-read failure, including a rejected io task (runIo), though nothing
+    is written yet and Compaction.cancel can abandon the move; compaction runs on every FSIF store, so a host-wide
+    EMFILE/ENOMEM or saturated io executor fail-stops many stores at once (D6). Fix: abandon and retry the move on a
+    read failure that is not evidence of damage (as the client read path does since X-W22); rewrite DESIGN.md's L18
+    and its "a client read only returns CorruptedObject" passage.
 
 
 PRIORITY 4: liveness (hangs, stalls, livelocks)
@@ -61,13 +114,61 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
-(no open items)
+4.1 [P-W9] A held late commit that then resolves by a non-late commit never expires.
+    CONFIRMED. Effort S. paxos-transactions.md.
+    Tx.lateCommitHeld stays set after a non-late TxResolved(commit) applies, and Tx.mayExpire requires
+    !lateCommitHeld, so the Tx, its CRL record and admission and its driver live until the store reloads.
+    Fix: mayExpire on !(lateCommitHeld && oresolution.isEmpty), or clear the flag in Tx.resolved.
+
+4.2 [RB-W18] A missing store whose directory returns while its rebuild request fails is left unserved.
+    PLAUSIBLE. Effort S. rebuild-process.md.
+    The Missing Stores pass silences the store and calls requestRebuild; if the directory comes back and the request
+    fails other than by collision, nothing asks again and no pass loads an unmarked offlineStores store with an
+    Active entry, so it is unserved until restart while its pool counts it writable. Fix: keep a host-local record of
+    the stores the pass declared and request again while the entry stays Active.
+
+4.3 [CRL-W18] The admission limit's proof fails for small streams in a large ring.
+    PLAUSIBLE. Effort S. crash-recovery-log.md, cross-document-review.md section 3.
+    (n-2)*S/2 - S/16 satisfies Lemma B only while 118*(n-1) <= S/16 + 8192; CrlSizingDefaults.resolve accepts 1 MiB
+    streams up to 1024 streams (broken past 625), so a W6 fail-stop within admission unloads the device until
+    restart. Fix: subtract 118*(n-1) in limitAt, or refuse/cap such configs.
 
 
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-(no open items)
+5.1 [R-W12] A sibling store on the same host relays a stale non-finalized commit, re-running T's finalization actions.
+    CONFIRMED. Effort S. transaction-recovery.md, paxos-transactions.md 10.2.
+    Store.handleTransactionMessage's sender relay (msg.from != msg.to && !entry.finalized) ignores the self-send rule,
+    so a same-host sibling answers an idle recovery driver with a non-late TxResolved from the shared status cache;
+    actions re-run and, without a late answer within errorTimeout, marks, entries and stubs are written for every
+    store. Safe (cross-document-review 2.6 checks every shipped action), but wasteful; also feeds X-W24.
+    Fix: skip the sender relay of a non-finalized entry when the sender is a store of this host.
+
+5.2 [RB-W20] An out-of-space write in retryFailures is recorded as an unreadable object.
+    CONFIRMED. Effort S. rebuild-process.md.
+    RebuildingStore.retryFailures never calls latchOutOfSpace, so the pass fails "incomplete" pointing at
+    accept-rebuild-loss instead of REBUILD OUT OF SPACE, and with acceptLoss set, objects peers can supply are
+    recorded as accepted losses. Fix: latchOutOfSpace in its recover; check the latch before lossAccepted.
+
+5.3 [X-W25] The join finalization action removes an upper-tier entry by its key alone.
+    PLAUSIBLE. Effort S. cross-document-review.md.
+    JoinFinalizationAction re-run (or delayed) after a later split at the same minimum deletes that split's index
+    entry; lookups still follow links, so performance only. Fix: delete only when the value is deleteNode's pointer,
+    under the key's revision as read.
+
+5.4 [X-W26] A failed stat of a moved store's arrival file drops its arrival margin; remaining os.exists uses.
+    PLAUSIBLE. Effort S. cross-document-review.md 2.2.
+    StoreLoader.readArrivedAt uses os.exists, so a failed stat drops AcceptorSinceMargin from a moved store's load
+    floor. Fix: FileStat there (failure counts as arrival now), and FileStat for the remaining existence tests that
+    cross-document-review 2.2 lists (DeviceDiscovery.adoptionClass, StoreRebuilds.retireForeignCopy /
+    discardLostStore / backendFailed, StoreTransfers.startIn markers, openDeviceCrl), which today only delay.
+
+5.5 [X-W27] A recovered vote's refcount re-check rests on an unenforced update-serial convention.
+    PLAUSIBLE. Effort S. cross-document-review.md 2.3, transaction-requirements.md 10.5(c).
+    Pins and DescriptionValidator accept a RefcountUpdate that does not advance ObjectRefcount.updateSerial (e.g.
+    (5,2)->(5,1)); no shipped caller does it, but the re-check would then pass on a replay. Fix: refuse such an
+    update in TransactionBuilder and DescriptionValidator.
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
@@ -79,4 +180,8 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-(no open items)
+7.1 [Q-W17] The blind-insert index's scaladoc still describes unchecked Inserts.
+    CONFIRMED. Effort S. transaction-requirements.md.
+    Frontend.BlindInsertRecord's scaladoc says indexed transactions Insert keys with "DoesNotExist, MayExist or no
+    requirement on the key"; those are now refused, and the index covers every KeyValueUpdate without a required
+    revision (KeyRevision- or content-lock-checked Inserts included). Fix: reword the scaladoc.

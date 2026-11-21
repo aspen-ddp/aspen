@@ -725,18 +725,7 @@ class Frontend(val storeId: StoreId,
     */
   private val parkedRepairs = scala.collection.mutable.HashMap[ObjectId, ParkedRepair]()
 
-  /** A client's read waiting for committed transactions it names (Read.awaitCommit) to release their locks on its
-    * object, or, for `allocation`, for this store's unapplied commit vote on the object's allocation to apply or abort,
-    * until `until` (wallClockMillis). See parkRead and parkAllocationRead
-    */
-  private final class ParkedRead(val clientId: ClientId, val pointer: ObjectPointer, val readType: ReadType,
-                                 val awaitCommit: Set[TransactionId], val until: Long, val allocation: Boolean = false)
-
-  /** By object, then read: a resent read replaces its entry. Declared before the constructor's recovery, whose Txs
-    * release locks (answerParkedReads)
-    */
-  private val parkedReads = scala.collection.mutable.HashMap[ObjectId, scala.collection.mutable.HashMap[UUID, ParkedRead]]()
-  private var parkedReadCount: Int = 0
+  private val parkedReads = new ParkedReads(Frontend.MaxParkedReads)
   private val commitStage = s"store commit (${backend.getClass.getSimpleName})"
 
   /** A transaction's backend commits on this store, made through commit.
@@ -963,32 +952,7 @@ class Frontend(val storeId: StoreId,
   private val unackedLookups = scala.collection.mutable.HashMap[TransactionId, UnackedLookup]()
   private var nextUnackedRequest: Long = 0L
 
-  /** The transactions this store holds an applied stub for (StoreRecoveryState), with their start timestamps: it holds
-    * their updates. Loaded at recovery, dropped by expireStubs. Written only on the store's executor; `@volatile` so
-    * tests may read hasAppliedStub from their own thread */
-  @volatile private var stubs: Map[TransactionId, HLCTimestamp] = Map()
-
-  /** Each stub's expiry (stubExpiresAt) and txid, soonest first, so a heartbeat looks only at the stubs due
-    * (expireStubs). One entry per stub recorded; an entry whose stub is gone, or carries another start, is stale and
-    * skipped when it comes up */
-  private val stubExpiry = scala.collection.mutable.PriorityQueue[(Long, TransactionId)]()(
-    Ordering.by[(Long, TransactionId), Long](_._1).reverse)
-
-  /** Stubs past their expiry that a Tx for their transaction still kept, rechecked at each heartbeat (expireStubs) */
-  private val heldStubs = scala.collection.mutable.HashSet[TransactionId]()
-
-  /** The wall-clock milliseconds past which a stub for a transaction started at `start` may be dropped: the horizon
-    * plus the expiry margin after it (as Tx.pastHorizon) */
-  private def stubExpiresAt(start: HLCTimestamp): Long = start.wallTime + horizon.toMillis + expiryMargin.toMillis
-
-  /** Holds a stub not already held, queued for its expiry. Returns whether it is new */
-  private def addStub(txid: TransactionId, start: HLCTimestamp): Boolean =
-    if stubs.contains(txid) then
-      false
-    else
-      stubs += (txid -> start)
-      stubExpiry.enqueue((stubExpiresAt(start), txid))
-      true
+  private val stubs = new AppliedStubs(horizon, expiryMargin)
 
   // Undeferred (tests only), the state is read here, which may block on the CRL
   if deferRecovery then awaitRecovery() else recoverState(Await.result(crl.readStoreState(storeId), Duration.Inf))
@@ -1000,7 +964,7 @@ class Frontend(val storeId: StoreId,
     * throws leaves the retained bytes counted too, which only over-counts */
   private def recoverState(state: StoreRecoveryState): Unit =
     // Counted without a check, as recovered transactions are: the CRL already holds them
-    adm.chargeStubs(state.appliedStubs.count((txid, start) => addStub(txid, start)))
+    adm.chargeStubs(state.appliedStubs.count((txid, start) => stubs.add(txid, start)))
     recoverTransactions(state.transactions)
     admission.releaseRetained(storeId)
 
@@ -1078,7 +1042,7 @@ class Frontend(val storeId: StoreId,
   def hasAppliedStub(txid: TransactionId): Boolean = stubs.contains(txid)
 
   /** The store's applied stubs, with their transactions' starts. Tests only */
-  def appliedStubs: Map[TransactionId, HLCTimestamp] = stubs
+  def appliedStubs: Map[TransactionId, HLCTimestamp] = stubs.all
 
   /** Records that the store holds `txid`'s update: an applied stub, saved in the CRL in place of the transaction's
     * state, for a transaction the store is forgetting. `onDurable` runs on the store's executor once the stub is
@@ -1102,12 +1066,12 @@ class Frontend(val storeId: StoreId,
     require(!txCommits.contains(txid),
       s"Store $storeId: an applied stub cannot replace transaction $txid's CRL state while its backend commits are " +
       s"outstanding or failed")
-    if addStub(txid, start) then
+    if stubs.add(txid, start) then
       adm.chargeStubs(1)
     if !keepAdmission then
       adm.replacedByStub(txid)
     stateConcluded(txid)
-    crl.saveAppliedStub(storeId, txid, stubs(txid), () => post { () =>
+    crl.saveAppliedStub(storeId, txid, stubs.startOf(txid), () => post { () =>
       adm.stubDurable(txid)
       onDurable
     })
@@ -1116,13 +1080,14 @@ class Frontend(val storeId: StoreId,
     * deletion is queued before the release, so no admission the release makes room for can reach the CRL ahead of it
     * (crash-recovery-log Lemma C (1)). Only expireStubs drops one; visible for tests */
   private[server] def dropAppliedStub(txid: TransactionId): Unit =
-    if stubs.contains(txid) then
-      stubs -= txid
-      heldStubs -= txid
-      crl.deleteAppliedStub(storeId, txid)
-      adm.releaseStub()
+    if stubs.remove(txid) then
+      releaseDroppedStub(txid)
 
-  /** Drops every applied stub whose transaction is past the horizon plus the expiry margin (stubExpiresAt) and for
+  private def releaseDroppedStub(txid: TransactionId): Unit =
+    crl.deleteAppliedStub(storeId, txid)
+    adm.releaseStub()
+
+  /** Drops every applied stub whose transaction is past the horizon plus the expiry margin  and for
     * which the store holds no Tx, whether live, waiting on a held commit (deferredFinalizations), on its backend
     * commits (txCommits). Called at heartbeat (expiryHeartbeat). Only the
     * stubs due are looked at (stubExpiry), plus those a Tx kept past theirs (heldStubs), so a heartbeat costs
@@ -1136,18 +1101,9 @@ class Frontend(val storeId: StoreId,
     * Tx is left to apply through it, and the scan's reconcile is exact
     */
   private def expireStubs(now: Long): Unit =
-    def txHeld(txid: TransactionId): Boolean =
-      transactions.contains(txid) || deferredFinalizations.contains(txid) || txCommits.contains(txid)
-    if heldStubs.nonEmpty then
-      heldStubs.toList.foreach: txid =>
-        if !txHeld(txid) then
-          dropAppliedStub(txid)
-    while stubExpiry.nonEmpty && stubExpiry.head._1 < now do
-      val (expiresAt, txid) = stubExpiry.dequeue()
-      stubs.get(txid) match
-        case Some(start) if stubExpiresAt(start) == expiresAt =>
-          if txHeld(txid) then heldStubs += txid else dropAppliedStub(txid)
-        case _ => // Stale: the stub was dropped, or is held again under its own entry
+    stubs.dueForDrop(now, txid =>
+      transactions.contains(txid) || deferredFinalizations.contains(txid) || txCommits.contains(txid))
+      .foreach(releaseDroppedStub)
 
   // ---- UnackedCommits lookups of recovered commit votes and held late commits (Tx.awaitsUnackedLookup) ----
 
@@ -1846,7 +1802,7 @@ class Frontend(val storeId: StoreId,
     else if holding then
       logger.trace(s"Store $storeId dropped read $readUUID: holding for recovered transactions")
     else
-      unparkRead(pointer.id, readUUID)
+      parkedReads.remove(pointer.id, readUUID)
       if awaitCommit.isEmpty || !parkRead(clientId, readUUID, pointer, readType, awaitCommit) then
         readForNetwork(clientId, readUUID, pointer, readType)
 
@@ -1861,11 +1817,10 @@ class Frontend(val storeId: StoreId,
                        awaitCommit: Set[TransactionId]): Boolean =
     val objectId = pointer.id
     val waits = servableState(objectId).exists(_.lockedWriteTransactions.exists(awaitCommit.contains))
-    if waits && parkedReadCount < Frontend.MaxParkedReads then
+    if waits && parkedReads.hasRoom then
       logger.trace(s"Store $storeId: read $readUUID of $objectId waits for the commit of $awaitCommit to apply")
-      parkedReads.getOrElseUpdate(objectId, scala.collection.mutable.HashMap())(readUUID) =
-        ParkedRead(clientId, pointer, readType, awaitCommit, wallClockMillis() + parkedReadWait.toMillis)
-      parkedReadCount += 1
+      parkedReads.add(objectId, readUUID,
+        new ParkedRead(clientId, pointer, readType, awaitCommit, wallClockMillis() + parkedReadWait.toMillis))
       true
     else
       false
@@ -1878,13 +1833,12 @@ class Frontend(val storeId: StoreId,
     * unaffected: a parked read only delays its own answer
     */
   private def parkAllocationRead(netRead: NetworkRead, pointer: ObjectPointer): Boolean =
-    if parkedReadCount < Frontend.MaxParkedReads then
+    if parkedReads.hasRoom then
       logger.trace(s"Store $storeId: read ${netRead.requestUUID} of ${pointer.id} waits for its allocation to apply")
-      unparkRead(pointer.id, netRead.requestUUID)
-      parkedReads.getOrElseUpdate(pointer.id, scala.collection.mutable.HashMap())(netRead.requestUUID) =
-        ParkedRead(netRead.clientId, pointer, netRead.readType, Set(), wallClockMillis() + parkedReadWait.toMillis,
-          allocation = true)
-      parkedReadCount += 1
+      parkedReads.remove(pointer.id, netRead.requestUUID)
+      parkedReads.add(pointer.id, netRead.requestUUID,
+        new ParkedRead(netRead.clientId, pointer, netRead.readType, Set(), wallClockMillis() + parkedReadWait.toMillis,
+          allocation = true))
       true
     else
       false
@@ -1892,33 +1846,24 @@ class Frontend(val storeId: StoreId,
   private def parkedReadReady(objectId: ObjectId, r: ParkedRead, locks: => Set[TransactionId]): Boolean =
     if r.allocation then !allocationPending(objectId) else !r.awaitCommit.exists(locks.contains)
 
-  private def unparkRead(objectId: ObjectId, readUUID: UUID): Unit =
-    if parkedReadCount > 0 then
-      parkedReads.get(objectId).foreach: reads =>
-        if reads.remove(readUUID).isDefined then
-          parkedReadCount -= 1
-          if reads.isEmpty then parkedReads.remove(objectId)
-
   /** Answers the parked reads (parkRead) of `objectIds` none of whose named transactions still holds a lock there.
     * Called by every Tx that releases its locks (Tx.unlock), after a commit's update is applied in memory
     */
   def answerParkedReads(objectIds: Iterable[ObjectId]): Unit =
-    if parkedReadCount > 0 then
+    if parkedReads.nonEmpty then
       objectIds.foreach: objectId =>
-        parkedReads.get(objectId).foreach: reads =>
+        parkedReads.of(objectId).foreach: reads =>
           lazy val locks = servableState(objectId).map(_.lockedWriteTransactions).getOrElse(Set())
           val ready = reads.filter((_, r) => parkedReadReady(objectId, r, locks)).toList
-          ready.foreach((readUUID, _) => unparkRead(objectId, readUUID))
+          ready.foreach((readUUID, _) => parkedReads.remove(objectId, readUUID))
           ready.foreach((readUUID, r) => readObjectForNetwork(r.clientId, readUUID, r.pointer, r.readType))
 
   /** Answers, with the state as it now is, every parked read past its deadline: AllocationPending for an allocation
     * read whose allocation is still pending, which would otherwise only park again. Called on the store's heartbeat */
   def expireParkedReads(): Unit =
-    if parkedReadCount > 0 then
-      val now = wallClockMillis()
-      val due = parkedReads.toList.flatMap((objectId, reads) =>
-        reads.toList.collect { case (readUUID, r) if r.until <= now => (objectId, readUUID, r) })
-      due.foreach((objectId, readUUID, _) => unparkRead(objectId, readUUID))
+    if parkedReads.nonEmpty then
+      val due = parkedReads.due(wallClockMillis())
+      due.foreach((objectId, readUUID, _) => parkedReads.remove(objectId, readUUID))
       due.foreach: (objectId, readUUID, r) =>
         if r.allocation && allocationPending(objectId) then
           net.sendClientResponse(ReadResponse(r.clientId, storeId, readUUID, HLCTimestamp.now,
@@ -1931,7 +1876,6 @@ class Frontend(val storeId: StoreId,
     */
   private def dropParkedReads(): Unit =
     parkedReads.clear()
-    parkedReadCount = 0
 
   private def readForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer, readType: ReadType): Unit = {
     val objectId = pointer.id

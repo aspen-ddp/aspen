@@ -215,8 +215,9 @@ Receivers trust every non-proof `TxResolved`.
 **P11 Application only on resolution.** A store applies T's update only on a non-late `TxResolved(true)`, a non-late
 `TxFinalized(true)`, a found UnackedCommits entry naming its incarnation or none (`Tx.unackedCommitFound`), or a late
 commit reaching its own undecided commit vote whose entry is found so (`Tx.lateCommit`). Never on its own vote, an Accept or a
-proof: a prover applies nothing (`Tx.applyNothing`). Never at a store holding an applied stub for T or owed nothing by
-its entry (`notOwedHere`): `Tx.doCommit` applies nothing and reports T's changed objects in `TxCommitted`.
+proof: a prover applies nothing (`Tx.applyNothing`). Never at a store holding an applied stub for T, owed nothing by
+its entry (`notOwedHere`), or whose Tx was recovered without a commit vote (`recoveredNonVoter`): `Tx.doCommit` applies
+nothing and reports T's changed objects in `TxCommitted` (9.1).
 
 **P12 Commit-vote locks.** From the moment a store votes commit until it learns the outcome, T's requirements hold
 locks on the store's object states (`Tx.lock`), and a vote that grows a KeyValue object reserves that growth with them
@@ -464,7 +465,8 @@ it counts in `a <= w - c`. A recovered prover has Paxos state, so it no longer p
 
 A Tx recovered from the CRL keeps its persisted disposition and acceptor state and restores a resolution its saved
 status records (`Tx.oresolution`; status is saved only incidentally, by a prepare or accept after the resolution). A
-recovered resolved Tx needs no lookup and applies its commit, or deletes its abort's state, once its objects load. A
+recovered resolved Tx needs no lookup and applies its commit (one without a commit vote applies nothing and reports
+its objects, 9.1), or deletes its abort's state, once its objects load. A
 restored commit with a commit vote relocks (`Tx.lock`: its locks and slice reservation, no check), counts as relocking
 in `Frontend.recoveringTransactions` and holds them until `Tx.doCommit` releases them: its backend commit may not have
 completed before the crash, and its locks keep a restored commit without a vote here waiting in lock order rather
@@ -495,7 +497,9 @@ poisons the object if the store's writes are frozen (`Tx.objectLoadFailed`), sin
 
 A client-prepared Tx checks its description once, before its requirements (`Tx.invalidDescription`,
 `server/store/DescriptionValidator`): its pool's IDA (`Frontend.poolIDA`), the primary object and leader, one update
-per object, and the pin rule. A refusal votes abort for every object, is never waited out, and logs a warning. It
+per object, every `RefcountUpdate` advancing the refcount's update serial unless it allocates the object or keeps the
+required refcount (`RefcountUpdate.advancesSerial`; `TransactionBuilder` refuses the same with
+`RefcountSerialNotAdvanced`), and the pin rule. A refusal votes abort for every object, is never waited out, and logs a warning. It
 depends only on the description and the store's pool, so every store of that pool refuses alike. Details:
 `transaction-requirements.md`.
 
@@ -594,7 +598,7 @@ the object updates (unless dropped), the disposition, the status and the accepto
 replaces the whole record and always carries the then-current acceptor state, so a later save never loses an earlier
 promise. The handler runs after the record, and everything saved before it, is durable (`crash-recovery-log.md`), on
 the CRL's completion thread (P3). Every save is charged to the device's `CrlAdmission` first: the prepare's admission
-(`Frontend.admitPrepare`) counts the description, data and record, and a Tx whose aborted state was deleted saves
+(`Frontend.admitPrepare`, held by the store's `StoreAdmission`) counts the description, data and record, and a Tx whose aborted state was deleted saves
 nothing more (`Tx.saveState` requires it; P9).
 
 | Message sent | Durable first | Code |
@@ -641,7 +645,9 @@ every prepare and accept response, retransmits included: write amplification, no
   * the commit overtook the data (`commitAwaitsData`: not recovered, no client prepare seen, not finalized, data
     missing, or adopted data not yet durable): held without `TxCommitted`, so the driver does not yet count the store as
     having missed the update. Released by the data's save, a client prepare, or `TxFinalized`; after `TxFinalized` the
-    store applies without the data, reports the object as uncommittable and repair restores it;
+    store applies without the data, reports the object as uncommittable and repair restores it. While adopted data is
+    being saved its objects are unsettled for repair (`Frontend.adoptedDataSaving`, `adoptedDataSaved`), since a
+    `TxFinalized` meanwhile drops the Tx from `transactions` with its commit still to apply;
   * lock order (`Tx.awaitLockOrder`): a committed Tx holding no locks here does not apply while another Tx here holds
     commit-vote locks its requirements or writes collide with (`RequirementsChecker.lockHolders`) on an object both
     change; it waits, holding its references, until each holder releases (`Frontend.locksReleased`), and new votes it
@@ -657,8 +663,9 @@ every prepare and accept response, retransmits included: write amplification, no
   `RequirementsApplyer.apply` re-checks the requirements with `applying = true`, skipping objects that already show T,
   one backend commit per changed object, and `TxCommitted` when all complete. A commit voter whose apply throws
   fail-stops the store (`Frontend.failStop`). A live voter whose re-check fails on a changed object meets an
-  invariant violation: it logs it at error, skips and reports the object. A recovered voter (through its entry too)
-  takes such an object as already applied; its Insert of a key now absent applies, since a key's deletion reaches
+  invariant violation: it logs it at error, skips and reports the object (`Tx.checkVoteCommitApplied`). A recovered
+  voter (through its entry too) takes such an object as already applied, and a passing re-check as an update not yet
+  applied, which holds for refcounts because every `RefcountUpdate` advances its update serial (6.5); its Insert of a key now absent applies, since a key's deletion reaches
   the backend only once no CRL state holding an applied blind Insert of it remains
   (`Frontend.awaitBlindInsertsDurable`; transaction-requirements.md 8.5, 9.4). A blind Insert of a key now absent
   still applies but reports the object, so the finalizer marks the store and repair installs the current state, where
@@ -666,10 +673,14 @@ every prepare and accept response, retransmits included: write amplification, no
   `Frontend.recordRepairInstall`), where the Tx did not vote commit here (it held no key lock that kept a later
   deletion out) and a committed Delete of the key started at or after T's start applied here, a no-op over the absent
   key included (`Frontend.keyDeletedSince`, recorded by `Tx.issueCommits` through `recordKeyDeletions`), or, for a
-  recovered commit vote, where the object's timestamp is past T's start (`Tx.issueCommits`, `reinserts`). A non-voter's
+  recovered commit vote, where the object's timestamp is past T's start (`Tx.blindReinsertObjects`). A live non-voter's
   Insert of a key no such deletion reached reports nothing. A non-voter does not count toward `t`, so its report costs
   a repair pass, not margin. A recovered Tx that did not vote commit applies nothing and reports every object it changes
-  (`Tx.doCommit`; transaction-requirements.md 8.5).
+  (`Tx.doCommit`, `recoveredNonVoter`; transaction-requirements.md 8.5): it may have applied and acknowledged T before
+  its crash, leaving no ErrorTree mark, and held no lock keeping a later deletion of a key T Inserts out. Its report
+  marks it while T's marker has not yet written; once the marker wrote, the store either acknowledged T in its earlier
+  life (so its backend held the update) or was marked. A `TxFinalized` listing it in `owed` (voters unknown) still
+  writes a stub; below its load floor no Tx for T arises there, so the stub suppresses nothing.
   Objects whose earlier backend commit failed are not applied and are reported.
 * **Forgetting a committed T.** Where its CRL record would be deleted (after `TxFinalized` and its backend commits), it
   is replaced by an applied stub if an UnackedCommits entry may name this store: `TxFinalized` listed it in `owed`, or
@@ -749,7 +760,7 @@ repair, no safety effect.
 * Tx unknown, no outcome cached, T at or above the floor: a fresh Tx, checked normally. A replay of a committed pinned
   transaction fails its pin; a store showing its update proves it (6.3). Accepted cost: a replay whose requirements pass
   holds commit-vote locks until a driver resolves it.
-* Dropped under CRL backpressure (`Frontend.admitPrepare` `Full`: an unseen transaction while the device's admission
+* Dropped under CRL backpressure (`Frontend.admitPrepare`, delegating to `StoreAdmission.admitPrepare`, `Full`: an unseen transaction while the device's admission
   is at its lane's ceiling, or uncounted object data past it), which asks the CRL to grow (`crl.requestGrowth`): the
   client retransmits, and the rest of the quorum can decide without this store, which repair catches up. A known
   transaction's data-less prepare, and one finalized in the cache, are admitted without a check.
@@ -805,7 +816,8 @@ T started is logged (`Tx.LateClientPrepareAfter`).
   its entry and applies only if it is found naming its incarnation (`lateCommitHeld`, `unackedCommitFound`,
   `unackedCommitAbsent`). A non-late commit reaching the held vote before its lookup answers (a second driver's
   resent `TxResolved`, a peer's expiry commit) resolves it as any commit does: `Tx.resolved` clears the hold, the
-  lookup's answer is dropped, and the Tx ends by `TxFinalized`, a later late commit (the forget-lookup above) or expiry
+  lookup's answer is dropped (`Tx.awaitsUnackedLookup` no longer holds), the Tx keeps `lateOutcome`, so its cache entry
+  and status replies report the commit late, as T was finalized, and it ends by `TxFinalized`, a later late commit (the forget-lookup above) or expiry
   (`Tx.mayExpire`, `concludeKnownOutcome`). Anything else (abort vote, no vote, muted, prover, abort learned) applies
   nothing.
 * **Found entry as a proof.** A commit vote that found its entry gives its own driver a proof (`Store.giveProof`).
@@ -864,8 +876,9 @@ changes, overwritten revisions), and memory cannot be infinite. The fix is a tim
   `StoreLoader`. Normally it is `min(load + MaxStartLead, JoinCeiling.boundAtLoad)`: before its load the store may have
   joined, and forgotten, a T started up to `MaxStartLead` ahead of its clock, but never one at or above the join ceiling
   its previous life on this host ran under (below). A store that arrived from another host (a transfer in,
-  `StoreTransfers`; an adoption, `DeviceDiscovery.bringIntoService`) durably writes `StoreLoader.ArrivedAtFile` before it
-  can load here; a load less than `AcceptorSinceMargin` (10 s) after the arrival uses `load + AcceptorSinceMargin`,
+  `StoreTransfers.clearTransferredInMarker`; an adoption, `DeviceDiscovery.bringIntoService`, but see P-W10) durably
+  writes `StoreLoader.ArrivedAtFile` before it can load here, and a stat or read of that file that fails counts as an
+  arrival now (`StoreLoader.readArrivedAt`); a load less than `AcceptorSinceMargin` (10 s) after the arrival uses `load + AcceptorSinceMargin`,
   and a later one keeps `arrival + AcceptorSinceMargin` as a lower bound, covering the other host's clock lead. A store
   this process just created for a pool's Initializing slot (`StoreRebuilds.createNewStore`, `StoreLoader.newStores`)
   has never served and gets load time 0;
@@ -1153,6 +1166,7 @@ transaction eventually resolves without operator action given a healthy quorum.
 | Store, after an Accept is saved | Acceptor state recovered | P8 holds. |
 | Store, after learning commit, before applying | Recovered, usually `Unresolved`, with its vote and data; re-locks | Re-learns from a driver (driven at once), the caches, a proof or its UnackedCommits lookup. If every other store finalized and forgot, its entry applies it, and without one it acknowledged or did not count, so a late commit applies nothing. Past the floor its Tx ends by expiry, applying T through an entry. |
 | Store, after the in-memory apply, before the backend commit is durable | Data still in the CRL (P13) | As above. |
+| Store without a commit vote, after learning commit | Recovered with its abort or no vote | Applies nothing on the commit and reports its changed objects (9.1): it was marked unless it acknowledged a durable apply before the crash. |
 | Store, after the backend commit, before the CRL data drop | Recovered; objects show the update | `doCommit` skips already applied objects. |
 | Leader/driver, before Accept sent | Driver state lost | A recovery driver (round >= 2, above its own acceptor's ids) after the idle timeout. |
 | Leader, after a quorum accepted, before `TxResolved` | Accepted state at `t` acceptors | A recovery driver's promise quorum intersects it and re-proposes the same value (P8). |
@@ -1216,4 +1230,25 @@ transaction eventually resolves without operator action given a healthy quorum.
 
 ## Open weaknesses
 
-(no open items)
+**P-W10 An adoption skips the arrival file of a store whose directory stat fails** (PLAUSIBLE, priority 5, effort S)
+
+Mechanism: `DeviceDiscovery.bringIntoService` (adoption, `rewriteOwner`) writes `StoreLoader.ArrivedAtFile` only for
+the store directories `os.isDir` reports, and `os.isDir` answers false on a failed stat, so a transient stat error
+skips that store's arrival record and the owner is rewritten anyway. Its later load finds the file known absent
+(`StoreLoader.readArrivedAt`) and passes no arrival, and `Frontend.loadFloorMillis` takes
+`min(load + MaxStartLead, JoinCeiling.boundAtLoad)`. For a store new to this process that bound is this host's
+`JoinCeiling.atStart`, which says nothing of joins on the previous host and may be far in the past, so the load part
+of the floor can fall to that old ceiling and the floor to `now - horizon` (10.10). The other existence tests on the
+store-arrival path use `FileStat` (`readArrivedAt`, the load's marker tests); this one does not.
+
+Trigger: an adoption within the horizon of the store's last service on its previous host, with a stat of that store's
+directory failing transiently during `bringIntoService`, and a prepare (a delayed client retransmit or a recovery
+driver's) for a transaction the store joined and forgot there reaching it after the load.
+
+Consequence: one store may rejoin a transaction it forgot, against the rejoin invariant. That transaction was
+concluded there, so its other acceptors refuse it below their floors or answer from their caches, and a lone rejoined
+acceptor decides nothing: hygiene, as for a failed stat of the arrival file itself.
+
+Fix direction: test each directory with `FileStat` in `bringIntoService`, failing the adoption step (left to the next
+scan, as its other failures are) when a stat fails, so every store directory present gets its arrival record before
+the owner is rewritten.

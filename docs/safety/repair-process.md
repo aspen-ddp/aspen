@@ -39,7 +39,7 @@ guards that make the copy safe against concurrent transactions at that store.
 | Q5 | A restored object with refcount 0 is `InvalidObject(provesDeletion = true)`. A read fails `InvalidObject` when more than `w - r` stores answered `ObjectNotFound`/`ObjectMismatch`, and `provesDeletion` is set when more than `w - t` did. A store that applied a deletion answers `ObjectNotFound`. | `BaseObjectReader.scala`; `client/ReadError.scala` `InvalidObject` |
 | Q6 | Every apply sets the object's timestamp to the later of its current timestamp and the transaction's start (`later`), so object timestamps never decrease. Only revision-bearing requirements (`checkRevision`, a `KeyValueUpdate` with a required revision) check `state.timestamp > txTimestamp`. A `RefcountUpdate` and a key-level `KeyValueUpdate` do not, so two transactions on one object may commit in the opposite order of their starts. | `server/store/RequirementsApplyer.scala`; `RequirementsChecker.checkRevision`, `checkKVRequirements` |
 | Q7 | A KeyValue update moves the object revision only when it has a required revision. | `RequirementsApplyer.scala` |
-| Q8 | Stores refuse blind writes as `TransactionBuilder` does: a key Delete needs a `KeyRevision` on that key or a content lock; a key Insert a check on its key, a required revision or a content lock; a min/max/left/right change needs a required revision (except an allocation's initial content). So every key delete fails at a store lacking the key (and is marked there), and every object-level change moves the revision. | `RequirementsChecker.refuseBlindWrites`; `TransactionBuilder.refuseBlindWrites` |
+| Q8 | Stores refuse blind writes as `TransactionBuilder` does: a key Delete needs a `KeyRevision` on that key or a content lock; a key Insert a check on its key, a required revision or a content lock; a min/max/left/right change needs a required revision (except an allocation's initial content). So every key delete fails at a store lacking the key (and is marked there), and every object-level change moves the revision. | `common/transaction/BlindWrites.scala` `BlindWrites.violation`, applied by `RequirementsChecker.refuseBlindWrites` and `TransactionBuilder.refuseBlindWrites` |
 | Q9 | A store holding recovered transactions (`Frontend.holding`: CRL still loading, a recovered Tx still loading its objects, a recovered Tx that does not relock waiting for every recovered commit vote to relock, or one deciding its vote) drops every client read, as a silent store would. A recovered commit vote retakes its locks before holding ends. | `Frontend.readObjectForNetwork`, `recoveredTransactionLoaded`; `Tx.completeLoad` |
 
 Q1 with Q2 and Q9 is why an unlocked part of a read reflects every transaction committed before the read began
@@ -119,7 +119,7 @@ recorded", and a read decides (section 9).
 |-----------|---------|------|
 | Insert or advance an ErrorTree entry | `MissedUpdateMarker.writeBatch`, from the finalizing client's `MissedUpdateFinalizationAction` | `errorTimeout` (2 s) after the action executes, for each store that did not report a clean commit |
 | Insert an UnackedCommits entry | same batch | same, for each counted commit voter (every store when the voters are unknown) that sent no `TxCommitted`, or one with `keptForReplay`, and hosts an object T changes |
-| Insert an ErrorTree entry at `HLCTimestamp.Zero` (or rewrite a held one unchanged) | a host, through `MissedUpdateMarker.mark`: a rebuild (`RebuildingStore.markUnsettled`, a restore whose read reported a write lock, `recordAcceptedLoss`) or a rebuilt store's inherited-growth scan (`StoreRepairer.inheritedGrowthScan`, 10.3) | see section 3, marks that name no transaction |
+| Insert an ErrorTree entry at `HLCTimestamp.Zero` (or rewrite a held one unchanged) | a host, through `MissedUpdateMarker.mark`: a rebuild (`PendingAllocationSweep.markUnsettled`, a restore whose read reported a write lock, `RebuildingStore.recordAcceptedLoss`, each mark built by `RebuildingStore.missMark`) or a rebuilt store's inherited-growth scan (`StoreRepairer.inheritedGrowthScan`, 10.3) | see section 3, marks that name no transaction |
 | Delete either kind | `StoreRepairer.deleteEntryIfUnchanged` only | after the object(s) are reconciled completely or proven deleted |
 | Point lookup of an UnackedCommits head | `Host.unackedLookup` (`server/store/UnackedCommitLookup.scala`) | a recovered, expiring or late commit vote |
 | Applied stubs | not repair's: each store writes and expires its own (`Frontend.expireStubs`; `server/transaction/CLAUDE.md`) | |
@@ -553,8 +553,8 @@ reconciles the whole object from a later read.
 
 A repair write that finds another object in the slot (`backend.RepairSlotOccupied`, FSIF slot reuse over a missed
 delete) drops the occupant (`StoreRepairer.dropOccupant`) with an id-checked `repairDelete`, but only when the
-AllocationTree does not list it: the object was just read live, and two live objects never share a slot. The repair
-is stale, so the entry stays and the next pass installs. A listed occupant is logged as an error and left.
+AllocationTree does not list it: the object was just read live, and two live objects never share a slot (the read can
+predate a deletion of the object, after which its slot may be reused: RP-W12). The repair is stale, so the entry stays and the next pass installs. A listed occupant is logged as an error and left.
 
 ---
 
@@ -591,7 +591,7 @@ is stale, so the entry stays and the next pass installs. A listed occupant is lo
 ### 8.1 DeferralState
 
 In memory, one per store, kept across scans by `RepairService` and dropped when the store leaves the repairable set
-(`StoreRepairer.DeferralState`). Keys: `errorDeferralKey(key)` (prefix 0), `unackedDeferralKey(key,
+(`server/repair/DeferralState.scala`). Keys: `errorDeferralKey(key)` (prefix 0), `unackedDeferralKey(key,
 objectId)` (prefix 1), `sweepDeferralKey(nodeId)` (prefix 2).
 
 - `record(entryKey, result)` counts the passes since the entry's last complete pass that deferred something by a lock
@@ -684,8 +684,8 @@ other miss (ErrorTree for silent or erroring stores, UnackedCommits for unacknow
   and the 60 s gate only paces. Clock skew moves the gate by at most the skew plus `MaxStartLead`; safety does not rest
   on it.
 - `repairDeletion` (`Frontend.deleteObjectForRepair`) is refused (`RepairDeleteDeferred`, counted deferred) while the
-  store is holding, or the object has a pending backend read, a commit, a repair write or a deletion in flight, or a
-  transaction references it. Otherwise it evicts the cache, counts the object in `deleting` (reads, snapshots and
+  store is holding, or the object has a pending backend read, a commit (in flight or held for its turn,
+  `hasPendingCommit`), a repair write or a deletion in flight, or a transaction references it. Otherwise it evicts the cache, counts the object in `deleting` (reads, snapshots and
   transactions get `ObjectNotFound`), waits for allocations to be durable (`awaitAllocationsDurable`), then
   `backend.repairDelete`: RocksDB deletes the key; FSIF deletes the extent only if its slot still holds that id. Both
   are idempotent. A stopped or closed store fails it. A `commitFailed` object is not refused: it is gone from the
@@ -925,4 +925,32 @@ its read threshold stalls the scan until the deadline.
 
 ## 14. Open weaknesses
 
-(none)
+**RP-W12 Dropping a slot's occupant can delete a live object allocated after the repaired object's deletion**
+(PLAUSIBLE, priority 2, effort S)
+
+Mechanism: `StoreRepairer.dropOccupant` takes a `RepairSlotOccupied` from an FSIF repair write as proof that the
+occupant is dead, on the grounds that the object being repaired was just read live and two live objects never share a
+slot (6.5). The read only shows the object live when it was taken. An FSIF pool's deleting transaction clears the
+object's index bit in the same transaction (`FsifIndexAllocationStrategy` `prepareCommit`, `updateBits`), so the index
+can be handed to a new allocation as soon as the deletion commits, and the new object's `AllocationFinalizationAction`
+lists it in the AllocationTree only after its own commit. The only check `dropOccupant` makes on the occupant is that
+absence; `Frontend.deleteObjectForRepair` refuses only while the occupant is in use, and an allocation's state is
+retained unshared (`Frontend.retain`, `shared = false`), so once the allocating commit has persisted nothing refuses.
+
+Trigger: store S missed the allocation of P, so it holds no copy and has an entry for P. A pass snapshots P as missing
+on S and reads P live. Before the reconcile reaches S's executor (a parked reconcile waits up to `RepairSettleWait`; a
+proof pass runs its proof transactions between the read and the second reconcile), P is deleted, the index is reused
+for a new object C, and C's allocation commits and applies on S. The reconcile plans a new copy of P (current and
+snapshot both missing, live refcount) and `backend.repair` fails with `RepairSlotOccupied(C)`. `dropOccupant` finds C
+absent from the AllocationTree (its `AllocationFinalizationAction` has not landed, which a slow metadata pool can
+prolong) and `repairDeletion` removes C's slice from S, id-checked against C.
+
+Consequence: a committed, live object loses its slice on S with no entry recording it. S may have been a counted
+commit voter of C's allocation, so this spends the `t - r` margin silently, and an object never written again stays
+short on S for good (no read-driven repair, 10.2). P's own entry is then settled normally by a later pass proving P's
+deletion.
+
+Fix direction: before dropping the occupant, re-read the repaired object (or let the next pass decide): only an object
+still live after the occupant was found shows the slot was not freed and reused meanwhile. Alternatively drop the
+occupant only on a read proving its own deletion (`InvalidObject.provesDeletion`), with its type taken from the FSIF
+header that `RepairSlotOccupied` could carry, since a read of the wrong type answers `ObjectMismatch`.

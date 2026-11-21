@@ -302,10 +302,10 @@ the client.
   latest prepare it saw (initially the designated leader); a `TxResolved` does not change it, so a store that never
   got the finalizing driver's prepare acknowledges another driver, and the finalizing one marks it (an extra repair
   pass). Its `objectCommitErrors` are the objects uncommittable at apply time (not those a recovered commit vote
-  takes as applied), plus every object a recovered Tx that did not vote commit applies, plus each object on which it
-  applies a blind Insert of a key absent before the apply where a later deletion of the key may already have applied
-  (7.4), plus those whose backend commit failed; a store that applies nothing (it holds an applied stub, or its entry is not owed
-  to it) reports every object it changes.
+  takes as applied), plus each object on which it applies a blind Insert of a key absent before the apply where a
+  later deletion of the key may already have applied (7.4), plus those whose backend commit failed; a store that
+  applies nothing (it holds an applied stub, its entry is not owed to it, or it is a recovered Tx that did not vote
+  commit, `Tx.doCommit`) reports every object it changes.
 * `commitVoters(voters, incarnations)`: `voters` is `Some(set)` if the prepare replies of this driver's current round
   (`peerDispositions`, reset by `nextRound`) hold commit votes reaching the write threshold for every referenced
   object (`countedCommitVoters`), else `None` (the outcome came from another
@@ -365,9 +365,9 @@ up and fails every entry of the batch. The marker transaction is `replaySafe` (m
   `TxCommitted` or has an entry, through which a recovered or expiring voter applies T, and repair leaves the entry
   alone while the store may still hold or join T. A `TxCommitted` naming no changed object means its backend commits
   persisted, so at least a write threshold of stores holds T. One naming objects comes from a store that holds T
-  already (a stub), that applied T but reports objects for repair (a recovered Tx that did not vote commit, a blind
-  Insert over a possibly newer deletion, a live voter's invariant violation: 7.4), that is not owed it (another
-  incarnation), or that keeps T's CRL state for a failed backend commit; the last two keep the object out of the write-threshold count until that state is replayed or repair reconciles the
+  already (a stub), that applied nothing (a recovered Tx that did not vote commit, 7.4), that applied T but reports
+  objects for repair (a blind Insert over a possibly newer deletion, a live voter's invariant violation: 7.4), that is
+  not owed it (another incarnation), or that keeps T's CRL state for a failed backend commit; the last two keep the object out of the write-threshold count until that state is replayed or repair reconciles the
   copy. Such a store set `keptForReplay`, so a counted voter among them has an entry, and a reload after
   T's finalization replays the state through it (an uncounted one's kept state applies nothing on reload; its
   ErrorTree marks repair it). An uncounted voter or non-voter that sent no `TxCommitted` gets only ErrorTree marks, which repair keeps
@@ -387,7 +387,7 @@ up and fails every entry of the batch. The marker transaction is `replaySafe` (m
 
 An **applied stub** (S, T) is a durable CRL record meaning "S holds T's update (or must never take it through its
 entry)", charged to `CrlAdmission` and carrying T's start (crash-recovery-log.md). The Frontend keeps the set in memory
-(`Frontend.stubs`).
+(`Frontend.stubs`, an `AppliedStubs`; its admission charges are `StoreAdmission`'s).
 
 * **`owed`.** A non-late commit `TxFinalized` lists the stores its driver's markers handed entries off for; aborts,
   late commits and the relay carry none (`TransactionDriver.onFinalized` sets it in the same critical section as the
@@ -406,8 +406,8 @@ entry)", charged to `CrlAdmission` and carrying T's start (crash-recovery-log.md
   reaching a commit vote with a stub applies nothing without a lookup; a recovered non-late commit vote with a stub
   resolves committed through `doCommit` and stays until `TxFinalized`.
 * **Expiry.** The store drops its own stub once T is past the horizon plus the expiry margin and it holds no Tx for T
-  (live, deferred or awaiting backend commits) (`Frontend.expireStubs`, a queue ordered by expiry plus
-  `heldStubs`). Below the floor no Tx for T can arise, so the stub could suppress nothing. Repair neither reads nor
+  (live, deferred or awaiting backend commits) (`Frontend.expireStubs` -> `AppliedStubs.dueForDrop`: a queue ordered
+  by expiry, stale entries skipped, plus the stubs a Tx kept past their expiry, rechecked each heartbeat). Below the floor no Tx for T can arise, so the stub could suppress nothing. Repair neither reads nor
   drops stubs.
 * **Entries without stubs.** An entry with no stub is harmless at a store that saw T: it never rejoins T, so no Tx
   exists there to apply through it. A store that never saw T can hold a replay's Tx only above its floor; its entry,
@@ -483,7 +483,8 @@ Code: `server/host/StoreLoader` (`awaitCrlLoad`, `handleUnloadFailed`), `StoreRo
 `readAndRecover`, `recoverOrFail`, `crlLoaded`; `Frontend.recover`, `recoverState`, `recoverTransactions`,
 `recoveredTransactionLoaded`. A save file is the store's whole state, so whatever the device CRL holds for the store
 is dropped, durably, before the file is loaded into it (crash-recovery-log.md). The recovered state is counted in the
-device's admission before what was retained for the store is released (`Frontend.recoverState`).
+device's admission before what was retained for the store is released (`Frontend.recoverState`,
+`StoreAdmission.admitRecovered`).
 
 While `Frontend.holding` (CRL awaited, recovered transactions loading, or loaded recovered ones that do not relock
 waiting for those that do, 7.2) the store
@@ -504,7 +505,8 @@ ends in a rebuild: its counted commit votes are lost with it (rebuild-process.md
 the persisted status and the acceptor state. A saved status of Committed or Aborted (re-saved by a prepare or accept
 after the resolution, before an abort's state is deleted; one deleted saves nothing more and answers with the abort,
 `Tx.stateDeleted`, crash-recovery-log 6.1 A4; the CRL persists it) is restored into `oresolution`: once its objects load such a Tx applies the
-commit with the recovered re-check rules, or deletes the abort's state, and needs no lookup, then waits for
+commit with the recovered re-check rules (a commit voter; one without a commit vote applies nothing and reports its
+objects, 7.4), or deletes the abort's state, and needs no lookup, then waits for
 `TxFinalized` as a live resolved Tx does. A restored commit with a commit vote relocks first and holds its locks until
 it applies (step 3); a restored abort takes none. The constructor also seeds the host status cache with the saved status.
 A Tx resolved through its UnackedCommits entry (`unackedCommitFound`, `unackedCommitNotOwed`) saves `Unresolved` on
@@ -531,9 +533,10 @@ Ordering (`Frontend.recoveredTransactionLoaded`, `Tx.completeLoad`):
    with a restored commit resolution then applies in the same `completeLoad`, holding them until `doCommit` releases
    them: its backend commit may not have completed before the crash, and until it applies the locks order the
    transactions behind it and show readers and repair that it has yet to apply (transaction-requirements.md R13). A
-   restored commit without a commit vote here takes no locks and applies in its `completeLoad`, waiting in lock order
-   (`Tx.awaitLockOrder`) for the holders it collides with. Every recovered commit vote has relocked by then (step 2),
-   so it never applies over a recovered vote's update before that vote applies.
+   restored commit without a commit vote here takes no locks and resolves in its `completeLoad`, waiting in lock order
+   (`Tx.awaitLockOrder`) for the holders it collides with and for its turn (`holdForTurn`), then applies nothing and
+   reports every object it changes (`Tx.doCommit`, 7.4). Every recovered commit vote has relocked by then (step 2), so
+   its wait sees every holder.
 4. `completeLoad` requests the UnackedCommits lookup if `needsUnackedCheck` (7.5).
 5. Held messages are released only once nothing is holding.
 
@@ -587,7 +590,10 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   transaction-requirements.md.
 * A recovered commit voter whose re-check fails on an object it changes takes it as applied: it held its locks until
   it applied and relocked them at recovery (with a restored commit resolution too, 7.2 step 3), so only its update and the writes after it in lock order changed the
-  object (superseded, traceless, or its data dropped once applied). A live voter's failed re-check is an invariant
+  object (superseded, traceless, or its data dropped once applied). A Tx recovered without a vote that votes commit
+  on its client's retransmit after load (7.2 step 2) is a recovered commit voter too: its vote checked T's
+  requirements, pin included, against the state after the crash, and it has held its locks since, so a failed re-check
+  at its apply again means an update already there. A live voter's failed re-check is an invariant
   violation, logged at error, skipped and reported; an allocation the backend missed is reported (no copy, no lost
   lock); any apply that throws fail-stops the store (transaction-requirements.md 8.5). A recovered Tx that did not vote
   commit applies nothing and reports every object it changes (`Tx.doCommit`): it may have applied and acknowledged T
@@ -680,7 +686,10 @@ state, and Paxos, safe with offline acceptors, never chooses abort once commit w
 
 **Late commit at any commit voter** (`Tx.lateCommit`, recovered or live): held for a lookup started then; an own entry
 applies T and the Tx is forgotten as finalized with a stub, as does an entry naming no incarnation; another
-incarnation, or no entry, applies nothing. A
+incarnation, or no entry, applies nothing. A non-late commit that resolves the Tx while the lookup is outstanding
+drops the hold (`Tx.resolved`): the answer is then ignored, the commit applies as any resolved commit vote's does,
+and the Tx ends on `TxFinalized` or by expiry (it may expire again once no hold remains, `Tx.mayExpire`), whose
+known-outcome conclusion looks its entry up for its stub. A
 stub already held applies nothing without a lookup. A Tx already resolved committed looks its entry up only to decide
 its stub (5.4, case 3). A Tx without its own commit vote (abort vote, no vote, prover, muted) applies nothing and
 sends no `TxCommitted`.
@@ -720,10 +729,14 @@ lookup that finds no entry.
                      through its entry)
                     |
               Frontend forgets Tx
- commit at a store holding a stub, or notOwedHere: applies nothing, TxCommitted reports T's objects
+ commit at a store holding a stub, notOwedHere, or a recovered Tx without a commit vote: applies nothing,
+                    TxCommitted reports T's objects
  recovered/expiring + VoteCommit + Unresolved: lookup; aborts held until a later lookup finds none;
-                    own entry -> resolved(true), applied, kept until TxFinalized; other/none -> resolved(true), nothing applied
- late commit: own commit vote -> lookup -> own entry: apply + stub + forget / other, none or absent: applyNothing;
+                    own or no-incarnation entry -> resolved(true), applied, kept until TxFinalized;
+                    other incarnation -> resolved(true), nothing applied
+ late commit: own commit vote -> lookup -> own or no-incarnation entry: apply + stub + forget;
+              other incarnation or absent: applyNothing;
+              a non-late commit before the answer drops the hold: resolved(true), applied, kept until TxFinalized/expiry;
               stub held -> applyNothing; already resolved committed -> lookup -> found: stub / absent: no stub; forget
               no commit vote or prover -> applyNothing
  past horizon + margin, unfinalized: expiry rounds -> adopt / commit / conclude known / discard (after lookup) / hold

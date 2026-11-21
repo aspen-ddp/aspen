@@ -40,7 +40,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Rebuild | Transactions | `CurrentAllocationsRequest` lists every unfinalized allocation and every held commit vote (`HeldVote`); reads of the pool's objects complete |
 | Rebuild | Repair | Everything the store missed while rebuilding is marked and repaired after promotion |
 | Rebuild (reassignment) | Host device lifecycle | The tombstoned device's former host stops serving its stores before the drain rebuilds them elsewhere: one best-effort nudge, else its hourly check; a running host that misses the nudge serving through the rebuild is an accepted limitation (rebuild-process.md B19) |
-| Transfer out (closed store) | Host loader | The store stays closed from its extraction until its `transferring-out` marker is written (an open meanwhile fails the extraction, or stops `startOut` in the task that would write the marker), and the extraction fails on a failed stat of the directory or save file rather than take it for an absence (crash-recovery-log.md 3.5) |
+| Transfer out (closed store) | Host loader | The store stays closed from its extraction until its `transferring-out` marker is written (an open seen meanwhile fails the extraction, or stops `startOut` in the task that would write the marker), and the extraction fails on a failed stat of the directory or save file rather than take it for an absence (crash-recovery-log.md 3.5). An open is seen only when a CRL call answers (`opensStarted`), so nothing keeps a load retry from opening the store while the extraction's final deletions are unwritten (CRL-W19, X-W28) |
 | Rebuild completion | Transfers | A flip that finds the entry already Active adopts the copy without checking its episode (`DeviceMetadata.markRebuiltStoreActive`); no transfer starts onto an occupied store path, so the copy is this episode's (2.2). A flip retried after `TransactionOutcomeUnknown` that finds the entry moved on (TransferringOut, absent) keeps the copy offline rather than discarding it (`Unconfirmed`, rebuild-process.md 5.7) |
 | Rebuild, CRL | Store lifecycle | A rebuilt copy's first load recovers nothing an earlier copy left under its id in the device CRL: it is a save-file load of the empty state `RebuildingStore.finish` writes, which drops those entries first (rebuild-process.md 5.6) |
 | Lost device CRL | Rebuild | A finished rebuild awaiting its flip (`rebuild-complete`) has never served, so it holds nothing in the device CRL and is not marked (`DeviceDiscovery.holdsOwnState`) |
@@ -113,7 +113,10 @@ The premises other subsystems take from this:
   a late outcome or an expiry discard. A Tx of T that saves after that
   point (the live Tx with `keepAdmission`) works on a transaction whose outcome this store has already concluded. If
   the store then crashes, its reload floor refuses T, which makes it an offline acceptor of a decided transaction;
-  the promise, accept or vote it acknowledged decides nothing that is not decided already.
+  the promise, accept or vote it acknowledged decides nothing that is not decided already. The one final deletion
+  queued for a transaction the store has not concluded is a closed store's transfer-out extraction
+  (`StoreTransfersOut.extractFromDirectory`), which deletes every record it saved into `crl_save.log`; a load of the
+  store before that deletion is written has its saves skipped and acknowledged, and loses the state (CRL-W19).
 * **Repair waits until the store cannot join T.** An entry is left alone while T's start is at or above the store's
   forget floor (`RepairTarget.mayJoinTransaction`) and while the store holds a Tx for T or is loading its CRL
   (`Frontend.mayHoldTransaction`), so no Tx can apply T after a reconcile and have its entry deleted under it. A Tx
@@ -225,8 +228,11 @@ The premises other subsystems take from this:
   absence use it too: the Missing Stores pass and the leftover drop skip a store whose stat fails, a retire fails
   rather than report a clear path, the Deleted Stores pass keeps the store offline, and the device CRL's open leaves the
   device unloaded for the next scan rather than declare a `crl/` lost (a child whose config cannot be stat'd counts as
-  a store). The existence tests outside the load use `FileStat` as well, so absence means one thing everywhere. A
-  failed stat of a moved store's `ArrivedAtFile` counts as an arrival now (`StoreLoader.readArrivedAt`), keeping its
+  a store). Existence tests outside these still use os-lib's `os.exists`/`os.isDir`, which answer absent on a failed
+  stat: the CRL open (SL-W21), the backend opens and FSIF recovery (SL-W22, SL-W23), the rebuilt store's
+  `acceptor-since` and `inherited-votes` reads (X-W29), `StoreCopies.delete` (SL-W24), `DeviceMarkers.isFailed`
+  (SL-W25), `RebuildingStore.isRebuildCompleteFor` (RB-W22), `DeviceDiscovery.bringIntoService` (P-W10), and others
+  listed in X-W30. A failed stat of a moved store's `ArrivedAtFile` counts as an arrival now (`StoreLoader.readArrivedAt`), keeping its
   arrival margin. `adoptionClass` and the adoption's `crl/` check throw, failing the adoption for the next scan;
   `retireForeignCopy` and `discardLostStore` hold the rebuild for a later check, neither starting it over a copy
   they cannot see nor retiring a finished one; `startIn` neither resumes nor discards an arrived copy whose marker
@@ -532,26 +538,70 @@ Terms the documents share mean the same in each:
 * "Below the floor no Tx is created" excepts, everywhere it is said, a rebuilt store's muted Tx for a transaction
   started before its acceptor (2.1; repair-process.md 5.4, paxos-transactions.md 10.10, transaction-recovery.md 4.2).
 
-Between the documents, each disagreement found is corrected where it stood:
-
-* systemic-loss-protection.md S10 described `fail-storage-device` as only for a drive whose data is already gone,
-  while rebuild-process.md 4.1 uses it to move a rebuild off suspect media. S10 now says that nothing checks that the
-  device is unserved, and points to the accepted limitation in rebuild-process.md B19.
-* transaction-recovery.md 4.2 (a resolved, unfinalized cache entry) and 2.6 here said a prepare below the floor
-  creates nothing; the rebuilt store's muted Tx is now excepted in both.
-* transaction-requirements.md 10.5(c) says a refcount requirement fails at a store that applied a later chained
-  write. That rests on every refcount change advancing `updateSerial`, which it now names and the builder and stores
-  enforce (transaction-requirements.md 2.5).
-
-Between a document, scaladoc or guide outside docs/safety and the code:
-
-* `server/store/backend/fsif/DESIGN.md` 4.2 (L18 and "What a false trigger looks like") counted any failed compaction
-  move read as loss, although its stated reason for loss (a failed write or fsync leaves the page cache
-  untrustworthy) covers writes only. A failed move read now abandons the move and retries it after a backoff, as a
-  client read retries a failure that is not evidence of damage, and both passages say so.
+Contradictions found between documents, or between a document and the code, are corrected where they stand and
+not recorded here.
 
 ---
 
 ## Open weaknesses
 
-(no open items)
+**X-W28 A load retry serves a store whatever its entry says** (CONFIRMED, priority 1, effort S)
+
+`StoreLoader.retryFailedLoads` offers every store in `storesAwaitingRetry` that is offline, unopened and has a
+`config.yaml` to `tryLoadStore`, which reads no tree. Nothing checks that the store's entry on the device is still
+Active or Offline, that the store is not being extracted for a transfer out, or that the Missing Stores pass has not
+declared it (`declaredMissing`) or a rebuild started for it. It is the shared enabler of two findings: a closed store
+whose entry is TransferringOut is opened while its extraction's final deletions are unwritten, and loses its CRL state
+(CRL-W19); a store whose directory came back after its rebuild checkpointed serves with full acceptor state between
+passes, and the resumed walk leaves what it acknowledged unmarked (RB-W21, running-host path). Trigger: any store left
+awaiting a retry (a transient backend open or build failure, no CRL room, a failed save-file removal) whose entry then
+moves. Fix direction: a retry loads only a store whose device entry, read in the reconcile that drives the scan, is
+Active or Offline, which is not in `declaredMissing`, not transferring out (`StoreTransfersOut` extraction or
+marker pending) and not being rebuilt; anything else drops the retry and leaves the store to its pass. CRL-W19's own
+fix (an empty `dropStore`/`deleteTransactions` completing through `whenWritten`) is still needed for a device load
+racing an extraction.
+
+**X-W29 A failed stat of a rebuilt store's `acceptor-since` or `inherited-votes` file loads it as a full acceptor**
+(PLAUSIBLE, priority 1, effort S)
+
+`RebuildingStore.readAcceptorSince` and `readInheritedVotes` test their files with `os.exists`, and `StoreLoader.handleLoad`
+passes the result straight into the `Store`, while it tests the save and incarnation files beside them with
+`FileStat`. A stat that fails (EIO, EACCES, ESTALE) yields `None`: the store has no acceptor start and no
+inherited-vote gate. Until the rebuild's `acceptor-since` (finish plus 10 s) it then promises, votes and answers
+expiry queries as a non-holder in transactions its old incarnation joined (paxos-transactions.md 10.10), and until
+its inherited-vote round it votes on objects its old incarnation's votes lock (2.3): with Replication(3,2), the
+rebuilt store and T's abort voter commit a T' over T's lock, and T can commit after it, a split decision.
+The unreadable-content fallback of both functions errs late, as it should; only the stat errs. Trigger: a transient
+stat failure at the load of a rebuilt store within the horizon plus 20 s of its rebuild pass. Fix direction: test both
+files with `FileStat` and hold the load back through `awaitUnreadRetry` on a failed stat, as the save and incarnation
+files are.
+
+**X-W30 Existence tests that remain on os-lib are unclassified** (CONFIRMED, priority 5, effort M)
+
+`server/host/CLAUDE.md` and 2.2 above state one rule, that every existence test over a store or device directory
+tells a failed stat from an absence (`server.FileStat`). The sites with their own findings are listed in 2.2. The
+rest still use `os.exists`/`os.isDir`/`os.isFile` and have not been checked for what a false absence does there:
+`DeviceShutdown` (`ShutdownStateFile` before a lookup), `DeviceMarkers.readHostId`, `DeviceDiscovery` (device-scan
+directory tests, `storesIn`, `tryLoadDevice`, the config `os.isFile`), `StoreTransfers` (the promotion's
+`transferring-out` test, the `rebuild-complete` test after a repoint), `StoreTransfersOut.startOut` (`rebuild-required`,
+two sites: a marked copy ships with its marker, so the destination declares it), `StoreCopies` (`release`'s
+`pending-delete/` listing and copy test, `deleting/` sweeps), `LocalDevices.discardStoreDirectory`,
+`StoreRebuilds` (the path test before create, the staging root), `RebuildState` (the checkpoint: a false absence
+costs a first pass), `StoreLoader` (`os.isDir` of a device child, the path test after a failed create),
+`JoinCeiling.FilePersistence.read` (fails safe: no ceiling gives the higher floor), `CrlLock`, `HostManager`,
+`GossipRetransmitter` and `FilePreallocation`. Consequence: unknown per site; the ones traced so far range from a
+wasted rebuild to a split decision. Fix direction: replace them all with `FileStat`, deciding at each site whether a
+failed stat waits, throws or is safe either way, and keep it so with a test that fails on any `os.exists`,
+`os.isDir` or `os.isFile` under `server/` outside `FileStat`.
+
+**X-W31 `keepUnpromotedCopyOffline` silences a store served from another device of this host** (PLAUSIBLE,
+priority 4, effort S)
+
+`StoreRebuilds.keepUnpromotedCopyOffline` marks through `DeviceControl.markStoreOffline`, setting the router's
+offline mark by store id, while `StoreLoader.keepMarkedCopyOffline` spares a store served or opening here. A rebuilt
+copy whose flip comes back `Unconfirmed` or `Superseded` after the store is served from another device of the same
+host (the `Unconfirmed` copy shipped by a same-host transfer, or a same-host re-placement) sets the mark over the
+served store: `HostStoreView` reports it non-repairable, so its repair scans stop, and `DeviceShutdown.storesToClose`
+skips stores the router reports offline. Trigger uncertain: it needs the other device's copy served before the
+settling flip attempt completes. Fix direction: mark the router only when no copy of the store is served or opening
+here, as `keepMarkedCopyOffline` does.

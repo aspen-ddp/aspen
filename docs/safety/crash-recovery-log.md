@@ -58,13 +58,13 @@ store; an applied stub is a `TransactionId` with its transaction's start `HLCTim
 | `loadStore(store, state): Future` | Saves a `crl_save.log`'s state: every stub first, then (once those are durable) every transaction. SimpleCRL tracks every save so a CRL death fails the Future. |
 | `saveAppliedStub(store, txid, start, onDurable)` | Saves a stub, replacing any transaction state of the id in the same entry. Never subject to admission checks. |
 | `deleteAppliedStub(store, txid)` | Lazy, unacknowledged deletion of the stub only. Writes nothing if no stub is held. |
-| `dropStore(store): Future` | Deletes every transaction and stub of the store held when the request is processed, durably. In SimpleCRL its transaction deletions are cancellable by a later save of the same id in the same entry (5.8). |
+| `dropStore(store): Future` | Deletes every transaction and stub of the store held when the request is processed, durably. In SimpleCRL its transaction deletions are cancellable by a later save of the same id in the same entry (5.8). A store holding nothing completes at once, without waiting for earlier unwritten entries (5.8). |
 | `storesWithEntries(): Future[Set[StoreId]]` | Stores with live entries, stub-only stores included. |
 | `recoveredBytesByStore` | What the open recovered for each store, as admission counts it (section 6). |
 | `failed: Future[Throwable]` | Completes, with the cause, if the CRL dies (5.10). |
 | `shutdown()` | Blocks until the CRL's thread and writer have stopped and its files are closed. Handlers already handed to the completion thread run first; every Future not answered by then, and every later one, fails with `CrlClosed` (5.10). Idempotent. |
 | `admissionLimitBytes` | The device's admission limit (section 6): `(n − 2) · S/2 − S/16 − H · (n − 1)` in SimpleCRL, for `n` streams of `S` bytes (`H = 118`, `SimpleCRL.admissionLimitFor`). |
-| `maxAdmissionLimitBytes` | The most admission limit the CRL can reach under any device config: `(m − 2) · S/2 − S/16 − H · (m − 1)` in SimpleCRL for `m = CrlSizingDefaults.MaxMaxStreams` (1024), whatever `crl-max-streams` this open allows. A loaded state is judged never to fit against it (A3), so no config edit can declare a state lost. |
+| `maxAdmissionLimitBytes` | The most admission limit the CRL can reach under any device config: `(m − 2) · S/2 − S/16 − H · (m − 1)` in SimpleCRL for `m` the larger of the ring size and `CrlSizingDefaults.MaxMaxStreams` (1024), whatever `crl-max-streams` this open allows. A loaded state is judged never to fit against it (A3), so no config edit can declare a state lost. |
 | `maxTransactionBytes` | The most bytes, as admission counts them, one store's transaction may hold: `S/2 − 8192` in SimpleCRL. A prepare past it is dropped unsaved (section 6, Oversized). |
 | `requestGrowth()` | Asks for more room; cheap, idempotent, from any thread. SimpleCRL adds one stream if its growth policy allows (5.11). |
 | `onAdmissionLimitRaised(f)` | Registers `f`, called on the CRL thread with the new `admissionLimitBytes` after each committed growth. |
@@ -122,8 +122,8 @@ no failure, no per-transaction bound, no growth) are for CRLs that keep nothing 
 - **C9 (deletion finality in an entry).** A deletion of (store, txid) applies to that txid's saves in the same entry
   and in all older ones. A save of the same txid queued while a final deletion of it lies in any unwritten entry,
   the one in flight included (W1b), is skipped and acknowledged once the deletion is durable, and creates no
-  in-memory record (`LogEntry.deletesFinally`, `SimpleCRL.onSaveTransaction`). Deletions made by a stub's save or
-  by `dropStore` are cancellable: a later save of the id in the same entry removes the deletion and is written
+  in-memory record (`LogEntry.deletesFinally`, `SimpleCRL.skippedAfterFinalDeletion`). Deletions made by a stub's
+  save or by `dropStore` are cancellable: a later save of the id in the same entry removes the deletion and is written
   (`LogEntry.deleteTxUnlessResaved`, `LogEntry.addTx`).
 - **C10 (deletion durability).** `deleteTransactions` and `dropStore` complete only after the entry carrying the
   deletion is durable. `deleteTransaction` and `deleteAppliedStub` have no completion; `whenDurable` orders later
@@ -148,8 +148,9 @@ no failure, no per-transaction bound, no growth) are for CRLs that keep nothing 
 - **C14 (queue order).** Every request is processed in the order it was queued. `readStoreState` sees every save queued
   before it, and `dropStore` drops exactly what was saved before it.
 - **C15 (recovered status).** Disk recovery and `readStoreState` return the same status: the one last saved. It is
-  stored in bits 3-4 of the static record's Paxos mask byte (`Tx.writeStaticEntry`, `Tx.loadTx`), and a recovered Tx
-  restores a saved resolution from it (`Tx.oresolution`, transaction-recovery.md).
+  stored in bits 3-4 of the static record's Paxos mask byte (`Tx.writeStatic`, `Tx.loadTx`, in
+  `S/crl/simple/LogContent.scala`), and a recovered Tx restores a saved resolution from it (`Tx.oresolution`,
+  transaction-recovery.md).
 
 ---
 
@@ -245,10 +246,10 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
    earlier copy left. Recovered as the store's own, such entries would rejoin transactions it has since forgotten, and a
    stale commit vote would find its own UnackedCommits entry (a transfer keeps the incarnation) and apply again. The
    drop first is why neither can happen.
-5. Recovered transactions are counted into the device's admission without a limit check (`Frontend.admitRecovered`),
-   as are recovered stubs (`chargeStubs`). Only then is what was retained for the store released: the share the
-   device's open, its last close, step 4's charge or a replaced store retained (`Frontend.recoverState`, section 6.1
-   A2).
+5. Recovered transactions are counted into the device's admission without a limit check
+   (`StoreAdmission.admitRecovered`), as are recovered stubs (`StoreAdmission.chargeStubs`). Only then is what was
+   retained for the store released: the share the device's open, its last close, step 4's charge or a replaced store
+   retained (`Frontend.recoverState`, section 6.1 A2).
 
 ### 3.4 Deletion is gated on the backend
 
@@ -265,9 +266,10 @@ the update (`Tx.persistWithoutUpdateOf`), and a concluded one's deletion or stub
 (`whenDurable`). A deletion of KeyValue keys (by a commit or a repair write) waits the same way for every recent
 transaction that may have Inserted one of them blindly, with no required revision, and holds that update here as
 applied (it issued its commit of the object, or voted commit: `Tx.holdsUpdateOf`) or has concluded
-(`Frontend.awaitBlindInsertsDurable`, `blindInsertRecords`): a recovered commit vote re-applies an Insert of an absent
-key. Both saves drop the update from every later save of the transaction too (`Tx.droppedUpdates`), and the update's
-piece leaves the image when that save's entry is built (5.3: a form's build unpins the pieces it does not name).
+(`Frontend.awaitBlindInsertsDurable`, `blindInserts`; both indexes are `CrlStateRecords`): a recovered commit vote
+re-applies an Insert of an absent key. Both saves drop the update from every later save of the transaction too
+(`Tx.droppedUpdates`), and the update's piece leaves the image when that save's entry is built (5.3: a form's build
+unpins the pieces it does not name).
 
 ### 3.5 Transfer out, drop, rebuild
 
@@ -275,7 +277,7 @@ piece leaves the image when that save's entry is built (5.3: a form's build unpi
 |-----------|-----------|--------|
 | Planned device shutdown | stores close with `extractCrl = false`, records stay live; then `crl.shutdown()` | `DeviceShutdown.closeForShutdown`, `shutDownCrl` |
 | Transfer out, store open | on the executor after `closing`: `readStoreState`; `saveStoreState` to `crl_save.log` (tmp, fsync, rename, directory fsync); `store.close()`; then `deleteTransactions(state.entryIds)` and the retained admission released | `StoreLoader.handleClose(extractCrl = true)` |
-| Transfer out, store closed | on the transfer's source device only (the device the pool entry names, whose directory ships; another device of the host may hold an earlier copy of the store, whose entries are its retire's); with a valid `crl_save.log`: the file ships unchanged and `dropStore` removes the device CRL's entries (a copy of part of the file or an earlier tenancy's leftovers, 3.3 step 4), releasing the charge retained when the drop was issued; without one: `readStoreState`, saved, then `deleteTransactions`. Either way the release is of the charge retained when the extraction began (`releaseRetained(storeId, charge)`), never a later one. An unusable save file, or a stat of the directory or the file that fails (`FileStat`), fails it before anything is read; an open started during the read, the deletion or the drop (`opensStarted`) fails it after, leaving the charge to the load. `startOut` checks again (loaded, opening, `opensStarted` unchanged since the close began) in the control task that writes the `transferring-out` marker, which keeps every later open off the store | `StoreTransfersOut.extractUnloaded`, `closeForTransferOut` |
+| Transfer out, store closed | on the transfer's source device only (the device the pool entry names, whose directory ships; another device of the host may hold an earlier copy of the store, whose entries are its retire's); with a valid `crl_save.log`: the file ships unchanged and `dropStore` removes the device CRL's entries (a copy of part of the file or an earlier tenancy's leftovers, 3.3 step 4), releasing the charge retained when the drop was issued; without one: `readStoreState`, saved, then `deleteTransactions`. Either way the release is of the charge retained when the extraction began (`releaseRetained(storeId, charge)`), never a later one. An unusable save file, or a stat of the directory or the file that fails (`FileStat`), fails it before anything is read; an open started during the read, the deletion or the drop (`opensStarted`) fails it after, leaving the charge to the load. Nothing keeps the store from opening meanwhile (`StoreLoader.retryFailedLoads` offers a store awaiting a load retry at each scan): an open during the drop loads the file behind the drop's cancellable deletions and is safe, but one during the final deletions loads the file just written behind them, and its saves are skipped (CRL-W19). `startOut` checks again (loaded, opening, `opensStarted` unchanged since the close began) in the control task that writes the `transferring-out` marker, which keeps every later open off the store | `StoreTransfersOut.extractUnloaded`, `closeForTransferOut` |
 | Retire of a copy no longer its store's owner (a lost store before its rebuild, a transfer out's source, a re-placed rebuild's source, an earlier tenancy's copy at the path of a store transferring in) | a path whose stat fails (`server.FileStat`) fails the retire, retried at a later check, rather than report it clear; marker `rebuild-required` durable; `lost-crl-state.log` kept if present, else the copy's `crl_save.log` renamed to it (any entries `readStoreState` still returns saved first as `lost-crl-entries.log`), else `readStoreState` saved to it; `dropStore`; directory renamed into pending-delete | `StoreCopies.retire` (from `StoreRebuilds.discardLostStore`, `StoreTransfers.retireEarlierTenancy` and the Deleted Stores pass) |
 | Store no longer on the device (safety net: a retire drops first) | `storesWithEntries`; for each store not in the device's tree entry, not loaded, with no directory (a stat that answers absent, `server.FileStat`: one that fails keeps them), no drop and no retire running: `dropStore` | `DeviceReconciler.dropLeftoverCrlState` |
 | Store whose `loadStore` of its `crl_save.log` failed (the file stays) | `dropStore` | `StoreLoader.handleUnloadFailed`, `closeUnloaded(dropDurably = true)` |
@@ -326,7 +328,8 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
 - **Admission.** Each stub is charged `CrlAdmission.AppliedStubBytes` (41: TxId 33, timestamp 8) without a check,
   and released when dropped; a closing store retains the charge (section 6).
 - **Lifetime.** The store drops a stub at heartbeat once T is past the horizon plus the expiry margin and the store
-  holds no Tx for T (`Frontend.expireStubs`). Past that point a prepare for T creates no Tx (`Frontend.receivePrepare`
+  holds no Tx for T, waiting on a held commit or on its backend commits (`Frontend.expireStubs`,
+  `AppliedStubs.dueForDrop`). Past that point a prepare for T creates no Tx (`Frontend.receivePrepare`
   refuses it below the forget floor), so the stub can suppress nothing. Stubs are therefore bounded by their write
   rate times about 30 s, whatever the repair scans do. A rebuilt store has none (its entries are dropped); it is
   muted for older transactions instead (rebuild-process.md).
@@ -366,7 +369,9 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   (`StoreLoader.tryLoadStore` leaves it offline), so its flip and load proceed as over the old CRL. Every existence
   test on this path is `server.FileStat`'s: a child directory whose `config` cannot be stat'd counts as a store
   directory (missing it could take an emptied `crl/` for a new CRL), and a failed stat of a child, of `crl/` or of
-  what `holdsOwnState` tests throws before anything is marked, leaving the device unloaded for the next scan,
+  what `holdsOwnState` tests, or a read of a store's config or save file that fails without saying anything of its
+  content (`CrashRecoveryLog.isUnreadable`), throws before anything is marked (every store is decided before any is
+  marked), leaving the device unloaded for the next scan,
   uncounted by `CrlOpenAttempts`. `crl/` is moved to
   `crl.lost-<uuid>` (kept deliberately, Backlog.txt); the device directory is forced; a fresh CRL is created in
   `crl.creating/` (`CrashRecoveryLog.replacementCrlDir`, `CrashRecoveryLogFactory.createCRL`, `SimpleCRL.create`: an
@@ -409,7 +414,8 @@ the ring need not be in numeric order. "Next", "successor" and "after" below alw
 (`Sizing.successor`), in rotation and in recovery alike. A sizing file whose ring is missing or not a permutation of
 `0 until num-streams` is unreadable.
 
-`SimpleCRL.apply`:
+`SimpleCRL.apply` (steps 2 to 5 are `CrlDirectory`'s, `S/crl/simple/CrlDirectory.scala`, which also holds `Sizing`
+and `SizingFile`, both re-exported by `SimpleCRL`):
 
 1. `CrlLock.acquire` takes an exclusive POSIX lock on `crl/lock` before anything is read. Then, with `mustExist`
    (`holdsStores`) and no stream files, the open throws `CrlMissing` before anything is written. A second opener in
@@ -442,6 +448,9 @@ the ring need not be in numeric order. "Next", "successor" and "after" below alw
 6. `Recovery.recover` (5.7), then the constructor (5.7). A constructor that fails shuts its writer down and waits for
    it before rethrowing, so a retry never runs two writers over the same files.
 
+The open's own file tests (`DeviceFactory.openCRL`, `CrlDirectory.streamFiles`, `recordedSizing`, `StreamReader`) are
+os-lib's, which answer absent on a stat that fails, not `server.FileStat`'s (systemic-loss-protection.md, SL-W21).
+
 `StreamWriter` opens existing files only, with `DSYNC | WRITE`, and refuses one of the wrong size. Because the files
 are preallocated and the file system overwrites in place (AS7), a CRL write never allocates, and a full device cannot
 fail it with `ENOSPC`.
@@ -472,9 +481,10 @@ Then **dynamic data** (serialized txds and object-update payloads of records wit
 TxIds of transaction deletions, then of stub deletions, then the stream UUID again. Then zero padding to a 4 KiB
 multiple (`LogEntry.padTo4k`), so entries start on 4 KiB boundaries.
 
-A transaction's static record (`Tx.writeStaticEntry`): TxId 33 (pool UUID 16, store index 1, tx UUID 16), txd
-location 14, disposition 1, Paxos mask 1 + promised 5 + accepted 5, update count 4, then per update object UUID 16 +
-location 14: 63 bytes plus 30 per update (`CrlAdmission.TxOverheadBytes`, `ObjectUpdateOverheadBytes`). The mask has
+A transaction's static record (`Tx.writeStatic`, `S/crl/simple/LogContent.scala`): TxId 33 (pool UUID 16, store
+index 1, tx UUID 16), txd location 14, disposition 1, Paxos mask 1 + promised 5 + accepted 5, update count 4, then per
+update object UUID 16 + location 14: 63 bytes plus 30 per update (`CrlAdmission.TxOverheadBytes`,
+`ObjectUpdateOverheadBytes`). The mask has
 bit 0 promise present, bit 1 accepted present, bit 2 accepted value, bits 3-4 status (0 Unresolved, 1 Committed,
 2 Aborted). After `dropTransactionObjectData` the record is written with count 0.
 
@@ -666,9 +676,12 @@ entry is built (W3, 5.3). `deleteTransactions` and `dropStore` (`onDeleteTransac
 deletion and a stub deletion (66 bytes per id) in the newest unwritten entry, sealing it when they would overflow it
 (W1), with the handler on the last: it runs once every deletion is durable. The records and stubs are removed from the
 live records. `dropStore`'s ids are those of the store held when the request is processed, and its transaction
-deletions are cancellable by a later save in the same entry. `deleteAppliedStub` writes a stub deletion only for a
-stub held in memory. A deleted transaction's save already in the same entry is taken out of it (`LogEntry.deleteTx`,
-as `deleteStub` does for stubs); saves of it in older unwritten entries stay, are built first, and the deletion
+deletions are cancellable by a later save in the same entry. An empty list (for `dropStore`, a store holding
+nothing) is handed to the completion thread at once: it waits for no earlier unwritten entry, so earlier deletions of
+the store's ids may still be unwritten when it completes (CRL-W19). `deleteAppliedStub` writes a stub deletion only
+for a stub held in memory. A deleted transaction's save already in the same entry is taken out of it
+(`LogEntry.deleteTx`, as `deleteStub` does for stubs); saves of it in older unwritten entries stay, are built first, and
+the deletion
 supersedes them. A save after a final deletion in any unwritten entry is skipped (W1b, C9).
 
 ### 5.9 Barriers
@@ -707,9 +720,10 @@ Shutdown and death stop growth first (5.11), before the lock is released.
 ### 5.11 Growth
 
 A SimpleCRL grows by one stream of its recorded size at a time and never shrinks (`requestGrowth`, `GrowthPolicy`).
-`Frontend.admitPrepare` calls `requestGrowth` on every `Full`; the call is cheap and idempotent, and wakes the growth
-thread unless an attempt is under way, the ring is at `crl-max-streams` (refused at once, logged once), or a refused
-or failed attempt's back-off (`retryAfter`, 10 s) has not passed. With `n` the ring size, the steps are, each durable
+`StoreAdmission.admitPrepare` (through `Frontend.admitPrepare`) calls `requestGrowth` on every `Full`; the call is
+cheap and idempotent, and wakes the growth thread unless an attempt is under way, the ring is at `crl-max-streams`
+(refused at once, logged once), or a refused or failed attempt's back-off (`retryAfter`, 10 s) has not passed. With `n`
+the ring size, the steps are, each durable
 before the next:
 
 1. On the growth thread, the policy is checked: the ring is below `crl-max-streams`, and the file system's free space
@@ -772,13 +786,15 @@ completing the write unwritten.
 `CrlAdmission` (`S/crl/CrlAdmission.scala`) is one atomic byte counter per device, with limit
 `crl.admissionLimitBytes`, and `crl.maxTransactionBytes` bounds one store's transaction. For a SimpleCRL ring of `n`
 streams of `S` bytes, 6.1 sets the limit SimpleCRL must give at `(n − 2) · S/2 − S/16 − H · (n − 1)`
-(`SimpleCRL.admissionLimitFor`, `H = 118`): `15S/16 − 354` for the minimum of 4 streams, `9S − S/16 − 2242` for 20. The per-transaction bound is `T = S/2 − 8192` (`SimpleCRL.EntryOverheadReserve`). 6.1
-proves that, with the rules it lists, these keep every entry writable, and it states the one assumption the proof
+(`SimpleCRL.admissionLimitFor`, `H = 118`): `15S/16 − 354` for the minimum of 4 streams, `9S − S/16 − 2242` for 20. The
+per-transaction bound is `T = S/2 − 8192` (`SimpleCRL.EntryOverheadReserve`). 6.1 proves that, with the rules it lists,
+these keep every entry writable, and it states the one assumption the proof
 cannot discharge. W1-W6 and S1 are SimpleCRL's, A1-A4 the Frontend's and the store loader's; all are implemented.
 
-- **New transactions.** `Frontend.admitPrepare` admits a prepare for a transaction it has not seen only while the
-  total is below its store's tier ceiling (`AdmissionTier`, the store's pool's, persisted in its StoreConfig): 3/4 of
-  the limit for data pools, 7/8 for metadata pools, the whole limit for the bootstrap pool. A data transaction's
+- **New transactions.** `StoreAdmission.admitPrepare` (the store's share of the device's admission, owned by its
+  Frontend and reached through `Frontend.admitPrepare`) admits a prepare for a transaction it has not seen only
+  while the total is below its store's tier ceiling (`AdmissionTier`, the store's pool's, persisted in its StoreConfig):
+  3/4 of the limit for data pools, 7/8 for metadata pools, the whole limit for the bootstrap pool. A data transaction's
   finalization writes trees in a metadata pool, and a metadata transaction's in the bootstrap pool, so lower-tier load
   never takes the headroom a higher tier's finalization needs (cross-document-review.md). It charges the description,
   object data and static record (`63 + 30 per update` + data). Otherwise the prepare is dropped silently
@@ -787,9 +803,10 @@ cannot discharge. W1-W6 and S1 are SimpleCRL's, A1-A4 the Frontend's and the sto
 - **Oversized.** A prepare that would make its transaction's counted bytes on the store exceed `T`
   (`crl.maxTransactionBytes`), with data already counted for an admitted one, is dropped the same way and charges
   nothing (`PrepareAdmission.Oversized`): no reply, no vote, no CRL write, and a warning, rate-limited
-  (`Frontend.OversizedLogPeriod`), naming the transaction and its bytes. The check is one comparison on the prepare
-  path. The bound keeps a lone record's entry within `S/2` (W1), which Lemma B needs, and keeps any record from
-  outgrowing a stream, which would fail the CRL at `writeHead`'s `require` on every retransmit. A transaction
+  (`Frontend.OversizedLogPeriod`, passed to `StoreAdmission`), naming the transaction and its bytes. The check is
+  one comparison on the prepare path. The bound keeps a lone record's entry within `S/2` (W1), which Lemma B needs, and
+  keeps any record from outgrowing a stream, which would fail the CRL at `writeHead`'s `require` on every retransmit. A
+  transaction
   oversized on every store can never commit; its client sees `TransactionOutcomeUnknown` once retransmits stop
   (`client/internal/CLAUDE.md`). Data arriving after a data-less prepare that would cross `T` is dropped the same way,
   leaving the store as one that never received it: a commit elsewhere reaches it through missed-update repair, and
@@ -798,8 +815,8 @@ cannot discharge. W1-W6 and S1 are SimpleCRL's, A1-A4 the Frontend's and the sto
 - **Late data** of an admitted transaction is charged by `admitPrepare` only while the total is below the store's
   tier ceiling (`tryAdmit`), as a new transaction is, and the prepare is dropped as `Full` otherwise (A1). A
   data-less prepare of an admitted transaction charges nothing and is handled.
-- **Charged without a check:** stubs (`chargeStubs`), recovered transactions (`admitRecovered`, its `chargeData`
-  included: that data is already in the CRL), and at device open everything the CRL holds, per store
+- **Charged without a check:** stubs (`StoreAdmission.chargeStubs`), recovered transactions (`admitRecovered`, its
+  `chargeData` included: that data is already in the CRL), and at device open everything the CRL holds, per store
   (`recoveredBytesByStore`, `chargeRetained`). A loading store's recovery counts its recovered state and only then
   releases what was retained for it (`Frontend.recoverState`, A2).
 - **Loaded state** (`loadStore`, from a `crl_save.log`) is charged before it is saved, in one check-and-charge
@@ -807,8 +824,9 @@ cannot discharge. W1-W6 and S1 are SimpleCRL's, A1-A4 the Frontend's and the sto
   for the store, stays at most `limit + T`, and is retained for the store (A3).
 - **Released** when the record is deleted (`deleteTransactionState`, `concludeTransactionState`), when a Tx is
   forgotten without reaching the CRL, or, for a transaction replaced by a stub, once the stub is durable. A stub's
-  charge is released when it expires (`dropAppliedStub`). A store replaced by a reload moves all its admissions into
-  what is retained for the store (`StoreRouter.install`, `Frontend.retainAdmissions`), released once the replacing
+  charge is released when it expires (`Frontend.expireStubs`, `releaseDroppedStub`). A store replaced by a reload
+  moves all its admissions into what is retained for the store (`StoreRouter.install`, `Frontend.retainAdmissions`,
+  `StoreAdmission.retain`), released once the replacing
   store has counted the same records (A2).
 - **Retained.** A closing store keeps its bytes counted for it (`CrlAdmission.retain`) until its entries leave the CRL
   (`releaseRetained` after an extraction's deletion, a `dropStore`, a leftover drop of the charge it was issued for,
@@ -877,7 +895,7 @@ SimpleCRL (implemented: `SimpleCRL.writeHead`, `entryFor`, `onSaveTransaction`, 
 - **W6, fail-stop.** A head not written after `n − 1` rotations in a row means an assumption below was broken: the CRL
   fails (5.10) instead of rotating on. The files are recoverable as after a crash.
 
-Frontend and store loader (implemented: `Frontend.admitPrepare`, `recoverState`, `retainAdmissions`,
+Frontend and store loader (implemented: `StoreAdmission.admitPrepare`, `Frontend.recoverState`, `retainAdmissions`,
 `StoreRouter.install`, `StoreLoader.handleLoad`, `CrlAdmission.tryChargeLoaded`, `Tx.stateDeleted`):
 
 - **A1, late data is checked.** Data arriving in a prepare for an admitted transaction is charged only while the total
@@ -914,7 +932,7 @@ Frontend and store loader (implemented: `Frontend.admitPrepare`, `recoverState`,
   transfer ends in the never-fits rebuild at the destination (Backlog.txt, "Transfers do not check the destination's CRL
   room").
 - **A4, no save without a charge.** A Tx saves to the CRL only while its transaction holds an admission record
-  (`Frontend.admitted`, or a retained or recovered charge). The one Tx in `transactions` without a record is an
+  (`StoreAdmission.admitted`, or a retained or recovered charge). The one Tx in `transactions` without a record is an
   abort whose state `deleteTransactionState` deleted at resolution, kept until `TxFinalized` (`Tx.stateDeleted`). It
   saves nothing more: a prepare (`admitPrepare` admits it as a known transaction, charging nothing), an accept, or a
   prepare response delayed until its objects loaded is answered with a `TxResolved` of the abort to the proposer,
@@ -1020,8 +1038,8 @@ charge (a new transaction, late data under A1) sees the total, which is at least
 and adds at most `T`; a loaded state's check-and-charge (A3) keeps the total less what is retained for the store at
 most `limit + T`; a replacing stub's charge is excluded
 until its state's release, which then lowers the covered total by that state's charge (at least 63) less 41; an
-unoffset stub adds 41 and its expiry removes it (`dropAppliedStub` queues the deletion, then releases); a reload's
-swap changes nothing (A2); every other release lowers it.
+unoffset stub adds 41 and its expiry removes it (`Frontend.releaseDroppedStub` queues the deletion, then releases);
+a reload's swap changes nothing (A2); every other release lowers it.
 So the covered total less `41 ·` (unoffset stubs outstanding) stays at most `limit + T`: each event keeps it, and at
 the device's open the covered total is the footprint of the recovered image, the durable image of the previous run.
 That run's last durable build bounded it the same way. A stub recovered at open, charged by `chargeStubs` with nothing
@@ -1049,8 +1067,9 @@ for 1 MiB. The limit charges one `H` for each of the `n − 1` evacuation entrie
 of `crl-max-file-size-mb` and `crl-max-streams` (or growth up to `MaxMaxStreams`) can leave admission itself past
 Lemma B's bound; the limit stays positive for every `n ≥ 3` and `S ≥ 4096`. In the form "live bytes at most
 `limit + T + unchecked charges`", the unchecked charges this leaves are the unoffset stubs, and the room for them is
-the `S/16` reserve plus the 8192 bytes `T` keeps back from half a stream (`SimpleCRL.EntryOverheadReserve`). The limit is `15S/16 − 354` at 4 streams, above the `S/2` floor. A ring of 3
-streams (accepted by `SimpleCRL.apply`, refused by `CrlSizingDefaults.resolve`) is covered by the same proof: limit
+the `S/16` reserve plus the 8192 bytes `T` keeps back from half a stream (`SimpleCRL.EntryOverheadReserve`). The limit
+is `15S/16 − 354` at 4 streams, above the `S/2` floor. A ring of 3 streams (accepted by `SimpleCRL.apply`, refused by
+`CrlSizingDefaults.resolve`) is covered by the same proof: limit
 `7S/16 − 236`, 2 rotations.
 
 **What is not proven.** `N` has no structural bound: an unoffset stub cannot be refused (the store must remember that
@@ -1217,7 +1236,9 @@ lists, commits an ownership transaction, then loads the device, which recovers t
 keeps a second process on the same host or file system out. A running old host relinquishes the device when it sees
 the tree name another owner (`DeviceShutdown.relinquishDevice`); on shared storage it may write until then (not
 defended, by decision). A store with `transferring-out` and no valid `crl_save.log` is adopted as lost
-(`DeviceDiscovery.adoptionClass`); one with `rebuild-required` is adopted Rebuilding.
+(`DeviceDiscovery.adoptionClass`); one with `rebuild-required` is adopted Rebuilding. A marker stat that fails, or a
+save file that cannot be read (`CrashRecoveryLog.isUnreadable`), fails the adoption for a later scan to retry
+(`StoreDirMarkers.firstPresent`).
 
 **10.10 Transfer-out, crash before `crl_save.log` is durable.** The state is still in the device CRL: `readStoreState`
 left it live, and the deletion follows only the durable save. The `transferring-out` marker is written only after the
@@ -1307,4 +1328,39 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-(none)
+**CRL-W19 A closed store's extraction loses its state to a load that opens during its deletion** (CONFIRMED,
+priority 1, effort S)
+
+*Mechanism.* `StoreTransfersOut.extractFromDirectory`, for a closed store with no `crl_save.log`, reads the store's
+state (`readStoreState`), writes it to `crl_save.log` and queues `deleteTransactions(state.entryIds)`, all in one
+control task. Those are final deletions (`LogEntry.deleteTx`), and the CRL thread removes the records from its live
+records as soon as it processes the request. Nothing keeps the store from opening before that deletion's entry is
+written: `opensStarted` is checked only when the read and the deletion answer, and `StoreLoader.tryLoadStore` checks
+no extraction. A load that starts then finds the new save file (`StoreLoader.handleLoad`) and runs
+`StoreLoader.awaitCrlLoad`: `dropStore` finds no live record for the store, so `onDeleteTransactions` completes it at
+once (an empty list waits for no unwritten entry), and `loadStore` queues one `SaveTransaction` per record of the file.
+Each meets the extraction's final deletion of the same id in an unwritten entry, the one in flight included, so
+`SimpleCRL.skippedAfterFinalDeletion` skips it: no live record is created, and its handler runs once the deletion is
+durable, so `loadStore` succeeds. `StoreRouter.crlLoaded` then removes the save file durably, and `readAndRecover`
+reads back only the applied stubs (a stub's save after its deletion is written, `LogEntry.addStub`). C1's exception for
+saves behind a final deletion rests on the deletion being the store's own decision to forget a concluded transaction;
+an extraction's deletion moves live state out, and a load of that same state behind it is no such save.
+
+*Trigger.* A store is in `StoreLoader.storesAwaitingRetry` with its entries in the device CRL and no save file: after
+a restart its backend open or Store build failed transiently (`awaitBuildRetry`, a failed open), or its save-file
+removal failed after the unlink succeeded (`handleSaveFileRemovalFailed`). Its pool entry is `TransferringOut` (the
+transfer was set up before the restart), and the destination's retransmitted `StartStoreTransfer` reaches
+`closeForTransferOut`, which extracts it unloaded. The next device scan's `retryFailedLoads` opens it while the
+deletion's entry is still unwritten: a CRL slowed by a busy device, queued sealed entries or rotations (10.6, 10.18)
+keeps it unwritten for longer than a backend open takes.
+
+*Consequence.* The store serves with none of its transactions: its promises and accepted values (a later proposal can
+be accepted against what it promised, a split decision), its commit votes and their object data (a commit decided
+from its vote whose backend commit had not completed or had failed, `keptForReplay`, is never applied here), all with
+the save file gone. `released()` and `startOut` then see the open and do not ship, so nothing reports the loss.
+
+*Fix direction.* Make an empty `dropStore` (and `deleteTransactions`) complete through `whenWritten`, like a barrier,
+so `awaitCrlLoad`'s `loadStore` is queued only once every earlier deletion of the store is durable and its saves
+create new records (`deletesFinally` looks only at unwritten entries). Alternatively, or as well, keep the store from
+opening while `extractFromDirectory` runs (an extraction set that `tryLoadStore` and `retryFailedLoads` check, as
+`opening` is), so the file is never loaded before its entries have left the device CRL.

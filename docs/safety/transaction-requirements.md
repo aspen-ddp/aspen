@@ -151,10 +151,14 @@ timestamps instead.
 ### 2.5 Structural rules: builder and store
 
 The client builder (`client/internal/transaction/TransactionBuilder`) refuses: a second content update of an object
-(`MultipleDataUpdatesToObject`), a second refcount update (`MultipleRefcountUpdatesToObject`), a lock on an object it
-gives a content update (`DataUpdate`, `KeyValueUpdate`, `VersionBump`), a second shared lock or a shared/exclusive mix
-(`ConflictingRequirements`), a blind KV Delete or object-level change (`refuseBlindWrites`, `BlindKeyValueWrite`, even
-when replay-safe), and an unpinned transaction not marked `replaySafe(reason)` (`UnpinnedTransaction`). A
+(`MultipleDataUpdatesToObject`, through `claimForUpdate`), a second refcount update
+(`MultipleRefcountUpdatesToObject`), a lock on an object it gives a content update (`DataUpdate`, `KeyValueUpdate`,
+`VersionBump`), a second shared lock or a shared/exclusive mix (`ConflictingRequirements`), a blind KV write (an
+unchecked Insert, an unchecked Delete or an unrevisioned object-level change; `refuseBlindWrites`,
+`BlindKeyValueWrite`, even when replay-safe), a `RefcountUpdate` that does not advance the update serial
+(`RefcountSerialNotAdvanced`, below), and an unpinned transaction not marked `replaySafe(reason)`
+(`UnpinnedTransaction`). The blind-write rule is one function, `common/transaction/BlindWrites.violation`, which the
+builder and the stores' `RequirementsChecker.refuseBlindWrites` share. A
 `RefcountUpdate` may accompany a content update of the same object (allocation does this) or a lock on it: both take
 X for the same transaction, and a transaction never collides with itself.
 
@@ -164,8 +168,9 @@ revision, a `KeyRevision(k, _)` on a key the same update Inserts or Deletes, or 
 differs from the required one. The refcount pin relies on `ObjectRefcount.updateSerial` never returning to an earlier
 value, and both the builder (`RefcountSerialNotAdvanced`) and the stores refuse a `RefcountUpdate` whose new serial is
 not above the required one (`RefcountUpdate.advancesSerial`), except an allocation of the object (from `Allocating`)
-and one that sets the refcount it requires (a repair proof's rc -> rc, which writes no new value). Callers derive the
-new refcount with `update`, `increment`, `decrement` or `setCount`, which add one to the serial. The builder records the key pin in the description as
+and one that sets the refcount it requires (a repair proof's rc -> rc, which writes no new value). Production callers
+derive the new refcount with `update`, `increment`, `decrement` or `setCount`, which add one to the serial, or name a
+higher serial (the amoebafs unlink). The builder records the key pin in the description as
 `KeyValueUpdate.pinned` (`Pins.writesCheckedKey`) and the client's claim as `TransactionDescription.replaySafe`.
 
 **Store-side validation.** Stores do not trust the builder. Before checking requirements, a client-prepared Tx runs
@@ -200,7 +205,7 @@ key first, and removes the key unreported (R15, 9.3). A `KeyRevision` or a conte
 changed the key. An Insert that checks nothing of its key would pass at a store that applied a later Delete of the key
 first, and be a no-op (superseded) at one that applied a later write of the key first, so the two orders diverge with
 nothing to report (R15). With its key checked, the Insert fails after the Delete, or holds the key's lock so that the
-later write comes after it. In this document, as in the code (`Frontend.blindInsertRecords`), a *blind* Insert means a
+later write comes after it. In this document, as in the code (`Frontend.blindInserts`), a *blind* Insert means a
 key-level one, in a `KeyValueUpdate` without a required revision: it is checked, but moves no object revision.
 
 The validation runs at vote only. It depends on the description and the store's pool alone, so a committed
@@ -428,9 +433,11 @@ when the outcome is known (`outcomeKnown`, a restored abort, or `txStatus` resol
 commit vote whose saved status restores Committed (re-saved by a prepare or accept after the resolution, possibly
 before its backend commit completed) relocks, locks and slice reservation without a check, as an unresolved
 recovered vote does, and holds them until it applies (`doCommit` releases them as for a live voter). Without them a
-restored commit that has no vote here could apply first (R15 would find no holder), fail the voter's re-check, and
-the recovered-voter rule (8.5) would take the skipped object as applied; and reads and repair would see no lock for
-an update the store has yet to apply, and take the state it replaces as current.
+committed transaction with no vote here could apply first (R15 would find no holder; a recovered one applies nothing,
+8.5, but one whose prepare reaches the store after the restart applies), fail the voter's re-check, and the
+recovered-voter rule (8.5) would take the skipped object as applied; a new vote could check the state before the
+update; and reads and repair would see no lock for an update the store has yet to apply, and take the state it
+replaces as current.
 
 **R14 (a commit voter that cannot apply stops counting).** A commit voter has dropped its locks before it applies,
 so one that cannot hold the update it voted for must not keep serving as if it had: an apply that threw fail-stops
@@ -495,12 +502,14 @@ commit per object.
 
 ### 8.2 State (`Frontend`)
 
-* `txCommitsInFlight: ObjectId -> count`: outstanding backend commits of transactions (deletions included) and repair
-  writes (`reconcileSettled`).
+* `txCommitsInFlight` (an `ObjectCounts`, per object): outstanding backend commits of transactions (deletions
+  included) and repair writes (`reconcileSettled`). `deleting` counts the deletions among them, and repair deletes.
 * `heldCommits: ObjectId -> List[Tx]`: committed transactions waiting their turn, oldest first.
 * `inFlightCommitWaiters: ObjectId -> List[Tx]`: transactions withholding their vote, for a commit in flight or held, or for
   a committed transaction waiting there in lock order (`Tx.lockOrderBlocked`).
-* `lockReleaseWaiters: TransactionId -> List[Tx]`: transactions waiting out a lock holder (8.4), by holder.
+* `lockReleaseWaiters: TransactionId -> List[Tx]`, by holder: transactions waiting out a lock holder (8.4,
+  `awaitLocksReleased`) and committed transactions waiting for it in lock order (8.3, `Frontend.awaitLockOrder`
+  registers them here too); `locksReleased` tells both.
 * `hasPendingCommit(oid) = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)`.
 * `lockOrderWaiters: ObjectId -> List[Tx]`: committed transactions waiting to apply in lock order (8.3), by object
   they change (`Frontend.lockOrderWaitersOf`). Not part of `hasPendingCommit`.
@@ -508,7 +517,7 @@ commit per object.
   (`Tx.saveAdoptedData`), by object they change, from the save's issue until it completes and a commit waiting for it
   has applied or moved to one of the lists above. Not part of `hasPendingCommit`; only repair consults it.
 * `failedCommits`: never cleared; the store reloads with a new Frontend.
-* `allocationRecords`/`allocationsOf` and `blindInsertRecords`/`blindInsertsOf`: transactions whose CRL state may
+* `allocations` and `blindInserts`, two `CrlStateRecords` (by txid and by object): transactions whose CRL state may
   still hold an allocation or a blind KeyValue update of an object here (9.4).
 
 ### 8.3 Behaviour
@@ -561,8 +570,10 @@ commit per object.
    without it. A holder that never resolves holds the waiter as long as its own locks (section 12).
 3. **Issue** (`doCommit`): release the locks, apply (`issueCommits`), answer parked reads, one `Frontend.commit` per
    changed object that applied, then `heldCommitIssued` removes the Tx from the queues and `commitTurnFree` wakes the
-   next. A store holding an applied stub for the transaction, or owed nothing through its UnackedCommits entry
-   (`notOwedHere`), applies nothing and reports its changed objects (transaction-recovery.md).
+   next. A store holding an applied stub for the transaction, owed nothing through its UnackedCommits entry
+   (`notOwedHere`), or holding a recovered Tx without a commit vote (8.5), applies nothing and reports its changed
+   objects (transaction-recovery.md). Such a commit still takes the lock-order wait and its turn before `doCommit`
+   (Q-W19).
 4. **Complete** (`Frontend.backendOperationComplete`): the count drops; at zero `commitTurnFree` runs last, so a
    synchronous backend completes inside the next transaction's commit safely. It first retries a parked repair (the
    one settled moment), then tells the head held commit, or else every waiting voter. On failure the object enters
@@ -583,7 +594,9 @@ vote): that wait ends only when a holder's transaction resolves at other stores,
 A transaction whose check fails only with collisions against holders it is **built on** (`Tx.buildsOn`: one of its
 `DataUpdate`, `VersionBump`, `ExclusiveRevisionLock`, `SharedRevisionLock` or KV `requiredRevision` requirements on that
 object requires the revision the holder writes; a key requirement such as `KeyRevision` is never built on) and that
-still hold locks here (`Frontend.holdsLocks`, a held commit included) does not vote (`Tx.awaitableHolders`). It
+still hold locks here (`Frontend.holdsLocks`: a Tx in `transactions` holding locks, a commit held for its turn
+included; one finalized while held has left `transactions`, but the objects it changes stay pending in `heldCommits`, so
+a vote on them waits for its commit first) does not vote (`Tx.awaitableHolders`). It
 registers with each holder (`awaitLocksReleased`), holds no locks, and decides when the holders release
 (`locksReleased`, called at the end of `releaseObjects`, after the commit was issued, so the waiter then sees the commit
 in flight and waits for it to persist) or after `Tx.CollisionWait` (500 ms), checked at the 1 s store heartbeat
@@ -615,7 +628,8 @@ the re-check after the wait only costs time.
   it in lock order changed the object. A failed re-check therefore means the store applied T before the crash: a later
   transaction superseded it (10.5a), the update leaves no trace for `appliedBy` (a `RefcountUpdate`, a KV update whose
   operations are all key Deletes), or its data was dropped from T's CRL state once applied (`MissingObjectUpdate` after
-  `Tx.persistWithoutUpdateOf`: an allocation then a deletion, or a blind Insert then a deletion of its key, 9.4). The
+  `Tx.persistWithoutUpdateOf`: an allocation then a deletion, or a blind Insert then a deletion of its key, 9.4;
+  `FalsePin` instead for a pinned KeyValue update, whose pin check finds no operations first). The
   rule does not filter by reason. It holds for a voter whose committed resolution was restored too: it relocks until it
   applies (R13). Proofs never use this rule: a store that never voted on T has no such bound, and proofs see only
   `appliedBy`. A recovered vote whose object is not found (`ObjectNotFound`) applies nothing and reports it;
@@ -697,13 +711,16 @@ marked `reloadRequired`, the cache entry dropped) and counts it in `deleting`; r
 answer `ObjectNotFound` meanwhile. Transactions referencing the old state fail `StaleObjectState`, later ones
 `MissingObject`, and a transaction built on the deletion waits for it in flight (R9) and then fails to load. A failed
 deletion keeps answering `ObjectNotFound` while the store is loaded. A deletion's backend commit waits until no
-allocation's CRL state durably holds the object's update (`awaitAllocationsDurable`, `Tx.persistWithoutUpdateOf`):
+allocation's CRL state durably holds the object's update (`awaitAllocationsDurable` over `allocations`,
+`Tx.persistWithoutUpdateOf`):
 otherwise a recovered allocating vote would recreate it (transaction-recovery.md).
 
 A key's deletion is ordered the same way after a blind Insert of the key (`Frontend.awaitBlindInsertsDurable`). The
-Frontend indexes, beside the allocation records and at both Tx creations (`registerReplayHazards`), every Tx with a
-`KeyValueUpdate` without a required revision on a hosted object (`blindInsertRecords`, `blindInsertsOf`; by shape
-alone, no decoding), until its CRL state's deletion or stub is durable (`stateConcluded`). A transaction commit that
+Frontend indexes, beside the allocation records (`allocations`) and at both Tx creations (`registerReplayHazards`),
+every Tx with a `KeyValueUpdate` without a required revision on a hosted object (`blindInserts`, a `CrlStateRecords`
+by txid and by object; by shape alone, no decoding), until its CRL state's deletion or stub is durable
+(`stateConcluded`, `CrlStateRecords.concluded`); a later Tx of the same transaction replaces the record's Tx. A
+transaction commit that
 deletes keys of such an object (`Frontend.commit`, whose `deletedKeys` is decoded only when the index covers the
 object) and a repair write whose plan removes keys (`reconcileSettled`, `plan.deletes`) reach the backend only after
 each other covering transaction T whose update Inserts one of those keys is handled:
@@ -712,7 +729,7 @@ each other covering transaction T whose update Inserts one of those keys is hand
 * T holds its update of the object here (`Tx.holdsUpdateOf`: it issued its commit of the object, or it voted commit;
   a commit voter holds the key's lock from its vote until it applies, so a key deletion applies before it only as a
   recovered vote sharing the lock, cast after T's update persisted, 10.5a): T's state is saved again without the
-  object's update (`persistWithoutUpdateOf`), and the write waits for that save;
+  object's update (`persistWithoutUpdateOf`, after `CrlStateRecords.dropObject`), and the write waits for that save;
 * otherwise (a non-voter that has not applied): nothing waits. Its update is one the store does not hold and may yet
   apply. When the deletion follows T in the serial order (a Delete checked against a later write of the key that
   superseded T's Insert at a store voting for both), that later apply writes the key back at this store alone, and
@@ -847,8 +864,9 @@ entry it wrote (`insertWins`), and the `ValueState` it installs keeps the key's 
 stays locked. A key Delete is never blind, so its re-check fails once applied and it never removes a key under B.
 
 (b) A recovered commit vote whose object data the CRL no longer holds (a re-save after `persistWithoutUpdateOf`) has a
-missing update: `MissingObjectUpdate` at the re-check. The update was applied before it was dropped (9.4), so the
-recovered vote takes it as applied (8.5).
+missing update: `MissingObjectUpdate` at the re-check (`FalsePin` for a pinned KeyValue update, checked first). The
+update was applied before it was dropped (9.4), so the recovered vote takes it as applied (8.5). This needs the data to
+stay missing: a client prepare that reaches the recovered vote with the dropped data brings it back (Q-W18).
 
 (c) A recovered commit vote re-applies its update when its outcome is learned. Revision, refcount and `KeyRevision`
 requirements fail on a store that applied a later chained write (a refcount because every refcount
@@ -866,8 +884,9 @@ object (9.4).
 
 (d) A recovered vote whose saved status is resolved (a prepare or accept after the resolution re-saved it) restores the
 resolution and applies the commit or deletes the abort's state once loaded. A restored commit vote relocks first and
-holds its locks until it applies (R13), so a restored commit without a vote here, which completes its load only after
-it, waits for it in lock order (R15) and cannot overtake it; a restored abort takes no locks.
+holds its locks until it applies (R13), so a committed transaction without a vote here waits for it in lock order
+(R15) and cannot overtake it; a restored commit without a vote here applies nothing at all (8.5); a restored abort
+takes no locks.
 
 ### 10.6 Failed backend commit
 
@@ -943,4 +962,58 @@ adds the revision check.
 
 ## Open weaknesses
 
-(no open items)
+**Q-W18 A recovered commit vote re-adopts object data its CRL state dropped, and re-applies an allocation over the
+object's deletion** (PLAUSIBLE, priority 2, effort S)
+
+Mechanism. A deletion of an object, or of keys of it, soon after a transaction T allocated it or blindly Inserted the
+keys reaches the backend only once T's CRL state no longer holds T's update of the object
+(`Frontend.awaitAllocationsDurable`, `awaitBlindInsertsDurable`): `Tx.persistWithoutUpdateOf` saves the state again
+without it. The safety argument (9.4, 10.5(b), 10.5(c)) is that a recovered commit vote then finds the update missing,
+fails its re-check (`MissingObjectUpdate`) and takes the object as applied. But the omission is recorded only in the
+live Tx (`droppedUpdates`); the recovered Tx starts from `trs.objectUpdates`, simply lacking the object. A client
+prepare that reaches the recovered Tx carrying this store's data (`Tx.receivePrepare` -> `adoptObjectUpdates`) finds
+the object absent from `objectUpdates`, adds it back, and, since the Tx is neither committing nor committed, saves the
+state with it (`saveAdoptedData`). Nothing in `adoptObjectUpdates` excludes a Tx that already voted commit, although a
+commit voter held all its data when it voted (a vote without it fails `MissingObjectUpdate`), so whatever a recovered
+voter's state lacks was dropped on purpose.
+
+Trigger. Store S votes commit for T, which allocates object o (or Inserts key k under `DoesNotExist`). T commits and S
+applies it. Before T is finalized, a later transaction D deletes o (or k) at S; its backend commit waits for T's state
+to be saved without o's update, then persists. S crashes and restarts with T's CRL state at Unresolved (outcome unknown,
+so the Tx waits for the resolution or its UnackedCommits lookup). A client prepare of T with S's data arrives: a
+retransmission from a client that has not yet learned the outcome (its votes and the resolution lost), or a delayed one.
+The recovered Tx adopts o's data. T's commit resolution then reaches S (T is still unfinalized). At load, o missed in
+the backend and, T allocating it, got the fresh `Allocating` state (`Tx.allocationLoaded`); the re-check now passes and
+`Tx.issueCommits` applies the allocation again.
+
+Consequence. The allocation case recreates o at S over a committed, persisted deletion and reports nothing (the apply
+succeeds; `blindReinsertObjects` covers only KeyValue Inserts), so S keeps a resurrected copy that no repair visits:
+permanent divergence of that store's replica. The key case re-inserts k; it is reported (a recovered vote's apply
+over an object timestamp newer than T's start is suspect), so the finalizer marks S while T is unfinalized, but the
+argument of 10.5(c) no longer holds by itself. A second crash after the adopted save recovers the update durably,
+with the same results. Needs a client prepare with data reaching a recovered commit vote whose data was dropped, after
+a deletion that followed T's apply, so it is rare.
+
+Fix direction. `adoptObjectUpdates` adopts nothing once the Tx has voted commit (`disposition == VoteCommit`): a
+voter's data was complete at its vote, so a recovered voter's missing data is a deliberate drop. A Tx without a vote
+still adopts (it may vote later; a recovered non-voter applies nothing anyway). Alternatively persist the dropped set
+with the state.
+
+**Q-W19 A commit that applies nothing still waits in lock order and for its turn** (CONFIRMED, priority 5, effort S)
+
+Mechanism. `Tx.resolvedAndAllObjectsLoaded` runs `awaitLockOrder` and `holdForTurn` before `doCommit`, and only
+`doCommit` decides that the commit applies nothing: a recovered Tx without a commit vote (`recoveredNonVoter`), a store
+holding an applied stub (`Frontend.hasAppliedStub`), or one owed nothing (`notOwedHere`). Such a commit registers in
+`lockOrderWaiters` and `heldCommits` like one that writes.
+
+Trigger. After a restart, a recovered Tx without a commit vote learns that its transaction committed while a recovered
+commit vote holds locks its requirements or writes collide with on an object both change. The holder may stay
+unresolved for as long as its UnackedCommits lookup and recovery driver take.
+
+Consequence. Meanwhile every new vote that the waiter "would wait for" is withheld for up to `Tx.CollisionWait` and
+then votes abort (`lockOrderBlocked`), the objects are unsettled for repair (`settledForRepair` checks
+`lockOrderWaiters`), and a held turn delays later commits, all for an apply that writes nothing. Liveness and
+performance only.
+
+Fix direction. Decide "applies nothing" before the waits (one predicate shared with `doCommit`) and take that path at
+once in `resolvedAndAllObjectsLoaded`.

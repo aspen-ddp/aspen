@@ -1,7 +1,7 @@
 TODO
 ====
 
-Safety work list (from docs/safety/*, eighth pass, built 2026-11-20 against d4a79bfd + working tree)
+Safety work list (from docs/safety/*, ninth pass, built 2026-11-21 against 2c8f4f51 + working tree)
 ----------------------------------------------------------------------------------------------------
 
 Every open weakness in docs/safety/* (the "## Open weaknesses" section at the end of each document) is listed below
@@ -39,7 +39,34 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-(no open items)
+Prerequisite: 1.2, 1.3, 2.3, 2.4 and 3.1 are one family with X-W30 (5.1): os-lib existence tests that answer absent on
+a failed stat. Fix them first, individually, with tests that fail a stat via a directory lacking search permission; 5.1
+then sweeps what remains.
+
+1.1 [S] CRL-W19 + X-W28: a closed store's transfer-out extraction loses its CRL state to a load retry
+    (CONFIRMED). StoreTransfersOut.extractFromDirectory saves the state to crl_save.log and queues final
+    deleteTransactions; opensStarted is checked only when CRL calls answer. A StoreLoader.retryFailedLoads load
+    meanwhile gets an empty dropStore that completes at once, its loadStore saves skipped as "after final deletion"
+    (SimpleCRL.skippedAfterFinalDeletion) yet acknowledged, and StoreRouter.crlLoaded removes the save file: the
+    store serves without its promises, accepts and commit votes. Two parts:
+    (a) CRL: an empty dropStore/deleteTransactions completes through whenWritten, a barrier behind earlier entries;
+    (b) host (X-W28): a load retry serves only a store whose device entry is Active or Offline, not declaredMissing,
+        not being extracted or marked for transfer out, not being rebuilt. (b) also closes RB-W21's running-host path.
+    Update cross-document-review 2.1 ("a save acknowledged without being written belongs to a concluded
+    transaction") once the extraction exception is gone.
+
+1.2 [S] SL-W21: the device CRL's open takes a failed stat for missing stream files (CONFIRMED).
+    CrlDirectory.streamFiles (os.isDir), StreamReader (os.exists), DeviceFactory.openCRL and removeUncommittedGrowth
+    use os-lib. A failed first check throws CrlMissing (every store on the device declared lost); a failed check in
+    createStreamsIfNew under mustExist creates new streams and os.move(atomicMove) renames them over the live ones:
+    the CRL opens empty under live stores. Fix: FileStat throughout the open, a failed stat transient
+    (DeviceDiscovery.isTransient path), and createStreamsIfNew never creates under mustExist.
+
+1.3 [S] X-W29: a failed stat of a rebuilt store's acceptor-since or inherited-votes file loads it as a full
+    acceptor (PLAUSIBLE). RebuildingStore.readAcceptorSince / readInheritedVotes use os.exists; StoreLoader.handleLoad
+    passes None into the Store, so within finish + 10 s it joins transactions its old incarnation joined, and before
+    its held-vote round it votes over inherited locks (split decision, RebuiltVoterLockIntegrationSuite shape). Fix:
+    FileStat, a failed stat held back through awaitUnreadRetry like the save and incarnation files.
 
 (RB-W19, a running host serving a tombstoned device's stores through their rebuild, is an accepted limitation:
 rebuild-process.md B19.)
@@ -48,11 +75,46 @@ rebuild-process.md B19.)
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-(no open items)
+2.1 [S] Q-W18: a recovered commit vote re-adopts object data its CRL state dropped (PLAUSIBLE).
+    After persistWithoutUpdateOf (a later deletion's wait), a retransmitted or delayed client prepare carrying this
+    store's data passes Tx.adoptObjectUpdates, which has no guard for a Tx that already voted commit. On a commit, a
+    deleted allocated object gets a fresh Allocating state, passes its re-check and is recreated with nothing
+    reported (a blind-Insert key is re-inserted but reported). Fix: adoptObjectUpdates adopts nothing once
+    disposition == VoteCommit; a commit voter held all its data when it voted.
+
+2.2 [S] RP-W12: repair's dropOccupant can delete a live object (PLAUSIBLE). An FSIF index freed by a deletion is
+    reusable in the same transaction (FsifIndexAllocationStrategy); a repair install meeting RepairSlotOccupied(C)
+    reads the AllocationTree, finds C unlisted (its AllocationFinalizationAction not yet landed), and its later
+    repairDeletion can arrive after C's Tx was finalized and left Frontend.referenced: C's slice is deleted with no
+    mark, silently spending the t - r margin. Fix: drop the occupant only on a read proving its own deletion
+    (InvalidObject.provesDeletion, type from the FSIF header), or re-read the repaired object first. Cross-check
+    rebuild-process FS6, which relies on the same id-checked repair delete.
+
+2.3 [S] SL-W22: FSIF recovery drops, then empties, a next-seq journal whose stat fails (CONFIRMED).
+    FsifRecovery.load reads a failed NioFsifFiles.exists as no journal and replays without seq m+1; step 5 then
+    finds it and truncates it as stale: acknowledged commits lost, replica divergent. Fix: FileStat in NioFsifFiles.
+    Update server/store/backend/fsif/DESIGN.md 3.11 and 4.1.
+
+2.4 [S] SL-W24: StoreCopies.delete reports a copy it could not stat as deleted (CONFIRMED). StoreTransfers.startIn
+    then finds the transferred-in marker with FileStat and resumes the pool update onto the stale or lost copy it
+    just rejected; the source's intact copy is retired. A failed marker read yields an empty id, counted stale. Fix:
+    FileStat in delete (failure is failure), and a marker read error waits rather than counts as stale.
+
+2.5 [S] RB-W21: a copy that serves between rebuild passes leaves the resumed walk's done part stale with no mark
+    (PLAUSIBLE). A Missing Stores directory that comes back after the checkpoint is served by a restart's device
+    load (or a load retry, closed by 1.1b), acknowledges commits, and is then retired by retireForeignCopy, but the
+    next pass resumes the checkpoint: its acknowledged updates on walked objects are never marked (t = r, exactly t
+    voters: t - 1 < r copies). Fix: retireForeignCopy deletes the staging directory before marking or fail-stopping
+    a foreign copy, forcing a first pass.
 
 
 PRIORITY 3: systemic loss protection
 ------------------------------------
+
+3.1 [S] SL-W23: a failed stat at a backend open declares the store lost (D5) (CONFIRMED). FsifBackend.open (os.isDir,
+    isBlank), FsifRecovery.recover's index and journal loads and RocksDBBackend.openDatabase (os.exists(CURRENT))
+    throw BackendStateLost on a failed stat, marked with no retry; one device hiccup marks every store on it in a
+    scan. Fix: FileStat; a failed stat is an I/O error the load retries (storesAwaitingRetry).
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
@@ -60,13 +122,41 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
+4.1 [S] RB-W24: persistently failing rebuilds starve the queued rebuilds of their device (PLAUSIBLE).
+    startRebuilds orders by pool index and startRebuild ignores the backoff; maxConcurrentRebuilds failing stores
+    that sort first (e.g. incomplete passes awaiting accept-rebuild-loss) retake the slots at every check. Fix: skip
+    a store inside its backoff (scheduleRebuildRetry) when choosing what to start.
+
+4.2 [S] X-W31: keepUnpromotedCopyOffline silences a store served from another device of this host (PLAUSIBLE).
+    It sets the router's offline mark by store id (DeviceControl.markStoreOffline), unlike
+    StoreLoader.keepMarkedCopyOffline: the served store turns non-repairable (HostStoreView) and
+    DeviceShutdown.storesToClose skips it. Trigger: an Unconfirmed/Superseded settle after a same-host transfer or
+    re-placement served the store elsewhere. Fix: mark the router only when no copy is served or opening here.
+
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
 
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-(no open items)
+5.1 [M] X-W30 + P-W10 + RB-W22 + SL-W25: the remaining os-lib existence tests (CONFIRMED). After 1.2, 1.3, 2.3, 2.4
+    and 3.1, replace every os.exists / os.isDir / os.isFile under server/ with FileStat, deciding per site whether a
+    failed stat waits, throws or is safe either way, and add a test that fails on any new use outside FileStat.
+    Sites with findings: DeviceDiscovery.bringIntoService skips the ArrivedAtFile (P-W10: a lower forget floor after
+    adoption); RebuildingStore.isRebuildCompleteFor swallows a read error and retires a finished copy (RB-W22: a
+    wasted rebuild; throw and wait instead); DeviceMarkers.isFailed loads a tombstoned device (SL-W25, within B19).
+    The rest are listed in cross-document-review X-W30. Then make server/host/CLAUDE.md's FileStat rule true.
+
+5.2 [S] Q-W19: a commit that applies nothing still waits in lock order and for its turn (CONFIRMED). A recovered
+    non-voter, an applied stub or notOwedHere runs awaitLockOrder and holdForTurn in resolvedAndAllObjectsLoaded
+    before doCommit decides to apply nothing, withholding votes (then CollisionWait aborts) and unsettling repair.
+    Fix: decide "applies nothing" first, with one predicate shared with doCommit.
+
+5.3 [S] RB-W23: a rebuilding store's router silence can be cleared and is never restored (CONFIRMED).
+    startRebuild marks the router offline once; clearOfflineUnlessHeld looks only at devices' offlineStores, which a
+    destination that never held the store does not list (same-host replaceRebuild). The host then answers
+    StoreNotFound for the rest of the rebuild: re-reads and dropped routes only. Fix: count running rebuilds in
+    clearOfflineUnlessHeld, or re-mark at each reconcile while the rebuild runs.
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)
@@ -78,4 +168,8 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-(no open items)
+7.1 [S] server/transaction/CLAUDE.md (Applied stubs) cites the removed stubExpiry / heldStubs (now
+    Frontend.expireStubs, AppliedStubs.dueForDrop, charges in StoreAdmission), and its "a restored non-voter could
+    apply first and fail its re-check" rationale predates the recovered-non-voter rule (Tx.doCommit applies nothing).
+    The scaladoc of Frontend.recoveredTransactionLoaded gives the same stale reason; the remaining one is the order
+    of votes decided later.

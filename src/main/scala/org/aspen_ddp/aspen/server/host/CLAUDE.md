@@ -26,7 +26,7 @@
   `StoreRebuildFactory.createRebuild`). The host and the rebuild see only `Backend.hasFailed`/`isWriteFrozen`,
   `BackendStateLost` and `Backend.isOutOfSpace`; only `DefaultBackendOpener` names concrete backends
 - Store creation is atomic (`BackendOpener.create`, `server.store.backend.StoreCreation`,
-  systemic-loss-protection 4.1, D5): `startOpen` with `create` (only `StoreRebuilds.createNewStore`) builds the
+  systemic-loss-protection 4.1): `startOpen` with `create` (only `StoreRebuilds.createNewStore`) builds the
   store in `<device>/creating/` and renames it to its path before opening it, so a store directory exists only
   complete and `open` never creates.
   A failed create, out of space included, leaves nothing at the path and is not put in `storesAwaitingRetry`: its
@@ -58,7 +58,7 @@
   `storeId`, `path`, `crlSaveFile` and the thread-safe `hasFailed`/`isWriteFrozen`. `release` frees the slot.
   Every exit (transfer out, shutdown, relinquish, fail-stop, failed CRL load) runs `Store.close`, which stops the
   store's drivers; a reload over a loaded store reusing its backend skips the close but calls
-  `Store.shutdownDrivers` (cross-document-review 2.2). A new exit path must do one or the other
+  `Store.shutdownDrivers`. A new exit path must do one or the other
 - Store identity: `StoreLoader.handleLoad` reads the `incarnation` file (`StoreIncarnationFile.load`) before building
   the Store and never writes it: `StoreCreation` writes it into every new store directory (bootstrap included) and a
   rebuild's `finish` replaces it (`server/store/CLAUDE.md`). A file known absent has the store retired unserved
@@ -128,7 +128,7 @@
   records, retained per store (`CrlAdmission.chargeRetained`). A loading store releases what is retained for it only
   after its recovery has counted its records (`Frontend.recoverState`); a reload over a loaded store retains the old
   store's admissions on the shared executor (`StoreRouter.install`), and the new store's CRL read is issued behind
-  every save the old one made (crash-recovery-log 6.1, A2)
+  every save the old one made (crash-recovery-log 6.1)
 - `DeviceDiscovery` registers `crl.onAdmissionLimitRaised(sds.admission.raiseLimit)` right after constructing the device
   state, before any store loads: a CRL growth raises the device's admission limit (raise-only, thread-safe) for all its
   stores
@@ -143,7 +143,7 @@
   device scan; the router records the file (`saveFileRemovalPending`), so the retry removes it again, forcing the
   directory even if it is gone, before recovering
 - A `crl_save.log` state is charged before `loadStore` saves it (`CrlAdmission.tryChargeLoaded`, at most the limit
-  plus one transaction, A3), after the Store is built and before install, retained for the store. Refused, the store
+  plus one transaction), after the Store is built and before install, retained for the store. Refused, the store
   is left offline, its file kept, and retried every device scan through `storesAwaitingRetry` (one warning per
   minute), and the CRL is asked to grow (`requestGrowth`). A state that can never fit (above the most limit any
   config allows, `maxAdmissionLimitBytes`, plus T, or a transaction above T) takes `crlSaveFileLost`: rebuilt; one
@@ -224,7 +224,7 @@
     retire every marked store at once.
   - `StoreTransfers.startIn`, for a `rebuild-complete` or `rebuild-required` copy an earlier tenancy left at the
     path of a store transferring onto the device (re-placed away while the host was down, then transferred back;
-    rebuild-process FS18). It retires before asking for bytes, waits while a rebuild of the store runs here, the
+    rebuild-process). It retires before asking for bytes, waits while a rebuild of the store runs here, the
     store is opening, or a copy is served from this path (not while the transfer's source is served from another
     device of this host: it closes only for the StartStoreTransfer sent once the path is clear), and checks the
     device again once the path is clear, which starts the transfer.

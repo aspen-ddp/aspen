@@ -50,7 +50,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   // Stores whose device-CRL entries are being dropped before their marked directory is discarded
   // (discardLostStore). Each one's rebuild waits for the drop to be durable. Each holds a rebuild slot, as a
   // running rebuild does: the discard is the first destructive step, so maxConcurrentRebuilds bounds discards too
-  // (systemic-loss-protection.md S3).
+  // (systemic-loss-protection.md).
   private var droppingCrlState: Set[StoreId] = Set()
 
   // rebuild-process 5.7, retry backoff: by store, how many passes or flips have failed in a row, and the stores
@@ -210,7 +210,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *
    *  A slot is taken from the start of a lost store's discard (`droppingCrlState`), not only once its walk runs, and
    *  passes straight from the discard to the rebuild: otherwise one pass would discard every marked store on the
-   *  device at once (systemic-loss-protection.md S3).
+   *  device at once (systemic-loss-protection.md).
    *
    *  `episode` is the Rebuilding entry's episode (StoreEntry.rebuildEpisode). The rebuild resumes only a checkpoint,
    *  and takes only a finished copy, of this episode, and its flip commits only while the entry still names it: a
@@ -266,9 +266,12 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           .filter(_ != local.storageDeviceId)
           .foreach(ctx.reconciler.checkStorageDevice)
 
-      // The store's metadata is settled: a later failure starts the backoff afresh
-      def settledOutcome(): Unit =
+      // The store's metadata is settled (a later failure starts the backoff afresh): its slot is released, then
+      // `recheck` runs
+      def finishSettled(recheck: => Unit): Unit =
         rebuildFailures -= storeId
+        release()
+        recheck
 
       // Guard-map leak defense: invoke `complete` in a try/catch that substitutes Future.failed(t)
       // on throw, so that either way a Future exists and onComplete below is registered. That
@@ -313,18 +316,14 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                   // pending, retries the removal and the load at each check of the device (rebuild-process 5.7)
                   keepUnpromotedCopyOffline(local, storeId)
               finally
-                settledOutcome()
-                release()
-                recheckAll()
+                finishSettled(recheckAll())
 
             case Success(RebuildOutcome.AdoptOffline) =>
               try
                 unsilence(storeId, clear = false)
                 keepRebuiltStoreOffline(local, storeId)
               finally
-                settledOutcome()
-                release()
-                recheckAll()
+                finishSettled(recheckAll())
 
             case Success(RebuildOutcome.Discard) =>
               try
@@ -332,9 +331,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 ctx.devices.discardStoreDirectory(storeId, local.storageDeviceId,
                   "The tree does not say this device owns a rebuilt store")
               finally
-                settledOutcome()
-                release()
-                recheckAll()
+                finishSettled(recheckAll())
 
             case Success(RebuildOutcome.Superseded) =>
               // The entry is Rebuilding here under a later episode: the store was re-placed away and back while this
@@ -346,9 +343,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 logger.info(s"Rebuild of store $storeId on device ${local.storageDeviceId} finished for an earlier " +
                             "Rebuilding episode. Not promoting it; the store is rebuilt again")
               finally
-                settledOutcome()
-                release()
-                recheckAll()
+                finishSettled(recheckAll())
 
             case Success(RebuildOutcome.Unconfirmed) =>
               // An attempt reported Unknown may have made the copy the owner's before its entry moved on (a transfer
@@ -358,9 +353,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 unsilence(storeId, clear = false)
                 keepUnpromotedCopyOffline(local, storeId)
               finally
-                settledOutcome()
-                release()
-                recheckAll()
+                finishSettled(recheckAll())
 
             case Success(RebuildOutcome.NotOwned) =>
               // The device is another host's now; the copy is left for it. Only the other
@@ -371,9 +364,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 logger.info(s"Rebuild of store $storeId finished after device " +
                             s"${local.storageDeviceId} moved to another host. Leaving it to that host")
               finally
-                settledOutcome()
-                release()
-                recheckOtherDevices()
+                finishSettled(recheckOtherDevices())
 
             case Failure(t) =>
               // The only observer this Future has. Its onFail routes the permanent errors to
@@ -510,8 +501,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private def keepUnpromotedCopyOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     if ctx.devices.isLoaded(local) &&
        !FileStat.existence(local.devicePath / storeId.directoryName).contains(false) then
-      ctx.router.markOffline(storeId)
-      local.offlineStores += storeId
+      ctx.markStoreOffline(local, storeId)
 
   /** Keeps a rebuilt store whose entry was written Offline (RebuildOutcome.AdoptOffline) out of
    *  service: it is not loaded, and it is recorded offline behind an empty transfer-out marker

@@ -114,6 +114,16 @@ final class DeviceControl(val metadata: DeviceMetadata,
   /** The latest snapshot published by the control thread. Safe to read from any thread. */
   def currentView: HostStoreView = view
 
+  /** Records `storeId` as offline on `sds` and in the router, where it is silent */
+  def markStoreOffline(sds: LocalStorageDeviceState, storeId: StoreId): Unit =
+    router.markOffline(storeId)
+    sds.offlineStores += storeId
+
+  /** Undoes markStoreOffline */
+  def clearStoreOffline(sds: LocalStorageDeviceState, storeId: StoreId): Unit =
+    router.clearOffline(storeId)
+    sds.offlineStores -= storeId
+
   /** Rebuilds the snapshot from the router's maps, the loaded devices, the rebuilds running and the stores
    *  transferring out, and publishes it. Called on the control thread after every change to any of them. */
   private[server] def publishView(): Unit =

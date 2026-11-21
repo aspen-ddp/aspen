@@ -550,7 +550,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  Nor is a CRL whose files do not match the sizing it recorded, or that holds a `.crl.tmp` that is no unfinished
    *  creation (CrlSizingMismatch): configuration cannot cause that,
    *  so it is a hand edit or damage of the directory, never by itself proof that the state is gone. The device is
-   *  refused (left unloaded, an error logged once) until an operator repairs it (systemic-loss-protection.md S6, M6).
+   *  refused (left unloaded, an error logged once) until an operator repairs it (systemic-loss-protection.md).
    *  Nor is a CRL directory holding no CRL yet whose device config cannot size one (CrlConfigInvalid): the device is
    *  refused the same way until the config is fixed.
    *  A device without stores simply gets its CRL created. */

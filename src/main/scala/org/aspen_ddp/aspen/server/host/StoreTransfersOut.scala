@@ -148,7 +148,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
       // and its transfers out cancelled. Starting one would reopen work the shutdown waits on.
       // The receiver's retransmit keeps asking, so the transfer resumes after a restart, or from
       // an adopting host once the device moves. Failed is not refused here: its stores are
-      // drained by FailedStorageDeviceDurableTask, which this path predates.
+      // drained by FailedStorageDeviceDurableTask.
       _ = if fromDevice.status == StorageDeviceState.DeviceStatus.ShuttingDown ||
              fromDevice.status == StorageDeviceState.DeviceStatus.Shutdown then
             err(s"Source device ${poolEntry.storageDeviceId} for transfer of store ${m.storeId} is " +
@@ -176,7 +176,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
       if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut &&
          os.exists(markedPath / RebuildingStore.RebuildRequiredMarkerFile) then
         // A store marked for rebuild (its backend failed, here during an earlier request's close;
-        // rebuild-process T11) has no trustworthy state to ship, and the destination would refuse
+        // rebuild-process) has no trustworthy state to ship, and the destination would refuse
         // its missing CRL save file forever. It goes back to the rebuild path instead.
         returnLostTransferToRebuild(m.storeId, sourceDs)
         err(s"Not starting the transfer out of store ${m.storeId}: it is marked rebuild-required")
@@ -238,7 +238,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
               logger.warn(s"Failed to start transfer out of store ${m.storeId}, transfer " +
                           s"${m.transferUUID}. Error: $t")
 
-  /** Takes a TransferringOut store marked rebuild-required back to the rebuild path (rebuild-process T11). The transfer
+  /** Takes a TransferringOut store marked rebuild-required back to the rebuild path (rebuild-process). The transfer
    *  is aborted (AspenClient.abortStoreTransfer: the source entry back to Active, or Offline on a device shutting down,
    *  and the destination's TransferringIn entry removed), and the device is checked, so the reconcile's lost-CRL pass
    *  flips the now Active entry to Rebuilding. One abort at a time per store: retransmits arriving meanwhile do nothing

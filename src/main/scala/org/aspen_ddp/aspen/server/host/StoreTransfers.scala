@@ -302,13 +302,11 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                 then
                   ctx.loadStoreById(toDeviceid, storeId)
                 else
-                  ctx.router.markOffline(storeId)
-                  sds.offlineStores += storeId
+                  ctx.markStoreOffline(sds, storeId)
               else
                 // Recorded as a restart's scan would have, which is what the transferred-in
                 // pass keys off.
-                ctx.router.markOffline(storeId)
-                sds.offlineStores += storeId
+                ctx.markStoreOffline(sds, storeId)
 
           case Success(TransferOutcome.PoolRepointedOffline) =>
             // Left exactly as it arrived, behind its transferred-in marker, and recorded offline
@@ -420,7 +418,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           recordTransferIn(storeId, transferUUID, fromDeviceId, toDeviceid)
 
         // A finished rebuild awaiting its flip or a lost copy, left by an earlier tenancy of the store on this device
-        // (rebuild-process FS17): retired, and the transfer starts at the check that follows
+        // (rebuild-process): retired, and the transfer starts at the check that follows
         else if StoreDirMarkers.knownPresent(finalPath, StoreDirMarkers.Marker.RebuildComplete) ||
                 StoreDirMarkers.knownPresent(finalPath, StoreDirMarkers.Marker.RebuildRequired) then
           retireEarlierTenancy(toDevice, storeId)
@@ -596,7 +594,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                   s"device $fromDeviceId has been declared failed")
 
       // Nothing consumes this Future, so retrying a permanent error would be a silent 60 s loop
-      // for the life of the process -- and now that the guard above is set, one that no later
+      // for the life of the process -- and, with the guard above set, one that no later
       // check could ever displace. Only a collision is retried.
       // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
       // the control-context onComplete; the prepare closure's combinators run on the control thread

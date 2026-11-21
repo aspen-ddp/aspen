@@ -346,8 +346,8 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
     // A reload over a loaded store, with no close: its queued tasks run, later ones skip it. Its object cache view is
     // cleared here, on its executor, behind those tasks: the view's bytes belong to that executor. It is closed there
     // too. What its transactions were counted for stays counted, retained for the store, until the new store's recovery
-    // has counted the same records and releases it (Frontend.recoverState; crash-recovery-log 6.1, A2). A backend the
-    // new store reuses is left open, but the old store's drivers stop either way (cross-document-review 2.2), as in the
+    // has counted the same records and releases it (Frontend.recoverState; crash-recovery-log 6.1). A backend the
+    // new store reuses is left open, but the old store's drivers stop either way, as in the
     // crash a reload over the same backend stands for (TestNetwork.restartStore).
     //
     // The new store's recovery reads its state from the CRL after every save the old store issued: a reload keeps the

@@ -103,8 +103,8 @@ object HostThreading extends Logging:
    *
    *  The trade is that a throw part-way through a handler leaves whatever that handler had already mutated
    *  half-updated, and LoadStore, Repair and ShutdownStore each carry a Promise completed by the handler or by work
-   *  the handler starts, so that promise stays uncompleted and its awaiter hangs forever. Neither is new -- a dead
-   *  loop left both too -- but a dead loop hung everything at once and so was obvious, whereas now one caller hangs
+   *  the handler starts, so that promise stays uncompleted and its awaiter hangs forever. A dead
+   *  loop would leave both too, but it hangs everything at once and so is obvious, whereas here one caller hangs
    *  inside a host that still looks healthy. This log line is the only signal that it happened.
    *
    *  Only the task's name (by default its class name) is interpolated: this call is inside the catch, so a throwing

@@ -92,7 +92,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  unchanged when the drop completes (CrlAdmission.releaseRetained(storeId, charge)). A store landing meanwhile
    *  charges its crl_save.log state under the same id (CrlAdmission.tryChargeLoaded) for records saved behind the drop,
    *  which the drop does not remove; its recovery releases the whole charge once it has counted them, so the records
-   *  stay counted throughout (crash-recovery-log 6.1, A2). */
+   *  stay counted throughout (crash-recovery-log 6.1). */
   private def dropLeftoverCrlState(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     val deviceId = local.storageDeviceId
     val listed =
@@ -166,176 +166,19 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // itself does nothing then, as the guard is held.
       ctx.shutdown.shutDownDevice(local, remote)
     else
-      //----------------------
-      // Deleted Stores
-      //
-      // An offline store whose entry is gone from this device is no longer owned here: a transfer out completed, or its
-      // rebuild was re-placed onto another device (rebuild-process 4.2). Its copy is retired, not deleted: it and its
-      // CRL state are kept in pending-delete until the store is Active on the device its pool names (StoreCopies). For
-      // a completed transfer that is already so, and the check the retire asks for deletes it.
-      //
-      // A served store whose entry is absent is a copy put at the store path by hand: every path that serves a store
-      // has its entry first. It is taken out of service (marked, closed, offline), and the check that follows
-      // retires it here like any other offline one.
-      ctx.router.loaded.collect {
-        case (storeId, store) if store.storageDeviceId == local.storageDeviceId && !remote.stores.contains(storeId) =>
-          storeId
-      }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
-        ctx.rebuilds.retireUnlistedServed(local, storeId)
-      local.offlineStores.filter(storeId =>
-        !remote.stores.contains(storeId)
-      ).foreach: storeId =>
-        // Dropped from loadedStores at once, or a later shutdown would take this store for one still open and write
-        // a marker into a retired directory. It stays offline (silent) until its copy has left its path.
-        local.loadedStores -= storeId
-        retireUnowned(local, storeId)
-      //----------------------
-      // Missing Stores
-      //
-      // An Active entry with no store behind it: its directory, or the directory's config.yaml, is gone (a bad
-      // restore, a partial mount, a hand removal). No other pass sees such a store, since each starts from a
-      // directory, a marker or a transitional entry, and the pool counts it writable meanwhile: one fault would cost
-      // a unit of margin for good. It is silenced and a rebuild requested, whose Rebuilding pass retires whatever is
-      // at the path. Its device-CRL entries stay: the directory may come back before the flip commits (a restore or
-      // a mount finishing late), and a copy loaded without them would answer for transactions whose state it lost.
-      // The rebuilt copy's empty crl_save.log drops them at its first load, a retire saves them into the copy, and a
-      // re-placement's entry leaving the device makes them leftovers (dropLeftoverCrlState). A config whose stat
-      // fails is no absence (FileStat): the store is skipped until a stat answers. A store served, opening or
-      // retiring has its directory, as does one a shutdown closed, so the first three are skipped only as a guard.
-      //
-      // A declared store stays declared (local.declaredMissing) while its entry is Active here and it is not served:
-      // its rebuild is requested again at each reconcile even once its directory is back, since a request that
-      // failed would otherwise leave it offline, with no pass to load or rebuild it, until a restart. The record is
-      // in memory only: a restart's device load serves a store whose directory is back, with its kept CRL entries.
-      def unserved(storeId: StoreId): Boolean =
-        ctx.router.get(storeId).isEmpty && !local.loadedStores.contains(storeId) &&
-          !ctx.loader.isOpening(storeId) && !ctx.copies.isRetiring(storeId)
-      local.declaredMissing = local.declaredMissing.filter(storeId =>
-        remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) && unserved(storeId))
-      val missing = remote.stores.collect {
-        case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Active &&
-            !local.declaredMissing.contains(storeId) &&
-            FileStat.existence(local.devicePath / storeId.directoryName / StoreConfig.configFilename)
-              .contains(false) &&
-            unserved(storeId) =>
-          storeId
-      }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
-      missing.foreach: storeId =>
-        logger.error(s"Store $storeId is Active on storage device ${local.storageDeviceId}, but " +
-                     s"${local.devicePath / storeId.directoryName} holds no store. Rebuilding it")
-        ctx.router.markOffline(storeId)
-        local.offlineStores += storeId
-        local.declaredMissing += storeId
-      local.declaredMissing.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
-        ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
-
+      reconcileDeletedStores(local, remote)
+      requestMissingStoresRebuild(local, remote)
       // Any entries a store transferred away left in the device CRL go too
       dropLeftoverCrlState(local, remote)
-
-      //----------------------
-      // Lost CRL State
-      //
-      // A store marked rebuild-required (crlSaveFileLost, or an adoption) whose entry still
-      // reads Active is flipped to Rebuilding; the Rebuilding pass below then discards its
-      // directory and rebuilds it. Before the abandoned-transfers-out pass, which would
-      // otherwise take a marked store left behind a transfer-out marker for one to reinstate.
-      val lostCrl = local.offlineStores.filter(storeId =>
-        hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildRequired))
-      lostCrl.foreach: storeId =>
-        if remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) then
-          ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
-
-      //----------------------
-      // Abandoned Transfers Out
-      //
-      // Nothing else ever clears a transfer-out marker from the source. StoreTransfers.startIn
-      // deletes it only from the destination's unpacked copy, and a transfer that completes
-      // normally has the source's whole store directory deleted by the pass above -- the marker
-      // goes with it. So a transfer that ends without completing, which is what a destination
-      // declared failed mid-flight produces, strands the marker forever, and tryLoadStore re-reads
-      // it on every restart and puts the store straight back into offlineStores.
-      //
-      // That pairs badly with the metadata repair for the same event. That repair puts this
-      // entry back to Active and leaves the pool naming this device, so afterwards the metadata
-      // reads entirely healthy while the slice is served by nobody, here or anywhere. Repairing
-      // the metadata alone would trade a visibly stalled TransferringOut entry for an invisible
-      // outage.
-      //
-      // On the source host's own poll rather than inline at either repair site, because only
-      // this host can touch this disk and one of those two sites -- the drain -- runs wherever
-      // the durable task happens to live. Polling for desired state rather than being told is
-      // also what the rest of this method does.
-      //
-      // The guard is narrow on purpose. Active *and* no transferDevice is the only combination
-      // that says no transfer is outstanding; an entry still TransferringOut, or Active with a
-      // destination still named, means the marker is doing its job. isTransferringOut is the
-      // same question asked of this process rather than the tree, and covers the window where
-      // the drain restores the entry while this host is still shipping bytes.
-      //
-      // A store still sending is left alone but re-checked shortly. An abort's nudge usually
-      // arrives while the send is still running, and the send ends (the destination cancels its
-      // receive) with nothing to prompt another check for a full checkStorageDevicePeriod.
-      val (stillSending, abandonedOut) = (local.offlineStores -- lostCrl).filter(storeId =>
-        remote.stores.get(storeId).exists(entry =>
-          entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
-        ) &&
-        hasMarker(local, storeId, StoreDirMarkers.Marker.TransferOut)
-      ).partition(ctx.storeTransferService.isTransferringOut)
-      abandonedOut.foreach: storeId =>
-        ctx.transfersOut.reinstateAbandonedOut(local, storeId)
-      if stillSending.nonEmpty then
-        scheduleDeviceRecheck(local.storageDeviceId)
-
-      //----------------------
-      // Cancelled Shutdown
-      //
-      // A shutdown cancelled by a restart leaves the stores it closed offline here, with nothing
+      val lostCrl = flipLostCrlStores(local, remote)
+      reinstateAbandonedTransfersOut(local, remote, lostCrl)
+      // Cancelled shutdown: a shutdown cancelled by a restart leaves the stores it closed offline here, with nothing
       // on disk to say so: their state stayed in the device CRL. Loaded again once Active.
       ctx.shutdown.reloadClosedStores(local, remote)
 
-      //----------------------
-      // Completed Transfers In
-      //
-      // A crash between the pool update committing and the transferred-in marker's removal
-      // leaves an Active entry naming this device over a copy that tryLoadStore skips. The entry
-      // is no longer TransferringIn, so StoreTransfers.startIn never sees it, and nothing else
-      // removes the marker. Active is the tree's word that the pool now names this device, so
-      // the copy is ours to load. transferringIn covers the window where this process's own
-      // metadata step has committed but has not yet removed the marker itself.
-      local.offlineStores.filter(storeId =>
-        !ctx.transfers.transferringIn.contains(storeId) &&
-        remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
-        hasMarker(local, storeId, StoreDirMarkers.Marker.TransferredIn)
-      ).foreach: storeId =>
-        val storePath = local.devicePath / storeId.directoryName
-        logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but still " +
-                    s"carries its transferred-in marker. Completing the transfer and loading the store")
-        if ctx.transfers.clearTransferredInMarker(storeId, storePath) then
-          ctx.tryLoadStore(local, storePath, None)
-
-      //----------------------
-      // Completed Rebuilds
-      //
-      // A crash between a rebuild's flip committing and the removal of its rebuild-complete marker leaves an Active
-      // entry over a copy that tryLoadStore skips; the rebuild's completion, which would remove the marker, is gone.
-      // Active is the tree's word that the flip committed, so the copy is ours to load. A rebuild still running here
-      // removes its own marker once its flip commits. A removal that failed here or in the rebuild's completion is
-      // retried too, marker or not: an unlink whose directory sync failed leaves none.
-      local.offlineStores.filter(storeId =>
-        !ctx.rebuilds.rebuildingStoreIds.contains(storeId) &&
-        remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
-        (ctx.rebuilds.markerRemovalsPending.contains(storeId) ||
-         hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildComplete))
-      ).foreach: storeId =>
-        val storePath = local.devicePath / storeId.directoryName
-        logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but its rebuild-complete marker " +
-                    s"is not durably removed. Completing the rebuild and loading the store")
-        if ctx.rebuilds.clearRebuildCompleteMarker(storeId, storePath) then
-          ctx.tryLoadStore(local, storePath, None)
-
-      //----------------------
-      // New Stores
-      //
+      completeTransfersIn(local, remote)
+      completeRebuilds(local, remote)
+      // New stores
       remote.stores.filter((storeId, entry) =>
         entry.status == StorageDeviceState.StoreStatus.Initializing
       ).map( (storeId, _) =>
@@ -343,93 +186,10 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       ).foreach: storeId =>
         ctx.rebuilds.createNewStore(local, storeId)
 
-      //----------------------
-      // Aborted Transfers In
-      //
-      // An abort removes this device's TransferringIn entry and tells nobody, so this check is the
-      // only thing that learns of it. Left alone, an attempt still waiting on bytes keeps
-      // retransmitting its request and holds the store in transferringIn, which would make the
-      // pass below skip a later transfer of the same store. Before that pass for that reason.
-      // An attempt past promotion is not covered here; updateStateForTransferredStore sees the
-      // abort in the source's entry instead.
-      val trackedTransfersIn =
-        ctx.transfers.pendingStartTransfers.valuesIterator
-          .filter(_.toDeviceId == local.storageDeviceId)
-          .map(p => (p.msg.storeId, p.msg.fromDevice)).toList ++
-        ctx.transfers.transferInRetries.iterator
-          .filter((_, r) => r.toDeviceId == local.storageDeviceId)
-          .map((storeId, r) => (storeId, r.fromDeviceId)).toList
-      trackedTransfersIn.filterNot((storeId, fromDeviceId) =>
-        remote.stores.get(storeId).exists(entry =>
-          entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
-          entry.transferDevice.contains(fromDeviceId))
-      ).foreach: (storeId, fromDeviceId) =>
-        ctx.transfers.dropAbandonedTransferIn(storeId, fromDeviceId, local.storageDeviceId)
-
-      // The same store can be re-targeted at another device of this host. transferringIn is keyed
-      // by store, so the earlier attempt would block the new one until its own device's next
-      // check noticed the abort. This device's entry is the newer word on who receives the store,
-      // so the other device's attempt is dropped here instead of a poll later.
-      val retargeted =
-        ctx.transfers.pendingStartTransfers.valuesIterator
-          .filter(_.toDeviceId != local.storageDeviceId)
-          .map(p => (p.msg.storeId, p.msg.fromDevice, p.toDeviceId)).toList ++
-        ctx.transfers.transferInRetries.iterator
-          .filter((_, r) => r.toDeviceId != local.storageDeviceId)
-          .map((storeId, r) => (storeId, r.fromDeviceId, r.toDeviceId)).toList
-      retargeted.filter((storeId, _, _) =>
-        remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.TransferringIn)
-      ).foreach: (storeId, fromDeviceId, toDeviceId) =>
-        ctx.transfers.dropAbandonedTransferIn(storeId, fromDeviceId, toDeviceId)
-
-      //----------------------
-      // Transferring In Stores
-      //
-      remote.stores.filter { (storeId, entry) =>
-        entry.status == StorageDeviceState.StoreStatus.TransferringIn
-      }.map { (storeId, status) =>
-        (storeId, status.transferDevice, status.transferId)
-      }.toList.foreach: (storeId, ofromDeviceId, transferId) =>
-        ofromDeviceId.foreach: fromDeviceId =>
-          ctx.metadata.readTransferSourceState(fromDeviceId).foreach: fromDevice =>
-            if fromDevice.isFailed then
-              // A tombstoned source has both ids zeroed, so fromDevice.hostId is HostId(0,0).
-              // Starting the transfer would address every StartStoreTransfer to a host that
-              // does not exist; the messages are dropped, the entry never resolves, and this
-              // check re-sends them forever. Nothing reports the stall either: rebalancing's
-              // ownedStores filters TransferringIn out of its accounting, so the store is
-              // invisible to the rebalancer too.
-              ctx.transfers.abandonIn(local.storageDeviceId, storeId, fromDeviceId)
-            else if ! fromDevice.isOperational then
-              // The source is shutting down or shut down, and its host refuses to send. The
-              // transfer stays pending: the next check of this device reads the source again,
-              // owner included, so a source adopted by another host is asked there.
-              logger.info(s"Not starting the transfer in of store $storeId onto device " +
-                          s"${local.storageDeviceId}: source device $fromDeviceId is " +
-                          s"${fromDevice.status}. Retrying on a later check")
-            else
-              // An attempt already asking the source's old host -- the source was shut down and
-              // adopted since -- is pointed at the new one and asked again now, rather than at
-              // the next retransmit.
-              ctx.transfers.pendingStartTransfers.get(storeId).filter(_.msg.fromDevice == fromDeviceId).foreach: pt =>
-                if ctx.transfers.readdressPendingTransfer(pt, fromDevice) then
-                  pt.lastSend = HLCTimestamp.now
-                  ctx.client.sendHostMessage(pt.msg)
-              ctx.transfers.startIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId, transferId)
-
-      //----------------------
-      // Rebuilding Stores
-      //
-      remote.stores.filter((_, entry) =>
-        entry.status == StorageDeviceState.StoreStatus.Rebuilding
-      ).toList.sortBy(_._1.poolIndex).foreach: (storeId, entry) =>
-        ctx.rebuilds.startRebuild(local, storeId, entry.rebuildEpisode)
-      // Rebuild work for stores no longer Rebuilding here (re-placed elsewhere, rebuild-process 4.2)
-      ctx.rebuilds.abandonUnlisted(local, remote)
-
-      //----------------------
-      // Pending Deletes
-      //
+      dropAbortedTransfersIn(local, remote)
+      startTransfersIn(local, remote)
+      startRebuilds(local, remote)
+      // Pending deletes
       // Retired copies whose store is Active on its owner device, and the remains of interrupted deletes
       ctx.copies.release(local, remote)
 
@@ -437,6 +197,239 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  false: the pass acting on the marker waits for a later reconcile, and the load it leads to stats it again */
   private def hasMarker(local: LocalStorageDeviceState, storeId: StoreId, marker: StoreDirMarkers.Marker): Boolean =
     StoreDirMarkers.knownPresent(local.devicePath / storeId.directoryName, marker)
+
+  /** Retires the copies of stores whose entries have left this device (retireUnowned) */
+  private def reconcileDeletedStores(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    // An offline store whose entry is gone from this device is no longer owned here: a transfer out completed, or its
+    // rebuild was re-placed onto another device (rebuild-process 4.2). Its copy is retired, not deleted: it and its
+    // CRL state are kept in pending-delete until the store is Active on the device its pool names (StoreCopies). For
+    // a completed transfer that is already so, and the check the retire asks for deletes it.
+    //
+    // A served store whose entry is absent is a copy put at the store path by hand: every path that serves a store
+    // has its entry first. It is taken out of service (marked, closed, offline), and the check that follows
+    // retires it here like any other offline one.
+    ctx.router.loaded.collect {
+      case (storeId, store) if store.storageDeviceId == local.storageDeviceId && !remote.stores.contains(storeId) =>
+        storeId
+    }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
+      ctx.rebuilds.retireUnlistedServed(local, storeId)
+    local.offlineStores.filter(storeId =>
+      !remote.stores.contains(storeId)
+    ).foreach: storeId =>
+      // Dropped from loadedStores at once, or a later shutdown would take this store for one still open and write
+      // a marker into a retired directory. It stays offline (silent) until its copy has left its path.
+      local.loadedStores -= storeId
+      retireUnowned(local, storeId)
+
+  /** Silences each Active entry with no store directory or config behind it and requests its rebuild (see the comment). */
+  private def requestMissingStoresRebuild(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    // An Active entry with no store behind it: its directory, or the directory's config.yaml, is gone (a bad
+    // restore, a partial mount, a hand removal). No other pass sees such a store, since each starts from a
+    // directory, a marker or a transitional entry, and the pool counts it writable meanwhile: one fault would cost
+    // a unit of margin for good. It is silenced and a rebuild requested, whose Rebuilding pass retires whatever is
+    // at the path. Its device-CRL entries stay: the directory may come back before the flip commits (a restore or
+    // a mount finishing late), and a copy loaded without them would answer for transactions whose state it lost.
+    // The rebuilt copy's empty crl_save.log drops them at its first load, a retire saves them into the copy, and a
+    // re-placement's entry leaving the device makes them leftovers (dropLeftoverCrlState). A config whose stat
+    // fails is no absence (FileStat): the store is skipped until a stat answers. A store served, opening or
+    // retiring has its directory, as does one a shutdown closed, so the first three are skipped only as a guard.
+    //
+    // A declared store stays declared (local.declaredMissing) while its entry is Active here and it is not served:
+    // its rebuild is requested again at each reconcile even once its directory is back, since a request that
+    // failed would otherwise leave it offline, with no pass to load or rebuild it, until a restart. The record is
+    // in memory only: a restart's device load serves a store whose directory is back, with its kept CRL entries.
+    def unserved(storeId: StoreId): Boolean =
+      ctx.router.get(storeId).isEmpty && !local.loadedStores.contains(storeId) &&
+        !ctx.loader.isOpening(storeId) && !ctx.copies.isRetiring(storeId)
+    local.declaredMissing = local.declaredMissing.filter(storeId =>
+      remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) && unserved(storeId))
+    val missing = remote.stores.collect {
+      case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Active &&
+          !local.declaredMissing.contains(storeId) &&
+          FileStat.existence(local.devicePath / storeId.directoryName / StoreConfig.configFilename)
+            .contains(false) &&
+          unserved(storeId) =>
+        storeId
+    }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+    missing.foreach: storeId =>
+      logger.error(s"Store $storeId is Active on storage device ${local.storageDeviceId}, but " +
+                   s"${local.devicePath / storeId.directoryName} holds no store. Rebuilding it")
+      ctx.markStoreOffline(local, storeId)
+      local.declaredMissing += storeId
+    local.declaredMissing.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
+      ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
+
+  /** Flips each store marked rebuild-required whose entry still reads Active to Rebuilding. Returns the offline stores so marked. */
+  private def flipLostCrlStores(local: LocalStorageDeviceState, remote: StorageDeviceState) =
+    // A store marked rebuild-required (crlSaveFileLost, or an adoption) whose entry still
+    // reads Active is flipped to Rebuilding; startRebuilds then discards its
+    // directory and rebuilds it. Before the abandoned-transfers-out pass, which would
+    // otherwise take a marked store left behind a transfer-out marker for one to reinstate.
+    val lostCrl = local.offlineStores.filter(storeId =>
+      hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildRequired))
+    lostCrl.foreach: storeId =>
+      if remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) then
+        ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
+    lostCrl
+
+  /** Reinstates stores left offline behind a transfer-out marker whose transfer was abandoned. */
+  private def reinstateAbandonedTransfersOut(local: LocalStorageDeviceState, remote: StorageDeviceState, lostCrl: Set[StoreId]): Unit =
+    // Nothing else ever clears a transfer-out marker from the source. StoreTransfers.startIn
+    // deletes it only from the destination's unpacked copy, and a transfer that completes
+    // normally has the source's whole store directory deleted by the pass above -- the marker
+    // goes with it. So a transfer that ends without completing, which is what a destination
+    // declared failed mid-flight produces, strands the marker forever, and tryLoadStore re-reads
+    // it on every restart and puts the store straight back into offlineStores.
+    //
+    // That pairs badly with the metadata repair for the same event. That repair puts this
+    // entry back to Active and leaves the pool naming this device, so afterwards the metadata
+    // reads entirely healthy while the slice is served by nobody, here or anywhere. Repairing
+    // the metadata alone would trade a visibly stalled TransferringOut entry for an invisible
+    // outage.
+    //
+    // On the source host's own poll rather than inline at either repair site, because only
+    // this host can touch this disk and one of those two sites -- the drain -- runs wherever
+    // the durable task happens to live. Polling for desired state rather than being told is
+    // also what the rest of this method does.
+    //
+    // The guard is narrow on purpose. Active *and* no transferDevice is the only combination
+    // that says no transfer is outstanding; an entry still TransferringOut, or Active with a
+    // destination still named, means the marker is doing its job. isTransferringOut is the
+    // same question asked of this process rather than the tree, and covers the window where
+    // the drain restores the entry while this host is still shipping bytes.
+    //
+    // A store still sending is left alone but re-checked shortly. An abort's nudge usually
+    // arrives while the send is still running, and the send ends (the destination cancels its
+    // receive) with nothing to prompt another check for a full checkStorageDevicePeriod.
+    val (stillSending, abandonedOut) = (local.offlineStores -- lostCrl).filter(storeId =>
+      remote.stores.get(storeId).exists(entry =>
+        entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
+      ) &&
+      hasMarker(local, storeId, StoreDirMarkers.Marker.TransferOut)
+    ).partition(ctx.storeTransferService.isTransferringOut)
+    abandonedOut.foreach: storeId =>
+      ctx.transfersOut.reinstateAbandonedOut(local, storeId)
+    if stillSending.nonEmpty then
+      scheduleDeviceRecheck(local.storageDeviceId)
+
+  /** Completes a transfer in whose pool update committed but whose marker was not removed, and loads the store. */
+  private def completeTransfersIn(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    // A crash between the pool update committing and the transferred-in marker's removal
+    // leaves an Active entry naming this device over a copy that tryLoadStore skips. The entry
+    // is no longer TransferringIn, so StoreTransfers.startIn never sees it, and nothing else
+    // removes the marker. Active is the tree's word that the pool now names this device, so
+    // the copy is ours to load. transferringIn covers the window where this process's own
+    // metadata step has committed but has not yet removed the marker itself.
+    local.offlineStores.filter(storeId =>
+      !ctx.transfers.transferringIn.contains(storeId) &&
+      remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
+      hasMarker(local, storeId, StoreDirMarkers.Marker.TransferredIn)
+    ).foreach: storeId =>
+      val storePath = local.devicePath / storeId.directoryName
+      logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but still " +
+                  s"carries its transferred-in marker. Completing the transfer and loading the store")
+      if ctx.transfers.clearTransferredInMarker(storeId, storePath) then
+        ctx.tryLoadStore(local, storePath, None)
+
+  /** Completes a rebuild whose flip committed but whose marker removal did not, and loads the store. */
+  private def completeRebuilds(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    // A crash between a rebuild's flip committing and the removal of its rebuild-complete marker leaves an Active
+    // entry over a copy that tryLoadStore skips; the rebuild's completion, which would remove the marker, is gone.
+    // Active is the tree's word that the flip committed, so the copy is ours to load. A rebuild still running here
+    // removes its own marker once its flip commits. A removal that failed here or in the rebuild's completion is
+    // retried too, marker or not: an unlink whose directory sync failed leaves none.
+    local.offlineStores.filter(storeId =>
+      !ctx.rebuilds.rebuildingStoreIds.contains(storeId) &&
+      remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
+      (ctx.rebuilds.markerRemovalsPending.contains(storeId) ||
+       hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildComplete))
+    ).foreach: storeId =>
+      val storePath = local.devicePath / storeId.directoryName
+      logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but its rebuild-complete marker " +
+                  s"is not durably removed. Completing the rebuild and loading the store")
+      if ctx.rebuilds.clearRebuildCompleteMarker(storeId, storePath) then
+        ctx.tryLoadStore(local, storePath, None)
+
+  /** Drops the transfers in this host is still tracking that the tree no longer records. */
+  private def dropAbortedTransfersIn(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    // An abort removes this device's TransferringIn entry and tells nobody, so this check is the
+    // only thing that learns of it. Left alone, an attempt still waiting on bytes keeps
+    // retransmitting its request and holds the store in transferringIn, which would make the
+    // pass below skip a later transfer of the same store. Before that pass for that reason.
+    // An attempt past promotion is not covered here; updateStateForTransferredStore sees the
+    // abort in the source's entry instead.
+    val trackedTransfersIn =
+      ctx.transfers.pendingStartTransfers.valuesIterator
+        .filter(_.toDeviceId == local.storageDeviceId)
+        .map(p => (p.msg.storeId, p.msg.fromDevice)).toList ++
+      ctx.transfers.transferInRetries.iterator
+        .filter((_, r) => r.toDeviceId == local.storageDeviceId)
+        .map((storeId, r) => (storeId, r.fromDeviceId)).toList
+    trackedTransfersIn.filterNot((storeId, fromDeviceId) =>
+      remote.stores.get(storeId).exists(entry =>
+        entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
+        entry.transferDevice.contains(fromDeviceId))
+    ).foreach: (storeId, fromDeviceId) =>
+      ctx.transfers.dropAbandonedTransferIn(storeId, fromDeviceId, local.storageDeviceId)
+
+    // The same store can be re-targeted at another device of this host. transferringIn is keyed
+    // by store, so the earlier attempt would block the new one until its own device's next
+    // check noticed the abort. This device's entry is the newer word on who receives the store,
+    // so the other device's attempt is dropped here instead of a poll later.
+    val retargeted =
+      ctx.transfers.pendingStartTransfers.valuesIterator
+        .filter(_.toDeviceId != local.storageDeviceId)
+        .map(p => (p.msg.storeId, p.msg.fromDevice, p.toDeviceId)).toList ++
+      ctx.transfers.transferInRetries.iterator
+        .filter((_, r) => r.toDeviceId != local.storageDeviceId)
+        .map((storeId, r) => (storeId, r.fromDeviceId, r.toDeviceId)).toList
+    retargeted.filter((storeId, _, _) =>
+      remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.TransferringIn)
+    ).foreach: (storeId, fromDeviceId, toDeviceId) =>
+      ctx.transfers.dropAbandonedTransferIn(storeId, fromDeviceId, toDeviceId)
+
+  /** Starts, resumes or abandons the transfer in of each TransferringIn entry. */
+  private def startTransfersIn(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    remote.stores.filter { (storeId, entry) =>
+      entry.status == StorageDeviceState.StoreStatus.TransferringIn
+    }.map { (storeId, status) =>
+      (storeId, status.transferDevice, status.transferId)
+    }.toList.foreach: (storeId, ofromDeviceId, transferId) =>
+      ofromDeviceId.foreach: fromDeviceId =>
+        ctx.metadata.readTransferSourceState(fromDeviceId).foreach: fromDevice =>
+          if fromDevice.isFailed then
+            // A tombstoned source has both ids zeroed, so fromDevice.hostId is HostId(0,0).
+            // Starting the transfer would address every StartStoreTransfer to a host that
+            // does not exist; the messages are dropped, the entry never resolves, and this
+            // check re-sends them forever. Nothing reports the stall either: rebalancing's
+            // ownedStores filters TransferringIn out of its accounting, so the store is
+            // invisible to the rebalancer too.
+            ctx.transfers.abandonIn(local.storageDeviceId, storeId, fromDeviceId)
+          else if ! fromDevice.isOperational then
+            // The source is shutting down or shut down, and its host refuses to send. The
+            // transfer stays pending: the next check of this device reads the source again,
+            // owner included, so a source adopted by another host is asked there.
+            logger.info(s"Not starting the transfer in of store $storeId onto device " +
+                        s"${local.storageDeviceId}: source device $fromDeviceId is " +
+                        s"${fromDevice.status}. Retrying on a later check")
+          else
+            // An attempt already asking the source's old host -- the source was shut down and
+            // adopted since -- is pointed at the new one and asked again now, rather than at
+            // the next retransmit.
+            ctx.transfers.pendingStartTransfers.get(storeId).filter(_.msg.fromDevice == fromDeviceId).foreach: pt =>
+              if ctx.transfers.readdressPendingTransfer(pt, fromDevice) then
+                pt.lastSend = HLCTimestamp.now
+                ctx.client.sendHostMessage(pt.msg)
+            ctx.transfers.startIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId, transferId)
+
+  /** Starts the rebuild of each Rebuilding entry and cancels rebuild work for stores no longer Rebuilding here. */
+  private def startRebuilds(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    remote.stores.filter((_, entry) =>
+      entry.status == StorageDeviceState.StoreStatus.Rebuilding
+    ).toList.sortBy(_._1.poolIndex).foreach: (storeId, entry) =>
+      ctx.rebuilds.startRebuild(local, storeId, entry.rebuildEpisode)
+    // Rebuild work for stores no longer Rebuilding here (re-placed elsewhere, rebuild-process 4.2)
+    ctx.rebuilds.abandonUnlisted(local, remote)
 
   /** The Deleted Stores pass's retire of `storeId`'s copy on `local`, whose entry no longer names it. The store
    *  leaves offlineStores, and its router offline mark goes (unless another device here holds the store offline), only
@@ -539,8 +532,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  Treating a synchronous throw as a failed lookup rather than letting it propagate leaves
    *  this method with no non-fatal synchronous throw path, and that is what makes
    *  endDeviceCheck's re-dispatch safe: a call that cannot throw cannot replace an exception
-   *  already unwinding out of the try body, which is how a reconcileDeviceState failure used to
-   *  be lost. Not literally none: the onComplete registration below sits outside the wrapper and
+   *  already unwinding out of the try body, which would lose a reconcileDeviceState failure. Not literally none: the onComplete registration below sits outside the wrapper and
    *  does rethrow if the ExecutionContext throws a fatal, which no real thread-pool EC does.
    *
    *  Totality also keeps the CheckAllDevices sweep whole. That handler iterates storageDevices

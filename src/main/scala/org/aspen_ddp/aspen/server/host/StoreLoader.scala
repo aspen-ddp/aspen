@@ -42,8 +42,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // startOpen, never blocking the control thread. A store leaves this map when a load starts; a retry that fails the
   // same way puts it back with a doubled wait. Never marked for rebuild: nothing says its data is gone. Without the
   // retry a store whose entry is Active would stay unserved for the life of the process while its previous copy is
-  // released (cross-document-review 2.2). A store whose crl_save.log state its device's CRL cannot admit now
-  // (handleLoad, crash-recovery-log 6.1 A3) waits here too, retried at every scan: its CRL frees room as transactions
+  // released. A store whose crl_save.log state its device's CRL cannot admit now
+  // (handleLoad, crash-recovery-log 6.1) waits here too, retried at every scan: its CRL frees room as transactions
   // conclude.
   private var storesAwaitingRetry: Map[StoreId, LoadRetry] = Map()
   // Stores whose backend open (recovery) or create is in progress (startOpen), each with the ShutdownStore
@@ -95,7 +95,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val storeCfgPath = potentialStoreFile / StoreConfig.configFilename
     // Every existence test here is FileStat's: a stat that fails is no absence. A marker taken as absent would load a
     // store it must keep offline, so a failed stat takes the unreadable-config retry like a failed read
-    // (cross-document-review 2.2)
+    //
     val hasConfig =
       try Right(FileStat.exists(storeCfgPath))
       catch case NonFatal(t) => Left(t)
@@ -155,7 +155,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  store), it is left offline and put in storesAwaitingRetry, as a failed open is, so the device scans offer it to
    *  tryLoadStore again with backoff. Without this, a load from a pass that removed its marker first (Completed
    *  Transfers In, Completed Rebuilds) or that offers it once (device load, reloadClosedStores) would leave an Active
-   *  store unserved and untracked until a restart (cross-document-review 2.2). `onServed` is kept for the load that
+   *  store unserved and untracked until a restart. `onServed` is kept for the load that
    *  serves it. A directory whose name is no store id is only logged. */
   private def awaitUnreadRetry(sds: LocalStorageDeviceState, storePath: os.Path, onServed: Option[() => Unit],
                                err: Throwable): Unit =
@@ -176,8 +176,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         else
           logger.warn(s"Store $storeId cannot be loaded: its directory could not be read. Leaving it offline and " +
                       s"retrying, with backoff. $storePath. Error: $err")
-        router.markOffline(storeId)
-        sds.offlineStores += storeId
+        ctx.markStoreOffline(sds, storeId)
         storesAwaitingRetry += storeId -> LoadRetry(sds, storePath, waitScans, waitScans,
           composeServed(previous.flatMap(_.onServed), onServed))
 
@@ -399,12 +398,12 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val deviceCrl = ctx.devices.devices.get(storageDeviceId).map(_.crl).orElse(ctx.unloadedDeviceCrl)
     // Whether the store has a save file: a stat that fails says nothing (FileStat). Taken as absent, it would recover
     // the store from a device CRL that holds none of its state, and the file, still there, would have the next load
-    // drop everything saved since (cross-document-review 2.2). So the load is held back and retried instead
+    // drop everything saved since. So the load is held back and retried instead
     val hasSaveFile = if failed then Success(false) else Try(FileStat.exists(backend.crlSaveFile))
     // The store's identity, read before anything is built. Never created here: every store directory gets one when it
     // is made (StoreCreation, RebuildingStore.finish). One that is missing is lost, which makes the store a new
     // incarnation, and one written fresh over a store keeping its data and CRL state would skip the commits it owes
-    // (a recovered commit vote finding its UnackedCommits entry under the old incarnation; cross-document-review 2.2)
+    // (a recovered commit vote finding its UnackedCommits entry under the old incarnation)
     val incarnation =
       if failed then Failure(new IllegalStateException("not read")) else
         Try(StoreIncarnationFile.load(backend.path, backend.storeId))
@@ -464,7 +463,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         p.failure(err)
 
       case (Right(Some(_)), Some(_)) if neverFitsReason.nonEmpty =>
-        // No CRL of this device can ever take it (crash-recovery-log 6.1, A3), as for a store moved from a device with
+        // No CRL of this device can ever take it (crash-recovery-log 6.1), as for a store moved from a device with
         // a larger CRL: retrying would keep the store offline for good, so it is rebuilt as one whose file is unusable
         val err = new IllegalStateException(s"the CRL state of store ${backend.storeId} can never fit its device's " +
           s"CRL: ${neverFitsReason.get}")
@@ -553,10 +552,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                   ctx.devices.devices.get(storageDeviceId).foreach: sds =>
                     awaitBuildRetry(sds, backend.path, storeId, err)
                 abandonLoad(storageDeviceId, backend, replacing.isDefined, err, p)
-              // A crl_save.log state is charged, checked, before any of it is saved (crash-recovery-log 6.1, A3).
+              // A crl_save.log state is charged, checked, before any of it is saved (crash-recovery-log 6.1).
               // Retained for the store, the charge is swapped for its recovery's own count (Frontend.recoverState),
               // as what the device's open or its last close retained is: the store's records are never uncounted
-              // (A2). Charged here, after the build, so no later failure of the load leaves it charged: a failed
+              // Charged here, after the build, so no later failure of the load leaves it charged: a failed
               // loadStore drops the store's entries and releases what is retained for it (handleUnloadFailed)
               case Success(entry) if !trs.forall(state => entry.store.frontend.admission.tryChargeLoaded(storeId,
                   CrlAdmission.recoveredBytes(state), crl.maxTransactionBytes)) =>
@@ -606,7 +605,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  bound, the most a load is charged against (CrlAdmission.tryChargeLoaded) once the CRL has grown, or one of its
    *  transactions exceeds that bound (crash-recovery-log 10.20). Neither depends on the device config, so no config
    *  edit can declare a state lost. A state within that limit but above the one now is refused by tryChargeLoaded,
-   *  which asks the CRL to grow and leaves the store waiting offline (crash-recovery-log 6.1, A3) */
+   *  which asks the CRL to grow and leaves the store waiting offline (crash-recovery-log 6.1) */
   private def neverFits(state: StoreRecoveryState, crl: CrashRecoveryLog, admission: CrlAdmission): Option[String] =
     val bytes = CrlAdmission.recoveredBytes(state)
     val slack = crl.maxTransactionBytes

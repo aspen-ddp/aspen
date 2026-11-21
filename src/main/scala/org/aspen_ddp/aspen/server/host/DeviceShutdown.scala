@@ -224,8 +224,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
       .map: clean =>
         // ShutdownStore records this too. Done here as well so the bookkeeping that later
         // steps read does not depend on how the store was closed.
-        ctx.router.markOffline(storeId)
-        local.offlineStores += storeId
+        ctx.markStoreOffline(local, storeId)
         if clean then
           closedForShutdown += deviceId -> (closedForShutdown.getOrElse(deviceId, Set()) + storeId)
         ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
@@ -325,8 +324,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
     else
       runSequentially(open): storeId =>
         ctx.closeStoreForShutdown(storeId).transform(_ => Success(())).map: _ =>
-          ctx.router.markOffline(storeId)
-          local.offlineStores += storeId
+          ctx.markStoreOffline(local, storeId)
           onClosed(storeId)
       .flatMap(_ => closeStoresToRelinquish(local, onClosed))
 

@@ -127,7 +127,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   driver, at its start or, if one already runs, through `Frontend.onCommitProven` -> `Store.giveProof`; the Tx applies
   its saved update locally, logs
   it at info and stays until TxFinalized, writing no status-cache entry (a Tx holding a late commit that finds its
-  entry applies and is forgotten at once). A failed or unanswered lookup holds the
+  entry applies and is forgotten at once; one resolved by a non-late commit before its lookup answers drops the
+  hold, `Tx.resolved`, and ends as any resolved Tx, expiry included). A failed or unanswered lookup holds the
   abort; a failed one is retried at heartbeat, an unanswered one awaited, never re-issued (its untimed read would
   only pile up beside it; logged after `Frontend.UnackedLookupTimeout`, 5 s). Past the horizon its peers refuse its
   driver, so such a Tx ends by expiry (below)

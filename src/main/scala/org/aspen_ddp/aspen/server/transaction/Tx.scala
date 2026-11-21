@@ -1422,6 +1422,9 @@ class Tx( trs: TransactionRecoveryState,
     */
   private def resolved(committed: Boolean, record: Boolean = true): Unit = if (oresolution.isEmpty) {
     oresolution = Some(committed)
+    // A held late commit resolved by a non-late outcome no longer waits for its lookup: its answer is dropped, and
+    // the Tx concludes as any resolved Tx does (TxFinalized, a late outcome, or expiry: mayExpire)
+    lateCommitHeld = false
 
     // The vote no longer matters
     waitingOn = Set()

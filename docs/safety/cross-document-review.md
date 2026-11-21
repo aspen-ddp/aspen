@@ -77,7 +77,7 @@ The premises other subsystems take from this:
   list, a store outside it acknowledged that driver and holds no Tx to consume an extra entry, and repair's reconcile
   of a copy that holds T is a no-op. A non-late commit can still reach a driver after T was finalized and forgotten,
   from a sibling store's relay on the same host (transaction-recovery.md R-W12) or a second driver's resent
-  `TxResolved` (paxos-transactions.md P-W9), and its finalizer then runs T's actions again until a late answer
+  `TxResolved` (paxos-transactions.md 10.5), and its finalizer then runs T's actions again until a late answer
   cancels it; every shipped action tolerates that (2.6). A `TxResolved` reaching a store after its `TxFinalized` (an
   abort's broadcast is queued after it) creates no Tx and only refreshes a monotone status-cache entry
   (`TransactionStatusCache.updateStatus`).

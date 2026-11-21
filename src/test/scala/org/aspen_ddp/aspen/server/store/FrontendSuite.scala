@@ -7746,6 +7746,36 @@ class FrontendSuite extends AnyFunSuite with Matchers {
           finalized = true, late = true))
   }
 
+  test("a held late commit that then resolves by a non-late commit still concludes past the horizon") {
+    // paxos-transactions P-W9: the non-late TxResolved resolves the held Tx before its lookup answers, which is then
+    // dropped; the Tx must still expire, or it lives until its store reloads
+    withExpiryFrontend: (frontend, backend, net, crl, lookup, clock, statusCache) =>
+      frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))
+      expectVote(net, TransactionDisposition.VoteCommit)
+      frontend.receiveTransactionMessage(TxResolved(storeId, unackedDriver, txid1, committed = true, late = true,
+        proof = false))
+      lookup.requests shouldBe List(txid1)
+      frontend.receiveTransactionMessage(TxResolved(storeId, peer1, txid1, committed = true, late = false,
+        proof = false))
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+      lookup.answer(txid1, lookup.absent) // Dropped: the Tx no longer waits for it
+      frontend.transactions.contains(txid1) shouldBe true
+
+      passHorizon(clock)
+      frontend.expiryHeartbeat()
+      reply(frontend, net, peer1, None)
+      reply(frontend, net, peer2, None)
+
+      // Concluded as a late commit of a transaction applied here: a fresh lookup decides its stub
+      lookup.requests shouldBe List(txid1, txid1)
+      lookup.answer(txid1, lookup.absent)
+      frontend.transactions.contains(txid1) shouldBe false
+      crl.deleted should contain (txid1)
+      lockedWriteTransactions(frontend, net, op1) shouldBe empty
+      statusCache.getStatus(txid1) shouldBe Some(TransactionStatusCache.Entry(TransactionStatus.Committed,
+        finalized = true, late = true))
+  }
+
   test("a committed Tx whose TxFinalized was lost keeps holding while a quorum of acceptor-state holders remains") {
     withExpiryFrontend: (frontend, _, net, _, lookup, clock, _) =>
       frontend.receiveTransactionMessage(clientPrepare(expiringTxd(List(overwrite(op1)))))

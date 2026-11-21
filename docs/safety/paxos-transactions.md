@@ -801,7 +801,11 @@ T started is logged (`Tx.LateClientPrepareAfter`).
   found and is forgotten either way (past the horizon plus the margin it is forgotten without waiting,
   `Tx.forgetWithoutStubPastExpiry`). An undecided commit vote with a stub applies nothing; one without a stub looks up
   its entry and applies only if it is found naming its incarnation (`lateCommitHeld`, `unackedCommitFound`,
-  `unackedCommitAbsent`). Anything else (abort vote, no vote, muted, prover, abort learned) applies nothing.
+  `unackedCommitAbsent`). A non-late commit reaching the held vote before its lookup answers (a second driver's
+  resent `TxResolved`, a peer's expiry commit) resolves it as any commit does: `Tx.resolved` clears the hold, the
+  lookup's answer is dropped, and the Tx ends by `TxFinalized`, a later late commit (the forget-lookup above) or expiry
+  (`Tx.mayExpire`, `concludeKnownOutcome`). Anything else (abort vote, no vote, muted, prover, abort learned) applies
+  nothing.
 * **Found entry as a proof.** A commit vote that found its entry gives its own driver a proof (`Store.giveProof`).
 
 Under the horizon, proofs and late resolution are optimisations inside the window: a driver without the proof cannot
@@ -1210,23 +1214,4 @@ transaction eventually resolves without operator action given a healthy quorum.
 
 ## Open weaknesses
 
-### P-W9: A held late commit that then resolves by a non-late commit never expires
-Verdict CONFIRMED. Priority 4. Effort S.
-Mechanism: an undecided commit vote reached by a late commit sets `lateCommitHeld` and looks up its UnackedCommits
-entry (`Tx.lateCommit`). If a non-late `TxResolved(commit)` arrives before the lookup answers (a second driver still
-running its finalizer re-sends `TxResolved` to stores not in its `knownResolved`, `SimpleTransactionDriver`
-`sendPeerMessages`; or a peer's expiry commit, `Frontend.decideExpiry`), `Tx.receiveResolved` calls
-`resolved(true)`, which applies the commit but leaves `lateCommitHeld` set and `ofinalized` empty. The lookup's answer
-is then dropped (`Tx.awaitsUnackedLookup` requires `lateCommitHeld && oresolution.isEmpty`,
-`Frontend.unackedLookupComplete`), but `Tx.mayExpire` still requires `!lateCommitHeld`, so `Frontend.expiryHeartbeat`
-never starts an expiry round and `Tx.concludeKnownOutcome` never runs. The Tx now ends only by a `TxFinalized`, or by
-its idle driver (`Store.heartbeat`) learning a late outcome from its peers' finalized relays. If the non-late source's
-`TxFinalized` is lost and the re-drive comes after the peers' status-cache entries expired, the peers refuse it below
-their floors, the store's own relay to itself is withheld (its Tx knows the outcome, 10.2), and nothing more happens.
-Consequence: liveness and hygiene only, not safety (the apply itself is the ordinary non-late path, P11): the Tx, its
-CRL record and admission, and a driver that `Store.removeExpiredDrivers` never removes (a Tx is held) live until the
-store reloads, the driver re-sending prepares every `maxDelay` to stores that refuse them.
-Fix: make `Tx.mayExpire` use the same condition as `awaitsUnackedLookup`, `!(lateCommitHeld && oresolution.isEmpty)`
-(or clear `lateCommitHeld` in `Tx.resolved`), so the resolved Tx expires and concludes its known outcome
-(`concludeKnownOutcome` -> `lateCommit` -> forget-lookup). Test: a held late commit that receives a non-late
-`TxResolved(commit)` before its lookup answers, with every peer past its floor, is forgotten past expiry.
+(no open items)

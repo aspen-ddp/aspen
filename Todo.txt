@@ -62,12 +62,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
-4.1 [P-W9] A held late commit that then resolves by a non-late commit never expires.
-    CONFIRMED. Effort S. paxos-transactions.md.
-    Tx.lateCommitHeld stays set after a non-late TxResolved(commit) applies, and Tx.mayExpire requires
-    !lateCommitHeld, so the Tx, its CRL record and admission and its driver live until the store reloads.
-    Fix: mayExpire on !(lateCommitHeld && oresolution.isEmpty), or clear the flag in Tx.resolved.
-
 4.2 [RB-W18] A missing store whose directory returns while its rebuild request fails is left unserved.
     PLAUSIBLE. Effort S. rebuild-process.md.
     The Missing Stores pass silences the store and calls requestRebuild; if the directory comes back and the request

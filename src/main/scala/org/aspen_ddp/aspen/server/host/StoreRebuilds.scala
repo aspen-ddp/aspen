@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.RebuildOutcome
 import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, Host, StoreConfig}
-import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild}
+import org.aspen_ddp.aspen.server.rebuild.{RebuildState, RebuildingStore, StoreRebuild}
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -562,21 +562,35 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  discardLostStore like any other. A served one is first taken out of service as a failed backend is, and its
    *  rebuild waits for a later check. A stat that fails is no absence (FileStat): the rebuild waits for a later
    *  check, neither starting over a copy it cannot see nor retiring a finished one whose marker it cannot see.
-   *  Returns whether the rebuild may go on now. */
+   *
+   *  Any copy at the path other than this episode's finished one, a foreign or a rebuild-required one, may have served
+   *  since the rebuild's first pass began: a restart's device load serves an unmarked copy until the device's first
+   *  reconcile, and a served copy that fails is marked rebuild-required. A resumed walk would leave its acknowledged
+   *  updates on the objects walked before the checkpoint stale with no mark, so the store's staging checkpoint is
+   *  first removed durably, making the next pass a first pass (dropStagingCheckpoint). No rebuild of the store runs
+   *  here when this is called. Returns whether the rebuild may go on now. */
   private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
     val storePath = local.devicePath / storeId.directoryName
-    val ours =
+    // Some(None): nothing at the path or this episode's finished copy; Some(Some(marked)): another copy, rebuild-required
+    // or not
+    val found =
       try
-        Some(!FileStat.exists(storePath) ||
-             StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildComplete) &&
-               RebuildingStore.isRebuildCompleteFor(storePath, episode) ||
-             StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildRequired))
+        if !FileStat.exists(storePath) ||
+           StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildComplete) &&
+             RebuildingStore.isRebuildCompleteFor(storePath, episode) then
+          Some(None)
+        else
+          Some(Some(StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildRequired)))
       catch case NonFatal(t) =>
         logger.error(s"Failed to stat the path of store $storeId at $storePath. Not rebuilding it yet: $t")
         None
-    if ours.isEmpty then
+    if found.isEmpty then
       false
-    else if ours.contains(true) then
+    else if found.contains(None) then
+      true
+    else if !dropStagingCheckpoint(local, storeId) then
+      false
+    else if found.contains(Some(true)) then
       true
     else if ctx.loader.isOpening(storeId) then
       false
@@ -597,6 +611,24 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             case t: Throwable =>
               logger.error(s"Failed to mark store $storeId for rebuild at $storePath. Not rebuilding it yet: $t")
               false
+
+  /** Removes the rebuild checkpoint of `storeId` from its staging directory on `local`, durably, then the rest of the
+   *  directory (a first pass's createStaging discards whatever is left). A staging directory without a checkpoint is a
+   *  first pass's. Returns false, logged, when the stat or the removal fails: the rebuild waits for a later check. */
+  private def dropStagingCheckpoint(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
+    val staging = local.devicePath / RebuildingStore.RebuildDirectory / storeId.directoryName
+    try
+      if FileStat.exists(staging) then
+        logger.info(s"Discarding the rebuild staging copy of store $storeId at $staging: a copy at the store's path " +
+                    "may have served since its first pass began, so the rebuild starts over")
+        RebuildState.removeAll(staging)
+        DurableFiles.syncDirectory(staging)
+        try os.remove.all(staging)
+        catch case NonFatal(t) => logger.warn(s"Failed to delete $staging. A first pass discards it. Error: $t")
+      true
+    catch case NonFatal(t) =>
+      logger.error(s"Failed to discard the rebuild checkpoint of store $storeId at $staging. Not rebuilding it yet: $t")
+      false
 
   /** A store served from `local` that the device's entry does not list: a copy put at the store path by hand, loaded
    *  without reading the tree. Nothing ties it to the store's current state, so it is taken out of service as a

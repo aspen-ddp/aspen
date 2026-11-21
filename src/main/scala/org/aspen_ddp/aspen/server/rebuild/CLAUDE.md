@@ -31,7 +31,9 @@
   once the flip commits (before the load, or after the transfer-out pair for `AdoptOffline`); the reconcile's Completed
   Rebuilds pass removes it for an Active entry after a crash. A directory at a Rebuilding store's path with neither this
   episode's marker nor `rebuild-required` (a copy finished for an earlier episode included) is retired as a lost copy
-  (`StoreRebuilds.retireForeignCopy`: marked, kept in `pending-delete/`, rebuilt)
+  (`StoreRebuilds.retireForeignCopy`: marked, kept in `pending-delete/`, rebuilt). Such a copy, or a `rebuild-required`
+  one, may have served since the first pass began, so the store's staging checkpoint is first removed durably
+  (`dropStagingCheckpoint`) and the next pass is a first pass: a resume would leave the walked objects' updates stale
 - Pending allocations (rebuild-process 5.3): before each pass's walk, `queryPeers` asks the pool's other stores
   (`CurrentAllocationsRequest`) and waits, resending, for `width - writeThreshold + 1` answers, at most
   `peerQueryTimeout` (default `PeerQueryTimeout`, 60 s, noticed at the next resend): then the pass fails with

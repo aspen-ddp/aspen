@@ -48,12 +48,7 @@ rebuild-process.md B19.)
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.5 [S] RB-W21: a copy that serves between rebuild passes leaves the resumed walk's done part stale with no mark
-    (PLAUSIBLE). A Missing Stores directory that comes back after the checkpoint is served by a restart's device
-    load (a load retry waits while the store is declared or Rebuilding), acknowledges commits, and is then retired
-    by retireForeignCopy, but the next pass resumes the checkpoint: its acknowledged updates on walked objects are
-    never marked (t = r, exactly t voters: t - 1 < r copies). Fix: retireForeignCopy deletes the staging directory before marking or fail-stopping
-    a foreign copy, forcing a first pass.
+(no open items)
 
 
 PRIORITY 3: systemic loss protection

@@ -7,12 +7,12 @@ import org.aspen_ddp.aspen.server.host.{ControlFixture, StoreRebuilds, DeviceMet
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState, fixed_ids}
 import org.aspen_ddp.aspen.common.network.{StoreMoved, StoreOffline}
-import org.aspen_ddp.aspen.common.objects.Insert
+import org.aspen_ddp.aspen.common.objects.{Insert, Key}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.RebuildOutcome
-import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
+import org.aspen_ddp.aspen.server.rebuild.{RebuildState, RebuildingStore, StoreRebuild, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
 
 import java.util.UUID
@@ -462,6 +462,74 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       pending should have size 1
       os.exists(pending.head / "data") should be(true)
       os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+
+  /** A checkpoint of `storeId` in its staging directory on `deviceDir`, as a pass that walked past one object leaves */
+  private def writeCheckpoint(deviceDir: os.Path, storeId: StoreId): os.Path =
+    val staging = deviceDir / RebuildingStore.RebuildDirectory / storeId.directoryName
+    os.makeDir.all(staging)
+    os.write.over(staging / "data", "walked")
+    RebuildState.save(staging, RebuildState(storeId, None, Some(Key(Array[Byte](1))), Nil, Nil))
+    staging
+
+  atest("a copy no rebuild produced discards the staging checkpoint before it is retired (RB-W21)"):
+    // The copy may have served since the first pass began (a restart's device load), so the walk must not resume:
+    // the objects walked before the checkpoint would keep its acknowledged updates stale with no mark
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+    val back = storeN(0)
+    val storeDir = deviceDir / back.directoryName
+    os.makeDir.all(storeDir)
+    os.write.over(storeDir / "data", "served")
+    val staging = writeCheckpoint(deviceDir, back)
+
+    val armed = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
+    armed.success(deviceState(deviceA, Map(rebuilding(back))))
+
+    yieldUntil(factory.created.nonEmpty).map: _ =>
+      factory.created.map(_.storeId).toList should be(List(back))
+      os.exists(storeDir) should be(false)
+      os.exists(staging) should be(false)
+
+  atest("a served copy at a Rebuilding store's path discards the staging checkpoint before it is fail-stopped (RB-W21)"):
+    // As a restart's device load leaves a Missing Stores directory that came back after the checkpoint: served until
+    // the device's first reconcile. Fail-stopped, it is rebuild-required, and the rebuild that follows is a first pass
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+    val back = storeN(0)
+    val storeDir = deviceDir / back.directoryName
+    os.makeDir.all(storeDir)
+    StoreIncarnationFile.writeFresh(storeDir)
+    val backend = new MapBackend(back):
+      override def path: os.Path = storeDir
+    val load = host.loadStore(deviceA, backend, None)
+    val staging = writeCheckpoint(deviceDir, back)
+
+    def served: Boolean = host.control.router.loaded.contains(back)
+    var stagingWhenUnserved: Option[Boolean] = None
+    def answerChecks(): Boolean =
+      host.testingOnlyHandleEvents()
+      if stagingWhenUnserved.isEmpty && !served then
+        stagingWhenUnserved = Some(os.exists(staging))
+      if !host.control.reconciler.activeDeviceChecks.contains(deviceA) then
+        recorded(host).armLookup(deviceA).success(deviceState(deviceA, Map(rebuilding(back))))
+        host.control.reconciler.checkStorageDevice(deviceA)
+        host.testingOnlyHandleEvents()
+      factory.created.nonEmpty
+
+    for
+      _ <- yieldUntil({ host.testingOnlyHandleEvents(); load.isCompleted && served })
+      _ <- yieldUntil(answerChecks())
+    yield
+      factory.created.map(_.storeId).toList should be(List(back))
+      served should be(false)
+      stagingWhenUnserved should be(Some(false))
+      os.exists(staging) should be(false)
+      os.exists(storeDir) should be(false)
 
   atest("a served store its device's entry does not list is taken out of service and retired (RB-W5)"):
     // A copy put back at a store path by hand, loaded at startup without reading the tree. The reconcile takes it out

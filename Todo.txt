@@ -67,15 +67,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.4 [CRL-W16] A closed store's transfer-out extraction may run on another device's copy of the store.
-    PLAUSIBLE. Effort S. crash-recovery-log.md.
-    startOut ships the pool device's directory (sourceDs) but extractUnloaded picks the first loaded device with a
-    directory for the store. With a second copy on another device of the host (an earlier tenancy, a source awaiting
-    retire, a failed retire) it validates/extracts that copy and drops that device's entries; the source ships with
-    no crl_save.log, the destination refuses it, every retransmit repeats. A stalled transfer, and the other copy's
-    entries lost from its future lost-crl-state.log.
-    Fix: pass sourceDs into closeForTransferOut / extractUnloaded.
-
 5.5 [X-W21] A held commit finalized before it applies is not seen as a lock holder; a prepare built on it votes abort.
     CONFIRMED. Effort S. cross-document-review.md.
     A commit held for its turn keeps its locks but leaves Frontend.transactions at TxFinalized

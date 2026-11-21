@@ -270,7 +270,7 @@ piece leaves the image when that save's entry is built (5.3: a form's build unpi
 |-----------|-----------|--------|
 | Planned device shutdown | stores close with `extractCrl = false`, records stay live; then `crl.shutdown()` | `DeviceShutdown.closeForShutdown`, `shutDownCrl` |
 | Transfer out, store open | on the executor after `closing`: `readStoreState`; `saveStoreState` to `crl_save.log` (tmp, fsync, rename, directory fsync); `store.close()`; then `deleteTransactions(state.entryIds)` and the retained admission released | `StoreLoader.handleClose(extractCrl = true)` |
-| Transfer out, store closed | on the first loaded device of the host with a directory for the store (CRL-W16); with a valid `crl_save.log`: the file ships unchanged and `dropStore` removes the device CRL's entries (a copy of part of the file or an earlier tenancy's leftovers, 3.3 step 4), releasing the charge retained when the drop was issued; without one: `readStoreState`, saved, then `deleteTransactions`. An unusable save file fails before anything is read; an open started during the read or drop (`opensStarted`) fails it after | `StoreTransfers.extractUnloaded` |
+| Transfer out, store closed | on the transfer's source device only (the device the pool entry names, whose directory ships; another device of the host may hold an earlier copy of the store, whose entries are its retire's); with a valid `crl_save.log`: the file ships unchanged and `dropStore` removes the device CRL's entries (a copy of part of the file or an earlier tenancy's leftovers, 3.3 step 4), releasing the charge retained when the drop was issued; without one: `readStoreState`, saved, then `deleteTransactions`. An unusable save file fails before anything is read; an open started during the read or drop (`opensStarted`) fails it after | `StoreTransfers.extractUnloaded` |
 | Retire of a copy no longer its store's owner (a lost store before its rebuild, a transfer out's source, a re-placed rebuild's source, an earlier tenancy's copy at the path of a store transferring in) | marker `rebuild-required` durable; `lost-crl-state.log` kept if present, else the copy's `crl_save.log` renamed to it (any entries `readStoreState` still returns saved first as `lost-crl-entries.log`), else `readStoreState` saved to it; `dropStore`; directory renamed into pending-delete | `StoreCopies.retire` (from `StoreRebuilds.discardLostStore`, `StoreTransfers.retireEarlierTenancy` and the Deleted Stores pass) |
 | Store no longer on the device (safety net: a retire drops first) | `storesWithEntries`; for each store not in the device's tree entry, not loaded, with no directory (a stat that answers absent, `server.FileStat`: one that fails keeps them), no drop and no retire running: `dropStore` | `DeviceReconciler.dropLeftoverCrlState` |
 | Store whose `loadStore` of its `crl_save.log` failed (the file stays) | `dropStore` | `StoreLoader.handleUnloadFailed`, `closeUnloaded(dropDurably = true)` |
@@ -1296,19 +1296,4 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-### CRL-W16: A closed store's transfer-out extraction may run on another device's copy of the store
-Verdict PLAUSIBLE. Priority 5. Effort S.
-Mechanism: `StoreTransfers.startOut` ships `sourceDs.devicePath / storeId` (the device the pool entry names), but
-`closeForTransferOut` for a store not loaded or opening calls `extractUnloaded(storeId)`, which picks the first
-loaded device of the host holding a directory for the store (`ctx.devices.devices.valuesIterator.find`). Two devices
-of one host can each hold a copy (`server/host/CLAUDE.md`: an earlier tenancy's copy, a transfer's source awaiting the
-Deleted Stores retire, a copy whose retire failed). When the other device comes first, the extraction validates that
-copy's save file and drops that device's CRL entries for the store (releasing its retained charge), or reads them
-into that copy's `crl_save.log` and deletes them, and succeeds; the source's own entries are not extracted. The
-source directory is shipped without a `crl_save.log`, the destination's validation refuses the staged copy, and every
-retransmitted request repeats the same choice.
-Consequence: the transfer stalls until the other copy leaves its path; an earlier copy's CRL entries, which a retire
-would keep in its `lost-crl-state.log`, are dropped. No acknowledged state is lost: the source's entries stay live in
-its device CRL.
-Fix: pass the source device (`sourceDs`) from `startOut` to `closeForTransferOut` and extract on that device only.
-No hot-path cost.
+None.

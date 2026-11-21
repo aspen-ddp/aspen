@@ -145,7 +145,7 @@ object Host:
                          scheduler: Option[ControlScheduler] = None,
                          backends: Option[BackendOpener] = None,
                          warn: Option[(os.Path, String) => Unit] = None,
-                         closeForTransferOut: Option[StoreId => Future[Unit]] = None,
+                         closeForTransferOut: Option[(StoreId, LocalStorageDeviceState) => Future[Unit]] = None,
                          closeForShutdown: Option[StoreId => Future[Unit]] = None,
                          gossipStoreOnline: Option[StoreId => Unit] = None,
                          loadStore: Option[(StorageDeviceId, Backend, Option[Long], Option[IDA], AdmissionTier) => Future[Unit]] = None,
@@ -322,7 +322,7 @@ class Host(val client: AspenClient,
     shutdownWorkTimeout = shutdownWorkTimeout,
     gossipStoreOnline = seams.gossipStoreOnline.getOrElse(storeId => deviceControl.services.gossipStoreOnline(storeId)),
     closeStoreForTransferOut = seams.closeForTransferOut.getOrElse(
-      storeId => deviceControl.transfers.closeForTransferOut(storeId)),
+      (storeId, sds) => deviceControl.transfers.closeForTransferOut(storeId, sds)),
     closeStoreForShutdown = seams.closeForShutdown.getOrElse(
       storeId => deviceControl.shutdown.closeForShutdown(storeId)),
     scheduleShutdownWorkTimeout = seams.scheduleShutdownWorkTimeout.getOrElse(

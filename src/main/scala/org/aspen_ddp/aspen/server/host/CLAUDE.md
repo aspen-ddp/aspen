@@ -246,7 +246,9 @@
   (`StoreTransfers.closeForTransferOut`), and deletes them from the device CRL (`deleteTransactions`) only once that
   file is durable: a crash or failed save before that leaves the device CRL holding them. A closed store that already
   has a valid `crl_save.log` ships it unchanged: the file is its whole state, so its device-CRL entries are copies or
-  an earlier tenancy's leftovers, dropped (`dropStore`) as its load would drop them (`extractUnloaded`).
+  an earlier tenancy's leftovers, dropped (`dropStore`) as its load would drop them (`extractUnloaded`). A closed
+  store is extracted on the transfer's source device only (`startOut` passes `sourceDs`), never on another copy of it
+  another device of the host holds.
   `DeviceReconciler.dropLeftoverCrlState` drops the entries of a store with no entry on the device, no directory
   (a stat that answers absent) and no retire running, as a safety net for a directory removed by hand; a store its
   entry names keeps them, even one the Missing Stores pass is rebuilding. It releases only the admission charge

@@ -1611,7 +1611,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- closed
       heldAfterClose = held(crl, storeId)
       saveFileAfterClose = os.exists(Backend.crlSaveFile(storeDir))
-      _ <- host.control.transfers.closeForTransferOut(storeId)
+      _ <- host.control.transfers.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
       heldAfterExtract = held(crl, storeId)
       _ = factory.shutdownAll()
@@ -1643,7 +1643,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       // state, and txid an earlier tenancy's leftover
       _ = CrashRecoveryLog.saveStoreState(storeId, fileState, Backend.crlSaveFile(storeDir))
       retainedBefore = admission.retainedBytes(storeId)
-      extracting = host.control.transfers.closeForTransferOut(storeId)
+      extracting = host.control.transfers.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       _ <- pumpUntil(host, extracting.isCompleted)
       _ <- extracting
       saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
@@ -1656,6 +1656,58 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       heldAfter should be(Set())
       retainedAfter should be(0L)
       heldOnDisk(deviceDir, storeId) should be(Set())
+
+  /** A closed store's transfer-out extraction with a second copy of it on another device of the host (an earlier
+   *  tenancy's, kept offline by its rebuild-required marker). The source, deviceA, is the directory `sourceName`, the
+   *  other copy's device (deviceB) the directory `otherName`, so the two calls put each first in the host's devices.
+   *  Returns the source's save file state, what the source's device CRL holds afterwards, and whether the other copy
+   *  got a save file */
+  private def extractionBesideOtherCopy(sourceName: String, otherName: String)
+    : Future[(Either[CrashRecoveryLog.InvalidSaveFile, StoreRecoveryState], Set[TransactionId], Boolean)] =
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    val hostRoot = newHostDir()
+    val sourceDir = writeSmallCrlDevice(hostRoot, sourceName, deviceA)
+    val otherDir = writeSmallCrlDevice(hostRoot, otherName, deviceB)
+    createCrl(sourceDir)
+    createCrl(otherDir)
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.copy(
+             stores = Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+      _ <- waitForTransactionsToComplete()
+      storeDir <- writeRocksStore(sourceDir, storeId)
+      otherCopy <- writeRocksStore(otherDir, storeId)
+      _ = os.write.over(marker(otherCopy), "")
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      source = host.control.devices.devices(deviceA)
+      crl = factory.opened.find(_.devicePath == sourceDir).get
+      _ <- prepareInFlight(host, crl, storeId, txid)
+      // Closed without extraction: txid stays in the source's device CRL
+      closed = host.closeStore(storeId)
+      _ <- pumpUntil(host, closed.isCompleted)
+      _ <- closed
+      extracting = host.control.transfers.closeForTransferOut(storeId, source)
+      _ <- pumpUntil(host, extracting.isCompleted)
+      _ <- extracting
+      saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
+      heldAfter = held(crl, storeId)
+      otherSaveFile = os.exists(Backend.crlSaveFile(otherCopy))
+      _ = factory.shutdownAll()
+    yield (saved, heldAfter, otherSaveFile)
+
+  atest("a closed store's transfer-out extraction runs on its source device, not another copy's (CRL-W16)"):
+    given ExecutionContext = executionContext
+    for
+      sourceFirst <- extractionBesideOtherCopy("dev0", "dev1")
+      otherFirst <- extractionBesideOtherCopy("dev1", "dev0")
+    yield
+      for (saved, heldAfter, otherSaveFile) <- List(sourceFirst, otherFirst) do
+        saved.map(_.transactions.map(_.txd.transactionId)) should be(Right(List(txid)))
+        heldAfter should be(Set())
+        otherSaveFile should be(false)
+      succeed
 
   /** Extracts the store's CRL state for a network transfer out, from the open store (`loaded`) or from its device
    *  CRL once closed, holding an in-flight transaction and an applied stub. Returns the save file's state, the stubs
@@ -1680,7 +1732,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
         else
           val closed = host.closeStore(storeId)
           pumpUntil(host, closed.isCompleted).flatMap(_ => closed)
-      extracting = host.control.transfers.closeForTransferOut(storeId)
+      extracting = host.control.transfers.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       _ <- pumpUntil(host, extracting.isCompleted)
       _ <- extracting
       saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
@@ -1968,7 +2020,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
         else
           // A non-empty directory where the save file's temporary goes: its write fails
           os.makeDir.all(storeDir / s".${Backend.crlSaveFile(storeDir).last}.tmp" / "blocker")
-      extracting = host.control.transfers.closeForTransferOut(storeId)
+      extracting = host.control.transfers.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       _ <- pumpUntil(host, if crash then crl.readCalled.isCompleted else extracting.isCompleted)
       outcome = extracting.value
       heldAfter = held(crl, storeId)
@@ -2000,7 +2052,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(host, recovered(host, storeId, txid))
       afterReload = admission.admittedBytes
       // A transfer out's extraction takes the entries out of the device CRL, and their count with them
-      extracted = host.control.transfers.closeForTransferOut(storeId)
+      extracted = host.control.transfers.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       _ <- pumpUntil(host, extracted.isCompleted)
       _ <- extracted
       afterExtraction = admission.admittedBytes
@@ -2025,7 +2077,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- closed
       gate = Promise[Unit]()
       _ = crl.readGate = Some(gate.future)
-      extracting = host.control.transfers.closeForTransferOut(storeId)
+      extracting = host.control.transfers.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       _ <- pumpUntil(host, crl.readCalled.isCompleted)
       // The store loads again while the extraction's read is outstanding, recovering its transaction
       _ = host.loadStoreById(deviceA, storeId)
@@ -2060,7 +2112,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = CrashRecoveryLog.saveStoreState(storeId, fileState, Backend.crlSaveFile(storeDir))
       gate = Promise[Unit]()
       _ = crl.dropGate = Some(gate.future)
-      extracting = host.control.transfers.closeForTransferOut(storeId)
+      extracting = host.control.transfers.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       _ <- pumpUntil(host, crl.dropCalls.get == 1)
       // The store loads again from its save file while the extraction's drop is outstanding
       _ = host.loadStoreById(deviceA, storeId)

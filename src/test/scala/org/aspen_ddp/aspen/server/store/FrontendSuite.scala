@@ -712,6 +712,37 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
   }
 
+  // cross-document-review X-W23: TxFinalized during the save of adopted data defers the commit and drops the Tx from
+  // `transactions`; the commit is in neither heldCommits nor lockWaitingCommits, so without its own record a repair
+  // would find the object settled and consume the store's ErrorTree mark before the update applies
+  test("a commit finalized while it waits for its adopted data's save leaves its object unsettled for repair") {
+    withDataless(): (frontend, backend, net, crl) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
+      crl.holdTxSaves = true
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true, late = false, owed = Set(),
+        startTimestamp = HLCTimestamp.now))
+      frontend.transactions.contains(txid1) shouldBe false
+      committedMessages(net) shouldBe Nil
+
+      val stale = Promise[ReconcileResult]()
+      frontend.reconcileForRepair(repairSnapshot(frontend, op1), newerRepairState(), stale)
+      stale.future.value.get.get.stale shouldBe true
+
+      // A repair that waits for the object to settle runs once the save completes and the commit applies
+      val parked = Promise[ReconcileResult]()
+      frontend.reconcileForRepair(repairSnapshot(frontend, op1).copy(awaitSettle = true), newerRepairState(), parked)
+      parked.isCompleted shouldBe false
+
+      crl.holdTxSaves = false
+      crl.completeHeldTxSaves()
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+      // Its snapshot predates the commit, which changed what it recorded
+      parked.future.value.get.get.stale shouldBe true
+  }
+
   test("an abort voter given late client data applies a later commit only once that data is durable") {
     withDataless(missingDataWait = Duration.Zero): (frontend, backend, net, crl) =>
       val txd = dataUpdateTxd
@@ -3083,12 +3114,12 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(1, 1)
 
     commitErrors(frontend, net, txid1) shouldBe Nil
-    // txid2, recovered without a commit vote, applies and reports its object: it may have applied before the crash
-    // (Tx.issueCommits), so the finalizer marks the store and repair installs the object's current state
+    // txid2, recovered without a commit vote, applies nothing and reports its object: it may have applied before the
+    // crash (Tx.doCommit, X-W24), so the finalizer marks the store and repair installs the object's current state
     committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe
       List(txid1 -> Nil, txid2 -> List(oid1))
     backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
-    backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(2, 2)
+    backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(1, 1)
     stops shouldBe Nil
   }
 
@@ -3136,6 +3167,34 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       List(txid1 -> Nil, txid2 -> List(oid2))
     stops shouldBe Nil
   }
+
+  // cross-document-review X-W24: a recovered non-voter may have applied T and acknowledged it before the crash, so its
+  // finalizer left no mark; a key T blindly Inserted and a later transaction deleted would come back with no repair
+  for disposition <- List(TransactionDisposition.VoteAbort, TransactionDisposition.Undetermined) do
+    test(s"a recovered Tx without a commit vote ($disposition) applies nothing on a non-late commit and reports its " +
+         "objects (X-W24)") {
+      val backend = new MapBackend(storeId)
+      populate(backend)
+      val net = new TestNet
+      var stops = List[Throwable]()
+      val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net,
+        new TestCrl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded,
+        onFailStop = err => stops = stops :+ err)
+      backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+      // txid1 blindly Inserted key 4 under DoesNotExist; the store holds keys 1 to 3, as after a later deletion of 4
+      val txd = lockTxd(txid1, List(KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.DoesNotExist(k(4))))))
+      val state = TransactionRecoveryState(storeId, txd.serialize(),
+        List(ObjectUpdate(oid2, KeyValueOperation.encode(List(new Insert(k(4), Array[Byte](4))), ida)(0))),
+        disposition, TransactionStatus.Unresolved, PersistentState.initial)
+      frontend.recover(StoreRecoveryState(List(state), Map()))
+      committedMessages(net) shouldBe Nil
+
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false,
+        proof = false))
+      kvKeys(backend) should not contain k(4)
+      committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe List(txid1 -> List(oid2))
+      stops shouldBe Nil
+    }
 
   test("a commit vote recovered Committed reports its locks until it applies (Req R13)") {
     val backend = new DeferredCommitBackend

@@ -499,6 +499,9 @@ commit per object.
 * `commitInFlight(oid) = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)`.
 * `lockWaitingCommits: ObjectId -> List[Tx]`: committed transactions waiting to apply in lock order (8.3), by object
   they change (`Frontend.lockWaiters`). Not part of `commitInFlight`.
+* `adoptedDataSaves: ObjectId -> List[Tx]`: transactions saving object data adopted from a later prepare
+  (`Tx.saveAdoptedData`), by object they change, from the save's issue until it completes and a commit waiting for it
+  has applied or moved to one of the lists above. Not part of `commitInFlight`; only repair consults it.
 * `failedCommits`: never cleared; the store reloads with a new Frontend.
 * `allocationRecords`/`allocationsOf` and `blindInsertRecords`/`blindInsertsOf`: transactions whose CRL state may
   still hold an allocation or a blind KeyValue update of an object here (9.4).
@@ -628,11 +631,14 @@ mark it rebuild-required and unload it. Every fail-stop is a lost-store declarat
 protection against correlated lost store declarations"), so only a thrown apply and a failed load fail-stop.
 
 Objects whose earlier backend commit failed (`failedHere`) are left out of the apply for every Tx, voter or not, and
-reported. Skipped objects of a non-voter are reported only. A recovered Tx that did not vote commit and applies a
-committed update reports every changed object it applies: it may have applied the update before the crash as a
-non-voter, and a later transaction may have deleted a key it Inserts, which nothing in its CRL state shows (its update
-is dropped from the state only once it voted commit or applied in this incarnation, 9.4). The finalizer marks the
-store, and repair installs the object's current state. A non-voter is not counted, so this costs no margin.
+reported. Skipped objects of a non-voter are reported only. A recovered Tx that did not vote commit applies nothing on a commit and reports every object it changes
+(`Tx.doCommit`): it may have applied the update before the crash as a non-voter and acknowledged it, so T's finalizer
+left no mark, and with no vote it held no key lock keeping a later deletion of a key it Inserts out, which nothing in
+its CRL state shows (its update is dropped from the state only once it voted commit or applied in this incarnation,
+9.4); a re-apply could write that key back with no repair to follow. While T's marker has not written, the report
+marks the store and repair installs the object's current state; once T is finalized, the store either acknowledged T
+in its earlier life, so its backend holds the update, or the finalizer marked it. A non-voter is not counted, so this
+costs no margin.
 
 A failed backend commit keeps the Tx's CRL state, object data included, for the life of the loaded store
 (`Tx.keptForReplay`): its `TxCommitted` says so, so the finalizer gives a counted voter an UnackedCommits entry even
@@ -724,14 +730,15 @@ floor too); it is pruned at `expiryHeartbeat`. A commit held here past its TxFin
 `Frontend.deferredFinalizations`) is not in `transactions` and keeps no record alive, so its apply may miss a pruned
 deletion. It needs no report: it was finalized before it applied here, so no TxCommitted reached the finalizer within
 `errorTimeout` and the finalizer marked this store, and that mark's repair finds the object unsettled while the
-commit is held or queued (`settledForRepair`, repair-process 8.2; a commit held for its adopted object data is not,
-cross-document-review X-W23) and installs the current state after it applies. A deletion that reached the store through repair is covered by `repairInstalls` (below).
+commit is held, queued, or waiting for the save of object data it adopted from a late client prepare
+(`settledForRepair`, `Frontend.adoptedDataSaves`, repair-process 8.2) and installs the current state after it
+applies. A deletion that reached the store through repair is covered by `repairInstalls` (below).
 The finalizer marks the store, and the mark's repair installs the object's current state. A non-voter is not counted
 toward the write threshold, so the report costs a repair pass, not margin. A non-voter's Insert of a key no deletion
 reached reports nothing, so the routine non-voter of pipelined inserts into one leaf (its vote withheld behind an
 in-flight commit, a collision or lock-order wait, or its client prepare) leaves its transaction's finalizer on the
 clean fast path. The record is empty at load: the load's floor refuses every transaction started before it, and a
-recovered non-voter reports every object it applies.
+recovered non-voter applies nothing and reports every object it changes.
 
 A store can also hold a key's deletion it never applied: repair installs it from a read (a whole-object reconcile), at a
 store that may never have held the Insert either. A transaction T that reaches such a store later (a delayed client

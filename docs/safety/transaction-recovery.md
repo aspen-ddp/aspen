@@ -566,7 +566,9 @@ saved data.
   repairs its copy. A repair of an object the held commit changes does not consume that mark while the commit waits:
   a commit held for its turn is listed in `heldCommits` under every object it changes, part of `commitInFlight`, and
   a commit waiting in lock order is listed in `lockWaitingCommits` under every object it changes, wherever the locks
-  it waits for lie. Either makes the object unsettled (`Frontend.settledForRepair`), so the reconcile parks or answers
+  it waits for lie, and a commit waiting for the save of object data it adopted from a late client prepare
+  (`Tx.commitAwaitsData`) is listed in `adoptedDataSaves` under every object it changes until the save completes and
+  the commit has applied or taken one of the other two holds. Each makes the object unsettled (`Frontend.settledForRepair`), so the reconcile parks or answers
   stale, and a parked one runs only once the wait has ended and the commit persisted, its snapshot then showing the
   apply (repair-process.md 6.2, 8.2).
 
@@ -587,7 +589,8 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   object (superseded, traceless, or its data dropped once applied). A live voter's failed re-check is an invariant
   violation, logged at error, skipped and reported; an allocation the backend missed is reported (no copy, no lost
   lock); any apply that throws fail-stops the store (transaction-requirements.md 8.5). A recovered Tx that did not vote
-  commit reports every object it applies: it may have applied before the crash. A blind Insert of an absent key is
+  commit applies nothing and reports every object it changes (`Tx.doCommit`): it may have applied and acknowledged T
+  before the crash, leaving no mark, and with no vote it held no lock keeping a later deletion of a key T Inserts out. A blind Insert of an absent key is
   applied and its object reported where a repair wrote, or found current, a state newer than T's start
   (`Tx.repairInstalled`, `Frontend.recordRepairInstall`; a complete reconcile that changes nothing counts at its entry's minimum timestamp); where the Tx did
   not vote commit (it held no key lock keeping a later deletion out) and a committed Delete of the key started at or
@@ -600,7 +603,8 @@ commit whose entry it finds, or an expiry commit) goes through the ordinary path
   the routine non-voter of pipelined inserts keeps its transaction's finalizer on the clean fast path. These reports
   reach a finalizer only while T's marker has not yet written: an apply after T's finalization relies on the store's
   ErrorTree mark instead, which no repair of an object T changes consumes before T has applied there (7.3). A
-  recovered non-voter that acknowledged T before its crash has no such mark (cross-document-review X-W24).
+  recovered non-voter applies nothing, so it needs none: once T is finalized it either acknowledged T in its earlier
+  life, so its backend holds the update, or the finalizer marked it.
 * The CRL's drop of applied object data (`Tx.allObjectCommitsComplete`, `CrashRecoveryLog.dropTransactionObjectData`)
   is in memory only, so a crash can recover a Tx with data it already applied. For allocations this matters: a
   deletion of an object an unconcluded Tx allocated here waits (`Frontend.awaitAllocationsDurable`) until that Tx's

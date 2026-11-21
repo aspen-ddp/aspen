@@ -213,7 +213,8 @@
   entry included) is taken as already applied, neither reported nor kept: the vote held its locks until it applied
   and relocked them at recovery, so only its update and the writes after it in lock order changed the object
   (superseded, traceless, or its data dropped from the CRL by `persistWithoutUpdateOf`). A recovered Tx that did not
-  vote commit and applies a committed update reports every object it applies, since it may have applied before the
+  vote commit applies nothing on a commit and reports every object it changes (`Tx.doCommit`), since it may have applied
+  and acknowledged it before the
   crash. A lock-only object that fails the re-check is skipped and reported only. A fail-stopped store drops every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the
   store is rebuilt as a failed backend is. Never for a full device: a write-frozen store poisons the object instead
   (`poisonObject`, the `BackendCommitFailed` rule) and keeps serving. Every fail-stop is a lost-store declaration
@@ -326,10 +327,13 @@
   install was applied (every deferred, stale or no-op path reports false)
 - Parked repairs (repair-process 8.2): a reconcile whose `RepairSnapshot.awaitSettle` is set, finding its object
   unsettled (`settledForRepair`: a commit or repair write in flight or held, a committed transaction changing it
-  waiting in lock order, `lockWaitingCommits`, a failed commit, a deletion, holding for recovery), waits in
+  waiting in lock order, `lockWaitingCommits`, or saving object data it adopted from a late client prepare,
+  `adoptedDataSaves` (a `TxFinalized` meanwhile drops the Tx from `transactions` with its commit still to apply), a
+  failed commit, a deletion, holding for recovery), waits in
   `parkedRepairs` (at most one per object, a newer one answers the older stale) instead of answering stale.
   `commitTurnFree` runs it before telling any waiting transaction, so at a settled moment before the next commit starts,
-  and `releaseHeldMessages` runs all of them when holding ends. It runs once, through `reconcileForRepair` with
+  `adoptedDataSaved` once the adopted data is durable and the commit has moved on, and `releaseHeldMessages` runs all
+  of them when holding ends. It runs once, through `reconcileForRepair` with
   `awaitSettle` off. Past `Frontend.RepairSettleWait` (1 s, `expireParkedRepairs` on the store heartbeat) it answers
   stale. Fail-stop and close fail it
 - Parked reads (client 1-RTT commit design section 5): a client read whose `Read.awaitCommit` names a transaction

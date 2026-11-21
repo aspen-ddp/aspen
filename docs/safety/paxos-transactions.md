@@ -668,7 +668,8 @@ every prepare and accept response, retransmits included: write amplification, no
   key included (`Frontend.keyDeletedSince`, recorded by `Tx.issueCommits` through `recordKeyDeletions`), or, for a
   recovered commit vote, where the object's timestamp is past T's start (`Tx.issueCommits`, `reinserts`). A non-voter's
   Insert of a key no such deletion reached reports nothing. A non-voter does not count toward `t`, so its report costs
-  a repair pass, not margin. A recovered Tx that did not vote commit reports every object it applies.
+  a repair pass, not margin. A recovered Tx that did not vote commit applies nothing and reports every object it changes
+  (`Tx.doCommit`; transaction-requirements.md 8.5).
   Objects whose earlier backend commit failed are not applied and are reported.
 * **Forgetting a committed T.** Where its CRL record would be deleted (after `TxFinalized` and its backend commits), it
   is replaced by an applied stub if an UnackedCommits entry may name this store: `TxFinalized` listed it in `owed`, or

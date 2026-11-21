@@ -48,17 +48,7 @@ rebuild-process.md B19.)
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.2 [X-W23, X-W24] A commit applied after T's finalization with no ErrorTree mark left for the store.
-    PLAUSIBLE (both). Effort S each. cross-document-review.md, transaction-requirements.md 9.4,
-    transaction-recovery.md 7.4.
-    X-W23: a non-voter's commit waiting for data adopted from a late client prepare (commitAwaitsData /
-    adoptedDataUnsaved), deferred by a TxFinalized during that save, is in neither heldCommits nor
-    lockWaitingCommits, so settledForRepair lets repair consume its mark; its later blind Insert can write back a key
-    a later transaction deleted. Fix: count a commit held for adopted data as unsettled, as heldCommits is.
-    X-W24: a recovered non-voter that applied and acknowledged T before a crash (so no mark) re-applies T on a
-    non-late commit after T's finalization (sources: R-W12's relay, P-W9's path, a second driver); a key deleted
-    since comes back, its report reaching no finalizer. Fix: a recovered Tx without a commit vote applies nothing
-    on a commit and reports every changed object.
+(no open items)
 
 
 PRIORITY 3: systemic loss protection
@@ -117,7 +107,7 @@ PRIORITY 5: performance and hygiene
     Store.handleTransactionMessage's sender relay (msg.from != msg.to && !entry.finalized) ignores the self-send rule,
     so a same-host sibling answers an idle recovery driver with a non-late TxResolved from the shared status cache;
     actions re-run and, without a late answer within errorTimeout, marks, entries and stubs are written for every
-    store. Safe (cross-document-review 2.6 checks every shipped action), but wasteful; also feeds X-W24.
+    store. Safe (cross-document-review 2.6 checks every shipped action), but wasteful.
     Fix: skip the sender relay of a non-finalized entry when the sender is a store of this host.
 
 5.2 [RB-W20] An out-of-space write in retryFailures is recorded as an unreadable object.

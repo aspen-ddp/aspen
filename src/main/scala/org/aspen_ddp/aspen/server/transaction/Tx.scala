@@ -485,18 +485,24 @@ class Tx( trs: TransactionRecoveryState,
   private var adoptedDataUnsaved: Boolean = false
 
   /** Saves the state with the adopted data, then releases a commit held for it. Only once the objects have loaded:
-    * before then completeLoad calls it ahead of applying an outcome learned meanwhile
+    * before then completeLoad calls it ahead of applying an outcome learned meanwhile. While the save is outstanding
+    * the objects it changes are unsettled for repair (Frontend.adoptedDataSaving): a TxFinalized meanwhile drops this
+    * Tx from the Frontend's `transactions` with its commit still to apply, which the store's ErrorTree mark must
+    * outlive
     */
   private def saveAdoptedData(): Unit = if adoptedDataUnsaved && loadCompleted then
     adoptedSaves += 1
     val save = adoptedSaves
     val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
       disposition, savedStatus, acceptor.persistentState)
+    frontend.adoptedDataSaving(changedHere, this)
     saveState(state, () => frontend.post { () =>
       // Only the latest save holds all the adopted data
       if save == adoptedSaves then
         adoptedDataUnsaved = false
+        // The commit is applied, or registered where it waits, before the objects count as settled again
         releaseHeldCommit()
+        frontend.adoptedDataSaved(changedHere, this)
     })
 
   /** Counts saveAdoptedData's saves */
@@ -1169,11 +1175,22 @@ class Tx( trs: TransactionRecoveryState,
 
     // An applied stub: the store already holds this transaction's update (or must never take it through its
     // UnackedCommits entry), so nothing is applied again, as for a recovered commit vote whose entry was found. A
-    // recovered vote whose entry names another incarnation applies nothing either (unackedCommitNotOwed)
-    if notOwedHere || frontend.hasAppliedStub(transactionId) then
+    // recovered vote whose entry names another incarnation applies nothing either (unackedCommitNotOwed).
+    //
+    // A recovered Tx that did not vote commit applies nothing either (cross-document-review X-W24): it may have applied
+    // T as a non-voter and acknowledged it before the crash, so T's finalizer left this store no mark, and with no vote
+    // it held no lock keeping a later deletion of a key T blindly Inserts out, so a re-apply could write that key back
+    // with no repair to follow. Its report marks the store while T's marker has not written; once T is finalized, the
+    // store either acknowledged T in its earlier life, so its backend holds the update, or the finalizer marked it. A
+    // non-voter is not counted toward the write threshold, so this costs at most a repair pass
+    val recoveredNonVoter = recovered && disposition != TransactionDisposition.VoteCommit
+    if notOwedHere || recoveredNonVoter || frontend.hasAppliedStub(transactionId) then
       if notOwedHere then
         logger.info(s"Tx $transactionId. Store $storeId is owed nothing through its UnackedCommits entry: nothing " +
           s"is applied")
+      else if recoveredNonVoter then
+        logger.info(s"Tx $transactionId. Store $storeId recovered it without a commit vote: nothing is applied, its " +
+          s"objects $changedHere are reported for repair")
       else
         logger.info(s"Tx $transactionId. Store $storeId holds an applied stub for it: nothing is applied again")
       pendingObjectCommits = 0
@@ -1324,21 +1341,14 @@ class Tx( trs: TransactionRecoveryState,
     pendingObjectCommits = toCommit.size
     issuedCommits = toCommit.iterator.map(_.objectId).toSet
 
-    // A recovered transaction that did not vote commit here may have applied the update before the crash, as a
-    // non-voter learning the commit, and a later transaction may have deleted a key it Inserts: nothing in its CRL state
-    // tells (its update is dropped from it only once it voted commit or applied in this incarnation,
-    // Frontend.awaitBlindInsertsDurable). It applies the update and reports every changed object, so the finalizer marks
-    // the store and repair installs the object's current state. A non-voter is not counted, so this costs no margin
-    val reportedApplied =
-      if recovered && disposition != TransactionDisposition.VoteCommit then toCommit.map(_.objectId) else Nil
-    val reportedReinserts = toCommit.map(_.objectId).filter(oid => reinserts.contains(oid) &&
-      !reportedApplied.contains(oid))
+    // A recovered transaction that did not vote commit here never gets this far: it applies nothing (doCommit)
+    val reportedReinserts = toCommit.map(_.objectId).filter(reinserts.contains)
     if reportedReinserts.nonEmpty then
       logger.info(s"Tx $transactionId. Store $storeId applies a blind Insert of an absent key to objects " +
         s"${reportedReinserts.mkString(", ")}, on which a later write may have deleted it: reported for repair")
 
     // Assigned before the commit loop: a synchronous backend completes inside it
-    objectCommitErrors = uncommittable.toList ++ reportedApplied ++ reportedReinserts
+    objectCommitErrors = uncommittable.toList ++ reportedReinserts
 
     toCommit.foreach { os =>
       val allocating = txd.allocatingObjects.contains(os.objectId)

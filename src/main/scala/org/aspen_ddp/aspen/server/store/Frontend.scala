@@ -610,6 +610,22 @@ class Frontend(val storeId: StoreId,
   /** `tx` no longer waits to apply: it is applying, or queued for its turn */
   def lockWaitEnded(oids: Set[ObjectId], tx: Tx): Unit = oids.foreach(oid => removeFrom(lockWaitingCommits, oid, tx))
 
+  /** Transactions saving object data adopted from a later prepare (Tx.saveAdoptedData), by object they change. A
+    * commit waits for that save, and a TxFinalized meanwhile drops the Tx from `transactions` (finalizationDeferred)
+    * while it is in neither heldCommits nor lockWaitingCommits, so this keeps its objects unsettled for repair
+    * (settledForRepair) until the save completes and the commit takes one of those paths or applies
+    */
+  private val adoptedDataSaves = scala.collection.mutable.HashMap[ObjectId, List[Tx]]()
+
+  /** `tx` issued a save of adopted object data for its changes of `oids` */
+  def adoptedDataSaving(oids: Set[ObjectId], tx: Tx): Unit =
+    oids.foreach(oid => adoptedDataSaves(oid) = adoptedDataSaves.getOrElse(oid, Nil).filterNot(_ eq tx) :+ tx)
+
+  /** `tx`'s adopted data is durable and its held commit, if any, has moved on: a parked repair may run now */
+  def adoptedDataSaved(oids: Set[ObjectId], tx: Tx): Unit =
+    oids.foreach(oid => removeFrom(adoptedDataSaves, oid, tx))
+    oids.foreach(retryParkedRepair)
+
   /** A committed transaction's wait to apply ended: the votes withheld for it (lockWaiters) decide, unless a commit of
     * the object is now in flight, whose completion tells them instead
     */
@@ -2313,14 +2329,16 @@ class Frontend(val storeId: StoreId,
     * While holding for recovered transactions, their locks are not all taken: the store's own locks would not defer
     * what they cover. A committed transaction that changes the object and has yet to apply here, held for its turn
     * (heldCommits, within commitInFlight) or waiting in lock order for a commit vote whose locks may lie on another
-    * object only (lockWaitingCommits), is unsettled work too: a completed pass would consume the store's ErrorTree mark
-    * for it, and its later blind Insert of an absent key could write back a key a later transaction deleted, with no
-    * mark left (transaction-recovery 7.4). A parked repair runs once the wait ends and the commit persists
-    * (lockWaitWakeVoters, commitTurnFree)
+    * object only (lockWaitingCommits), or waiting for the save of object data it adopted from a later prepare
+    * (adoptedDataSaves), is unsettled work too: a completed pass would consume the store's ErrorTree mark for it, and
+    * its later blind Insert of an absent key could write back a key a later transaction deleted, with no mark left
+    * (transaction-recovery 7.4). A parked repair runs once the wait ends and the commit persists (lockWaitWakeVoters,
+    * commitTurnFree, adoptedDataSaved)
     */
   private def settledForRepair(objectId: ObjectId): Boolean =
-    !(holding || commitInFlight(objectId) || lockWaitingCommits.contains(objectId) || commitFailed(objectId) ||
-      committing.contains(objectId) || deleting.contains(objectId))
+    !(holding || commitInFlight(objectId) || lockWaitingCommits.contains(objectId) ||
+      adoptedDataSaves.contains(objectId) || commitFailed(objectId) || committing.contains(objectId) ||
+      deleting.contains(objectId))
 
   /** Runs the repair parked on `objectId` once the object is settled. It runs once: still unsettled then (the store
     * serves another state, say), it answers stale

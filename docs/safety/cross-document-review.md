@@ -27,7 +27,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Transaction requirements | CRL, recovery | Recovered commit votes, unresolved or with a restored committed resolution, re-take their locks and slice reservations before any message is handled, and a restored one holds them until it applies (transaction-requirements.md R13) |
 | Transaction requirements | CRL, recovery | A key's deletion (commit or repair write) reaches the backend only once no CRL state holding an applied blind Insert of the key remains (`Frontend.awaitBlindInsertsDurable`), so a recovered Insert of an absent key was never applied |
 | Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter whose re-check fails holds it already (2.3) |
-| Transaction requirements | Repair | Every repair write, and every complete reconcile pass that changes nothing (at its entry's minimum timestamp), tells every Tx of the object started before the timestamp it records (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert of an absent key applied after it reports the object; a non-voter's blind Insert of an absent key reports its object also where a committed Delete of the key started at or after its start applied here (`Frontend.keyDeletedSince`), and only while the Tx is in `Frontend.transactions` and its marker has not written; a later apply relies on the store's ErrorTree mark, which no reconcile of an object it changes consumes while its commit is held or waits in lock order (`Frontend.settledForRepair`), with two gaps: a commit held for adopted object data (X-W23) and a recovered non-voter that acknowledged T before its crash (X-W24) |
+| Transaction requirements | Repair | Every repair write, and every complete reconcile pass that changes nothing (at its entry's minimum timestamp), tells every Tx of the object started before the timestamp it records (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert of an absent key applied after it reports the object; a non-voter's blind Insert of an absent key reports its object also where a committed Delete of the key started at or after its start applied here (`Frontend.keyDeletedSince`), and only while the Tx is in `Frontend.transactions` and its marker has not written; a later apply relies on the store's ErrorTree mark, which no reconcile of an object it changes consumes while its commit is held, waits in lock order, or waits for the save of object data it adopted from a late client prepare (`Frontend.settledForRepair`); a recovered Tx without a commit vote applies nothing on a commit and reports every object it changes (`Tx.doCommit`), since it may have acknowledged T before its crash and left no mark |
 | Requirements (lock order) | Recovery | Every recovered commit vote (unresolved, or with a restored committed resolution) has relocked before a recovered Tx that does not relock applies (`Frontend.recoveredTransactionLoaded`, transaction-recovery.md 7.2) |
 | Requirements (slice limit) | Repair, rebuild | The commit votes a store holds on a KeyValue object fit the KeyValue limit together (`Frontend.maxKVSliceSize`, `ObjectState.sliceReservations`, R16); a repair install keeps them fitting (`Frontend.repairFitsReservations`, repair-process.md M6a), and the union of every committed update, which repair and rebuild install unchecked, fits `maxSliceSize` because the KeyValue limit is `t / w` of it (R16), a rebuilt store admitting no growth of an object it may hold without an inherited commit until repaired (2.3) |
 | Client reads | Requirements, rebuild | `InvalidObject.provesDeletion`: a commit voter of an unapplied allocation answers `AllocationPending` (2.5) |
@@ -123,10 +123,12 @@ The premises other subsystems take from this:
   commit held for its turn is in `heldCommits`, part of `commitInFlight`, and a commit waiting in lock order is in
   `lockWaitingCommits`, each under every object it changes wherever the locks or commits it waits for lie, so those
   objects are unsettled (`Frontend.settledForRepair`) and no reconcile installs or completes there until it has
-  applied. A third hold is in neither list: a committed non-voter waiting for object data it adopted from a late
-  client prepare to be saved (`Tx.commitAwaitsData`, `adoptedDataUnsaved`), which `TxFinalized` can also defer, so a
-  reconcile may consume its mark before it applies (X-W23). A recovered vote with a restored resolution is safe either
-  way: its kept CRL state applies it again after a reload without the entry.
+  applied. A committed non-voter waiting for object data it adopted from a late client prepare to be saved
+  (`Tx.commitAwaitsData`, `adoptedDataUnsaved`), which `TxFinalized` can also defer, is in `adoptedDataSaves` under
+  every object it changes from the save's issue until the save completes and the commit has applied or taken one of
+  the other two holds (`Tx.saveAdoptedData`, `Frontend.adoptedDataSaved`), so its objects are unsettled meanwhile
+  too. A recovered vote with a restored resolution is safe either way: its kept CRL state applies it again after a
+  reload without the entry.
 * **Kept state after finalization is concluded only with T decided.** `Frontend.concludeTransactionState` with
   `keepAdmission` (a replay's Tx is live) replaces or deletes the CRL record that live Tx shares, so its later
   promises and accepts are acknowledged unwritten (C9). It runs only for a finalized T (after its backend commits),
@@ -387,10 +389,12 @@ The premises other subsystems take from this:
   6.2). A non-voter still holding T, which held no key lock that
   kept a deletion out, also reports a blind Insert of an absent key where a committed Delete of the key started at or
   after T's start applied here (`Frontend.keyDeletedSince`), and a recovered non-voter (after a restart, a transfer or
-  an adoption) reports every object it applies (`Tx.issueCommits`). These notices reach only Txs in
-  `Frontend.transactions`, and a report only a finalizer still running: a commit applied after T's finalization
-  relies on the store's ErrorTree mark, which no reconcile of an object it changes consumes while the commit is held
-  or waits in lock order (`Frontend.settledForRepair`).
+  an adoption) applies nothing on a commit and reports every object it changes (`Tx.doCommit`). These notices reach
+  only Txs in `Frontend.transactions`, and a report only a finalizer still running: a commit applied after T's
+  finalization relies on the store's ErrorTree mark, which no reconcile of an object it changes consumes while the
+  commit is held, waits in lock order or waits for its adopted data's save (`Frontend.settledForRepair`). A recovered
+  non-voter needs no mark: once T is finalized it either acknowledged T in its earlier life, so its backend holds the
+  update, or the finalizer marked it.
 * Rebuild installs a KeyValue object's read state with no size check (`RebuildingStore.restore`); repair checks it
   only beside held votes' reservations (`Frontend.repairFitsReservations`). A committed apply never exceeds the limit
   at a commit voter, since the votes a store holds fit together (R16) and a repair install that would break that is
@@ -450,7 +454,7 @@ at its key, checking the key but not the node it names (X-W25, a performance cos
 writes marks and entries for stores that no longer hold T, which repair consumes as no-ops (below the floor, no Tx),
 and the stubs its `TxFinalized` has stores write expire (`Frontend.expireStubs`). No compute or durable-task code
 registers a finalization action. A recovered commit voter that re-applies on such a non-late outcome is safe by the
-re-check rules of 2.3; a recovered non-voter is not always (X-W24). A prepare dropped by CRL admission
+re-check rules of 2.3; a recovered non-voter applies nothing and reports its objects (`Tx.doCommit`). A prepare dropped by CRL admission
 (`Store.receiveTransactionMessage`, lane full) gets no relay either; every store still holding T answers itself, so
 that only delays the sender.
 
@@ -517,7 +521,7 @@ Terms the documents share mean the same in each:
 
 * A transaction that "holds" or "has applied" a blind Insert's update at a store, for a key deletion's wait, includes
   a commit voter that has not applied yet (`Tx.holdsUpdateOf`; crash-recovery-log.md 3.4, transaction-requirements.md
-  9.4, 2.3 above). A recovered non-voter that applied before its crash is not one (X-W24).
+  9.4, 2.3 above). A recovered non-voter is not one, and applies nothing (`Tx.doCommit`).
 * A "recovered" commit vote is one rebuilt from the CRL at load (`Tx.recovered`). A live voter applying through its
   UnackedCommits entry past expiry is not one: its failed re-check is a live voter's invariant violation.
 * The collision wait is `Tx.CollisionWait`, 500 ms checked at the 1 s store heartbeat, so up to about 1.5 s, for a
@@ -534,8 +538,6 @@ Between the documents, each disagreement found is corrected where it stood:
   creates nothing; the rebuilt store's muted Tx is now excepted in both.
 * transaction-requirements.md 10.5(c) says a refcount requirement fails at a store that applied a later chained
   write. That rests on the `updateSerial` convention (X-W27), which it now names.
-* transaction-requirements.md 9.4 and transaction-recovery.md 7.4 rely on the ErrorTree mark for every apply after
-  T's finalization; each now names the exception it misses (X-W23, X-W24).
 
 Between a document, scaladoc or guide outside docs/safety and the code:
 
@@ -549,48 +551,6 @@ Between a document, scaladoc or guide outside docs/safety and the code:
 ---
 
 ## Open weaknesses
-
-### X-W23: A commit held for its adopted object data past TxFinalized leaves its objects settled for repair
-Verdict PLAUSIBLE. Priority 2. Effort S.
-Mechanism: a Tx created by a driver's prepare carries no object data; a commit it learns waits for it
-(`Tx.commitAwaitsData`). The client's late prepare brings the data: `Tx.adoptObjectUpdates` sets `adoptedDataUnsaved`
-and saves, and the commit waits for that save (`saveAdoptedData`). A `TxFinalized` arriving during the save has
-`Tx.finalized` defer (`commitHeld`, `Frontend.finalizationDeferred`) and the Frontend drop the Tx from
-`transactions`. It is in neither `heldCommits` nor `lockWaitingCommits`, so `Frontend.settledForRepair` is true for
-its objects and `mayHoldTransaction` false, and for a T started below the floor (a client prepare more than a horizon
-late) `mayJoinTransaction` is false too. The store's ErrorTree mark for T (it sent no `TxCommitted`, so the finalizer
-marked it) can then be reconciled and deleted in that window. When the save completes T applies as a non-voter
-outside `transactions`, so `keyDeletedSince` is not consulted and any report reaches no finalizer: a blind Insert of a
-key that a later T2 deleted here (T2's apply did not wait, as T holds no locks) passes its `DoesNotExist` re-check and
-writes the key back.
-Consequence: a deleted key resurrected at one store with no entry left to repair it: permanent divergence, one unit
-of the object's margin. Needs a client prepare older than the horizon, a `TxFinalized` landing within one CRL save,
-and a repair pass of the object in that window.
-Fix: treat a commit held for adopted data as unsettled work, as `heldCommits` is (an object set kept from
-`adoptObjectUpdates` until `saveAdoptedData` releases the commit and it persists), so the parked repair runs after
-the apply; or have a Tx finalized while its commit awaits adopted data apply nothing, since the finalizer marked the
-store.
-
-### X-W24: A recovered non-voter that acknowledged T before its crash re-applies T after T's finalization unmarked
-Verdict PLAUSIBLE. Priority 2. Effort S.
-Mechanism: store S applies committed T as a non-voter and sends `TxCommitted` once its backend commits persisted, so
-T's finalizer gives S no mark. S crashes before `TxFinalized`; T's CRL state survives with its object data (the drop
-after apply is in memory only, `CrashRecoveryLog.dropTransactionObjectData`). After the reload the recovered Tx is
-unresolved in `transactions`. A later T2, started after S's load floor, deletes a key k that T Inserted blindly:
-`Frontend.awaitBlindInsertsDurable` does not wait for T (`Tx.holdsUpdateOf` is false: no commit vote, nothing issued
-in this incarnation), so the deletion reaches the backend. If T then learns a non-late commit (the finalizing
-driver's `TxFinalized`, a second driver's resent `TxResolved`, paxos-transactions.md P-W9, or a sibling relay,
-transaction-recovery.md R-W12), it applies, behind T2 in lock order if S voted on T2, and its Insert of the absent k
-passes its re-check and writes k back. It reports every object it applies (`Tx.issueCommits`, `reportedApplied`), but
-in a `TxCommitted` to `lastProposer` after T's marker has written or been cancelled, so no finalizer marks S, and S's
-earlier acknowledgment left no mark either. Learning the commit late instead applies nothing, which is right.
-Consequence: a deleted key resurrected at one store with no entry: permanent divergence. Needs a crash between T's
-apply and its `TxFinalized` at S, a deletion of a key T inserted started after the reload, and a non-late outcome
-reaching S after that deletion's vote or apply.
-Fix: have a recovered Tx without a commit vote apply nothing on a commit and report every changed object in
-`TxCommitted.objectCommitErrors`, as it reports what it applies now. While T's marker has not written, that marks S;
-after T's finalization S either acknowledged T in its earlier life, so its backend holds T's update, or was marked by
-the finalizer. A non-voter is not counted, so this costs at most a repair pass.
 
 ### X-W25: The join finalization action removes an upper-tier entry by its key alone
 Verdict PLAUSIBLE. Priority 5. Effort S.

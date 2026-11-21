@@ -95,7 +95,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   after load so a client retransmit that arrives first is still checked. This holds for data-less transactions too, so
   their late resolution may take 5 s longer. A vote
   given stands, but later data is still used to apply a commit. Adopted data is saved to the CRL first: the commit
-  waits for that save (`Tx.adoptedDataUnsaved`, `saveAdoptedData`; P13). A delayed duplicate client prepare of an
+  waits for that save (`Tx.adoptedDataUnsaved`, `saveAdoptedData`; P13), its objects unsettled for repair meanwhile
+  (`Frontend.adoptedDataSaves`), since a `TxFinalized` during the save drops the Tx from `transactions`. A delayed duplicate client prepare of an
   aborted transaction cannot commit it: every store that took part remembers the abort for longer than it would join T,
   and refuses T past its forget floor (below)
 - Description validation (transaction-requirements 2.5): a client-prepared Tx checks its description once,
@@ -288,7 +289,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   meets an invariant violation: it logs `INVARIANT VIOLATION` at error, naming the transaction each object now shows
   (where two conflicting commits would surface), and skips and reports the object. A recovered voter (through its
   entry too) takes such an object as already applied (`Tx.issueCommits`, transaction-requirements 8.5); a recovered
-  Tx that did not vote commit reports every object it applies. A lock-only object that fails the re-check is skipped
+  Tx that did not vote commit applies nothing and reports every object it changes (`Tx.doCommit`): it may have applied
+  and acknowledged T before its crash, leaving no ErrorTree mark, and held no lock keeping a later deletion of a key T
+  Inserts out. A lock-only object that fails the re-check is skipped
   and reported only
 - Lock order (transaction-requirements 8.3, R15): a committed Tx holding no locks at a store does not apply while
   another Tx there holds locks its requirements or writes collide with (`RequirementsChecker.lockHolders`) on an

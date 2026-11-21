@@ -1641,7 +1641,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(movingStore, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.transfers.startOut(StartStoreTransfer(host.hostId, client.clientId,
+      _ = host.control.transfersOut.startOut(StartStoreTransfer(host.hostId, client.clientId,
             sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
       _ <- pumpUntil(sends.isTransferringOut(movingStore))
     yield

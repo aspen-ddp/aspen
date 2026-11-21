@@ -668,7 +668,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
   private def deliver(host: Host, sends: StagedSendService, ask: StartStoreTransfer): Future[Unit] =
     given ExecutionContext = executionContext
     for
-      _ <- host.control.transfers.startOut(ask)
+      _ <- host.control.transfersOut.startOut(ask)
       _ <- pumpUntil(sends.transfersOut.nonEmpty)
     yield ()
 

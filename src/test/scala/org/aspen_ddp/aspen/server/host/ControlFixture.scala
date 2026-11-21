@@ -323,7 +323,7 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
         leave()
         Future.failed(Host.StoreFailedOnClose(storeId))
       case None =>
-        transferOutCloseGate.get.map(_.future).getOrElse(attached.control.transfers.closeForTransferOut(storeId, sourceDs))
+        transferOutCloseGate.get.map(_.future).getOrElse(attached.control.transfersOut.closeForTransferOut(storeId, sourceDs))
 
   /** The seams that make a Host record and, where a test asks, hold or fail what the old RecordingHost did. `None`
    *  fields keep the production behaviour; the schedule of retries and timeouts goes through `scheduler`. */

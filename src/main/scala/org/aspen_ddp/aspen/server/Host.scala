@@ -325,7 +325,7 @@ class Host(val client: AspenClient,
     shutdownWorkTimeout = shutdownWorkTimeout,
     gossipStoreOnline = seams.gossipStoreOnline.getOrElse(storeId => deviceControl.services.gossipStoreOnline(storeId)),
     closeStoreForTransferOut = seams.closeForTransferOut.getOrElse(
-      (storeId, sds) => deviceControl.transfers.closeForTransferOut(storeId, sds)),
+      (storeId, sds) => deviceControl.transfersOut.closeForTransferOut(storeId, sds)),
     closeStoreForShutdown = seams.closeForShutdown.getOrElse(
       storeId => deviceControl.shutdown.closeForShutdown(storeId)),
     scheduleShutdownWorkTimeout = seams.scheduleShutdownWorkTimeout.getOrElse(
@@ -545,7 +545,7 @@ class Host(val client: AspenClient,
     event match {
 
       case HostMsg(msg) => msg match
-        case m: StartStoreTransfer => transfers.startOut(m)
+        case m: StartStoreTransfer => deviceControl.transfersOut.startOut(m)
         case m: CheckStorageDevice => reconciler.handleCheckMessage(m)
         case m: (ServiceMessage | ExecuteSystemTask) => services.deliver(m)
       

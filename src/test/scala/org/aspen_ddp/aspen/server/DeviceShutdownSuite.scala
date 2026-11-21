@@ -311,7 +311,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- setDeviceState(sourceId)(_.copy(status = DeviceStatus.ShuttingDown))
       _ <- waitForTransactionsToComplete()
-      refused <- host.control.transfers.startOut(StartStoreTransfer(host.hostId, client.clientId,
+      refused <- host.control.transfersOut.startOut(StartStoreTransfer(host.hostId, client.clientId,
                    sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID())).failed
     yield
       refused.getMessage should include("ShuttingDown")
@@ -610,7 +610,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(storeDir)
     val local = loadedDevices(host)(sourceId)
     local.loadedStores = local.loadedStores + movingStore
-    def ask() = host.control.transfers.startOut(StartStoreTransfer(host.hostId, client.clientId,
+    def ask() = host.control.transfersOut.startOut(StartStoreTransfer(host.hostId, client.clientId,
       sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
 
     for
@@ -664,7 +664,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       // The request passes every check and starts closing the store, which is held open.
       transferGate = recorded(host).holdTransferOutCloses()
-      _ <- host.control.transfers.startOut(StartStoreTransfer(host.hostId, client.clientId,
+      _ <- host.control.transfersOut.startOut(StartStoreTransfer(host.hostId, client.clientId,
              sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
       closesRequested = recorded(host).transferOutCloses.toList
       // The device's shutdown begins meanwhile and is held in its own close of the store. The

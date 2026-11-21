@@ -282,7 +282,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         hasMarker(local, storeId, StoreDirMarkers.Marker.TransferOut)
       ).partition(ctx.storeTransferService.isTransferringOut)
       abandonedOut.foreach: storeId =>
-        ctx.transfers.reinstateAbandonedOut(local, storeId)
+        ctx.transfersOut.reinstateAbandonedOut(local, storeId)
       if stillSending.nonEmpty then
         scheduleDeviceRecheck(local.storageDeviceId)
 

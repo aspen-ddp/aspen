@@ -96,7 +96,7 @@ class TransactionBuilder(
     *
     * A pool missing from either map is treated as unlimited by that map.
     */
-  def buildTranaction(poolIDAMap: Map[PoolId, IDA],
+  def buildTransaction(poolIDAMap: Map[PoolId, IDA],
                       poolMaxObjectSizeMap: Map[PoolId, Option[Int]],
                       poolMaxSliceSizeMap: Map[PoolId, Option[Int]]): (TransactionDescription,
     Map[StoreId, TransactionData], HLCTimestamp) = synchronized {

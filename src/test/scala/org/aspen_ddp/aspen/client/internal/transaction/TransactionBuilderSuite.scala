@@ -36,7 +36,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   private val appended = Array.tabulate[Byte](50)(i => (i * 7 + 1).toByte)
 
   private def build(bldr: TransactionBuilder, ida: IDA) =
-    bldr.buildTranaction(Map(p1.poolId -> ida), Map(p1.poolId -> None), Map())
+    bldr.buildTransaction(Map(p1.poolId -> ida), Map(p1.poolId -> None), Map())
 
   private val kvp = KeyValueObjectPointer(ObjectId(new UUID(0, 9)), PoolId(new UUID(0, 0)), Array[Byte]())
 
@@ -45,7 +45,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
     bldr.replaySafe("test")
     val deleted = ops.collect { case d: Delete => KeyRevision(d.key, rev1) }
     bldr.update(kvp, Some(rev1), None, deleted, ops)
-    val (txd, _, _) = bldr.buildTranaction(Map(kvp.poolId -> Replication(3, 2)),
+    val (txd, _, _) = bldr.buildTransaction(Map(kvp.poolId -> Replication(3, 2)),
       Map(kvp.poolId -> None), Map())
     txd.requirements.collectFirst { case r: KeyValueUpdate => r.deletesKeys }.get
 
@@ -56,7 +56,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
     bldr.addAllocatingObject(kvp)
     bldr.addAllocatingObject(kv2)
     bldr.addAllocatingObject(kvp)
-    val (txd, _, _) = bldr.buildTranaction(Map(kvp.poolId -> Replication(3, 2)), Map(kvp.poolId -> None), Map())
+    val (txd, _, _) = bldr.buildTransaction(Map(kvp.poolId -> Replication(3, 2)), Map(kvp.poolId -> None), Map())
     val allocActions = txd.finalizationActions.filter(_.typeId.uuid == AllocationFinalizationAction.typeUUID)
     allocActions.map(fa => ObjectPointer(fa.data).id).sortBy(_.uuid) shouldBe List(kvp.id, kv2.id).sortBy(_.uuid)
   }
@@ -139,7 +139,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   private def withPins[T](f: => T): T = f
 
   private def buildPin(bldr: TransactionBuilder) =
-    bldr.buildTranaction(Map(p1.poolId -> Replication(3, 2)),
+    bldr.buildTransaction(Map(p1.poolId -> Replication(3, 2)),
       Map(p1.poolId -> None), Map())
 
   private val k1 = Key(Array[Byte](1))

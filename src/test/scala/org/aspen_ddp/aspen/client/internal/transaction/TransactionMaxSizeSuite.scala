@@ -32,10 +32,10 @@ class TransactionMaxSizeSuite extends AnyFunSuite with Matchers {
     b
 
   private def build(bldr: TransactionBuilder, ida: IDA, max: Option[Int]) =
-    bldr.buildTranaction(Map(pool -> ida), Map(pool -> max), Map())
+    bldr.buildTransaction(Map(pool -> ida), Map(pool -> max), Map())
 
   private def buildKV(bldr: TransactionBuilder, ida: IDA, sliceLimit: Option[Int]) =
-    bldr.buildTranaction(Map(pool -> ida),
+    bldr.buildTransaction(Map(pool -> ida),
       Map(pool -> sliceLimit.map(ida.maxObjectSize(_))), Map(pool -> sliceLimit))
 
   private def state(ida: IDA, length: Int): RangedWriteState =

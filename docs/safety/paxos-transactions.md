@@ -29,7 +29,7 @@ scenarios; 12 accepted limitations; open weaknesses (last).
 | Role | Who | Notes |
 |---|---|---|
 | Client | `client/internal/transaction/ClientTransactionDriver`, `SimpleClientTransactionDriver` | Builds the `TransactionDescription` (txd) and each store's object data, sends prepares to every store of every referenced pool, retransmits until the leader's outcome or the give-up point. Learns a commit from the stores' votes (P-VC), never an abort. Not a Paxos participant. |
-| Primary pool | the pool of `txd.primaryObject` | Chosen in `TransactionBuilder.buildTranaction` as the object requirement whose pool IDA is greatest (`maxBy(poolIDAMap)`). Its `w` stores are the Paxos acceptors; its IDA's `writeThreshold` is the quorum. |
+| Primary pool | the pool of `txd.primaryObject` | Chosen in `TransactionBuilder.buildTransaction` as the object requirement whose pool IDA is greatest (`maxBy(poolIDAMap)`). Its `w` stores are the Paxos acceptors; its IDA's `writeThreshold` is the quorum. |
 | Secondary pools | the other pools the txd references | Their stores vote on their own objects and run an `Acceptor` like any Tx, but are not acceptors: the driver feeds only primary-pool promises to its `Proposer` (`TransactionDriver.isValidAcceptor`) and sends `TxAccept` only to `txd.primaryObjectDataStores`. |
 | Designated leader | primary-pool store `txd.designatedLeaderUID` | Chosen by the client among stores believed online (`client/internal/transaction/DesignatedLeader`). Its first driver, created by the client's prepare, is the normal-case proposer and learner. |
 | Recovery driver | any store whose `Tx` is idle | `Store.heartbeat` drives a Tx idle for more than `Host.txHeartbeatTimeout` (5 heartbeats); `server/SimpleDriverRecoveryMixin` drives one idle for more than the factory's `failedDriverDuration` (`2 * maxDelay`, 6 s in production). Same `TransactionDriver` class. A driver on a secondary-pool store is learn-only (7.6). |
@@ -350,7 +350,7 @@ Notation: client `C`; primary pool stores `P0..P4`, leader `L = P2`, `t = 3`; on
 
 | # | Step | Code |
 |---|---|---|
-| 1 | Client builds the txd: `startTimestamp = HLCTimestamp.now`, primary object, designated leader, `originatingClient`. | `TransactionBuilder.buildTranaction` |
+| 1 | Client builds the txd: `startTimestamp = HLCTimestamp.now`, primary object, designated leader, `originatingClient`. | `TransactionBuilder.buildTransaction` |
 | 2 | Client sends the prepares and retransmits all of them every 1 s until the leader's outcome or the give-up point; a transaction already past give-up at `begin()` is never sent. | `ClientTransactionDriver.sendPrepareMessages`, `SimpleClientTransactionDriver.tick` |
 | 3 | Store entry: `Store.receiveTransactionMessage` applies CRL admission to prepares of unseen transactions and to prepares bringing uncounted data (`Frontend.admitPrepare`), dropping a `Full` or `Oversized` one without a reply (10.2). `Store.handleTransactionMessage` answers from the status cache (10.6) and, at the designated leader, starts a driver unless T is finalized in the cache, starts too far ahead, or is refused below the floor. The Frontend then finds or creates the Tx. | `Store.handleTransactionMessage`, `Frontend.receivePrepare` |
 | 4 | New Tx: reads its hosted objects; once loaded, `completeLoad` decides the vote and locks. | `Frontend.createTx`, `Tx.completeLoad` |

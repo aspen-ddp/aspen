@@ -359,7 +359,7 @@ class TransactionImpl(val client: AspenClient,
             val poolMaxObjectSizeMap = pools.map((poolId, pool) => poolId -> pool.maxObjectSize)
             val poolMaxSliceSizeMap = pools.map((poolId, pool) => poolId -> pool.maxSliceSize)
             bldr.onBuilt = client.testingOnlyOnBuilt
-            val (txd, transactionData, _) = bldr.buildTranaction(poolIDAMap,
+            val (txd, transactionData, _) = bldr.buildTransaction(poolIDAMap,
               poolMaxObjectSizeMap, poolMaxSliceSizeMap)
 
             //---- Tx Debugging ----

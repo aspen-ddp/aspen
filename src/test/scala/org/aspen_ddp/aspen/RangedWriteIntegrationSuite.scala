@@ -518,7 +518,7 @@ class RangedWritePayloadSuite extends AnyFunSuite with Matchers:
       HLCTimestamp.now, HLCTimestamp.now, ida, 0, DataBuffer(content)))
     val bldr = new TransactionBuilder(TransactionId(new UUID(0, 2)), (_, _) => 0.toByte, ClientId(new UUID(0, 4)))
     bldr.rangedWrites(state, writes, false)
-    val (_, updates, _) = bldr.buildTranaction(Map(pointer.poolId -> ida),
+    val (_, updates, _) = bldr.buildTransaction(Map(pointer.poolId -> ida),
                                                Map(pointer.poolId -> None), Map())
     updates.size should be (ida.width)
     (0 until ida.width).toList.map: i =>

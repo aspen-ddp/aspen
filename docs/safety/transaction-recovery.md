@@ -250,7 +250,7 @@ the client.
   committed; every path that concludes T finalized rests on acceptors having forgotten T, which happens only on
   TxFinalized, sent once a finalizer completed every action. `complete` fails with the first failure once all have
   settled. An action whose type cannot be loaded, or whose factory throws, is a failed action (`Finalizer.of`), so the
-  marker still runs. The marker is the first action (`TransactionBuilder.buildTranaction` prepends it). An action
+  marker still runs. The marker is the first action (`TransactionBuilder.buildTransaction` prepends it). An action
   whose `execute()` throws is a failed action too: `Finalizer` catches the throw as that action's failure, so the
   finalizer is still created, the actions after it still execute, and the marker still receives `commitVoters` and
   `updateCommitErrors` and is cancelled with the others; no marker is left running outside a finalizer. The shipped
@@ -315,7 +315,7 @@ the client.
 
 ### 5.2 `MissedUpdateFinalizationAction`
 
-Added to every transaction by `TransactionBuilder.buildTranaction` unless `disableMissedUpdateTracking`
+Added to every transaction by `TransactionBuilder.buildTransaction` unless `disableMissedUpdateTracking`
 (`MissedUpdateFinalizationAction.limitTracking`, used only for writes about the pool they touch: in practice the
 bootstrap pool's own trees, healed by the bootstrap tree sweep instead, repair-process.md).
 

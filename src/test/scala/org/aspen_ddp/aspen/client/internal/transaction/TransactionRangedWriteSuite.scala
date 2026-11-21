@@ -34,7 +34,7 @@ class TransactionRangedWriteSuite extends AnyFunSuite with Matchers {
       ars, 0, DataBuffer(bytes)))
 
   private def build(bldr: TransactionBuilder, ida: IDA, maxObjectSize: Option[Int] = None) =
-    bldr.buildTranaction(Map(p1.poolId -> ida), Map(p1.poolId -> maxObjectSize), Map())
+    bldr.buildTransaction(Map(p1.poolId -> ida), Map(p1.poolId -> maxObjectSize), Map())
 
   private def bytes(s: String): Array[Byte] = s.getBytes("UTF-8")
 

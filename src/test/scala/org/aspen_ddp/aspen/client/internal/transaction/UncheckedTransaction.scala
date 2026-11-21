@@ -21,5 +21,5 @@ object UncheckedTransaction:
     build(bldr)
     val pools = Future.sequence(bldr.allReferencedPoolIds.toList.map(id => client.getStoragePool(id).map(id -> _)))
     pools.flatMap: ps =>
-      val (txd, data, _) = bldr.buildTranaction(ps.map((id, pool) => id -> pool.ida).toMap, Map(), Map())
+      val (txd, data, _) = bldr.buildTransaction(ps.map((id, pool) => id -> pool.ida).toMap, Map(), Map())
       client.txManager.runTransaction(txd, data, None).map(_ == ClientOutcome.Committed)

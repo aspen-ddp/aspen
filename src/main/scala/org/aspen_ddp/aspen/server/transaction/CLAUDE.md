@@ -105,7 +105,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   vote does not wait for a driver: it votes abort and promises at once (paxos-transactions 6.2), but stays undecided
   after load so a client retransmit that arrives first is still checked. This holds for data-less transactions too, so
   their late resolution may take 5 s longer. A vote
-  given stands, but later data is still used to apply a commit. Adopted data is saved to the CRL first: the commit
+  given stands, but a Tx without a commit vote still adopts later data to apply a commit. A commit voter adopts none
+  (`Tx.adoptObjectUpdates`): it held all its data when it voted, so data its state lacks was dropped on purpose
+  (`persistWithoutUpdateOf`) and must stay dropped (transaction-requirements 10.5b). Adopted data is saved to the CRL first: the commit
   waits for that save (`Tx.adoptedDataUnsaved`, `saveAdoptedData`; P13), its objects unsettled for repair meanwhile
   (`Frontend.adoptedDataSaves`), since a `TxFinalized` during the save drops the Tx from `transactions`. A delayed duplicate client prepare of an
   aborted transaction cannot commit it: every store that took part remembers the abort for longer than it would join T,

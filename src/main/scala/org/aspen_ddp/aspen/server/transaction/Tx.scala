@@ -1468,12 +1468,16 @@ class Tx( trs: TransactionRecoveryState,
 
   /** Adopts the object data of a prepare that has some this Tx lacks: the first prepare to arrive may have been a
     * driver's, which carries none, while the client's was lost or delayed. A vote already given stands, but the data
-    * is still needed to apply a commit decided by the other stores' votes. See commitAwaitsData
+    * is still needed to apply a commit decided by the other stores' votes. See commitAwaitsData. A commit voter adopts
+    * nothing: it held all its data when it voted (a vote without it fails MissingObjectUpdate), so whatever it lacks
+    * was dropped on purpose (persistWithoutUpdateOf), and a recovered vote must keep taking that update as applied
+    * rather than apply it again over the deletion that dropped it (transaction-requirements 10.5b)
     */
   private def adoptObjectUpdates(m: TxPrepare): Unit =
     val have = objectUpdates.iterator.map(_.objectId).toSet
     val added = m.objectUpdates.filterNot(ou => have.contains(ou.objectId))
-    if added.nonEmpty && !committing && !committed && !stateDeleted then
+    if added.nonEmpty && disposition != TransactionDisposition.VoteCommit && !committing && !committed &&
+      !stateDeleted then
       objectUpdates = objectUpdates ++ added
       // A muted Tx applies nothing, so its data need not be durable
       if !muted then

@@ -48,13 +48,6 @@ rebuild-process.md B19.)
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.1 [S] Q-W18: a recovered commit vote re-adopts object data its CRL state dropped (PLAUSIBLE).
-    After persistWithoutUpdateOf (a later deletion's wait), a retransmitted or delayed client prepare carrying this
-    store's data passes Tx.adoptObjectUpdates, which has no guard for a Tx that already voted commit. On a commit, a
-    deleted allocated object gets a fresh Allocating state, passes its re-check and is recreated with nothing
-    reported (a blind-Insert key is re-inserted but reported). Fix: adoptObjectUpdates adopts nothing once
-    disposition == VoteCommit; a commit voter held all its data when it voted.
-
 2.2 [S] RP-W12: repair's dropOccupant can delete a live object (PLAUSIBLE). An FSIF index freed by a deletion is
     reusable in the same transaction (FsifIndexAllocationStrategy); a repair install meeting RepairSlotOccupied(C)
     reads the AllocationTree, finds C unlisted (its AllocationFinalizationAction not yet landed), and its later

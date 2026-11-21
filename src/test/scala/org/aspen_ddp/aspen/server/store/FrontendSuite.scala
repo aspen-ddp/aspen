@@ -5121,6 +5121,24 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     readData(frontend, net, newPtr) shouldBe Left(ReadError.ObjectNotFound)
   }
 
+  test("a recovered commit vote does not adopt the data its CRL state dropped from a retransmitted client prepare " +
+       "(Q-W18)") {
+    // As above, and a client that never learned the outcome re-sends its prepare, with the store's data, before the
+    // commit arrives: a commit voter held all its data when it voted, so what it lacks was dropped on purpose
+    val newPtr = DataObjectPointer(ObjectId(new UUID(0, 41)), poolId, Array[Byte]())
+    val crl = new TestCrl
+    val txd = allocateData(txid1, newPtr)
+    val (frontend, net, stops) = recoveredVote(mkObjectState(oid1), txd = txd, updates = Nil, crl = crl)
+    val saves = crl.savedStates.size
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(newPtr.id, DataBuffer(Array[Byte](7))))))
+    crl.savedStates.drop(saves).flatMap(_.objectUpdates) shouldBe Nil
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true, late = false, proof = false))
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(Nil)
+    stops() shouldBe Nil
+    readData(frontend, net, newPtr) shouldBe Left(ReadError.ObjectNotFound)
+  }
+
   test("a pinned state counts toward the store's bytes") {
     val (frontend, backend, cache, net) = commitWindowFixture()
     prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit

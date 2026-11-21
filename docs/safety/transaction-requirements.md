@@ -865,8 +865,10 @@ stays locked. A key Delete is never blind, so its re-check fails once applied an
 
 (b) A recovered commit vote whose object data the CRL no longer holds (a re-save after `persistWithoutUpdateOf`) has a
 missing update: `MissingObjectUpdate` at the re-check (`FalsePin` for a pinned KeyValue update, checked first). The
-update was applied before it was dropped (9.4), so the recovered vote takes it as applied (8.5). This needs the data to
-stay missing: a client prepare that reaches the recovered vote with the dropped data brings it back (Q-W18).
+update was applied before it was dropped (9.4), so the recovered vote takes it as applied (8.5). The data stays
+missing: a commit voter adopts no object data from a later prepare (`Tx.adoptObjectUpdates`), since it held all its
+data when it voted (a vote without it fails `MissingObjectUpdate`), so a client retransmission reaching the recovered
+vote with the dropped data does not bring it back. Only a Tx without a commit vote adopts late data.
 
 (c) A recovered commit vote re-applies its update when its outcome is learned. Revision, refcount and `KeyRevision`
 requirements fail on a store that applied a later chained write (a refcount because every refcount
@@ -961,43 +963,6 @@ adds the revision check.
   transaction's lifetime than the write threshold's margin covers, and is alarmed; there is no way out of the wait.
 
 ## Open weaknesses
-
-**Q-W18 A recovered commit vote re-adopts object data its CRL state dropped, and re-applies an allocation over the
-object's deletion** (PLAUSIBLE, priority 2, effort S)
-
-Mechanism. A deletion of an object, or of keys of it, soon after a transaction T allocated it or blindly Inserted the
-keys reaches the backend only once T's CRL state no longer holds T's update of the object
-(`Frontend.awaitAllocationsDurable`, `awaitBlindInsertsDurable`): `Tx.persistWithoutUpdateOf` saves the state again
-without it. The safety argument (9.4, 10.5(b), 10.5(c)) is that a recovered commit vote then finds the update missing,
-fails its re-check (`MissingObjectUpdate`) and takes the object as applied. But the omission is recorded only in the
-live Tx (`droppedUpdates`); the recovered Tx starts from `trs.objectUpdates`, simply lacking the object. A client
-prepare that reaches the recovered Tx carrying this store's data (`Tx.receivePrepare` -> `adoptObjectUpdates`) finds
-the object absent from `objectUpdates`, adds it back, and, since the Tx is neither committing nor committed, saves the
-state with it (`saveAdoptedData`). Nothing in `adoptObjectUpdates` excludes a Tx that already voted commit, although a
-commit voter held all its data when it voted (a vote without it fails `MissingObjectUpdate`), so whatever a recovered
-voter's state lacks was dropped on purpose.
-
-Trigger. Store S votes commit for T, which allocates object o (or Inserts key k under `DoesNotExist`). T commits and S
-applies it. Before T is finalized, a later transaction D deletes o (or k) at S; its backend commit waits for T's state
-to be saved without o's update, then persists. S crashes and restarts with T's CRL state at Unresolved (outcome unknown,
-so the Tx waits for the resolution or its UnackedCommits lookup). A client prepare of T with S's data arrives: a
-retransmission from a client that has not yet learned the outcome (its votes and the resolution lost), or a delayed one.
-The recovered Tx adopts o's data. T's commit resolution then reaches S (T is still unfinalized). At load, o missed in
-the backend and, T allocating it, got the fresh `Allocating` state (`Tx.allocationLoaded`); the re-check now passes and
-`Tx.issueCommits` applies the allocation again.
-
-Consequence. The allocation case recreates o at S over a committed, persisted deletion and reports nothing (the apply
-succeeds; `blindReinsertObjects` covers only KeyValue Inserts), so S keeps a resurrected copy that no repair visits:
-permanent divergence of that store's replica. The key case re-inserts k; it is reported (a recovered vote's apply
-over an object timestamp newer than T's start is suspect), so the finalizer marks S while T is unfinalized, but the
-argument of 10.5(c) no longer holds by itself. A second crash after the adopted save recovers the update durably,
-with the same results. Needs a client prepare with data reaching a recovered commit vote whose data was dropped, after
-a deletion that followed T's apply, so it is rare.
-
-Fix direction. `adoptObjectUpdates` adopts nothing once the Tx has voted commit (`disposition == VoteCommit`): a
-voter's data was complete at its vote, so a recovered voter's missing data is a deliberate drop. A Tx without a vote
-still adopts (it may vote later; a recovered non-voter applies nothing anyway). Alternatively persist the dropped set
-with the state.
 
 **Q-W19 A commit that applies nothing still waits in lock order and for its turn** (CONFIRMED, priority 5, effort S)
 

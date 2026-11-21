@@ -219,7 +219,8 @@
   each object now shows, then skipped and reported. A recovered commit vote's (one applying through its UnackedCommits
   entry included) is taken as already applied, neither reported nor kept: the vote held its locks until it applied
   and relocked them at recovery, so only its update and the writes after it in lock order changed the object
-  (superseded, traceless, or its data dropped from the CRL by `persistWithoutUpdateOf`). A recovered Tx that did not
+  (superseded, traceless, or its data dropped from the CRL by `persistWithoutUpdateOf`, which a commit voter never
+  adopts back from a later prepare: `Tx.adoptObjectUpdates`). A recovered Tx that did not
   vote commit applies nothing on a commit and reports every object it changes (`Tx.doCommit`), since it may have applied
   and acknowledged it before the
   crash. A lock-only object that fails the re-check is skipped and reported only. A fail-stopped store drops every transaction message, read, repair and heartbeat. `Store.onFailStop` posts `Host.StoreFailStopped`, and the

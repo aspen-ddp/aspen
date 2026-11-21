@@ -227,8 +227,7 @@ store is not already rebuilding here; `rebuildingStores.size + droppingCrlState.
 (default 2, `Host`); the device is not shutting down; `retireForeignCopy` clears the path (T12; it waits, returning
 false, while the store's backend is opening, `StoreLoader.isOpening`, after fail-stopping a copy served from the path,
 and when a stat fails); and `discardLostStore` reports the path clear (a failed stat of the marker waits too). The
-order of the Rebuilding pass is the pool index, and a store whose pass failed is started again at any check of its
-device, its backoff (5.7) notwithstanding (RB-W24).
+order of the Rebuilding pass is the pool index, and a store inside its backoff (5.7) is skipped, so stores whose passes keep failing cannot retake the slots at each check from those queued behind them.
 For a directory with `rebuild-required`, `discardLostStore` retires the copy (`StoreCopies.retire`, the one path by
 which any store copy that is no longer its owner's leaves its store path):
 
@@ -495,8 +494,12 @@ Every settled outcome resets the store's failure count, releases the slot and th
 or a permanently failed flip releases the slot, re-checks the **other** devices (re-checking its own would restart the
 same store at once) and schedules a backoff re-check of its own (`StoreRebuilds.scheduleRebuildRetry`:
 `Host.RebuildRetryInitialDelay` 30 s, doubled per consecutive failure of the store, capped at `RebuildRetryMaxDelay`
-30 min, reset when a flip settles; at most one scheduled per store). The backoff only schedules a check: any other
-check of the device starts the store again too (RB-W24). A failed flip first records its copy in the
+30 min, reset when a flip settles; at most one scheduled per store). Until that re-check runs (it clears the
+store's backoff before checking the device), `startRebuild` does not start the store for what the failure that
+scheduled it ran for (`HeldRebuild`: the device, the episode and the entry's `acceptLoss`), whatever check of the
+device runs; an operator's remedy since (a re-placement to another device or episode, an `accept-rebuild-loss`, whose
+nudge checks the device) starts at once. A further failure while a re-check is scheduled points that re-check at what
+it ran for. A failed flip first records its copy in the
 device's `offlineStores`, as `Superseded` does: the Deleted Stores pass retires it if the entry leaves the device during
 the backoff, and an entry found Active (the flip committed after all) has the Completed Rebuilds pass load it. A cancel
 for a shutdown re-checks the other devices; a cancel because the entry left the device (`abandonedRebuilds`) re-checks
@@ -946,21 +949,3 @@ route lookups. No decision changes (an unknown store answers no allocation query
 
 Fix direction: mark the router offline on every reconcile that sees the Rebuilding entry (idempotent), or have
 `clearOfflineUnlessHeld` also keep a store in `StoreRebuilds.silenced`.
-
-**RB-W24 Persistently failing rebuilds can starve the queued rebuilds of their device** (PLAUSIBLE, priority 4, effort S)
-
-Mechanism: the Rebuilding pass (`DeviceReconciler.startRebuilds`) starts entries in pool-index order, and
-`startRebuild` does not consult the store's backoff (`rebuildFailures`, `scheduledRebuildRetries`): any check of the
-device restarts a failed store if a slot is free. A failed pass releases its slot but re-checks only the other devices
-(`recheckOtherDevices`), so a store queued on the same device starts only at a later check of that device, where the
-failed stores, sorting first, take the free slots again.
-
-Trigger: `maxConcurrentRebuilds` (2) stores on one device whose passes keep failing (FS15's incomplete pass awaiting
-`accept-rebuild-loss`, which walks the whole tree before failing; a pool below `r`, FS3) and whose pool indices sort
-before other Rebuilding stores of that device, for example after a lost device CRL (T1) marks every store on it.
-
-Consequence: the other stores of the device stay Rebuilding (each a unit of its pool's `w - t` margin) for as long as
-the failing ones fail, although their pools could supply them.
-
-Fix direction: in the Rebuilding pass, start stores with no recorded failure first, or skip a store whose backoff
-re-check is still scheduled unless the check is that re-check.

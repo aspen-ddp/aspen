@@ -54,9 +54,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private var droppingCrlState: Set[StoreId] = Set()
 
   // rebuild-process 5.7, retry backoff: by store, how many passes or flips have failed in a row, and the stores
-  // with a retry scheduled
+  // with a retry scheduled, each with what the failure that scheduled it (the latest) ran for
   private var rebuildFailures: Map[StoreId, Int] = Map()
-  private var scheduledRebuildRetries: Set[StoreId] = Set()
+  private var scheduledRebuildRetries: Map[StoreId, StoreRebuilds.HeldRebuild] = Map()
 
   // rebuild-process 6.2: stores this class marked offline in the router for a Rebuilding entry, by device. A store
   // rebuilt on a device that never held it is not loaded, so without the mark this host would answer
@@ -82,7 +82,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private[server] def silencedStores: Set[StoreId] = silenced.keySet
 
   /** The stores with a backoff re-check of their device scheduled */
-  private[server] def rebuildRetriesScheduled: Set[StoreId] = scheduledRebuildRetries
+  private[server] def rebuildRetriesScheduled: Set[StoreId] = scheduledRebuildRetries.keySet
 
   /** The stores whose rebuild is running here, for any device. */
   def rebuildingStoreIds: Set[StoreId] = rebuildingStores.keySet
@@ -221,15 +221,21 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  store re-placed away and back is a new episode, and nothing of the earlier one is resumed or promoted
    *  (rebuild-process.md 5.1).
    */
-  def startRebuild(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Unit =
+  def startRebuild(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
+                   acceptLoss: Boolean): Unit =
+    val held = StoreRebuilds.HeldRebuild(local.storageDeviceId, episode, acceptLoss)
     // Silent from the first reconcile that sees the entry, a store queued for a slot included (rebuild-process 6.2)
     if !silenced.contains(storeId) then
       ctx.router.markOffline(storeId)
       silenced += storeId -> local.storageDeviceId
-    if !rebuildingStores.contains(storeId) &&
+    // A store inside its backoff (scheduleRebuildRetry) waits for that re-check, which clears the mark before it
+    // checks the device: otherwise stores whose passes keep failing, sorting first, would retake the slots at every
+    // check of the device and starve the stores queued behind them. An operator's remedy since the failure (a
+    // re-placement to another device or episode, an accept-rebuild-loss) is not held back (rebuild-process 5.7)
+    if !rebuildingStores.contains(storeId) && !scheduledRebuildRetries.get(storeId).contains(held) &&
        rebuildingStores.size + droppingCrlState.size < ctx.maxConcurrentRebuilds &&
        ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId, episode) &&
-       discardLostStore(local, storeId, episode) then
+       discardLostStore(local, storeId, episode, acceptLoss) then
       val sr = ctx.storeRebuildFactory.createRebuild(
         ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends, episode)
 
@@ -387,7 +393,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 release()
                 // Not this device at once: its reconcile restarts the rebuild, which flips again (rebuild-process 5.7)
                 recheckOtherDevices()
-                scheduleRebuildRetry(local.storageDeviceId, storeId)
+                scheduleRebuildRetry(storeId, held)
 
         case Failure(RebuildingStore.RebuildCancelled(_)) if abandonedRebuilds.contains(storeId) =>
           // Its entry left this device (abandonUnlisted). This device is checked once more: if the entry is
@@ -423,7 +429,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           finally
             release()
             recheckOtherDevices()
-            scheduleRebuildRetry(local.storageDeviceId, storeId)
+            scheduleRebuildRetry(storeId, held)
 
   /** Retires the rebuild work on `local` for stores whose entry on it is no longer Rebuilding: re-placed
    *  elsewhere by AspenClient.replaceRebuild, or gone for another reason. A rebuild still running for one, or for an
@@ -481,18 +487,25 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   /** Checks `deviceId` again after a backoff, so a store whose rebuild pass or flip failed is retried without waiting
    *  for the periodic sweep (an hour) and without spinning (rebuild-process 5.7). The first delay is
    *  Host.RebuildRetryInitialDelay, doubled for each failure of the store in a row, up to Host.RebuildRetryMaxDelay;
-   *  a settled flip resets it. At most one is scheduled per store. The check is an ordinary reconcile: a device
-   *  unloaded meanwhile, or an entry that has left Rebuilding, does nothing. */
-  private def scheduleRebuildRetry(deviceId: StorageDeviceId, storeId: StoreId): Unit =
+   *  a settled flip resets it. At most one is scheduled per store. Until it runs, startRebuild does not start the store
+   *  for what failed last (HeldRebuild; any other check of the device would restart it, and stores failing for good
+   *  would starve the ones queued behind them); a re-placement to another device or episode, or an accept-rebuild-loss
+   *  since, starts at once.
+   *  The check is an ordinary reconcile: a device unloaded meanwhile, or an entry that has left Rebuilding, does
+   *  nothing. */
+  private def scheduleRebuildRetry(storeId: StoreId, held: StoreRebuilds.HeldRebuild): Unit =
     val failures = rebuildFailures.getOrElse(storeId, 0)
     rebuildFailures += storeId -> (failures + 1)
-    if !scheduledRebuildRetries.contains(storeId) then
-      scheduledRebuildRetries += storeId
+    val scheduled = scheduledRebuildRetries.contains(storeId)
+    // One already scheduled covers this failure: it holds back, and then checks the device of, the one that failed last
+    scheduledRebuildRetries += storeId -> held
+    if !scheduled then
       val delay = StoreRebuilds.rebuildRetryDelay(failures)
-      logger.info(s"Retrying the rebuild of store $storeId on device $deviceId in $delay")
+      logger.info(s"Retrying the rebuild of store $storeId on device ${held.deviceId} in $delay")
       ctx.scheduler.schedule(delay):
-        scheduledRebuildRetries -= storeId
-        ctx.reconciler.checkStorageDevice(deviceId)
+        scheduledRebuildRetries.get(storeId).foreach: latest =>
+          scheduledRebuildRetries -= storeId
+          ctx.reconciler.checkStorageDevice(latest.deviceId)
 
   /** Records a finished copy not yet loaded (RebuildOutcome.Superseded, a permanently failed flip, an adopted copy
    *  whose rebuild-complete marker could not be removed) in its device's offlineStores, as a restart's load of the
@@ -822,7 +835,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  it with no gap in which another store's discard could take it. A failure frees the slot and leaves everything in
    *  place for a later check.
    */
-  private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
+  private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
+                               acceptLoss: Boolean): Boolean =
     val storePath = local.devicePath / storeId.directoryName
     // A stat that fails is no absence (FileStat): the rebuild waits for a later check rather than start over the copy
     val marked = FileStat.existence(storePath / RebuildingStore.RebuildRequiredMarkerFile)
@@ -837,10 +851,14 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         ctx.copies.retire(local, storeId).foreach: clear =>
           droppingCrlState -= storeId
           if clear then
-            startRebuild(local, storeId, episode)
+            startRebuild(local, storeId, episode, acceptLoss)
       false
 
 object StoreRebuilds:
+  /** What a failed rebuild pass or flip ran for, which its backoff holds back (scheduleRebuildRetry): the device, the
+   *  Rebuilding episode and whether the entry accepted the loss of unreadable objects */
+  private case class HeldRebuild(deviceId: StorageDeviceId, episode: Option[UUID], acceptLoss: Boolean)
+
   /** Host.StoreFailStopped's `what` for a store whose CRL recovery failed */
   val RecoveryFailed = "failed to recover its transactions from its CRL"
   /** Host.StoreFailStopped's `what` for a store that fail-stopped (Frontend.failStop) */

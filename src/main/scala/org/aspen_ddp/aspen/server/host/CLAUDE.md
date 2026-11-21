@@ -307,7 +307,10 @@
 - A failed rebuild pass or a permanently failed flip never re-checks its own device at once, which would restart the
   same store in a spin: it re-checks the other devices (the slot is host-wide) and schedules a backoff re-check of its
   own (`StoreRebuilds.scheduleRebuildRetry`: `Host.RebuildRetryInitialDelay` 30 s, doubled per failure of the store in
-  a row up to `RebuildRetryMaxDelay` 30 min, reset when a flip settles; rebuild-process 5.7). Tests drive it with
+  a row up to `RebuildRetryMaxDelay` 30 min, reset when a flip settles; rebuild-process 5.7). Until it runs,
+  `startRebuild` skips the store for what failed (`HeldRebuild`: device, episode, `acceptLoss`), so a failing store
+  cannot retake the slot from those queued behind it; an operator's remedy since (a re-placement to another device or
+  episode, an `accept-rebuild-loss`) starts at once. Tests drive it with
   `ControlFixture.runRebuildRetries`
 - Re-placement (rebuild-process 4.2): `AspenClient.replaceRebuild` (`transfer-store` on a Rebuilding store) moves a
   Rebuilding entry to another device and repoints the pool, under a new rebuild episode

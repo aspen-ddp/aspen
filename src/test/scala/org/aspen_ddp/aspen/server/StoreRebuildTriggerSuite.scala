@@ -189,13 +189,82 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = factory.created.head.promise.failure(new Exception("disk on fire"))
       _ <- yieldUntil(factory.created.size == 2, 20)
       restartedImmediately = factory.created.size
-      // The ordinary periodic check is what resumes it. The staging checkpoint survives the
-      // failure, so that check resumes rather than restarting from the beginning.
+      // Nor does any other check of the device inside the backoff (RB-W24)
+      periodic = recorded(host).armLookup(deviceA)
       _ = host.control.reconciler.checkAll()
+      _ = periodic.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+      restartedInBackoff = factory.created.size
+      // The backoff's re-check resumes it. The staging checkpoint survives the failure, so that
+      // check resumes rather than restarting from the beginning.
+      _ = recorded(host).armLookup(deviceA).success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
+      _ = runRebuildRetries(host)
       _ <- yieldUntil(factory.created.size == 2)
     yield
       restartedImmediately should be(1)
+      restartedInBackoff should be(1)
       factory.created.map(_.storeId).toList should be(List(storeN(0), storeN(0)))
+
+  atest("a store whose rebuild keeps failing does not retake the slot from the stores queued behind it (RB-W24)"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+    val both = deviceState(deviceA, Map(rebuilding(storeN(0)), rebuilding(storeN(1))))
+
+    val first = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
+    first.success(both)
+
+    for
+      _ <- yieldUntil(factory.created.size == 1)
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+      _ = factory.created.head.promise.failure(new Exception("pass incomplete"))
+      _ <- yieldUntil(host.control.rebuilds.rebuildRetriesScheduled.contains(storeN(0)))
+      // A check of the device inside store 0's backoff: store 0 sorts first, but the free slot goes to store 1
+      second = recorded(host).armLookup(deviceA)
+      _ = host.control.reconciler.checkStorageDevice(deviceA)
+      _ = second.success(both)
+      _ <- yieldUntil(factory.created.size == 2)
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+    yield
+      factory.created.map(_.storeId).toList should be(List(storeN(0), storeN(1)))
+
+  atest("an accept-rebuild-loss after a failed pass starts the rebuild inside its backoff (RB-W24)"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+    val accepted = storeN(0) -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None,
+      acceptLoss = true)
+
+    def check(entry: (StoreId, StorageDeviceState.StoreEntry)): Future[Unit] =
+      val lookup = recorded(host).armLookup(deviceA)
+      host.control.reconciler.checkStorageDevice(deviceA)
+      lookup.success(deviceState(deviceA, Map(entry)))
+      yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+
+    val first = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkAll()
+    first.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
+
+    for
+      _ <- yieldUntil(factory.created.size == 1)
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+      _ = factory.created.head.promise.failure(new Exception("objects unreadable"))
+      _ <- yieldUntil(host.control.rebuilds.rebuildRetriesScheduled.contains(storeN(0)))
+      _ <- check(rebuilding(storeN(0)))
+      heldBack = factory.created.size
+      // The operator's acceptance nudges the host: that check starts it
+      _ <- check(accepted)
+      _ <- yieldUntil(factory.created.size == 2)
+      // A failure with the loss accepted holds back the accepted entry in turn
+      _ = factory.created(1).promise.failure(new Exception("pool below r"))
+      _ <- yieldUntil(!host.control.rebuilds.rebuildingStoreIds.contains(storeN(0)))
+      _ <- check(accepted)
+    yield
+      heldBack should be(1)
+      factory.created.size should be(2)
 
   atest("a failed rebuild releases its slot for another device"):
     val hostRoot = newHostDir()

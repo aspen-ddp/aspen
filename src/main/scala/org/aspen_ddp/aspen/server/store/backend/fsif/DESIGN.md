@@ -270,7 +270,13 @@ to the lowest free slot f < t:
 
 A move does not start for an object that is gated, being rebuilt, or dead. A copy-on-write, delete,
 re-allocation or rebuild write of X before step 5 cancels the move (`cancel`), and f is released once the move's
-I/O has settled. On ENOSPC, writes and forces into f are held and re-run. A data force failure re-queues every
+I/O has settled. A failed read of t in step 1 (an I/O error, a rejected io task) ends the move the same way: nothing
+was written into f, so the store's state is not in doubt. No move starts until the next of
+`FsifTuning.moveRetryDelays` (10 ms, 100 ms, 1 s, then 10 s repeating; a successful move read starts over) has
+passed, and none starts once the backend is closing. A damaged t reads successfully and is copied as it is; a
+client read of f then reports the damage (`CorruptedObject`), as a read of t would have (tests: `FsifFaultSuite`
+"a failed compaction move read abandons the move, ...", "a rejected compaction move read task ...", "a move retry
+delay that ends after close starts no move"). On ENOSPC, writes and forces into f are held and re-run. A data force failure re-queues every
 write into f that no good force has covered (`dataLost`).
 
 ### 2.9 Backpressure and the journal hard limit
@@ -659,7 +665,7 @@ Every fail-stop calls `onFatal` once. The host's `onFatal` posts `BackendFailed`
 | L15 | A data force fails with a non-ENOSPC error | `FsifBackend.dataForceDone` |
 | L16 | A checkpoint step (open the other journal, header rewrite, index write, truncates) fails with a non-ENOSPC error | `FsifBackend.checkpointIo` |
 | L17 | A copy-on-write segment write or force fails with a non-ENOSPC error | `FsifBackend.cowWritten` |
-| L18 | Compaction: the move's raw read of slot t fails with **any** error; a move write or force fails with a non-ENOSPC error; the truncate of free tail slots fails with a non-ENOSPC error | `Compaction.copied`, `written`, `forced`; the truncate (`Compaction.truncate`) fails through `FsifBackend.guarded` |
+| L18 | Compaction: a move write or force fails with a non-ENOSPC error; the truncate of free tail slots fails with a non-ENOSPC error. (A failed move read is not a trigger: it abandons the move, 2.8.) | `Compaction.written`, `forced`; the truncate (`Compaction.truncate`) fails through `FsifBackend.guarded` |
 | L19 | Any `NonFatal` exception escapes a serial task, checkpoint advance or compaction drive (an internal error), for example `allocateSlot`'s `IllegalStateException`, a rejected io task, or an NPE | `FsifBackend.guarded` |
 
 **Why these are believed to mean loss.** After a write or fsync error other than ENOSPC, the page cache no longer
@@ -668,9 +674,10 @@ but the backend does not assume it.
 
 **What a false trigger looks like.** L19 is the broad one. Any bug that throws inside the serial executor (an
 assertion, an index out of range, a new `require`) fail-stops the store. A bug on a common path (every commit,
-every checkpoint) fires on every FSIF store on every host running that version. L18 is broader than the
-others: a failed compaction read fail-stops the store, while a failed client read only returns
-`CorruptedObject`. L13-L17 would fire together if an error classifier misses ENOSPC (for example a filesystem or
+every checkpoint) fires on every FSIF store on every host running that version. Reads trigger none of them: a
+failed client read is retried and only then returns `CorruptedObject`, and a failed compaction move read abandons
+the move and retries it after a backoff, so a host-wide EMFILE, ENOMEM or saturated io executor stalls compaction
+but fail-stops no store. L13-L17 would fire together if an error classifier misses ENOSPC (for example a filesystem or
 JDK that words it differently from `FsifIo.isOutOfSpace`'s strings), which turns every full device into a
 correlated loss.
 

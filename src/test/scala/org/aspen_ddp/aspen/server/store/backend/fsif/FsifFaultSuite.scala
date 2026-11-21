@@ -577,6 +577,112 @@ class FsifFaultSuite extends FileBasedTests:
     h.await(f) shouldBe Right(ReadError.CorruptedObject)
     h.fatals.size shouldBe 0
 
+  // ---- Compaction move read failures: the move is abandoned and retried, never a fail-stop ----
+
+  /** Objects 1..3 at exts 0..2 in slots 0..2, checkpointed so they live only in data. Deleting ext 0 then frees slot 0,
+    * which starts a move of ext 2 from slot 2 into it.
+    */
+  private def threeObjects(h: Harness): IndexedSeq[ObjectPointer] =
+    val ps = (0 until 3).map(x => ptr(x, oid(x + 1)))
+    for i <- 0 until 3 do h.commitOk(alloc(ps(i), bytes(60 + i * 30, i), 1))
+    h.await(h.backend.checkpointNow())
+    h.quiesce()
+    h.slotOf(2) shouldBe 2
+    ps
+
+  private def compacted(h: Harness, ps: IndexedSeq[ObjectPointer]): Unit =
+    h.backend.compactionStats.mapped shouldBe 1
+    h.slotOf(2) shouldBe 0
+    h.backend.slotCount shouldBe 2
+    h.read(ps(0)) shouldBe Right(ReadError.ObjectNotFound)
+    for i <- 1 until 3 do h.readData(ps(i)) shouldBe bytes(60 + i * 30, i).toList
+    h.fatals.isEmpty shouldBe true
+    h.crash()
+    h.read(ps(0)) shouldBe Right(ReadError.ObjectNotFound)
+    for i <- 1 until 3 do h.readData(ps(i)) shouldBe bytes(60 + i * 30, i).toList
+
+  test("a failed compaction move read abandons the move, backs off through moveRetryDelays and then compacts"):
+    val h = new Harness
+    val ps = threeObjects(h)
+    h.files.failReads(1, isData)
+    h.commitOk(delete(ps(0), 2))
+    h.backend.compactionStats.readFailures shouldBe 1
+    h.backend.compactionStats.mapped shouldBe 0
+    h.fatals.isEmpty shouldBe true
+    h.backend.hasFailed shouldBe false
+    // The move's target slot is released, and the store serves reads and writes while backing off
+    h.backend.slotCount shouldBe 3
+    h.readData(ps(2)) shouldBe bytes(120, 2).toList
+    h.commitOk(overwrite(ps(1), bytes(90, 1), 2))
+    h.files.failReads(1, isData)
+    h.tick() // the second move read fails
+    h.backend.compactionStats.readFailures shouldBe 2
+    h.backend.compactionStats.mapped shouldBe 0
+    h.tick() // the third succeeds
+    h.quiesce()
+    scheduled(h) shouldBe FsifTuning().moveRetryDelays.take(2).toList
+    h.backend.compactionStats.started shouldBe 3
+    compacted(h, ps)
+
+  test("consecutive failed move reads repeat the last of moveRetryDelays, and a successful read starts over"):
+    val h = new Harness
+    val ps = (0 until 5).map(x => ptr(x, oid(x + 1)))
+    for i <- 0 until 5 do h.commitOk(alloc(ps(i), bytes(50 + i, i), 1))
+    h.await(h.backend.checkpointNow())
+    h.quiesce()
+    val delays = FsifTuning().moveRetryDelays
+    h.files.failReads(delays.size + 1, isData)
+    h.commitOk(delete(ps(0), 2)) // ext 4 moves from slot 4 into slot 0
+    for _ <- 0 until delays.size do h.tick()
+    h.backend.compactionStats.readFailures shouldBe delays.size + 1
+    scheduled(h) shouldBe (delays :+ delays.last).toList
+    h.tick() // succeeds
+    h.quiesce()
+    h.backend.compactionStats.mapped shouldBe 1
+    h.files.failReads(1, isData)
+    h.commitOk(delete(ps(1), 2)) // ext 3 moves from slot 3 into slot 1: the first failure again
+    scheduled(h).last shouldBe delays.head
+    h.tick()
+    h.quiesce()
+    h.backend.compactionStats.mapped shouldBe 2
+    h.backend.slotCount shouldBe 3
+    for i <- 2 until 5 do h.readData(ps(i)) shouldBe bytes(50 + i, i).toList
+    h.fatals.isEmpty shouldBe true
+
+  test("a rejected compaction move read task abandons the move without fail-stopping the store"):
+    val reject = new AtomicBoolean(false)
+    val rejecting = new ExecutionContext:
+      def execute(r: Runnable): Unit =
+        if reject.get && isKind(FsifBackend.IoKind.MoveRead)(r) then
+          reject.set(false)
+          throw new java.util.concurrent.RejectedExecutionException("io executor saturated")
+        InlineEc.execute(r)
+      def reportFailure(t: Throwable): Unit = InlineEc.reportFailure(t)
+    val h = new Harness(mkIo = () => rejecting)
+    val ps = threeObjects(h)
+    reject.set(true)
+    h.commitOk(delete(ps(0), 2))
+    h.backend.compactionStats.readFailures shouldBe 1
+    h.backend.compactionStats.mapped shouldBe 0
+    h.fatals.isEmpty shouldBe true
+    h.tick()
+    h.quiesce()
+    compacted(h, ps)
+
+  test("a move retry delay that ends after close starts no move"):
+    val h = new Harness
+    val ps = threeObjects(h)
+    h.files.failReads(1, isData)
+    h.commitOk(delete(ps(0), 2))
+    h.backend.compactionStats.readFailures shouldBe 1
+    h.await(h.backend.close())
+    h.tick()
+    h.backend.compactionStats.started shouldBe 1
+    h.fatals.isEmpty shouldBe true
+    h.reopen()
+    h.quiesce()
+    compacted(h, ps)
+
   test("rebuildWrite and rebuildFlush throw out-of-space instead of hanging while frozen"):
     // The store is frozen by something else
     locally:

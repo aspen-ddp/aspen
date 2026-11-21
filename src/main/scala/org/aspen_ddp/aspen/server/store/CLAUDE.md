@@ -307,7 +307,10 @@
   value reports at once. FSIF (`FsifBackend.assemble`): a CRC mismatch, no valid header, or a fail-stopped backend
   reports at once. In both, any other failure is retried after each of `RetryScheduler.ReadRetryDelays` (10 ms,
   100 ms, 1 s; FSIF's `FsifTuning.readRetryDelays`) on the host-wide `backend.SharedRetryScheduler` (also FSIF's
-  ENOSPC timer), then reported; a closed database or closing FSIF backend is not retried. Tests inject read failures
+  ENOSPC timer), then reported; a closed database or closing FSIF backend is not retried. An FSIF compaction move's
+  failed read (a rejected io task included) never fail-stops: the move is abandoned, its target slot released, and
+  no move starts until the next of `FsifTuning.moveRetryDelays` has passed (`Compaction.abandonAfterReadFailure`;
+  fsif/DESIGN.md 2.8). Tests inject read failures
   by overriding `getValue` (RocksDB) or with `SimulatedFsifFiles.failReads` (FSIF)
 - Pluggable: RocksDB, in-memory Map, and FSIF (`backend/fsif`, a flat file of fixed-size segments located by a
   4-byte storePointer, with a journal and checkpointed index; design in `backend/fsif/DESIGN.md`). FSIF freezes

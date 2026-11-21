@@ -541,12 +541,10 @@ Between the documents, each disagreement found is corrected where it stood:
 
 Between a document, scaladoc or guide outside docs/safety and the code:
 
-* `server/store/backend/fsif/DESIGN.md` 4.2 (L18 and "What a false trigger looks like") counts any failed compaction
-  move read as loss, deliberately, and contrasts it with a client read that "only returns `CorruptedObject`". Its
-  stated reason for loss (a failed write or fsync leaves the page cache untrustworthy) covers writes, not a read that
-  wrote nothing, and since the client read path retries a failure that is not evidence of damage
-  (`RetryScheduler.ReadRetryDelays`, `FsifBackend.assemble`) the contrast is also imprecise. Tracked with
-  systemic-loss-protection.md SL-W19, whose fix must rewrite both passages.
+* `server/store/backend/fsif/DESIGN.md` 4.2 (L18 and "What a false trigger looks like") counted any failed compaction
+  move read as loss, although its stated reason for loss (a failed write or fsync leaves the page cache
+  untrustworthy) covers writes only. A failed move read now abandons the move and retries it after a backoff, as a
+  client read retries a failure that is not evidence of damage, and both passages say so.
 
 ---
 

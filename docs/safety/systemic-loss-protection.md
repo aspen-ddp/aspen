@@ -134,8 +134,10 @@ These are facts about the current code. They define the problem; none of them is
   fail-stopped. Any other failure (an IOError, Busy or TryAgain status, EIO, EMFILE or ENOMEM, a rejected io task, a
   throw while issuing) is retried after each of `RetryScheduler.ReadRetryDelays` (about 1.1 s in all), so only a
   failure that outlasts them declares. Every FSIF error other than ENOSPC in a write, force, checkpoint or compaction
-  write, any failure of a compaction move's read (`Compaction.copied`, a rejected io task included; SL-W19), and any
-  internal exception in its serial executor, fail-stops the backend. Persistent and version causes are handled
+  write, and any internal exception in its serial executor, fail-stops the backend. A compaction move's failed read
+  (`Compaction.copied`, a rejected io task included) wrote nothing, so it abandons the move, and no move starts until
+  the next of `FsifTuning.moveRetryDelays` (10 ms, 100 ms, 1 s, then 10 s repeating) has passed; it never declares.
+  A damaged slot reads successfully and is copied as it is, so its damage is reported by a client read of the copy. Persistent and version causes are handled
   the same way as damage. A commit vote whose apply re-check fails does not declare (section 4.6). The existence
   checks that decide D1 (`<device>/crl` present, and which children are store directories), D13 (`config.yaml` at a
   store path) and D14 (the `incarnation` file) take only a stat that answers absent for absence (`server.FileStat`):
@@ -200,7 +202,7 @@ store to mark: it silences the store and requests the flip directly.
 | D3 | `crl_save.log` present but `loadValidStoreState` rejects it (missing, truncated, unparsable, another store's; a read that fails with `isUnreadable` holds the load back through `awaitUnreadRetry` instead), or its state can never fit the device's CRL (`StoreLoader.neverFits`: a transaction above `maxTransactionBytes`, or the whole above the admission limit at the most streams any config allows, `maxAdmissionLimitBytes`, plus that bound: neither follows the device config, so a lowered or invalid `crl-max-streams` declares nothing) | `StoreLoader.handleLoad` then `StoreRebuilds.crlSaveFileLost`/`retireUnserved` | closed unserved, marked, offline, device checked | a save-file format change: every store whose directory holds a save file; a change to `CrlAdmission.recoveredBytes` or the CRL bounds in a release (never-fits); a transfer onto a device with a smaller CRL (Backlog, "Transfers do not check the destination's CRL room"), or a store D1/D2 spared whose save file meets a replacement CRL sized smaller by a changed config. A crash between the save and `deleteTransactions` leaves the same entries in the device CRL, and the retire saves those beside the file (`lost-crl-entries.log`). A state that does not fit *yet*, including one that fits only once the CRL grows, is not declared: the store waits offline, asking the CRL to grow, retried at each device scan |
 | D4 | Adoption: an Offline or Active store whose directory has `transferring-out` without a valid save file, or has `rebuild-required` | `DeviceDiscovery.adoptionClass` (`CrlLost`); `DeviceMetadata.adoptDevice` writes the marker in its prepare closure and the entry Rebuilding in the adoption transaction | adopted as Rebuilding | a save-file read path that fails on the adopting host's version (a read failing with `isUnreadable` throws instead, and the adoption is retried at the next scan); it inherits any false mark the previous host wrote. A marker left by an adoption transaction that does not commit is harmless when the classification is right, as the state is lost whatever the outcome; one inherited from the previous host stays a false mark |
 | D5 | `BackendStateLost` at backend open: FSIF `StoreLost` (missing directory or blank files, no valid index, journal sequence or corruption checks, replay bounds; `FsifRecovery`, fsif/DESIGN.md 4.1), RocksDB `RocksDBStateLost` (`CURRENT` missing) | `StoreLoader.handleBackendOpened` | marked, offline, device checked | a format or validation change in a release; an incomplete mount or restore. An open never creates: stores are created atomically (`StoreCreation`), so a store path holds nothing or a complete store, and a missing or blank backend is declared rather than silently served empty |
-| D6 | Backend fail-stop while served (`Host.BackendFailed`; FSIF `onFatal`, fsif/DESIGN.md 4.2) | `StoreRebuilds.handleBackendFailed`/`backendFailed` | marked, then `closeUnloaded(dropDurably = false)`: its device-CRL entries stay live until the discard saves them | any I/O error FSIF treats as fatal, including any failed read of a compaction move, transient or not (SL-W19); any internal exception in its serial executor; an ENOSPC that the classifier fails to recognize |
+| D6 | Backend fail-stop while served (`Host.BackendFailed`; FSIF `onFatal`, fsif/DESIGN.md 4.2) | `StoreRebuilds.handleBackendFailed`/`backendFailed` | marked, then `closeUnloaded(dropDurably = false)`: its device-CRL entries stay live until the discard saves them | any I/O error FSIF treats as fatal (a failed compaction move read is not one: it abandons and retries the move); any internal exception in its serial executor; an ENOSPC that the classifier fails to recognize |
 | D7 | Store fail-stop (`Host.StoreFailStopped`): its CRL read failed other than by the CRL's own death or shutdown (`CrlFailed`, `CrlClosed`: the device's failure, left to `DeviceShutdown.crlFailed`), or its recovery failed (`StoreRouter.readAndRecover`, `recoverOrFail`), or `Frontend.failStop` (a commit voter whose apply throws, `Tx.issueCommits`; a recovered commit vote whose object fails to load with other than ObjectNotFound on a store whose writes are not frozen, `Tx.objectLoadFailed`; for RocksDB a Corruption status, an undecodable value, or a read failure outlasting `RetryScheduler.ReadRetryDelays`; for FSIF a CRC mismatch, no valid header, or a read failure outlasting the same delays) | `StoreRebuilds.handleFailStopped` then `backendFailed`, only while that Store is still the one installed | as D6 | a decoding change in `TransactionRecoveryState`; a bug in an applier or requirement checker, which fires on **every replica of the object** in the same transaction |
 | D8 | Backend failed before it was served: at `LoadStore` (`hasFailed`), opened but not served, or failed after it stopped being served (not replaced, directory on a loaded device) | `StoreLoader.handleLoad` then `retireUnserved`; `StoreLoader.handleBackendOpened`; `StoreRebuilds.backendFailed` | marked, offline | as D6 |
 | D9 | Backend fail-stop during a clean close (`ShutdownStore`) | `StoreLoader.handleClose` then `StoreRebuilds.failedOnClose` | marked; a transfer-out close's `crl_save.log` kept, saved as the copy's lost CRL state by its retire (X2) | as D6, and any close-path bug |
@@ -436,7 +438,7 @@ These are places where one software change or environmental fault produces decla
   constructor's discovery and the `CheckAllDevices` posted right after it) and nudges do not count, so the first
   counted failure is at the first 10 s scan and the declaration at the third: a condition must outlast about 20 s, two
   scan periods, to be declared. A save-file or store-config read that fails with `isUnreadable` is retried, never declared, and an
-  FSIF compaction move's failed read, a rejected io task included, fail-stops its store at once (SL-W19).
+  FSIF compaction move's failed read, a rejected io task included, abandons the move and retries it after a backoff.
 * **SC6 Incomplete mount or restored backup.** `crl/` absent, or present without stream files, while store
   directories exist is D1, with no retry. Absent FSIF files or a missing RocksDB `CURRENT` is D5. Store directories
   or configs missing beside Active entries are D13 at the first reconcile; their device-CRL entries stay, so a
@@ -562,20 +564,4 @@ with its copies retained in `pending-delete/` or at their paths, and nothing to 
 
 ## Open weaknesses
 
-### SL-W19: A failed read of an FSIF compaction move fail-stops the store, whatever the error
-Verdict CONFIRMED. Priority 3. Effort S.
-Mechanism: `Compaction.start` reads the slot being moved through `runIo(IoKind.MoveRead)`; `Compaction.copied` calls
-`host.failStop` on any `Failure`, and `runIo` turns a rejected io task into one. `FsifBackend.failStop` calls
-`onFatal`, which posts `Host.BackendFailed`, and `StoreRebuilds.backendFailed` marks the served store
-`rebuild-required` (D6). Nothing has been written at that point: the move's target slot was never mapped, and
-`Compaction.cancel` already abandons a move before its Map is appended. A client read of the same slot, by contrast,
-is retried over `RetryScheduler.ReadRetryDelays` and reports `CorruptedObject` only on evidence of damage
-(`FsifBackend.assemble`).
-Consequence: a transient read error, descriptor or memory exhaustion, or an io executor that rejects a task declares
-the store lost. Compaction is background work that runs on every FSIF store, so a host-wide condition (EMFILE, ENOMEM,
-a saturated or shutting-down io executor, a flaky controller on a shared device) fail-stops every store that has a
-move in flight, all at once.
-Fix: on a failed move read, cancel the move (release the target slot as `cancel` does) and let a later compaction
-retry it, keeping fail-stop for write and force failures; report damage only as the client read path does (no valid
-header, CRC mismatch), and then as `CorruptedObject` to repair rather than a fail-stop.
-
+(none)

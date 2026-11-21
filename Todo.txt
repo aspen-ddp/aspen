@@ -56,15 +56,6 @@ PRIORITY 3: systemic loss protection
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
-3.2 [SL-W19] A failed read of an FSIF compaction move fail-stops the store, whatever the error.
-    CONFIRMED. Effort S. systemic-loss-protection.md, cross-document-review.md section 5,
-    server/store/backend/fsif/DESIGN.md (4.2, L18).
-    fsif Compaction.copied fail-stops on any move-read failure, including a rejected io task (runIo), though nothing
-    is written yet and Compaction.cancel can abandon the move; compaction runs on every FSIF store, so a host-wide
-    EMFILE/ENOMEM or saturated io executor fail-stops many stores at once (D6). Fix: abandon and retry the move on a
-    read failure that is not evidence of damage (as the client read path does since X-W22); rewrite DESIGN.md's L18
-    and its "a client read only returns CorruptedObject" passage.
-
 
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------

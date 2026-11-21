@@ -256,6 +256,9 @@ class FsifBackend(val storeId: StoreId,
     def failStop(t: Throwable): Unit =
       logger.error(s"FSIF store $storeId: compaction I/O failed: $t")
       FsifBackend.this.failStop(t)
+    def warn(msg: String): Unit = logger.warn(s"FSIF store $storeId: $msg")
+    def schedule(delay: FiniteDuration)(f: => Unit): Unit = scheduler.schedule(delay, () => post(f))
+    def closing: Boolean = FsifBackend.this.closing
     def forceData(kind: IoKind)(done: Try[Unit] => Unit): Unit = FsifBackend.this.forceData(kind)(done)
     def dataEpoch: Long = FsifBackend.this.dataEpoch
     def commitMove(x: Int, id: ObjectId, from: Int, to: Int)(done: Try[Unit] => Unit): Unit =
@@ -264,7 +267,7 @@ class FsifBackend(val storeId: StoreId,
       onDurable(appendRecords(List(JournalRecord.Mapping(x, to, id)))): r =>
         if r.isSuccess then unmapDurable(dead)
         done(r)
-  , layout)
+  , layout, tuning.moveRetryDelays)
 
   // Compaction resumes after recovery without waiting for the first operation
   post(())
@@ -1675,7 +1678,7 @@ object FsifBackend:
     case Read, InPlace, Cow, Journal, Checkpoint, MoveRead, MoveWrite, MoveForce, DataForce
 
   /** Test counters: moves started, moves whose Map(X, f) is durable, and moves cancelled */
-  private[fsif] final case class CompactionStats(started: Int, mapped: Int, cancelled: Int)
+  private[fsif] final case class CompactionStats(started: Int, mapped: Int, cancelled: Int, readFailures: Int)
 
   /** An io task, labelled so tests can hold one kind back */
   private[fsif] final class IoTask(val kind: IoKind, body: () => Unit) extends Runnable:

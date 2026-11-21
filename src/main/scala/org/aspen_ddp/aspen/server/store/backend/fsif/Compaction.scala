@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server.store.backend.fsif
 
 import scala.collection.mutable
+import scala.concurrent.duration.FiniteDuration
 import scala.util.{Failure, Success, Try}
 
 import org.aspen_ddp.aspen.common.objects.ObjectId
@@ -27,6 +28,12 @@ import org.aspen_ddp.aspen.common.objects.ObjectId
   * A copy-on-write overwrite, a delete or any re-occupation of X before the Map is appended cancels the move
   * (`cancel`). f was never mapped, so it is released once the move's io in flight has finished.
   *
+  * A failed read of t (an I/O error, a rejected io task) abandons the move the same way: nothing has been written
+  * into f, so the failure says nothing about the store's state and is no cause to fail-stop it. No move starts until
+  * the next of `moveRetryDelays` has passed (consecutive failures step through them, the last repeating; a successful
+  * read starts over). A damaged slot reads successfully and is copied as it is: a client read of f reports the damage
+  * as a read of t would. A write or force into f that fails other than with ENOSPC fail-stops the store.
+  *
   * Truncation runs inline on serial, so no allocation can interleave with it: the slot count is lowered to
   * (highest used slot + 1), or 0 when nothing is used, and a longer `data` is cut to that many strides (never
   * grown). A used slot is mapped, reserved (copy-on-write, rebuild or move target) or waiting for the slot-freeing
@@ -43,7 +50,8 @@ import org.aspen_ddp.aspen.common.objects.ObjectId
   * task, which the checkpoint's Barrier makes durable before index s+1 (taken with X -> t) is written; and f was
   * forced holding them before that Map.
   */
-private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout):
+private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout,
+                                     moveRetryDelays: Seq[FiniteDuration]):
   import Compaction.*
   import FsifBackend.IoKind
 
@@ -52,19 +60,26 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout):
   @volatile private var started = 0
   @volatile private var mapped = 0
   @volatile private var cancelled = 0
+  @volatile private var readFailures = 0
+  /** Move reads failed since the last successful one */
+  private var consecutiveReadFailures = 0
+  /** A move read failed and its retry delay has not yet passed: no move starts */
+  private var backingOff = false
 
-  def stats: FsifBackend.CompactionStats = FsifBackend.CompactionStats(started, mapped, cancelled)
+  def stats: FsifBackend.CompactionStats = FsifBackend.CompactionStats(started, mapped, cancelled, readFailures)
 
   /** No move outstanding */
   def idle: Boolean = move.isEmpty
 
-  /** Run after every serial task: truncate free tail slots, then resume or start a move. Paused while frozen. */
+  /** Run after every serial task: truncate free tail slots, then resume or start a move. Paused while frozen; no
+    * move starts while closing or backing off after a failed move read.
+    */
   def drive(): Unit =
     if host.fatal then
       move.foreach(finishIfDone)
     else if !host.frozen then
       move.foreach(m => pump(m))
-      if truncate() && move.isEmpty && host.journalHasRoomForMove then
+      if truncate() && move.isEmpty && !backingOff && !host.closing && host.journalHasRoomForMove then
         start()
 
   /** X's occupant is about to change (copy-on-write, delete, re-allocation, rebuild): a move of X that has not yet
@@ -149,15 +164,30 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout):
     host.readDone(st)
     image match
       case Failure(t) =>
-        host.failStop(t)
+        if !m.cancelled && !host.fatal then
+          abandonAfterReadFailure(m, t)
         finishIfDone(m)
       case Success(img) =>
+        consecutiveReadFailures = 0
         if m.cancelled || host.fatal then
           finishIfDone(m)
         else
           m.assembled = true
           m.queue += ((layout.slotOffset(m.to), img))
           pump(m)
+
+  /** Nothing has been written into f: the move ends as a cancelled one (f is released by `finishIfDone`) and no move
+    * starts until the retry delay has passed
+    */
+  private def abandonAfterReadFailure(m: Move, t: Throwable): Unit =
+    readFailures += 1
+    val delay = moveRetryDelays(math.min(consecutiveReadFailures, moveRetryDelays.size - 1))
+    consecutiveReadFailures += 1
+    host.warn(s"compaction move read of slot ${m.from} failed; abandoning the move, retrying in $delay: $t")
+    m.cancelled = true
+    m.queue.clear()
+    backingOff = true
+    host.schedule(delay) { backingOff = false }
 
   /** The raw image of t with every Delta in its list overlaid in order, the newest header last */
   private def assemble(disk: Array[Byte], st: SlotState): Array[Byte] =
@@ -294,6 +324,11 @@ private[fsif] object Compaction:
     /** Runs `work` on io and `done` on serial (guarded); a rejected task completes `done` with the failure */
     def runIo[A](kind: FsifBackend.IoKind)(work: => A)(done: Try[A] => Unit): Unit
     def failStop(t: Throwable): Unit
+    def warn(msg: String): Unit
+    /** Runs `f` on serial (guarded) after `delay` */
+    def schedule(delay: FiniteDuration)(f: => Unit): Unit
+    /** The backend is closing: no new move may start */
+    def closing: Boolean
     /** Writes are frozen by ENOSPC: start nothing new */
     def frozen: Boolean
     /** The active journal has room for one more move's Mapping under the hard limit, and nothing is held by it */

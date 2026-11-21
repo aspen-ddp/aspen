@@ -222,9 +222,9 @@
   (Backlog: correlated declarations)
 - Deletion after allocation (crash-recovery-log 3.4): a recovered allocating commit vote treats a backend miss as "not
   yet applied" and creates the object from its CRL data, so a deletion must never reach the backend while an
-  allocation's CRL state still durably holds the object's update. `allocationRecords`/ `allocationsOf` index the Txs
+  allocation's CRL state still durably holds the object's update. `Frontend.allocations` (a `CrlStateRecords`) indexes the Txs
   that allocate objects here (registered at both Tx creations) until their CRL state's deletion or stub is durable
-  (`allocationConcluded`, at `concludeTransactionState`, `deleteTransactionState`, `recordAppliedStub`, `forgetMuted`,
+  (`CrlStateRecords.concluded` via `stateConcluded`, at `concludeTransactionState`, `deleteTransactionState`, `recordAppliedStub`, `forgetMuted`,
   then a `whenDurable`). `awaitAllocationsDurable` holds a deletion's `backend.commit` (`commit` with refcount 0) and
   `backend.repairDelete` until each covering allocation's state is saved without the object's update
   (`Tx.persistWithoutUpdateOf`, which also covers a forgotten Tx whose state the CRL keeps for a failed commit) or, once
@@ -234,7 +234,7 @@
   and FSIF, so its tests see no miss: the deletion-after-allocation tests use a removing MapBackend
 - Key deletion after a blind insert (transaction-requirements 9.4, 10.5c): a recovered commit vote re-applies an Insert
   of an absent key, which is right only if no deletion of that key followed the update its CRL state holds. So
-  `blindInsertRecords`/`blindInsertsOf` index the Txs whose KeyValue update of an object here has no required
+  `Frontend.blindInserts` (also a `CrlStateRecords`) indexes the Txs whose KeyValue update of an object here has no required
   revision (by shape only, registered beside the allocations by `registerReplayHazards`, dropped once the state's
   deletion or stub is durable, `stateConcluded`), and `awaitBlindInsertsDurable` holds a key deletion's backend write
   (`commit`, whose `deletedKeys` thunk is asked only when the index covers the object, and a repair write whose plan

@@ -763,114 +763,24 @@ class Frontend(val storeId: StoreId,
     if !listed.exists(_ eq tx) then
       deferredFinalizations(tx.transactionId) = listed :+ tx
 
-  /** A transaction that allocates objects here, whose CRL state may still hold their updates. `tx` is its latest Tx,
-    * kept after the Tx is forgotten: its state may stay in the CRL meanwhile (its backend commits outstanding or
-    * failed). `concluded`: its state's deletion or stub is queued in the CRL, not yet known durable
+  /** Transactions that allocate objects here and may still hold their updates in the CRL (crash-recovery-log 3.4).
+    * An ordinary deletion consults nothing else
     */
-  private final class AllocationRecord(var tx: Tx, var objects: Set[ObjectId], var concluded: Boolean)
-
-  /** Transactions that allocate objects here and may still hold their updates in the CRL (crash-recovery-log 3.4),
-    * by txid and by object. Empty for every object no unconcluded allocation covers, so an ordinary deletion consults
-    * nothing else
-    */
-  private val allocationRecords = scala.collection.mutable.HashMap[TransactionId, AllocationRecord]()
-  private val allocationsOf = scala.collection.mutable.HashMap[ObjectId, Set[TransactionId]]()
-
-  private def registerAllocation(tx: Tx, hosted: List[ObjectPointer]): Unit =
-    val allocated = tx.txd.allocatingObjects.intersect(hosted.iterator.map(_.id).toSet)
-    if allocated.nonEmpty then
-      val txid = tx.transactionId
-      allocationRecords.get(txid) match
-        case Some(r) =>
-          r.tx = tx
-          r.concluded = false
-          r.objects ++= allocated
-        case None => allocationRecords(txid) = new AllocationRecord(tx, allocated, false)
-      allocated.foreach(oid => allocationsOf(oid) = allocationsOf.getOrElse(oid, Set()) + txid)
-
-  private def unregisterAllocation(txid: TransactionId, oids: Set[ObjectId]): Unit =
-    oids.foreach: oid =>
-      val rest = allocationsOf.getOrElse(oid, Set()) - txid
-      if rest.isEmpty then allocationsOf.remove(oid) else allocationsOf(oid) = rest
-
-  /** `txid`'s CRL state was deleted or replaced by a stub: no save of it may follow. Its record is dropped once that is
-    * durable, unless a newer Tx registered it again meanwhile */
-  private def allocationConcluded(txid: TransactionId): Unit =
-    allocationRecords.get(txid).foreach: r =>
-      r.concluded = true
-      crl.whenDurable(storeId, () => post { () =>
-        allocationRecords.get(txid).filter(_ eq r).filter(_.concluded).foreach: r =>
-          allocationRecords.remove(txid)
-          unregisterAllocation(txid, r.objects)
-      })
-
-  /** Runs `proceed` once no CRL state of a transaction allocating `oid` here holds its update durably: the store is
-    * about to delete `oid` from its backend, and a restart that recovered the update would allocate the object again
-    * over the deletion (crash-recovery-log 3.4). An unconcluded allocation's state is saved again without it
-    * (Tx.persistWithoutUpdateOf); a concluded one's deletion or stub only has to be durable (whenDurable). Inline when
-    * no allocation covers `oid`, which is every deletion but one soon after its object's allocation
-    */
-  private def awaitAllocationsDurable(oid: ObjectId)(proceed: () => Unit): Unit =
-    val txids = allocationsOf.getOrElse(oid, Set())
-    if txids.isEmpty then
-      proceed()
-    else
-      var pending = txids.size
-      def oneDone(): Unit =
-        pending -= 1
-        if pending == 0 then proceed()
-      logger.info(s"Store $storeId deletes object $oid soon after transactions ${txids.mkString(", ")} allocated it: " +
-        s"the deletion waits until their CRL state durably holds no update of it")
-      txids.foreach: txid =>
-        allocationRecords.get(txid) match
-          case Some(r) if !r.concluded =>
-            // The update is gone from its state for good: later deletions of the object need nothing from it
-            r.objects -= oid
-            unregisterAllocation(txid, Set(oid))
-            if r.objects.isEmpty then allocationRecords.remove(txid)
-            r.tx.persistWithoutUpdateOf(oid)(() => oneDone())
-          case _ =>
-            crl.whenDurable(storeId, () => post(() => oneDone()))
-
-  /** A transaction whose KeyValue update of objects here has no required revision, and whose CRL state may still
-    * hold that update. Its Inserts are checked only at the key (`KeyRevision`, `Exists`, `DoesNotExist`, a timestamp
-    * requirement) or by a content lock, so a recovered commit vote's re-check of them may pass again after a later
-    * deletion of their keys (transaction-requirements 9.4, 10.5c). Kept, as an AllocationRecord is, until the state's
-    * deletion or stub is durable
-    */
-  private final class BlindInsertRecord(var tx: Tx, var objects: Set[ObjectId], var concluded: Boolean)
+  private val allocations = new CrlStateRecords(storeId, crl, post)
 
   /** Transactions with a KeyValue update of objects here that has no required revision and whose CRL state may still
     * hold the update, by txid and by object (transaction-requirements 9.4). Filled by the update's shape alone; its
     * keys are decoded only when a key deletion meets it (awaitBlindInsertsDurable). Empty for every object no recent
     * such update covers
     */
-  private val blindInsertRecords = scala.collection.mutable.HashMap[TransactionId, BlindInsertRecord]()
-  private val blindInsertsOf = scala.collection.mutable.HashMap[ObjectId, Set[TransactionId]]()
-
-  private def registerBlindInserts(tx: Tx, hosted: List[ObjectPointer]): Unit =
-    val ids = hosted.iterator.map(_.id).toSet
-    val blind = tx.txd.requirements.iterator.collect {
-      case r: KeyValueUpdate if r.requiredRevision.isEmpty && ids.contains(r.objectPointer.id) => r.objectPointer.id
-    }.toSet
-    if blind.nonEmpty then
-      val txid = tx.transactionId
-      blindInsertRecords.get(txid) match
-        case Some(r) =>
-          r.tx = tx
-          r.concluded = false
-          r.objects ++= blind
-        case None => blindInsertRecords(txid) = new BlindInsertRecord(tx, blind, false)
-      blind.foreach(oid => blindInsertsOf(oid) = blindInsertsOf.getOrElse(oid, Set()) + txid)
-
-  private def unregisterBlindInserts(txid: TransactionId, oids: Set[ObjectId]): Unit =
-    oids.foreach: oid =>
-      val rest = blindInsertsOf.getOrElse(oid, Set()) - txid
-      if rest.isEmpty then blindInsertsOf.remove(oid) else blindInsertsOf(oid) = rest
+  private val blindInserts = new CrlStateRecords(storeId, crl, post)
 
   private def registerReplayHazards(tx: Tx, hosted: List[ObjectPointer]): Unit =
-    registerAllocation(tx, hosted)
-    registerBlindInserts(tx, hosted)
+    val ids = hosted.iterator.map(_.id).toSet
+    allocations.register(tx, tx.txd.allocatingObjects.intersect(ids))
+    blindInserts.register(tx, tx.txd.requirements.iterator.collect {
+      case r: KeyValueUpdate if r.requiredRevision.isEmpty && ids.contains(r.objectPointer.id) => r.objectPointer.id
+    }.toSet)
     if repairInstalls.nonEmpty then
       hosted.foreach(p => repairInstalls.get(p.id).foreach(at => tx.repairInstalled(p.id, at)))
 
@@ -910,18 +820,39 @@ class Frontend(val storeId: StoreId,
   def keyDeletedSince(oid: ObjectId, key: Key, since: HLCTimestamp): Boolean =
     keyDeletions.nonEmpty && keyDeletions.get(oid).flatMap(_.get(key)).exists(_ >= since)
 
-  /** `txid`'s CRL state was deleted or replaced by a stub: no save of it may follow. Its records are dropped once that
-    * is durable, unless a newer Tx registered them again meanwhile
-    */
+  /** `txid`'s CRL state was deleted or replaced by a stub: no save of it may follow */
   private def stateConcluded(txid: TransactionId): Unit =
-    allocationConcluded(txid)
-    blindInsertRecords.get(txid).foreach: r =>
-      r.concluded = true
-      crl.whenDurable(storeId, () => post { () =>
-        blindInsertRecords.get(txid).filter(_ eq r).filter(_.concluded).foreach: r =>
-          blindInsertRecords.remove(txid)
-          unregisterBlindInserts(txid, r.objects)
-      })
+    allocations.concluded(txid)
+    blindInserts.concluded(txid)
+
+  /** A callback that runs `proceed` on its `n`th call */
+  private def countDown(n: Int, proceed: () => Unit): () => Unit =
+    var pending = n
+    () =>
+      pending -= 1
+      if pending == 0 then proceed()
+
+  /** Runs `proceed` once no CRL state of a transaction allocating `oid` here holds its update durably: the store is
+    * about to delete `oid` from its backend, and a restart that recovered the update would allocate the object again
+    * over the deletion (crash-recovery-log 3.4). An unconcluded allocation's state is saved again without it
+    * (Tx.persistWithoutUpdateOf); a concluded one's deletion or stub only has to be durable (whenDurable). Inline when
+    * no allocation covers `oid`, which is every deletion but one soon after its object's allocation
+    */
+  private def awaitAllocationsDurable(oid: ObjectId)(proceed: () => Unit): Unit =
+    val txids = allocations.covering(oid)
+    if txids.isEmpty then
+      proceed()
+    else
+      val done = countDown(txids.size, proceed)
+      logger.info(s"Store $storeId deletes object $oid soon after transactions ${txids.mkString(", ")} allocated it: " +
+        s"the deletion waits until their CRL state durably holds no update of it")
+      txids.foreach: txid =>
+        allocations.get(txid) match
+          case Some(r) if !r.concluded =>
+            allocations.dropObject(txid, r, oid)
+            r.tx.persistWithoutUpdateOf(oid)(() => done())
+          case _ =>
+            crl.whenDurable(storeId, () => post(() => done()))
 
   /** Runs `proceed` once no CRL state of another transaction that applied a blind Insert of one of `deleted` (keys of
     * `oid`, about to be removed from the backend by `by`'s commit or by a repair write) holds that update durably. A
@@ -941,34 +872,29 @@ class Frontend(val storeId: StoreId,
     */
   private def awaitBlindInsertsDurable(oid: ObjectId, by: Option[TransactionId], deleted: () => Set[Key])
                                       (proceed: () => Unit): Unit =
-    val covering = blindInsertsOf.getOrElse(oid, Set()) -- by
+    val covering = blindInserts.covering(oid) -- by
     if covering.isEmpty then
       proceed()
     else
       val keys = deleted()
       val hazards = if keys.isEmpty then Nil else covering.toList.flatMap: txid =>
-        blindInsertRecords.get(txid).filter(r => r.tx.insertedKeys(oid).exists(keys.contains)).map(txid -> _)
+        blindInserts.get(txid).filter(r => r.tx.insertedKeys(oid).exists(keys.contains)).map(txid -> _)
       if hazards.isEmpty then
         proceed()
       else
-        var pending = hazards.size
-        def oneDone(): Unit =
-          pending -= 1
-          if pending == 0 then proceed()
+        val done = countDown(hazards.size, proceed)
         logger.info(s"Store $storeId deletes keys of object $oid soon after transactions " +
           s"${hazards.map(_._1).mkString(", ")} inserted them: the deletion waits until their CRL state durably holds " +
           s"no update of it")
         hazards.foreach: (txid, r) =>
           if r.concluded then
-            crl.whenDurable(storeId, () => post(() => oneDone()))
+            crl.whenDurable(storeId, () => post(() => done()))
           else if r.tx.holdsUpdateOf(oid) then
-            // The update is gone from its state for good: later deletions of its keys need nothing from it
-            r.objects -= oid
-            unregisterBlindInserts(txid, Set(oid))
-            if r.objects.isEmpty then blindInsertRecords.remove(txid)
-            r.tx.persistWithoutUpdateOf(oid)(() => oneDone())
+            blindInserts.dropObject(txid, r, oid)
+            r.tx.persistWithoutUpdateOf(oid)(() => done())
           else
-            oneDone()
+            done()
+
 
   private var pendingReads: Map[ObjectId, List[ReadKind]] = Map()
 

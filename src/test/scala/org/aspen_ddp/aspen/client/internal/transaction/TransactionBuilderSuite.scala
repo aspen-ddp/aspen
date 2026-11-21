@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
-import org.aspen_ddp.aspen.client.{BlindKeyValueWrite, UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject}
+import org.aspen_ddp.aspen.client.{BlindKeyValueWrite, RefcountSerialNotAdvanced, UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject}
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, IDA, ReedSolomon}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, VersionBump}
@@ -211,6 +211,18 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
       message should include (s"${p1.id}: the RefcountUpdate leaves the refcount at $rc1")
       message should include ("has no pin and is not marked replay-safe")
       message should include ("Transaction.replaySafe(reason)")
+  }
+
+  test("a refcount update that does not advance the update serial is refused, except an allocation's or an identity") {
+    val b = mkBuilder(); b.setRefcount(p1, ObjectRefcount(5, 2), ObjectRefcount(5, 1))
+    intercept[RefcountSerialNotAdvanced](buildPin(b)) shouldBe
+      RefcountSerialNotAdvanced(p1, ObjectRefcount(5, 2), ObjectRefcount(5, 1))
+    val c = mkBuilder(); c.replaySafe("test"); c.setRefcount(p1, ObjectRefcount(5, 2), ObjectRefcount(4, 3))
+    intercept[RefcountSerialNotAdvanced](buildPin(c))
+    val d = mkBuilder(); d.replaySafe("test"); d.setRefcount(p1, rc1, rc1); buildPin(d)
+    // Allocation, staged in either order
+    val e = mkBuilder(); e.replaySafe("test"); e.setRefcount(p1, ObjectRefcount.Allocating, ObjectRefcount(0, 3))
+    e.addAllocatingObject(p1); e.overwrite(p1, ObjectRevision.Allocating, DataBuffer(Array[Byte](1))); buildPin(e)
   }
 
   // Blind writes (todo 2.2): stores apply a blind Insert last-writer-wins, but keep no tombstone for a Delete and no

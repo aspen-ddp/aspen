@@ -80,6 +80,18 @@ class DescriptionValidatorSuite extends AnyFunSuite with Matchers:
     validate(txd(List(rc, rc))).get should include("refcount")
   }
 
+  test("a refcount update that does not advance the update serial is refused, except an allocation's or an identity") {
+    validate(txd(List(RefcountUpdate(data, ObjectRefcount(5, 2), ObjectRefcount(5, 1))))).get should include("serial")
+    validate(txd(List(RefcountUpdate(data, ObjectRefcount(5, 2), ObjectRefcount(4, 3))))).get should include("serial")
+    validate(txd(List(RefcountUpdate(data, ObjectRefcount(5, 2), ObjectRefcount(6, 2))))) shouldBe None
+    // The repair proof's rc -> rc writes no new value, so no later write can return to one
+    validate(txd(List(RefcountUpdate(data, ObjectRefcount(5, 2), ObjectRefcount(5, 2))), replaySafe = true)) shouldBe None
+    // An allocation sets the initial refcount from ObjectRefcount.Allocating, whatever its serial
+    val allocation = txd(List(overwrite(), RefcountUpdate(kv, ObjectRefcount.Allocating, ObjectRefcount(0, 3))))
+    validate(allocation.copy(allocatingObjects = Set(kv.id))) shouldBe None
+    validate(allocation).get should include("serial")
+  }
+
   test("a lock on an updated object, or a shared lock beside another lock, is refused") {
     validate(txd(List(overwrite(), ExclusiveRevisionLock(data, rev0)))).get should include("also updates")
     validate(txd(List(overwrite(), SharedRevisionLock(data, rev0)))).get should include("also updates")

@@ -18,6 +18,9 @@ import org.aspen_ddp.aspen.common.transaction.*
   *  - At most one content update (DataUpdate, KeyValueUpdate, VersionBump) and one RefcountUpdate per object, no
   *    lock on an object the transaction updates, and no shared lock beside another lock. A second KeyValueUpdate's
   *    keys would otherwise go unlocked (KVWrites keeps the last).
+  *  - Every RefcountUpdate advances ObjectRefcount.updateSerial, unless it allocates the object or sets the refcount
+  *    it requires (RefcountUpdate.advancesSerial). A recovered vote takes a passing refcount check as not yet
+  *    applied, which a later change returning the refcount to the required value would falsify.
   *  - The pin rule (Pins.declared), unless the client marked the description replaySafe. A key pin is taken from
   *    KeyValueUpdate.pinned, which the stores holding that object check (RequirementsChecker, FalsePin): a false one
   *    gets abort votes on its object, so the transaction cannot commit.
@@ -31,7 +34,7 @@ object DescriptionValidator:
     * @param poolIDA The IDA of the store's pool (StoreConfig.ida). None skips that check (tests only)
     */
   def validate(txd: TransactionDescription, storeId: StoreId, poolIDA: Option[IDA]): Option[String] =
-    pools(txd, storeId, poolIDA).orElse(structure(txd)).orElse(pin(txd))
+    pools(txd, storeId, poolIDA).orElse(structure(txd)).orElse(refcounts(txd)).orElse(pin(txd))
 
   private def pools(txd: TransactionDescription, storeId: StoreId, poolIDA: Option[IDA]): Option[String] =
     val referenced = txd.allReferencedObjectsSet
@@ -70,6 +73,12 @@ object DescriptionValidator:
       else if shared > 0 && exclusive + shared > 1 then Some(s"holds a shared lock on object $oid beside another lock")
       else None
     }.nextOption()
+
+  private def refcounts(txd: TransactionDescription): Option[String] =
+    txd.requirements.collectFirst:
+      case ru: RefcountUpdate if !RefcountUpdate.advancesSerial(ru, txd.allocatingObjects) =>
+        s"sets the refcount of object ${ru.objectPointer.id} from ${ru.requiredRefcount} to ${ru.newRefcount} " +
+          "without advancing its update serial"
 
   private def pin(txd: TransactionDescription): Option[String] =
     if txd.replaySafe || Pins.declared(txd.requirements) then None

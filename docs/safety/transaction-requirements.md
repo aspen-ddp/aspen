@@ -162,8 +162,10 @@ X for the same transaction, and a transaction never collides with itself.
 applied: a `DataUpdate` at a required revision other than `Allocating`, a `VersionBump`, a KV update with a required
 revision, a `KeyRevision(k, _)` on a key the same update Inserts or Deletes, or a `RefcountUpdate` whose new refcount
 differs from the required one. The refcount pin relies on `ObjectRefcount.updateSerial` never returning to an earlier
-value: every production caller derives the new refcount with `update`, `increment` or `decrement`, which add one to the
-serial, but neither the builder nor the stores check it. The builder records the key pin in the description as
+value, and both the builder (`RefcountSerialNotAdvanced`) and the stores refuse a `RefcountUpdate` whose new serial is
+not above the required one (`RefcountUpdate.advancesSerial`), except an allocation of the object (from `Allocating`)
+and one that sets the refcount it requires (a repair proof's rc -> rc, which writes no new value). Callers derive the
+new refcount with `update`, `increment`, `decrement` or `setCount`, which add one to the serial. The builder records the key pin in the description as
 `KeyValueUpdate.pinned` (`Pins.writesCheckedKey`) and the client's claim as `TransactionDescription.replaySafe`.
 
 **Store-side validation.** Stores do not trust the builder. Before checking requirements, a client-prepared Tx runs
@@ -180,6 +182,9 @@ serial, but neither the builder nor the stores check it. The builder records the
 * per object at most one content update and one `RefcountUpdate`, no lock beside a content update (a lock beside a
   `RefcountUpdate` passes, as in the builder), no shared lock beside another lock (duplicate `ExclusiveRevisionLock`s,
   harmless, are allowed as the builder allows them);
+* every `RefcountUpdate` advances the update serial, unless the description allocates its object or it keeps the
+  required refcount (`RefcountUpdate.advancesSerial`), so a recovered vote's passing refcount re-check means its update
+  is not applied (10.5(c));
 * the pin rule from the description alone (`Pins.declared`, taking `pinned` as the key pin), unless `replaySafe`.
 
 The stores that hold a `pinned` object check the claim against the operations (`FalsePin`); a store that does not hold
@@ -846,8 +851,9 @@ missing update: `MissingObjectUpdate` at the re-check. The update was applied be
 recovered vote takes it as applied (8.5).
 
 (c) A recovered commit vote re-applies its update when its outcome is learned. Revision, refcount and `KeyRevision`
-requirements fail on a store that applied a later chained write (a refcount only because every shipped refcount
-change advances `ObjectRefcount.updateSerial`, which nothing enforces: cross-document-review X-W27), and the vote takes the object as applied (8.5). An
+requirements fail on a store that applied a later chained write (a refcount because every refcount
+change advances `ObjectRefcount.updateSerial`, which the builder and the stores enforce, 2.5, so no later write returns
+it to the required value), and the vote takes the object as applied (8.5). An
 `Exists`-checked Insert over a present key re-applies harmlessly (last writer wins). A `DoesNotExist` or blind Insert of a key now
 absent passes its re-check again, and applies: T never applied it. Had T applied it and a later transaction deleted the
 key, the deletion would have reached the backend only once T's CRL state no longer held the update

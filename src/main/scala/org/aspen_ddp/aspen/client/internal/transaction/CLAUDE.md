@@ -9,6 +9,10 @@
   (`server/store/DescriptionValidator`): `KeyValueUpdate.pinned` when the update writes a key it carries a
   `KeyRevision` on, and `TransactionDescription.replaySafe`. The builder's check is `Pins.declared` over the flagged
   requirements, the same test the stores apply.
+- A `RefcountUpdate` must advance `ObjectRefcount.updateSerial` (`RefcountUpdate.advancesSerial`; derive the new
+  refcount with `update`/`increment`/`decrement`/`setCount`), except an allocation's and an rc -> rc (repair proof).
+  The builder throws `RefcountSerialNotAdvanced` at build (never retried); stores refuse it too. A recovered vote
+  takes a passing refcount re-check as "not applied", which a repeated value would falsify
   So a forgotten transaction replayed by a delayed prepare cannot gather a write threshold of commit votes. The
   stores also bound joining by time: a 20 s transaction horizon (`common.transaction.TransactionHorizon`) and a forget
   floor refuse a prepare for a transaction a store may have forgotten (paxos-transactions 10.10; the details are in

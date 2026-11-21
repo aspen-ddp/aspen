@@ -66,11 +66,7 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.5 [X-W27] A recovered vote's refcount re-check rests on an unenforced update-serial convention.
-    PLAUSIBLE. Effort S. cross-document-review.md 2.3, transaction-requirements.md 10.5(c).
-    Pins and DescriptionValidator accept a RefcountUpdate that does not advance ObjectRefcount.updateSerial (e.g.
-    (5,2)->(5,1)); no shipped caller does it, but the re-check would then pass on a replay. Fix: refuse such an
-    update in TransactionBuilder and DescriptionValidator.
+(no open items)
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)

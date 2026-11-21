@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.common.transaction
 
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, ObjectRefcount, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision}
 
 import scala.concurrent.duration.{DurationInt, FiniteDuration}
 
@@ -39,6 +39,19 @@ case class RefcountUpdate(
                            objectPointer: ObjectPointer,
                            requiredRefcount: ObjectRefcount,
                            newRefcount: ObjectRefcount) extends TransactionObjectRequirement
+
+object RefcountUpdate:
+  /** Whether the update advances `ObjectRefcount.updateSerial`, so no later refcount change can return the object to
+    * its required value. A recovered commit vote takes its passing refcount check as "not yet applied" (`Tx`,
+    * transaction-requirements 10.5(c)), which holds only if the value never repeats. Exempt are an allocation of the
+    * object (it starts from `ObjectRefcount.Allocating`, guarded by the object's absence) and an update setting the
+    * refcount it requires (a repair proof's rc -> rc), which writes no new value. `TransactionBuilder` and
+    * `DescriptionValidator` refuse any other.
+    */
+  def advancesSerial(ru: RefcountUpdate, allocating: Set[ObjectId]): Boolean =
+    ru.newRefcount.updateSerial > ru.requiredRefcount.updateSerial ||
+      ru.newRefcount == ru.requiredRefcount ||
+      allocating.contains(ru.objectPointer.id)
 
 case class VersionBump(
                         objectPointer: ObjectPointer,

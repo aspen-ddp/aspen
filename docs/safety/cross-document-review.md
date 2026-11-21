@@ -296,8 +296,9 @@ The premises other subsystems take from this:
   object waits, its requirements unchecked, until the commit persists, by when the held commit has applied and
   released its locks (`Tx.determineDisposition`). A recovered voter whose re-check fails therefore
   holds T already (transaction-requirements.md 8.5); for a refcount the converse, that a re-check passing means T is
-  not applied, holds only because every shipped refcount change advances `ObjectRefcount.updateSerial`, so no later
-  write returns the refcount to T's required value (X-W27). One
+  not applied, holds because every refcount change advances `ObjectRefcount.updateSerial`, which the builder and
+  `DescriptionValidator` enforce (`RefcountUpdate.advancesSerial`), so no later write returns the refcount to T's
+  required value. One
   whose Insert of an absent key passes never applied it: a key's deletion reaches the backend only once no CRL state
   holding an applied blind Insert of the key remains (`Frontend.awaitBlindInsertsDurable`, transaction-requirements.md
   9.4). A live voter's failed re-check is an invariant violation, logged and reported.
@@ -539,7 +540,8 @@ Between the documents, each disagreement found is corrected where it stood:
 * transaction-recovery.md 4.2 (a resolved, unfinalized cache entry) and 2.6 here said a prepare below the floor
   creates nothing; the rebuilt store's muted Tx is now excepted in both.
 * transaction-requirements.md 10.5(c) says a refcount requirement fails at a store that applied a later chained
-  write. That rests on the `updateSerial` convention (X-W27), which it now names.
+  write. That rests on every refcount change advancing `updateSerial`, which it now names and the builder and stores
+  enforce (transaction-requirements.md 2.5).
 
 Between a document, scaladoc or guide outside docs/safety and the code:
 
@@ -552,18 +554,4 @@ Between a document, scaladoc or guide outside docs/safety and the code:
 
 ## Open weaknesses
 
-### X-W27: A recovered vote's refcount re-check rests on an unenforced update-serial convention
-Verdict PLAUSIBLE. Priority 5. Effort S.
-Mechanism: a recovered commit vote takes a failed re-check as applied and a passing one as not yet applied
-(`Tx.issueCommits`, `recoveredApplied`). A `RefcountUpdate`'s check is equality (`RequirementsChecker.checkRefcount`)
-and its apply sets the new refcount (`RequirementsApplyer.apply`), so a later T2 that returns the refcount to T's
-required value lets T's re-check pass after the store applied T and T2, and T applies again. Every shipped caller
-derives the new refcount by `update`, `increment`, `decrement` or `setCount`, all of which advance
-`ObjectRefcount.updateSerial`, so the value never repeats. Nothing enforces that: `Pins` and
-`DescriptionValidator` accept any `newRefcount != requiredRefcount`, such as (5, 2) -> (5, 1), and
-`TransactionBuilder.setRefcount` takes any `ObjectRefcount`.
-Consequence: none with shipped code. A caller that writes a refcount by hand without advancing the serial can have a
-recovered vote re-apply an old count over a later change at one store, unreported.
-Fix: refuse, in `TransactionBuilder` and `DescriptionValidator`, a `RefcountUpdate` whose new `updateSerial` is not
-above the required one, except an allocation's (`Allocating` to the initial refcount, guarded by `ObjectExists`) and a
-`replaySafe` repair proof (rc -> rc).
+(no open items)

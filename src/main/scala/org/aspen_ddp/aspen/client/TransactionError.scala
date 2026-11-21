@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.AspenError
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.objects.ObjectPointer
+import org.aspen_ddp.aspen.common.objects.{ObjectPointer, ObjectRefcount}
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
 
 sealed abstract class TransactionError extends AspenError
@@ -62,6 +62,19 @@ final case class UnpinnedTransaction(transactionId: TransactionId, found: List[S
 final case class BlindKeyValueWrite(objectPointer: ObjectPointer, reason: String) extends TransactionCreationError:
   override def getMessage: String =
     s"Refused KeyValue update of object ${objectPointer.id} (transaction-requirements 2.5): $reason"
+
+/** Thrown for a refcount update whose new refcount does not advance `ObjectRefcount.updateSerial` past the required
+  * one (e.g. (5, 2) -> (5, 1)), outside an allocation of the object and an update that keeps the required refcount.
+  * A later change could then return the refcount to a committed transaction's required value, and a recovered commit
+  * vote would re-apply the old count over it (`RefcountUpdate.advancesSerial`). Derive the new refcount with
+  * `ObjectRefcount.update`, `increment`, `decrement` or `setCount`. A programming error.
+  */
+final case class RefcountSerialNotAdvanced(objectPointer: ObjectPointer,
+                                           requiredRefcount: ObjectRefcount,
+                                           newRefcount: ObjectRefcount) extends TransactionCreationError:
+  override def getMessage: String =
+    s"Refused refcount update of object ${objectPointer.id} from $requiredRefcount to $newRefcount: the new refcount " +
+      "must advance the update serial (use ObjectRefcount.update, increment, decrement or setCount)"
 
 /** Used if multiple refcount modifications are attempted on the same object within a single transaction */
 final case class MultipleRefcountUpdatesToObject(objectPointer:ObjectPointer) extends TransactionCreationError

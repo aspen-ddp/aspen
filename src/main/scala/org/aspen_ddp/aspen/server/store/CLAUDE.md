@@ -9,7 +9,8 @@
   as `Frontend.poolIDA`; `None` skips the check, tests only), so each pool's stores guard their own thresholds. The
   primary object must be referenced, with its pool's IDA, the most failure-tolerant pool, and a leader among its
   stores. Per object: one content update, one `RefcountUpdate`, no lock on an updated object, no shared lock beside
-  another. And the pin rule must hold from the description alone (`Pins.declared`), or the description must be
+  another. Every `RefcountUpdate` advances the update serial unless it allocates the object or keeps the required
+  refcount (`RefcountUpdate.advancesSerial`). And the pin rule must hold from the description alone (`Pins.declared`), or the description must be
   `replaySafe` (a trusted client claim). A key pin is the update's `pinned` flag. The stores holding that object
   refuse a false flag (`FalsePin`, in `RequirementsChecker` beside `UnflaggedDelete`), so a store that does not hold
   it may rely on the flag

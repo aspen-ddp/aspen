@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.internal.allocation.{AllocationFinalizationAction, DeletionFinalizationAction}
-import org.aspen_ddp.aspen.client.{BlindKeyValueWrite, UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject, ObjectSizeLimitExceeded, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState}
+import org.aspen_ddp.aspen.client.{BlindKeyValueWrite, RefcountSerialNotAdvanced, UnpinnedTransaction, AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject, ObjectSizeLimitExceeded, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState}
 import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -110,6 +110,12 @@ class TransactionBuilder(
           keyValueUpdates += (kvptr -> KVUpdate(kvptr, None, None, Nil, Nil))
 
     keyValueUpdates.valuesIterator.foreach(refuseBlindWrites)
+
+    // Checked here, not in setRefcount, since the object may be marked allocating after its refcount is set
+    requirements.foreach:
+      case ru: RefcountUpdate if !RefcountUpdate.advancesSerial(ru, allocatingObjects.map(_.id)) =>
+        throw RefcountSerialNotAdvanced(ru.objectPointer, ru.requiredRefcount, ru.newRefcount)
+      case _ =>
 
     keyValueUpdates.valuesIterator.foreach: kvu =>
       val kv = KeyValueUpdate(kvu.pointer, kvu.requiredRevision, kvu.contentLock, kvu.requirements,

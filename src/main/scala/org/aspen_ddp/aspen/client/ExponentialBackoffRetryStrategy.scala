@@ -6,7 +6,7 @@ import scala.concurrent.duration.Duration
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
-/** `UnpinnedTransaction` and `BlindKeyValueWrite` are programming errors that fail identically on every attempt, so
+/** `UnpinnedTransaction`, `BlindKeyValueWrite` and `RefcountSerialNotAdvanced` are programming errors that fail identically on every attempt, so
   * they are never retried
   */
 class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 60 * 1000, initialRetryDelay: Int = 16) extends RetryStrategy {
@@ -48,6 +48,7 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
           case StopRetrying(reason) => p.failure(reason)
           case e: UnpinnedTransaction => p.failure(e)
           case e: BlindKeyValueWrite => p.failure(e)
+          case e: RefcountSerialNotAdvanced => p.failure(e)
           case _ => scheduleNextAttempt(retryCount)
 
       try
@@ -96,6 +97,7 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
           case StopRetrying(reason) => p.failure(reason)
           case e: UnpinnedTransaction => p.failure(e)
           case e: BlindKeyValueWrite => p.failure(e)
+          case e: RefcountSerialNotAdvanced => p.failure(e)
           case _ =>
             try
               onAttemptFailure(cause) onComplete {

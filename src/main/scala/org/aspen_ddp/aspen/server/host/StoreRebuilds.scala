@@ -201,11 +201,12 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  Every completion re-checks the host's other loaded devices, because
    *  `rebuildingStores` is host-wide: a slot released by device A's rebuild could unblock a queued
    *  rebuild on device B, and without a re-check of B it would wait for the periodic sweep (one
-   *  hour) with data under-replicated. The outcomes that settle the store's metadata (`Adopt`,
-   *  `AdoptOffline`, `Discard`) additionally re-check this device, to start the next store queued
-   *  behind the slot just freed. A failed walk and a permanently failed flip do not, since that
-   *  re-check would restart the same store at once: they schedule a backoff re-check instead
-   *  (scheduleRebuildRetry, rebuild-process 5.7).
+   *  hour) with data under-replicated. Every flip outcome but `NotOwned` (`Adopt`, `AdoptOffline`,
+   *  `Discard`, `Superseded`, `Unconfirmed`) additionally re-checks this device, to start the next
+   *  store queued behind the slot just freed; after `NotOwned` the device is another host's. A
+   *  failed walk and a permanently failed flip do not, since that re-check would restart the same
+   *  store at once: they schedule a backoff re-check instead (scheduleRebuildRetry,
+   *  rebuild-process 5.7).
    *
    *  A slot is taken from the start of a lost store's discard (`droppingCrlState`), not only once its walk runs, and
    *  passes straight from the discard to the rebuild: otherwise one pass would discard every marked store on the
@@ -717,7 +718,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  device afterwards, so the Rebuilding pass starts the rebuild now.
    *
    *  Only a collision is retried, as everywhere else in Host. A permanent failure is logged and
-   *  left for a later reconcile, which finds the marker again.
+   *  left for a later reconcile: the Lost CRL State pass requests it again while the store's
+   *  rebuild-required marker is in place, and the Missing Stores pass (which has no marker) only
+   *  while the store is still missing.
    */
   def requestRebuild(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
     if !pendingRebuildRequests.contains(storeId) then

@@ -125,7 +125,7 @@ object DeviceMetadata:
      *  and the copy the store's owner copy, and the entry has since become something the flip does not adopt
      *  (TransferringOut, say, or gone from the device). Nothing was written. The copy stays at the store's path,
      *  offline and unpromoted, for the pass that owns the entry's current state: a transfer out ships it, an aborted
-     *  one reinstates it, and an entry that has left the device has its copy retired (rebuild-process 5.4). */
+     *  one reinstates it, and an entry that has left the device has its copy retired (rebuild-process 5.7). */
     case Unconfirmed
 
   /** What completeDeviceShutdown decided, so shutDownDevice knows whether to unload the device,

@@ -849,14 +849,4 @@ transfer's promotion fail and retry; its flip then reads TransferringIn and gets
 
 ## Open weaknesses
 
-### RB-W17: Scaladoc of the Unconfirmed outcome and of startRebuild misdescribe the rebuild process
-Verdict CONFIRMED. Priority 7. Effort S.
-Mechanism: `DeviceMetadata.RebuildOutcome.Unconfirmed`'s scaladoc cites "rebuild-process 5.4" (retries) for the
-handling that is in 5.7. `StoreRebuilds.startRebuild`'s scaladoc lists `Adopt`, `AdoptOffline` and `Discard` as the
-outcomes that re-check this device; `Superseded` and `Unconfirmed` do too (`settledOutcome` then `recheckAll`).
-`StoreRebuilds.requestRebuild`'s scaladoc says a permanent failure is left for a later reconcile "which finds the
-marker again"; a Missing Stores request (T14) has no marker, and is found again only while the store is still
-missing.
-Consequence: readers following the citation or the outcome list get the wrong section or the wrong behaviour.
-Fix: cite 5.7; list every settled outcome but `NotOwned` as re-checking all devices; say that a Missing Stores
-request is retried only while the store stays missing.
+None.

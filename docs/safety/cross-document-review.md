@@ -477,8 +477,7 @@ Between the documents, none is open. Terms they share mean the same in each:
 * The collision wait is `Tx.CollisionWait`, 500 ms checked at the 1 s store heartbeat, so up to about 1.5 s, for a
   lock holder a vote builds on and for a colliding lock-order waiter alike.
 
-Between a document, scaladoc or guide outside docs/safety and the code, open: RB-W17 (`RebuildOutcome.Unconfirmed`,
-`StoreRebuilds.startRebuild` and `requestRebuild` scaladoc).
+Between a document, scaladoc or guide outside docs/safety and the code, none is open.
 
 ---
 

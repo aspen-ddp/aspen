@@ -79,8 +79,4 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.1 [RB-W17, X section 5] Scaladoc errors in the rebuild and repair code.
-    CONFIRMED. Effort S. rebuild-process.md, cross-document-review.md.
-    RebuildOutcome.Unconfirmed cites "rebuild-process 5.4" (it is 5.7); StoreRebuilds.startRebuild's scaladoc omits
-    Superseded and Unconfirmed among the outcomes that re-check the device; requestRebuild's scaladoc says a later
-    reconcile "finds the marker again" (a Missing Stores request has none). Fix: correct the texts.
+(no open items)

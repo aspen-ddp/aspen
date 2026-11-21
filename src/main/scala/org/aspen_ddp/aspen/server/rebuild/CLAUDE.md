@@ -1,4 +1,5 @@
 ### Store rebuilds
+- Files: `RebuildingStore.scala` (the pass: walk, restore, retry, finish; the on-disk marker files), `PendingAllocationSweep.scala` (the peer query for allocations held unfinalized and the direct restore of those objects, reaching the pass through callbacks), `RebuildState.scala` (checkpoint), `StoreRebuild.scala`. `RebuildingStore.missMark` builds the ErrorTree mark (missed at `HLCTimestamp.Zero`) every rebuild record uses
 - A rebuilt store lost its Paxos acceptor state. `RebuildingStore.finish` writes `acceptor-since` (finish time plus
   `AcceptorSinceMargin`, 10 s) into its directory; how the Frontend enforces it: `server/store/CLAUDE.md`. The
   margin covers `Frontend.MaxStartLead` (2 s) plus host-to-host clock skew; client clocks do not enter into it

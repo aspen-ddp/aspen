@@ -66,7 +66,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
   /** Set when the marks are handed to the marker. From then on only the write's outcome completes the action: a late
     * TxCommitted making every store clean must not complete it before the writes land. A failed write (the marker gave
-    * up on a pool) fails it, and the driver starts the transaction's finalizer again (TransactionDriver.startFinalizer)
+    * up on a pool) fails it, and the driver starts the transaction's finalizer again (FinalizerRunner.start)
     */
   private var handedOff = false
 

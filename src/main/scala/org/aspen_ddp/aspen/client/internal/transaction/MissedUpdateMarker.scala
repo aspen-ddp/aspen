@@ -173,7 +173,7 @@ class MissedUpdateMarker(client: AspenClient,
 
     // A TransactionCreationError, or an entry that fits no node (NodeSizeExceeded: a node too small for even one
     // object's chunk), is permanent: the write gives up and fails every entry of the batch, whose finalizers their
-    // drivers start again (TransactionDriver.startFinalizer), logging each failure. Other errors stay on the retry
+    // drivers start again (FinalizerRunner.start), logging each failure. Other errors stay on the retry
     // path: the error tree deletes entries, so a join racing the insert's scan can raise a transient InvalidObject.
     def onFail(err: Throwable): Future[Unit] = err match
       case err: TransactionCreationError => throw StopRetrying(err)

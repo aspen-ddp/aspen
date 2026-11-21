@@ -694,7 +694,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       entries shouldBe Map(UnackedCommitEntry.key(net.storeId0, txid) -> entry)
 
   // An entry that fits no node fails the same way on every attempt: the write gives up rather than retrying in place,
-  // and the finalizer's failure path takes over (TransactionDriver.startFinalizer)
+  // and the finalizer's failure path takes over (FinalizerRunner.start)
   atest("a write that fails with NodeSizeExceeded gives up"):
     val marker = new MissedUpdateMarker(client):
       override private[aspen] def commitErrorTreeTransaction(tx: Transaction): Future[Unit] =

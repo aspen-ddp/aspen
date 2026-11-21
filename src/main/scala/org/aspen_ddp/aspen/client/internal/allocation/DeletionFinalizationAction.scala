@@ -29,7 +29,7 @@ class DeletionFinalizationAction(val client: AspenClient,
         _ <- tx.commit()
       } yield ()
     }
-    // A failure fails the action, and the driver starts the finalizer again (TransactionDriver.startFinalizer)
+    // A failure fails the action, and the driver starts the finalizer again (FinalizerRunner.start)
     completionPromise.completeWith(fcomplete)
   }
 }

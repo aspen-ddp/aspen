@@ -41,7 +41,7 @@ class AllocationFinalizationAction(val client: AspenClient,
     * just as an exclusive one does, and two runs of the action (a leader's and a recovery driver's finalizer) do not
     * collide on it. It still collides with a concurrent write of the object, whose writer retries.
     */
-  // A failure fails the action, and the driver starts the finalizer again (TransactionDriver.startFinalizer)
+  // A failure fails the action, and the driver starts the finalizer again (FinalizerRunner.start)
   def execute(): Unit = client.retryStrategy.retryUntilSuccessful {
     val key = Key(newObject.id.toBytes)
     for

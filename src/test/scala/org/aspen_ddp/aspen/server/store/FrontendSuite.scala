@@ -2150,6 +2150,40 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     readData(frontend, net, op1) shouldBe Right(List[Byte](1))
   }
 
+  test("a prepare built on a held commit finalized before it applies waits for its commit, then votes commit") {
+    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
+    def insertOf(key: Int) = KeyValueOperation.encode(List(new Insert(k(key), Array[Byte](1))), ida)(0)
+
+    // txid2 votes commit and locks op1 and key 1 of kvPtr; txid1 writes key 2 of kvPtr and commits, its backend
+    // commit held
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1),
+      KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.KeyRevision(k(1), rev0))))), insertOf(1))
+      .disposition shouldBe TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid1, List(KeyValueUpdate(kvPtr, None, None,
+      List(KeyValueUpdate.KeyRevision(k(2), rev0)), pinned = true))), insertOf(2))
+      .disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+
+    // txid2 commits, held for its turn behind txid1, and is finalized meanwhile: it keeps its locks
+    resolve(frontend, net, txid2, committed = true)
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid2, committed = true, late = false, owed = Set(),
+      startTimestamp = HLCTimestamp.now))
+    frontend.transactions.contains(txid2) shouldBe false
+    backend.issued shouldBe List(txid1)
+
+    // txid3, built on txid2's write of op1: op1's commit is held (commitInFlight), so txid3 withholds its vote, its
+    // requirements unchecked, rather than meet txid2's locks with no live holder to wait for and vote abort
+    sendPrepare(frontend, lockTxd(txid3, List(overwriteAfter(txid2))))
+    prepareResponses(net, txid3) shouldBe empty
+
+    // txid1 persists: txid2 applies and releases its locks, and txid3 votes on the applied state once txid2's
+    // commits persist
+    backend.deliverOne()
+    backend.issued shouldBe List(txid1, txid2, txid2)
+    while backend.heldCommits > 0 do backend.deliverOne()
+    prepareResponses(net, txid3).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+  }
+
   // ---- Requirement locks held between a commit vote and resolution ----
 
   val txid3 = TransactionId(new UUID(0, 11))

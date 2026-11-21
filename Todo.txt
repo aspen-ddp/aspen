@@ -67,12 +67,7 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.5 [X-W21] A held commit finalized before it applies is not seen as a lock holder; a prepare built on it votes abort.
-    CONFIRMED. Effort S. cross-document-review.md.
-    A commit held for its turn keeps its locks but leaves Frontend.transactions at TxFinalized
-    (deferredFinalizations); holdsLocks and changes look only in transactions, so Tx.awaitableHolders finds no holder
-    and a pipelined single writer's next transaction votes abort. Lock-order waiters stay safe via heldCommits.
-    Performance only. Fix: have holdsLocks and changes also consult deferredFinalizations (one lookup per collision).
+(no open items)
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)

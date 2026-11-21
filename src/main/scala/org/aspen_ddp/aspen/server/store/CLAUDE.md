@@ -192,7 +192,9 @@
 - One in-flight transaction commit per object (`Frontend.commitInFlight`): a transaction touching an object whose
   commit is in flight, whether or not it builds on it, withholds its vote with no locks and no timer until the commit
   persists, then checks its requirements against the state as it is then. A follower resolved committed meanwhile
-  holds its commit (queued per object, oldest first) until earlier commits of its objects persist. Locks still
+  holds its commit (queued per object, oldest first) until earlier commits of its objects persist. A held commit is
+  in `commitInFlight` too, so a prepare built on it waits for it even once a `TxFinalized` has moved it out of
+  `transactions` (`deferredFinalizations`, where `holdsLocks` does not look). Locks still
   release when a commit is applied in memory: the in-flight marker orders followers. A committed transaction holding
   no locks here applies in lock order: it waits while another transaction holds locks it collides with on an object
   both change (`Tx.awaitLockHolders`, `RequirementsChecker.lockHolders`; `server/transaction/CLAUDE.md`, Lock order),

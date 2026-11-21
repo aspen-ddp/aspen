@@ -256,8 +256,10 @@ The premises other subsystems take from this:
   (transaction-requirements.md R15). A commit voter whose commit is held for its
   turn keeps its locks after a `TxFinalized` takes it out of `Frontend.transactions` (`finalizationDeferred`); a
   lock-order waiter that then skips it (`Frontend.holdsLocks` is false) is still queued behind it on every object both
-  change (`heldCommits`, `holdForTurn`), so it applies first, but a built-on prepare votes abort rather than wait
-  (X-W21). A recovered voter whose re-check fails therefore
+  change (`heldCommits`, `holdForTurn`), so it applies first. A prepare built on it never meets its locks: it builds on
+  an object the held commit changes, which is in `heldCommits` and so in `commitInFlight`, and a vote touching such an
+  object waits, its requirements unchecked, until the commit persists, by when the held commit has applied and
+  released its locks (`Tx.determineDisposition`). A recovered voter whose re-check fails therefore
   holds T already (transaction-requirements.md 8.5), and one
   whose Insert of an absent key passes never applied it: a key's deletion reaches the backend only once no CRL state
   holding an applied blind Insert of the key remains (`Frontend.awaitBlindInsertsDurable`, transaction-requirements.md
@@ -482,17 +484,4 @@ Between a document, scaladoc or guide outside docs/safety and the code, open: RB
 
 ## Open weaknesses
 
-### X-W21: A held commit finalized before it applies is not seen as a lock holder, so a prepare built on it votes abort
-Verdict CONFIRMED. Priority 5. Effort S.
-Mechanism: a commit voter whose commit is held for its turn (`Tx.holdForTurn`) keeps its locks until it applies
-(`releaseObjects` skips a held commit). A `TxFinalized` reaching it meanwhile moves it from `Frontend.transactions` to
-`deferredFinalizations` (`finalizationDeferred`), and `Frontend.holdsLocks` and `Frontend.changes` look in
-`transactions` only. A single writer's next transaction, whose requirement names this commit's revision, then meets
-the lock and finds no holder to wait for (`Tx.awaitableHolders` needs `frontend.holdsLocks(holder)`), so it votes abort
-at once. A committed non-voter colliding with the locks skips the lock-order wait (`Tx.awaitLockHolders`) but is still
-queued behind the held commit on every object both change (`heldCommits` is part of `commitInFlight`), so it applies
-after it.
-Consequence: a collision abort and a client retry for a pipelined writer whose previous commit is still waiting for an
-earlier backend commit at one store when its finalization arrives: performance only. Repair is unaffected: the held
-commit stays in `heldCommits`, so its objects are unsettled until it applies.
-Fix: have `holdsLocks` and `changes` also consult `deferredFinalizations`. One extra map lookup on a collision only.
+None.

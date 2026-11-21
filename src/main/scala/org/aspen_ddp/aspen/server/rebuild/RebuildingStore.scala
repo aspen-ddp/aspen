@@ -275,6 +275,12 @@ class RebuildingStore(client: AspenClient,
 
   private val aborted: () => Boolean = () => synchronized(abortCause).isDefined
 
+  /** Sets the abort cause unless one is already latched: the first fatal condition owns the abort */
+  private def latchAbort(cause: Throwable): Unit =
+    synchronized:
+      if abortCause.isEmpty then
+        abortCause = Some(cause)
+
   /** Latches `RebuildCancelled` as the abort cause, so the walk stops and the pass fails with the
    *  checkpoint left in staging, exactly as for any other fatal condition.
    *
@@ -285,10 +291,7 @@ class RebuildingStore(client: AspenClient,
    *  allocation tree would hold the staging RocksDB open on a disk about to be pulled. The
    *  backend is never closed under a write still in progress: the walk hands out one object at
    *  a time, and the close waits for the pass to end. */
-  def cancel(): Unit =
-    synchronized:
-      if abortCause.isEmpty then
-        abortCause = Some(RebuildCancelled(storeId))
+  def cancel(): Unit = latchAbort(RebuildCancelled(storeId))
 
   // Key's equality is not something to bet a test seam on; compare the bytes directly.
   // Declared here, before start(), so it is initialized before the walk begins.
@@ -421,9 +424,7 @@ class RebuildingStore(client: AspenClient,
   private def openStaging(cfg: StoreConfig): Future[Backend] =
     def onFatal(err: Throwable): Unit =
       logger.error(s"Rebuild of $storeId: the staging store failed. Abandoning this pass. Error: $err")
-      synchronized:
-        if abortCause.isEmpty then
-          abortCause = Some(err)
+      latchAbort(err)
     val fopen =
       try backends.open(cfg, stagingPath, onFatal)
       catch case NonFatal(t) => Future.failed(t)
@@ -580,7 +581,7 @@ class RebuildingStore(client: AspenClient,
                             value: ValueState): Future[Unit] =
     // If the abort latch is set, return immediately to make the remainder of the walk a cheap
     // no-op rather than thousands of repeated failures.
-    if synchronized(abortCause).isDefined then
+    if aborted() then
       Future.unit
     else
       // Everything below is inside the try, not just the decode: the walk logs a synchronous
@@ -626,9 +627,7 @@ class RebuildingStore(client: AspenClient,
    *  emitted every time, because a disk that fills during the wind-down is still news.
    */
   private def latchOutOfSpace(err: Throwable): Unit =
-    synchronized:
-      if abortCause.isEmpty then
-        abortCause = Some(err)
+    latchAbort(err)
     logger.error(s"REBUILD OUT OF SPACE: store $storeId cannot fit on device " +
                  s"$storageDeviceId at $devicePath. The store will remain Rebuilding " +
                  s"until capacity is added or it is re-placed on another device with transfer-store. " +
@@ -731,9 +730,7 @@ class RebuildingStore(client: AspenClient,
       // rebuild slot for days before the cap below. Aborted as the cap aborts, the checkpoint kept
       val cause = new Exception(
         s"Rebuild of $storeId aborted: $maxConsecutiveReadTimeouts object reads in a row timed out")
-      synchronized:
-        if abortCause.isEmpty then
-          abortCause = Some(cause)
+      latchAbort(cause)
       checkpointBestEffort("after consecutive read timeouts")
       Future.unit
     else if over then
@@ -744,9 +741,7 @@ class RebuildingStore(client: AspenClient,
       // the latch.
       val cause = new Exception(
         s"Rebuild of $storeId aborted: more than $maxFailedObjects unreadable objects")
-      synchronized:
-        if abortCause.isEmpty then
-          abortCause = Some(cause)
+      latchAbort(cause)
       checkpointBestEffort("after max failures")
       Future.unit
     else

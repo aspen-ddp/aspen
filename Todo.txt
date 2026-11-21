@@ -39,17 +39,7 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-1.1 [CRL-W17, SL-W20] A transfer out of a closed store can ship a copy that is serving, or overwrite its valid save file.
-    PLAUSIBLE (both). Effort S. crash-recovery-log.md, systemic-loss-protection.md, cross-document-review.md.
-    CRL-W17: StoreTransfers.extractUnloaded checks opensStarted once, and startOut's fclosed.foreach writes the
-    transferring-out marker in a later control task without re-checking router.loaded / isOpening / opensStarted;
-    StoreLoader.retryFailedLoads can open a store waiting in storesAwaitingRetry in between, so the live directory
-    is archived and the destination promoted without the source's later promises, votes and commits. The
-    no-save-file branch's argument-less releaseRetained also drops a loaded store's charge (A2).
-    SL-W20: extractUnloaded tests crl_save.log with os.exists, false on a failed stat, so a closed store holding a
-    valid save file plus leftover device-CRL entries gets the leftovers written over its whole state, then deleted.
-    Fix: do the open check and the marker write in one control task and re-check after the deletion; release the
-    identity-checked charge; FileStat for the save file, a failed stat failing the extraction.
+(no open items)
 
 (RB-W19, a running host serving a tombstoned device's stores through their rebuild, is an accepted limitation:
 rebuild-process.md B19.)

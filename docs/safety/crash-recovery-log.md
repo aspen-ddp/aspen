@@ -273,7 +273,7 @@ piece leaves the image when that save's entry is built (5.3: a form's build unpi
 |-----------|-----------|--------|
 | Planned device shutdown | stores close with `extractCrl = false`, records stay live; then `crl.shutdown()` | `DeviceShutdown.closeForShutdown`, `shutDownCrl` |
 | Transfer out, store open | on the executor after `closing`: `readStoreState`; `saveStoreState` to `crl_save.log` (tmp, fsync, rename, directory fsync); `store.close()`; then `deleteTransactions(state.entryIds)` and the retained admission released | `StoreLoader.handleClose(extractCrl = true)` |
-| Transfer out, store closed | on the transfer's source device only (the device the pool entry names, whose directory ships; another device of the host may hold an earlier copy of the store, whose entries are its retire's); with a valid `crl_save.log`: the file ships unchanged and `dropStore` removes the device CRL's entries (a copy of part of the file or an earlier tenancy's leftovers, 3.3 step 4), releasing the charge retained when the drop was issued; without one: `readStoreState`, saved, then `deleteTransactions`, then all that is retained for the store released (`releaseRetained(storeId)`). An unusable save file fails before anything is read; an open started during the read (no save file) or the drop (`opensStarted`) fails it after. The check is not made again after the deletion, nor before `startOut` writes the `transferring-out` marker (CRL-W17) | `StoreTransfers.extractUnloaded`, `closeForTransferOut` |
+| Transfer out, store closed | on the transfer's source device only (the device the pool entry names, whose directory ships; another device of the host may hold an earlier copy of the store, whose entries are its retire's); with a valid `crl_save.log`: the file ships unchanged and `dropStore` removes the device CRL's entries (a copy of part of the file or an earlier tenancy's leftovers, 3.3 step 4), releasing the charge retained when the drop was issued; without one: `readStoreState`, saved, then `deleteTransactions`. Either way the release is of the charge retained when the extraction began (`releaseRetained(storeId, charge)`), never a later one. An unusable save file, or a stat of the directory or the file that fails (`FileStat`), fails it before anything is read; an open started during the read, the deletion or the drop (`opensStarted`) fails it after, leaving the charge to the load. `startOut` checks again (loaded, opening, `opensStarted` unchanged since the close began) in the control task that writes the `transferring-out` marker, which keeps every later open off the store | `StoreTransfers.extractUnloaded`, `closeForTransferOut` |
 | Retire of a copy no longer its store's owner (a lost store before its rebuild, a transfer out's source, a re-placed rebuild's source, an earlier tenancy's copy at the path of a store transferring in) | a path whose stat fails (`server.FileStat`) fails the retire, retried at a later check, rather than report it clear; marker `rebuild-required` durable; `lost-crl-state.log` kept if present, else the copy's `crl_save.log` renamed to it (any entries `readStoreState` still returns saved first as `lost-crl-entries.log`), else `readStoreState` saved to it; `dropStore`; directory renamed into pending-delete | `StoreCopies.retire` (from `StoreRebuilds.discardLostStore`, `StoreTransfers.retireEarlierTenancy` and the Deleted Stores pass) |
 | Store no longer on the device (safety net: a retire drops first) | `storesWithEntries`; for each store not in the device's tree entry, not loaded, with no directory (a stat that answers absent, `server.FileStat`: one that fails keeps them), no drop and no retire running: `dropStore` | `DeviceReconciler.dropLeftoverCrlState` |
 | Store whose `loadStore` of its `crl_save.log` failed (the file stays) | `dropStore` | `StoreLoader.handleUnloadFailed`, `closeUnloaded(dropDurably = true)` |
@@ -1306,34 +1306,6 @@ at `writeHead`'s `require`, which only a bug can reach.
 ---
 
 ## Open weaknesses
-
-### CRL-W17: A closed store opened after its transfer-out extraction's check is shipped while it serves
-Verdict PLAUSIBLE. Priority 1. Effort S.
-Mechanism: `StoreTransfers.closeForTransferOut` finds the store neither loaded nor opening and runs `extractUnloaded`.
-Without a `crl_save.log` it checks `openedMeanwhile` (`StoreLoader.opensStarted`) once, when `readStoreState` answers,
-then writes the save file and issues `deleteTransactions`; with one it checks after `dropStore`. Nothing keeps the
-store closed until `startOut`'s `fclosed.foreach`, a later control task, writes `StoreTransfer.TransferOutMarkerFile`,
-and that callback checks only shutdown and `rebuild-required`, not `ctx.router.loaded`, `isOpening` or `opensStarted`.
-A closed store with live device-CRL entries is typically in `StoreLoader.storesAwaitingRetry` (a failed open: ENOSPC,
-an I/O or lock error, a build failure), and `retryFailedLoads` at a device scan calls `tryLoadStore`, which sees no
-marker yet and `startOpen`s it. An open in the no-save-file branch's deletion window (one CRL write) or in either
-branch's task hop: `handleLoad` finds the just-written save file, `tryChargeLoaded` merges its charge into what is
-retained, the store installs, `awaitCrlLoad` drops and loads, and `StoreRouter.crlLoaded` removes the file and
-recovers it. Then (1) the no-save-file branch's `releaseRetained(storeId)` releases the loaded charge too, leaving the
-loaded records uncounted until the recovery's own count (an A2 gap of the store's state size); (2) `fclosed` succeeds,
-the marker is written beside a loaded store, and `beginTransferOut` archives the directory of a store that is voting
-and committing, with or without the `crl_save.log` depending on whether the archive read it before `crlLoaded` removed
-it.
-Consequence: if the archive carries the file, the destination validates it (`loadValidStoreState`) and can be promoted
-holding a CRL state that lacks every promise, vote and commit the source made after its load, and a backend copied
-while it changed: acceptor amnesia (a split decision) and committed updates the destination never holds, with no
-UnackedCommits entry to repair them (the source acknowledged them). Without the file the destination refuses it and a
-retransmit closes the now loaded store with extraction, which heals it. (1) alone is liveness: Lemma C's bound can be
-exceeded by the store's state, past the margin into W6.
-Fix: make the open check and the marker write one control task: in `fclosed.foreach`, skip (log; the retransmit
-retries) unless the store is neither loaded nor opening and `opensStarted` is unchanged since `closeForTransferOut`
-began; in the no-save-file branch check `openedMeanwhile` again after the deletion and release with the identity-checked
-`releaseRetained(storeId, charge)` read before the read, as the save-file branch does.
 
 ### CRL-W18: The admission limit's proof fails for small streams in a large ring
 Verdict PLAUSIBLE. Priority 4. Effort S.

@@ -40,7 +40,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Rebuild | Transactions | `CurrentAllocationsRequest` lists every unfinalized allocation and every held commit vote (`HeldVote`); reads of the pool's objects complete |
 | Rebuild | Repair | Everything the store missed while rebuilding is marked and repaired after promotion |
 | Rebuild (reassignment) | Host device lifecycle | The tombstoned device's former host stops serving its stores before the drain rebuilds them elsewhere: one best-effort nudge, else its hourly check; a running host that misses the nudge serving through the rebuild is an accepted limitation (rebuild-process.md B19) |
-| Transfer out (closed store) | Host loader | The store stays closed from its extraction until its `transferring-out` marker is written (crash-recovery-log.md CRL-W17), and the extraction tells a failed stat of the save file from its absence (systemic-loss-protection.md SL-W20) |
+| Transfer out (closed store) | Host loader | The store stays closed from its extraction until its `transferring-out` marker is written (an open meanwhile fails the extraction, or stops `startOut` in the task that would write the marker), and the extraction fails on a failed stat of the directory or save file rather than take it for an absence (crash-recovery-log.md 3.5) |
 | Rebuild completion | Transfers | A flip that finds the entry already Active adopts the copy without checking its episode (`DeviceMetadata.markRebuiltStoreActive`); no transfer starts onto an occupied store path, so the copy is this episode's (2.2). A flip retried after `TransactionOutcomeUnknown` that finds the entry moved on (TransferringOut, absent) keeps the copy offline rather than discarding it (`Unconfirmed`, rebuild-process.md 5.7) |
 | Rebuild, CRL | Store lifecycle | A rebuilt copy's first load recovers nothing an earlier copy left under its id in the device CRL: it is a save-file load of the empty state `RebuildingStore.finish` writes, which drops those entries first (rebuild-process.md 5.6) |
 | Lost device CRL | Rebuild | A finished rebuild awaiting its flip (`rebuild-complete`) has never served, so it holds nothing in the device CRL and is not marked (`DeviceDiscovery.holdsOwnState`) |
@@ -229,9 +229,9 @@ The premises other subsystems take from this:
   `FileStat`), `adoptionClass` (an `Unclean` refusal, or a marked copy classed `Clean` that its load then keeps
   offline), `retireForeignCopy`/`discardLostStore` (a rebuild whose finish cannot move onto the occupied path),
   `startIn` (a transfer whose promotion fails on the occupied path), and `openDeviceCrl`'s move of `crl/` (a
-  replacement whose rename fails on it). Two act on the absence: `StoreTransfers.extractUnloaded`'s save-file test,
-  which writes device-CRL entries over a valid save file (systemic-loss-protection.md SL-W20), and
-  `StoreLoader.readArrivedAt`, whose false absence drops the arrival margin from a moved store's load floor (X-W26).
+  replacement whose rename fails on it). `StoreTransfers.extractUnloaded` tests the directory and the save file with
+  `FileStat`, failing the extraction on a failed stat. One acts on the absence: `StoreLoader.readArrivedAt`, whose
+  false absence drops the arrival margin from a moved store's load floor (X-W26).
 * A lost device CRL marks every store directory except those that held nothing in it (`DeviceDiscovery.holdsOwnState`):
   a store whose valid `crl_save.log` is its whole state, and a finished rebuild awaiting its flip (`rebuild-complete`),
   which `tryLoadStore` never serves, so its flip or the Completed Rebuilds pass loads it over the fresh CRL. A copy
@@ -612,8 +612,7 @@ the load then passes no arrival (`handleLoad`). `Frontend.loadFloorMillis` uses 
 host's join ceiling when lower, instead of the arrival plus `AcceptorSinceMargin`, so a store loaded within the margin
 of its arrival may accept a prepare for a transaction it joined and forgot on its previous host, started ahead of this
 host's clock by up to the skew the margin covers. An unreadable file already counts as an arrival now; only the stat
-is unguarded. The other `os.exists`/`os.isDir` decisions outside the load only delay (2.2), except
-`StoreTransfers.extractUnloaded` (systemic-loss-protection.md SL-W20).
+is unguarded. The other `os.exists`/`os.isDir` decisions outside the load only delay (2.2).
 Consequence: one store rejoins a transaction it forgot. That T was concluded there, so the other acceptors also refuse
 it below their floors or ignore it from their caches, and a lone rejoined acceptor decides nothing: hygiene. Needs a
 failing stat of that one file during the margin and a replayed prepare.

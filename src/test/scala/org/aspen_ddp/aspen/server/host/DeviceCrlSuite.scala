@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceState,
   StoragePoolState}
-import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, TxPrepare}
+import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, StartStoreTransfer, TxPrepare}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Metadata, ObjectId, ObjectRefcount,
   ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
@@ -1656,6 +1656,85 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       heldAfter should be(Set())
       retainedAfter should be(0L)
       heldOnDisk(deviceDir, storeId) should be(Set())
+
+  atest("a transfer out of a closed store whose save file cannot be stat'd fails, writing nothing over it (SL-W20)"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    val fileTx = TransactionId(new UUID(9, 44))
+    val fileState = StoreRecoveryState(List(recoveryState(storeId, fileTx, Array[Byte](4, 5))))
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      crl = host.control.devices.devices(deviceA).crl
+      _ <- prepareInFlight(host, factory.opened.head, storeId, txid)
+      // Closed without extraction: txid stays in the device CRL, a leftover beside the save file below
+      closed = host.closeStore(storeId)
+      _ <- pumpUntil(host, closed.isCompleted)
+      _ <- closed
+      // Its whole state is in its save file, reached through a link into a directory without search permission, so
+      // the file's stat alone fails (EACCES) while the store directory reads and writes
+      locked = hostRoot / "locked"
+      _ = os.makeDir(locked)
+      _ = CrashRecoveryLog.saveStoreState(storeId, fileState, locked / "state.log")
+      _ = os.symlink(Backend.crlSaveFile(storeDir), locked / "state.log")
+      _ = os.perms.set(locked, "rw-------")
+      extracting = host.control.transfers.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
+      _ <- pumpUntil(host, extracting.isCompleted)
+      outcome = extracting.value
+      _ = os.perms.set(locked, "rwx------")
+      saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
+      heldAfter = held(crl, storeId)
+      _ = factory.shutdownAll()
+    yield
+      outcome.exists(_.isFailure) should be(true)
+      saved.map(_.transactions.map(_.txd.transactionId)) should be(Right(List(fileTx)))
+      heldAfter should be(Set(txid))
+
+  atest("a transfer out does not mark or ship a closed store opened between its extraction and its marker (CRL-W17)"):
+    given ExecutionContext = executionContext
+    import StorageDeviceState.{StoreEntry, StoreStatus}
+    val factory = newFactory()
+    val hostRoot = newHostDir()
+    val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
+    createCrl(deviceDir)
+    var hostRef: Option[Host] = None
+    // Once the extraction is done, and before startOut's marker task runs, the store is opened: as retryFailedLoads
+    // opens a store awaiting a load retry
+    val seams = Host.Seams(closeForTransferOut = Some((sid, sds) =>
+      val host = hostRef.get
+      host.control.transfers.closeForTransferOut(sid, sds).map: _ =>
+        host.control.loader.tryLoadStore(sds, sds.devicePath / sid.directoryName)))
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- net.createDevice(deviceB)
+      pool <- client.createNewStoragePool("transfer-out-pool", Replication(1, 1), None, RocksDBConfig(),
+                StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+      sid = StoreId(pool, 0.toByte)
+      _ <- setPoolEntry(sid, deviceA)
+      _ <- setDeviceState(deviceA)(_.copy(stores = Map(sid -> StoreEntry(StoreStatus.Active, None))))
+      _ <- waitForTransactionsToComplete()
+      storeDir <- writeRocksStore(deviceDir, sid)
+      host = newCrlHost(hostRoot, factory, seams = seams)
+      _ = hostRef = Some(host)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(sid))
+      closed = host.closeStore(sid)
+      _ <- pumpUntil(host, closed.isCompleted)
+      _ <- closed
+      _ <- setDeviceState(deviceA)(_.copy(stores = Map(
+             sid -> StoreEntry(StoreStatus.TransferringOut, Some(deviceB), Some(UUID.randomUUID())))))
+      _ <- waitForTransactionsToComplete()
+      _ <- host.control.transfers.startOut(StartStoreTransfer(host.hostId, client.clientId, deviceA, sid,
+             HLCTimestamp.now, UUID.randomUUID()))
+      _ <- pumpUntil(host, host.control.router.loaded.contains(sid))
+      _ <- pumpUntil(host, false, rounds = 20)
+      marked = os.exists(storeDir / StoreTransfer.TransferOutMarkerFile)
+      served = host.control.router.loaded.get(sid)
+      _ <- served.map(_.backend.close()).getOrElse(Future.unit)
+      _ = factory.shutdownAll()
+    yield
+      served should be(defined)
+      marked should be(false)
 
   /** A closed store's transfer-out extraction with a second copy of it on another device of the host (an earlier
    *  tenancy's, kept offline by its rebuild-required marker). The source, deviceA, is the directory `sourceName`, the

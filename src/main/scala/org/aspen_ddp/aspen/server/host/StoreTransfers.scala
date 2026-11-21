@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.TransferOutcome
-import org.aspen_ddp.aspen.server.DurableFiles
+import org.aspen_ddp.aspen.server.{DurableFiles, FileStat}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.Backend
@@ -19,7 +19,7 @@ import scribe.Logging
 import java.util.UUID
 import scala.concurrent.duration.{Duration, SECONDS}
 import scala.concurrent.{Future, Promise}
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Success, Try}
 import scala.util.control.NonFatal
 
 object StoreTransfers:
@@ -85,40 +85,52 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  since it was written; crash-recovery-log 3.3 step 4). Whatever the device CRL holds for the store is then a copy
    *  of part of it or an earlier tenancy's leftover, which StoreLoader.awaitCrlLoad would drop before loading the
    *  file. So the file ships unchanged and the entries are dropped (`dropStore`), releasing only the admission charge
-   *  retained for them when the drop was issued. An unusable save file fails the close before anything is read: its
-   *  state is lost, and writing the CRL's entries over it would hide that. Runs on the control thread, as the marker
-   *  writes beside it do; nothing blocks on the CRL.
+   *  retained for them when the extraction began. An unusable save file fails the close before anything is read: its
+   *  state is lost, and writing the CRL's entries over it would hide that. So does a stat of the directory or the
+   *  file that fails (FileStat): it says nothing of whether the file is there, and taken for an absence it would
+   *  write the CRL's entries over a valid file. Runs on the control thread, as the marker writes beside it do;
+   *  nothing blocks on the CRL.
    *
    *  The store must stay closed throughout: one loaded meanwhile recovered the entries read, which the deletion would
    *  take from under it, and may have saved others the file would lack (or, from a save file, removed the file).
-   *  Nothing keeps it closed (the transfer-out marker is written only once this completes), so an open started
-   *  during the read or the drop fails the extraction; the transfer's retransmitted request closes the store and
-   *  extracts again.
+   *  Nothing keeps it closed, so an open started during the read, the deletion or the drop fails the extraction
+   *  (`opensStarted`, checked when each answers) and leaves the charge to the load; the transfer's retransmitted
+   *  request closes the store and extracts again. The release is of the charge read when the extraction began
+   *  (`releaseRetained(storeId, charge)`), so it never takes a later one. startOut checks again in the control task
+   *  that writes the transfer-out marker, which keeps every later open off the store.
    *
    *  Only `sds`, the transfer's source, is read: another device of the host may hold its own copy of the store (an
    *  earlier tenancy's, a transfer's source awaiting retire), whose entries are its retire's to save. */
   private def extractUnloaded(storeId: StoreId, sds: LocalStorageDeviceState): Future[Unit] =
-    if !os.isDir(sds.devicePath / storeId.directoryName) then
-      Future.unit
-    else
-      val saveFile = Backend.crlSaveFile(sds.devicePath / storeId.directoryName)
-      val opens = ctx.loader.opensStarted(storeId)
-      def openedMeanwhile: Option[Future[Unit]] =
-        if ctx.loader.opensStarted(storeId) != opens then
-          Some(Future.failed(new IllegalStateException(
-            s"store $storeId was opened while its CRL state was being extracted")))
-        else
-          None
-      if os.exists(saveFile) then
+    // A stat that fails says nothing (FileStat): taken for an absence, the CRL's entries would be written over a save
+    // file, or nothing extracted from a directory that ships
+    Try(FileStat.isDir(sds.devicePath / storeId.directoryName)) match
+      case Failure(err) => Future.failed(err)
+      case Success(false) => Future.unit
+      case Success(true) => extractFromDirectory(storeId, sds)
+
+  private def extractFromDirectory(storeId: StoreId, sds: LocalStorageDeviceState): Future[Unit] =
+    val saveFile = Backend.crlSaveFile(sds.devicePath / storeId.directoryName)
+    val opens = ctx.loader.opensStarted(storeId)
+    def openedMeanwhile: Option[Future[Unit]] =
+      if ctx.loader.opensStarted(storeId) != opens then
+        Some(Future.failed(new IllegalStateException(
+          s"store $storeId was opened while its CRL state was being extracted")))
+      else
+        None
+    // Read before anything is, so the release below covers only the entries the extraction takes
+    val charge = sds.admission.retainedCharge(storeId)
+    def released(): Future[Unit] =
+      openedMeanwhile.getOrElse:
+        charge.foreach(sds.admission.releaseRetained(storeId, _))
+        Future.unit
+    Try(FileStat.exists(saveFile)) match
+      case Failure(err) => Future.failed(err)
+      case Success(true) =>
         CrashRecoveryLog.loadValidStoreState(saveFile, storeId) match
           case Left(err) => Future.failed(err)
-          case Right(_) =>
-            val charge = sds.admission.retainedCharge(storeId)
-            sds.crl.dropStore(storeId).flatMap: _ =>
-              openedMeanwhile.getOrElse:
-                charge.foreach(sds.admission.releaseRetained(storeId, _))
-                Future.unit
-      else
+          case Right(_) => sds.crl.dropStore(storeId).flatMap(_ => released())
+      case Success(false) =>
         sds.crl.readStoreState(storeId).flatMap: state =>
           openedMeanwhile.getOrElse:
             if state.isEmpty then
@@ -126,7 +138,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
             else
               // A failed save leaves them in the device CRL, for a retried request to extract again
               CrashRecoveryLog.saveStoreState(storeId, state, saveFile)
-              sds.crl.deleteTransactions(storeId, state.entryIds).map(_ => sds.admission.releaseRetained(storeId))
+              sds.crl.deleteTransactions(storeId, state.entryIds).flatMap(_ => released())
 
   /** The transfer-in work on `deviceId` that a shutdown of it must stop or wait for. `ingStores` are the stores
    *  the device's tree entry records as TransferringIn.
@@ -699,6 +711,9 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
       if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut then
         // A retransmitted request finds the store already closed, and its going offline already gossiped
         val wasLoaded = ctx.router.loaded.contains(m.storeId)
+        // Nothing keeps the store closed between its close and the marker below, written in a later control task: an
+        // open meanwhile (StoreLoader.retryFailedLoads) serves it, so it is not marked or shipped
+        val opens = ctx.loader.opensStarted(m.storeId)
         val fclosed = ctx.closeStoreForTransferOut(m.storeId, sourceDs)
 
         fclosed.failed.foreach:
@@ -722,6 +737,10 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
              !ctx.devices.devices.get(sourceDs.storageDeviceId).contains(sourceDs) then
             logger.info(s"Not starting the transfer out of store ${m.storeId}: source device " +
                         s"${sourceDs.storageDeviceId} began shutting down while the store closed")
+          else if ctx.router.loaded.contains(m.storeId) || ctx.loader.isOpening(m.storeId) ||
+                  ctx.loader.opensStarted(m.storeId) != opens then
+            // Opened since its close: the open serves it, and a retransmitted request closes it again
+            logger.info(s"Not starting the transfer out of store ${m.storeId}: it was opened after its close")
           else if os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
             // Marked while it closed (a BackendFailed for it): as above, never shipped.
             logger.error(s"Not starting the transfer out of store ${m.storeId}: it was marked " +

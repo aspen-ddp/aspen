@@ -248,7 +248,12 @@
   has a valid `crl_save.log` ships it unchanged: the file is its whole state, so its device-CRL entries are copies or
   an earlier tenancy's leftovers, dropped (`dropStore`) as its load would drop them (`extractUnloaded`). A closed
   store is extracted on the transfer's source device only (`startOut` passes `sourceDs`), never on another copy of it
-  another device of the host holds.
+  another device of the host holds. Its directory and save file are tested with `FileStat`: a failed stat fails the
+  extraction rather than read as an absence (which would write the CRL's entries over a valid file). The store must
+  stay closed from the extraction to the `transferring-out` marker: an open started meanwhile (`opensStarted`, checked
+  as each CRL call answers) fails the extraction, and `startOut` re-checks loaded / opening / `opensStarted` in the
+  control task that writes the marker. The extraction releases only the charge retained when it began
+  (`releaseRetained(storeId, charge)`).
   `DeviceReconciler.dropLeftoverCrlState` drops the entries of a store with no entry on the device, no directory
   (a stat that answers absent) and no retire running, as a safety net for a directory removed by hand; a store its
   entry names keeps them, even one the Missing Stores pass is rebuilding. It releases only the admission charge

@@ -197,7 +197,7 @@ The premises other subsystems take from this:
   by `StoreLoader.tryLoadStore` (`awaitUnreadRetry`), or whose load finds its executor slot still held
   (`HostThreading.AlreadyAssigned`), is left offline and in `storesAwaitingRetry` like a failed open, its `onServed`
   kept for the load that serves it. A load's `onServed` (the `StoreMoved` gossip of `DeviceShutdown.reloadClosedStores`
-  and `StoreTransfers.reinstateAbandonedOut`) runs only once its LoadStore has installed and recovered the store
+  and `StoreTransfersOut.reinstateAbandonedOut`) runs only once its LoadStore has installed and recovered the store
   (`StoreLoader.awaitServed`); a LoadStore that leaves it offline with its data intact (no CRL room, no executor slot, a
   save file whose removal failed, a Store whose build throws) hands the callback to its `storesAwaitingRetry` entry,
   and any other failure drops it, so peers never clear their offline mark for a store left offline. An Active entry on a loaded
@@ -234,7 +234,7 @@ The premises other subsystems take from this:
   `keepUnpromotedCopyOffline` and an unserved `backendFailed` treat the directory as present (kept offline, marked).
   A marker a reconcile pass looks for counts only when a stat finds it, so the pass waits for a later reconcile,
   and `reloadClosedStores` loads a store whose marker stat fails, the load then holding it back with its own
-  `FileStat` tests. `StoreTransfers.extractUnloaded` tests the directory and the save file with `FileStat`, failing
+  `FileStat` tests. `StoreTransfersOut.extractUnloaded` tests the directory and the save file with `FileStat`, failing
   the extraction on a failed stat.
 * A lost device CRL marks every store directory except those that held nothing in it (`DeviceDiscovery.holdsOwnState`):
   a store whose valid `crl_save.log` is its whole state, and a finished rebuild awaiting its flip (`rebuild-complete`),
@@ -254,7 +254,7 @@ The premises other subsystems take from this:
   `crl_save.log` (`RebuildingStore.writeEmptyCrlState`), so its first load (by the flip, the Completed Rebuilds pass,
   a restart, a reinstatement or an adoption) drops whatever device-CRL entries an earlier copy left under its id
   (`StoreLoader.awaitCrlLoad`), and a transfer out of the unloaded copy ships the file and drops them
-  (`StoreTransfers.extractUnloaded`). Such a transfer (an `Unconfirmed` copy whose entry went TransferringOut) ships
+  (`StoreTransfersOut.extractUnloaded`). Such a transfer (an `Unconfirmed` copy whose entry went TransferringOut) ships
   `rebuild-complete` too, which the destination removes when its pool update commits, before the load
   (`StoreTransfers.recordTransferIn`), since its entry is then Active; a failed removal leaves the copy offline for the
   Completed Rebuilds pass, as for `Adopt`.

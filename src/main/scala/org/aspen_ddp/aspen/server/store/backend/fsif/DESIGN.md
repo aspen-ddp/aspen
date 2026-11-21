@@ -695,9 +695,9 @@ correlated loss.
   marker before the save file. A `crl_save.log` a transfer-out close just wrote is kept, since its entries have left
   the device CRL; the rebuild's retire renames it to `lost-crl-state.log` in the retired copy. Entries left in the
   device CRL are saved and dropped by that retire, after the marker is durable.
-- **Transfer out** (`StoreTransfers.startOut`):
+- **Transfer out** (`StoreTransfersOut.startOut`):
   - a store already marked whose entry is TransferringOut is returned to rebuild
-    (`StoreTransfers.returnLostTransferToRebuild`);
+    (`StoreTransfersOut.returnLostTransferToRebuild`);
   - a close that fails with `StoreFailedOnClose` is never shipped, and its transfer is aborted;
   - a store marked while it closed is likewise never shipped.
 

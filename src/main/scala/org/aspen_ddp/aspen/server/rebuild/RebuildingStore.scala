@@ -64,7 +64,7 @@ object RebuildingStore:
    *  retire's drop). Its first load, wherever it comes from (the flip, the Completed Rebuilds pass, a restart, a
    *  reinstated transfer out, an adoption), is a save-file load, which drops those entries durably before loading the
    *  file (StoreLoader.awaitCrlLoad); a transfer out of the unloaded copy ships the file and drops them likewise
-   *  (StoreTransfers.extractUnloaded). Without it the copy would recover their votes, locks and applied stubs as its
+   *  (StoreTransfersOut.extractUnloaded). Without it the copy would recover their votes, locks and applied stubs as its
    *  own under its new incarnation, and a stale commit vote could apply again. */
   def writeEmptyCrlState(storePath: os.Path, storeId: StoreId): Unit =
     CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, Backend.crlSaveFile(storePath))

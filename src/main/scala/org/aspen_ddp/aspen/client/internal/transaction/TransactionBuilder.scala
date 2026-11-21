@@ -65,11 +65,14 @@ class TransactionBuilder(
     * exclusively revision-locked.
     */
   private def claimForUpdate(pointer: ObjectPointer): Unit =
+    checkUpdatable(pointer)
+    updatingObjects += pointer
+
+  private def checkUpdatable(pointer: ObjectPointer): Unit =
     if updatingObjects.contains(pointer) then
       throw MultipleDataUpdatesToObject(pointer)
     if exclusiveRevisionLocks.contains(pointer) then
       throw ConflictingRequirements(pointer)
-    updatingObjects += pointer
 
   def isEmpty: Boolean =
     requirements.isEmpty &&
@@ -276,6 +279,8 @@ class TransactionBuilder(
     val sorted = writes.sortBy(_.offset)
     sorted.zip(sorted.tail).foreach: (prev, next) =>
       require(prev.end <= next.offset, s"Ranged write at ${next.offset} overlaps the write at ${prev.offset}")
+
+    checkUpdatable(objectPointer)
 
     val edits = sorted.map(w => RangeEdit(w.offset, w.data, state.oldBytes(w.offset, w.data.length)))
 

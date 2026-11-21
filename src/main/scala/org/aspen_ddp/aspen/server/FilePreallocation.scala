@@ -43,8 +43,9 @@ object FilePreallocation extends Logging:
    *  the partial file before rethrowing. */
   def preallocate(path: os.Path, size: Long, mode: Mode = Mode.Auto): Unit =
     require(size >= 0, s"negative size $size")
-    // Checked first, so the cleanup below only ever removes a file this call created
-    if os.exists(path, followLinks = false) then
+    // Checked first, so the cleanup below only ever removes a file this call created. A stat that fails throws
+    // (FileStat), creating nothing
+    if FileStat.exists(path, followLinks = false) then
       throw new java.nio.file.FileAlreadyExistsException(path.toString)
     try
       mode match

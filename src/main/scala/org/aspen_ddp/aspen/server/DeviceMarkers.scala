@@ -20,18 +20,22 @@ object DeviceMarkers:
   val ShutdownStateFile = "shutdown.state"
   val FailedFile = "failed"
 
-  def isFailed(devicePath: os.Path): Boolean = os.exists(devicePath / FailedFile)
+  /** Whether the device carries `failed`. A stat that fails throws (FileStat), so the caller refuses the device as if
+   *  it did: a tombstoned device is never loaded on a false absence */
+  def isFailed(devicePath: os.Path): Boolean = FileStat.exists(devicePath / FailedFile)
 
   /** Durable before returning, so a restart never loads the device */
   def writeFailed(devicePath: os.Path): Unit = DurableFiles.write(devicePath / FailedFile, "")
 
-  /** None if the file is absent. Throws IllegalArgumentException on malformed content. */
+  /** None if the file is known absent. Throws IllegalArgumentException on malformed content, and the stat's or read's
+   *  error when it cannot be read (FileStat). */
   def readOwningHost(devicePath: os.Path): Option[HostId] = readHostId(devicePath / OwningHostFile)
 
   def writeOwningHost(devicePath: os.Path, hostId: HostId): Unit =
     writeHostId(devicePath, OwningHostFile, hostId)
 
-  /** None if the file is absent. Throws IllegalArgumentException on malformed content. */
+  /** None if the file is known absent. Throws IllegalArgumentException on malformed content, and the stat's or read's
+   *  error when it cannot be read (FileStat). */
   def readShutdownState(devicePath: os.Path): Option[HostId] = readHostId(devicePath / ShutdownStateFile)
 
   def writeShutdownState(devicePath: os.Path, hostId: HostId): Unit =
@@ -41,7 +45,7 @@ object DeviceMarkers:
     DurableFiles.remove(devicePath / ShutdownStateFile)
 
   private def readHostId(file: os.Path): Option[HostId] =
-    if os.exists(file) then
+    if FileStat.exists(file) then
       Some(HostId(UUID.fromString(os.read(file).trim)))
     else
       None

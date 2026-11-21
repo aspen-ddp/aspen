@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server.rebuild
 
 import org.aspen_ddp.aspen.common.network.PendingAllocation
+import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -144,10 +145,13 @@ object RebuildState extends YObject[RebuildState] with Logging:
    *  discarding it is a restart of the walk and nothing more: `rebuildWrite` is a plain
    *  overwrite, so re-restoring already-restored objects is free. That is the correct direction
    *  under the checkpoint rule -- lose work, never claim work that never reached stable storage.
+   *
+   *  A stat that fails is no absence (FileStat): it throws, failing the pass with the checkpoint kept for the next,
+   *  rather than discard the walk done so far.
    */
   def load(path: os.Path): Option[RebuildState] =
     val f = path / stateFilename
-    if !os.exists(f) then
+    if !FileStat.exists(f) then
       None
     else
       try

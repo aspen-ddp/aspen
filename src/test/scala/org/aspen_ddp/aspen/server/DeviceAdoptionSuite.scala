@@ -452,6 +452,38 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).storeLoadAttempts.map(_._2) should contain(d0)
       storeMoves().map(_.storeId) should be(List(s0))
 
+  atest("an adoption whose store directory cannot be stat'd leaves the owner unwritten for the next scan (P-W10)"):
+    // The store directory is a link into a directory this process cannot search once the lookup is out: its stat
+    // fails (EACCES). Skipped, its arrival record would be missing when the rewritten owner loads it
+    given ExecutionContext = executionContext
+    val locked = os.temp.dir()
+    for
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Operational, 1, registerOldHost = true): ss =>
+                  Map(ss(0) -> StoreEntry(StoreStatus.Active, None))
+      s0 = stores.head
+      _ <- setDeviceState(deviceA)(_.copy(hostId = HostId.BootstrapHostId))
+      _ <- setPoolEntry(s0, HostId.BootstrapHostId, deviceA)
+      (hostRoot, deviceDir) = writePulledDevice(oldHostId)
+      d0 = writeClosedStore(deviceDir, s0)
+      _ = os.move(d0, locked / "store")
+      _ = os.symlink(d0, locked / "store")
+      host = newHost(hostRoot)
+      _ <- pumpUntil(queuedMarkerEvents(host) > 0)
+      _ = os.perms.set(locked, "rw-------")
+      _ = handleMarkerEvents(host)
+      _ <- pumpUntil(host.control.discovery.pendingMarkerResolutions.isEmpty &&
+                     host.control.reconciler.activeDeviceChecks.isEmpty)
+      ownerWhileUnknown = DeviceMarkers.readOwningHost(deviceDir)
+      loadedWhileUnknown = loadedDevices(host).contains(deviceA)
+      _ = os.perms.set(locked, "rwx------")
+      _ <- scanAndResolve(host)
+    yield
+      ownerWhileUnknown should be(Some(oldHostId))
+      loadedWhileUnknown should be(false)
+      DeviceMarkers.readOwningHost(deviceDir) should be(Some(HostId.BootstrapHostId))
+      os.exists(d0 / StoreLoader.ArrivedAtFile) should be(true)
+      loadedDevices(host).contains(deviceA) should be(true)
+
   atest("a crash between the adoption commit and the load is finished on the next scan"):
     given ExecutionContext = executionContext
     for

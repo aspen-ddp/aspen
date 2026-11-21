@@ -10,6 +10,9 @@
 - `server.DurableFiles` forces files and their directories so markers and moves survive a pulled disk. That
   durability holds on Linux only, the supported host platform: directory fsync is a no-op on Windows and a plain fsync
   on macOS, each logging one warning
+- Every existence test under `server/` is `server.FileStat`'s, never os-lib's `os.exists`/`os.isDir`/`os.isFile`,
+  which answer false on a failed stat: absent only on ENOENT, otherwise it throws, and each site decides whether that
+  waits, throws or is safe either way (`FileStatUsageSuite` enforces it; per-site rules in `host/CLAUDE.md`)
 - `aspen host --load-jars=<version>` loads user RegisteredTypeFactory lists from every jar in
   `<host-dir>/jars/<version>/` (may be a symlink, e.g. `latest`) via `UserJarLoader`: one URLClassLoader,
   parent-first, `AspenTypeProvider` classes found with ServiceLoader. Duplicate UUIDs (including against built-ins)

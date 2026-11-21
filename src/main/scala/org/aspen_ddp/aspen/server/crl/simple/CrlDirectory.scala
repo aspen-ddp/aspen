@@ -138,11 +138,11 @@ object CrlDirectory extends Logging:
     * would be created under the device's stores */
   private[simple] def removeUncommittedGrowth(streamsDir: os.Path, listed: Set[os.Path]): Unit =
     val ringSize = listed.size
-    val leftovers = List(s"$ringSize.crl", s"$ringSize.crl.tmp").map(streamsDir / _).filter(FileStat.exists)
+    val leftovers = List(s"$ringSize.crl", s"$ringSize.crl.tmp").map(streamsDir / _).filter(FileStat.exists(_))
     if leftovers.nonEmpty then
       val others = os.list(streamsDir).filter(f => f.ext == "crl" || f.last.endsWith(".crl.tmp")).toSet --
         leftovers -- listed
-      if others.nonEmpty || !listed.forall(FileStat.exists) then
+      if others.nonEmpty || !listed.forall(FileStat.exists(_)) then
         throw CrlSizingMismatch(streamsDir, s"it holds ${leftovers.map(_.last).mkString(", ")}, an uncommitted " +
           s"growth, beside ${(streamFiles(streamsDir) -- leftovers).map(_.last).toList.sorted.mkString(", ")}, " +
           s"not the $ringSize streams its ring lists")

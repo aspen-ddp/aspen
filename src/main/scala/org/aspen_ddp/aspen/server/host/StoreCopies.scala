@@ -131,7 +131,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
     val pendingDir = local.devicePath / RebuildingStore.PendingDeleteDirectory
     val copies =
       try
-        if os.isDir(pendingDir) then os.list(pendingDir).toList else Nil
+        if FileStat.isDir(pendingDir) then os.list(pendingDir).toList else Nil
       catch
         case t: Throwable =>
           logger.warn(s"Failed to list $pendingDir: $t")
@@ -165,8 +165,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
                 releaseLookups -= copy
                 result match
                   case Success(true) =>
-                    if os.exists(copy) then
-                      delete(copy, s"store $storeId is Active on the device its pool names")
+                    delete(copy, s"store $storeId is Active on the device its pool names")
                   case Success(false) => ()
                   case Failure(t) =>
                     logger.info(s"Keeping $copy: the state of store $storeId could not be read. Error: $t")
@@ -192,10 +191,10 @@ object StoreCopies extends Logging:
         StoreId(name.dropRight(suffix))
       .toOption
 
-  /** `devicePath / name`, created durably if absent */
+  /** `devicePath / name`, created durably if absent. A stat that fails throws (FileStat) */
   private[host] def ensureDirectory(devicePath: os.Path, name: String): os.Path =
     val dir = devicePath / name
-    if !os.exists(dir) then
+    if !FileStat.exists(dir) then
       os.makeDir.all(dir)
       DurableFiles.syncDirectory(devicePath)
     dir
@@ -227,7 +226,7 @@ object StoreCopies extends Logging:
   def sweepDeleting(devicePath: os.Path): Unit =
     val deleting = devicePath / DeletingDirectory
     try
-      if os.isDir(deleting) then os.list(deleting).foreach(removeQuietly)
+      if FileStat.isDir(deleting) then os.list(deleting).foreach(removeQuietly)
     catch
       case t: Throwable => logger.warn(s"Failed to list $deleting: $t")
 

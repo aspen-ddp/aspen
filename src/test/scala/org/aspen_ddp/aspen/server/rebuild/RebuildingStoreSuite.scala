@@ -507,6 +507,23 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       rebuild.testingOnlyRestoredKeys should be(Nil)
       os.list(leftover).map(_.last) should be(Seq("data"))
 
+  atest("a rebuild-complete marker that cannot be read names no episode by throwing, never by answering false (RB-W22)"):
+    val dev = deviceDir()
+    val episode = Some(UUID.randomUUID())
+    val storePath = dev / storeId.directoryName
+    os.makeDir.all(storePath)
+    val marker = storePath / RebuildingStore.RebuildCompleteMarkerFile
+    os.write.over(marker, RebuildingStore.rebuildCompleteContent(episode))
+    // Its stat succeeds and its open fails (EACCES): a read error that says nothing of the episode it names
+    os.perms.set(marker, "---------")
+    val unreadable = Try(RebuildingStore.isRebuildCompleteFor(storePath, episode))
+    os.perms.set(marker, "rw-------")
+    Future.successful:
+      unreadable.failed.toOption.map(_.isInstanceOf[java.io.IOException]) should be(Some(true))
+      RebuildingStore.isRebuildCompleteFor(storePath, episode) should be(true)
+      RebuildingStore.isRebuildCompleteFor(storePath, Some(UUID.randomUUID())) should be(false)
+      RebuildingStore.isRebuildCompleteFor(dev / "absent", episode) should be(false)
+
   atest("a pre-existing final directory skips straight to completion"):
     given ExecutionContext = executionContext
     val dev = deviceDir()

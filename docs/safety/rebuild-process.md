@@ -158,7 +158,7 @@ write the entry straight to Rebuilding.
 | T9 | a `transferring-out` store with an unusable `crl_save.log`, found by adoption | `DeviceDiscovery.adoptionClass`; `DeviceMetadata.adoptDevice` | marker written in the transaction's prepare closure; entry written Rebuilding |
 | T10 | a marked store on an adopted device | same | as T9 |
 | T11 | transfer out requested for a marked store | `StoreTransfersOut.returnLostTransferToRebuild` | transfer aborted, entry back to Active, then R1 |
-| T12 | a directory at a Rebuilding store's path that carries neither `rebuild-complete` of the entry's episode nor `rebuild-required` | `StoreRebuilds.retireForeignCopy` | the store's staging checkpoint removed durably first (`dropStagingCheckpoint`; so too for a `rebuild-required` copy at the path), so the next pass is a first pass: the copy may have served since the first pass began (a restart's device load serves an unmarked copy until the device's first reconcile), and a resumed walk would leave its acknowledged updates on the objects walked before the checkpoint stale with no mark; then marked (a served one is first fail-stopped through `backendFailed`, and its rebuild waits for a later check), then discarded like any lost copy. No rebuild of the store runs here when it is called; a removal that fails holds the rebuild back for a later check. A stat of the path or a marker that fails holds the rebuild back for a later check (`FileStat`); the marker's content is read by `RebuildingStore.isRebuildCompleteFor`, for which an unreadable marker names no episode (RB-W22) |
+| T12 | a directory at a Rebuilding store's path that carries neither `rebuild-complete` of the entry's episode nor `rebuild-required` | `StoreRebuilds.retireForeignCopy` | the store's staging checkpoint removed durably first (`dropStagingCheckpoint`; so too for a `rebuild-required` copy at the path), so the next pass is a first pass: the copy may have served since the first pass began (a restart's device load serves an unmarked copy until the device's first reconcile), and a resumed walk would leave its acknowledged updates on the objects walked before the checkpoint stale with no mark; then marked (a served one is first fail-stopped through `backendFailed`, and its rebuild waits for a later check), then discarded like any lost copy. No rebuild of the store runs here when it is called; a removal that fails holds the rebuild back for a later check. A stat of the path or a marker that fails holds the rebuild back for a later check (`FileStat`); so does a marker whose content `RebuildingStore.isRebuildCompleteFor` cannot read: it throws, never taking a finished copy for a foreign one |
 | T13 | operator declares the device dead | `fail-storage-device`, `FailedStorageDeviceDurableTask` | tombstone, then R3 per store |
 | T14 | an Active entry on a loaded, Operational device with no `config.yaml` at the store's path (the config's stat answers absent, `FileStat`: the directory or its config is gone; a stat that fails is no absence, and the store is skipped until one answers), the store neither served, in `loadedStores`, opening nor retiring | the reconcile's Missing Stores pass (`DeviceReconciler.requestMissingStoresRebuild`, after Deleted Stores and before Lost CRL State) | router offline, added to `offlineStores` and to the device's host-local `declaredMissing` record, `requestRebuild` (R1). The store's device-CRL entries stay: nothing durable records the declaration, and the directory may come back (a restore or mount finishing late) before the flip commits, when a restart's device load serves it as the store it is, with its state. Once the entry is Rebuilding, `retireForeignCopy` (T12) retires a directory that is back (or a configless one), saving them into the copy; the rebuilt copy's empty `crl_save.log` drops whatever is left at its first load (5.6); a re-placement's entry leaving the device makes them leftovers for `dropLeftoverCrlState`. `tryLoadStore` only logs a configless store directory, so no other path notices such a store while its pool counts it writable. Without a restart, a directory back before the flip commits stays offline (no pass loads an unmarked `offlineStores` member with an Active entry, and a load retry, `StoreLoader.retryFailedLoads`, waits while the store is declared or its reconciled entry is not Active or Offline) and is retired once the flip commits. A directory back after the rebuild has checkpointed, and served by a restart's device load, is retired the same way, and its checkpoint is discarded first (T12), so the rebuild walks again from the start. A request that fails permanently is made again at each reconcile while the declared store's entry stays Active on the device and it is neither served, loaded, opening nor retiring, its directory back or not (`declaredMissing`; dropped once the entry leaves Active or the store is served, and gone with the device's unload or a restart, whose load serves a store that is back) |
 | T15 | the store's `incarnation` file known absent at load (its stat answers absent; every store directory gets one at creation, `StoreCreation`, or at a rebuild's `finish`) | `StoreLoader.handleLoad` ► `retireUnserved` | marker, offline: the store's identity is lost, so it is rebuilt as a new incarnation rather than given a fresh one over its data and CRL state |
@@ -276,9 +276,10 @@ Constructed on the control thread by `StoreRebuildFactory.createRebuild`, with t
 read; everything expensive runs on the client's execution context. A final path carrying `rebuild-complete` of this
 episode (`RebuildingStore.isRebuildCompleteFor`) is a finished rebuild awaiting its flip: staging is deleted and only
 the flip remains. A final path without it fails the pass (a defence: `retireForeignCopy` has already retired such a
-copy, a finished copy of an earlier episode included). `isRebuildCompleteFor` takes a marker it cannot read for one
-naming no episode, and `start` tests the final path with `os.exists`, not `FileStat` (RB-W22). Otherwise `runPass`, which resumes the checkpoint only if it
-names this episode (`RebuildState.episode`); one of an earlier episode counts as none, so staging is discarded and
+copy, a finished copy of an earlier episode included). A marker or final path whose stat or read fails
+(`isRebuildCompleteFor`, `FileStat`) fails the pass, which a later check starts again. Otherwise `runPass`, which
+resumes the checkpoint only if it names this episode (`RebuildState.episode`); one of an earlier episode counts as
+none, so staging is discarded and
 the walk starts over. A store re-placed away and back may have taken updates elsewhere, and repair consumed their
 ErrorTree entries there, so the earlier episode's copy of every object is stale with nothing to mark it.
 
@@ -917,22 +918,6 @@ an old episode's copy.
 ---
 
 ## Open weaknesses
-
-**RB-W22 A rebuild-complete marker that cannot be read retires a finished copy** (CONFIRMED, priority 5, effort S)
-
-Mechanism: `StoreRebuilds.retireForeignCopy` stats the path and both markers through `FileStat`, but reads the marker's
-content through `RebuildingStore.isRebuildCompleteFor`, which answers false on any read error (and stats with
-`os.exists`). A finished copy of the current episode whose marker read fails (EIO, a descriptor limit) is taken for a
-foreign copy: marked `rebuild-required` and retired to `pending-delete/`. `RebuildingStore.start` makes the same
-read, and tests the final path with `os.exists`, so a failed stat there runs a whole pass that fails at the move.
-
-Trigger: a transient read error on `rebuild-complete` at the reconcile that starts the flip-only pass.
-
-Consequence: the complete copy is discarded and the store is rebuilt from scratch (its checkpoint was removed by
-`finish`): hours of walking and a longer window with the store missing. Nothing is lost; the retired copy is kept.
-
-Fix direction: have `isRebuildCompleteFor` throw on a read error (and `start` use `FileStat`), and treat a throw in
-`retireForeignCopy` and `start` as the failed stats already are: wait for a later check.
 
 **RB-W23 A rebuilding store's router silence can be cleared and is never restored** (CONFIRMED, priority 5, effort S)
 

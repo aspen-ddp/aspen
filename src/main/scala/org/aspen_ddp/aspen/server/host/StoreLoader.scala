@@ -136,7 +136,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             startOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)
         catch
           case t: Throwable => awaitUnreadRetry(sds, potentialStoreFile, onServed, t)
-      case Right(false) if os.isDir(potentialStoreFile) && isStoreDirectoryName(potentialStoreFile) =>
+      // Only logged, so a directory whose stat fails is passed over quietly
+      case Right(false) if Try(FileStat.isDir(potentialStoreFile)).getOrElse(false) &&
+                           isStoreDirectoryName(potentialStoreFile) =>
         // Never a half-made store (creates, transfers and rebuilds move a store into place whole), so a store whose
         // config was lost. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass
         logger.error(s"Not loading $potentialStoreFile: it has no ${StoreConfig.configFilename}")
@@ -297,7 +299,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         if registered then
           ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
         created.foreach(_.tryFailure(e))
-      case Failure(e) if create && !os.exists(storePath) =>
+      case Failure(e) if create && FileStat.existence(storePath).contains(false) =>
         // The create failed and left nothing at the path (StoreCreation), so the entry is still Initializing and the
         // next device check creates it again (DeviceReconciler, StoreRebuilds.createNewStore). A create that
         // succeeded and whose open failed left a complete store, which the next check flips without loading: it

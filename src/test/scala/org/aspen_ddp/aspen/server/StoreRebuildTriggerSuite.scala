@@ -745,6 +745,40 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
       os.read(storeDir(1) / RebuildingStore.RebuildCompleteMarkerFile) should be(current.toString)
 
+  atest("a finished copy whose rebuild-complete marker cannot be read is kept, and its rebuild waits (RB-W22)"):
+    // Taken for a foreign copy it would be retired, and the store rebuilt from scratch
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+    val current = UUID.randomUUID()
+    val storeDir = deviceDir / storeN(0).directoryName
+    os.makeDir.all(storeDir)
+    val marker = storeDir / RebuildingStore.RebuildCompleteMarkerFile
+    os.write.over(marker, current.toString)
+    // Its stat succeeds and its open fails (EACCES)
+    os.perms.set(marker, "---------")
+
+    def check(): Unit =
+      val armed = recorded(host).armLookup(deviceA)
+      host.control.reconciler.checkAll()
+      armed.success(deviceState(deviceA, Map(rebuildingIn(storeN(0), current))))
+
+    check()
+    for
+      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
+      createdWhileUnreadable = factory.created.size
+      pendingWhileUnreadable = os.exists(deviceDir / RebuildingStore.PendingDeleteDirectory) &&
+                               os.list(deviceDir / RebuildingStore.PendingDeleteDirectory).nonEmpty
+      _ = os.perms.set(marker, "rw-------")
+      _ = check()
+      _ <- yieldUntil(factory.created.nonEmpty)
+    yield
+      createdWhileUnreadable should be(0)
+      pendingWhileUnreadable should be(false)
+      factory.created.map(_.storeId).toList should be(List(storeN(0)))
+      os.read(marker) should be(current.toString)
+
   atest("a rebuild that finishes after its entry moved to a new Rebuilding episode is not promoted (RB-W3)"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)

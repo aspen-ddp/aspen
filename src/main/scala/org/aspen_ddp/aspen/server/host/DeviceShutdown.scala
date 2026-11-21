@@ -115,9 +115,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
           // which loads each store this shutdown closed and that is Active again
           // (reloadClosedStores).
           logger.info(s"Shutdown of storage device $deviceId was cancelled by a restart")
-          try
-            if os.exists(local.devicePath / DeviceMarkers.ShutdownStateFile) then
-              DeviceMarkers.removeShutdownState(local.devicePath)
+          try DeviceMarkers.removeShutdownState(local.devicePath)
           catch case t: Throwable =>
             // Harmless while this process runs: the device stays loaded. A restart of this host
             // would find the file and treat the device as shut down until it is resolved.

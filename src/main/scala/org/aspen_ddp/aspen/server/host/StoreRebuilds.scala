@@ -18,7 +18,7 @@ import scribe.Logging
 import java.util.UUID
 import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration.FiniteDuration
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Success, Try}
 import scala.util.control.NonFatal
 
 /** Runs only on the control thread. See HostThreading.scala.
@@ -139,25 +139,27 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       creatingStores += storeId
 
       // True when the store exists on disk (created here, or by an attempt that crashed before
-      // its flip), false when the create was skipped for a shutdown.
-      val fcreate: Future[Boolean] = if os.exists(storePath) then
-        Future.successful(true)
-      else
-        ctx.client.getStoragePoolState(storeId.poolId).flatMap: pstate =>
-          if ctx.shutdown.isShuttingDown(deviceId) || ! ctx.devices.isLoaded(local) then
-            logger.info(s"Not creating store $storeId: device $deviceId is being shut down")
-            Future.successful(false)
-          else
-            val storeConfig = StoreConfig.forPool(storeId, pstate)
+      // its flip), false when the create was skipped for a shutdown. A stat that fails (FileStat) fails the flip, which
+      // the next check tries again: never a create over a store that may be there, nor a flip of one that may not.
+      val fcreate: Future[Boolean] = Try(FileStat.exists(storePath)) match
+        case Failure(t) => Future.failed(t)
+        case Success(true) => Future.successful(true)
+        case Success(false) =>
+          ctx.client.getStoragePoolState(storeId.poolId).flatMap: pstate =>
+            if ctx.shutdown.isShuttingDown(deviceId) || ! ctx.devices.isLoaded(local) then
+              logger.info(s"Not creating store $storeId: device $deviceId is being shut down")
+              Future.successful(false)
+            else
+              val storeConfig = StoreConfig.forPool(storeId, pstate)
 
-            // Created wherever its backend opens, atomically (BackendOpener.create, StoreCreation): the
-            // directory, config included, appears at storePath only complete, so the os.exists check above
-            // means the store exists. startOpen records the store in loadedStores now, so a shutdown of this
-            // device waits for the create and then closes the store. A create that fails, out of space
-            // included, leaves nothing at storePath, and the next device check tries again.
-            val created = Promise[Unit]()
-            ctx.loader.startOpen(local, storeConfig, storePath, create = true, Some(created))
-            created.future.map(_ => true)
+              // Created wherever its backend opens, atomically (BackendOpener.create, StoreCreation): the
+              // directory, config included, appears at storePath only complete, so the FileStat check above
+              // means the store exists. startOpen records the store in loadedStores now, so a shutdown of this
+              // device waits for the create and then closes the store. A create that fails, out of space
+              // included, leaves nothing at storePath, and the next device check tries again.
+              val created = Promise[Unit]()
+              ctx.loader.startOpen(local, storeConfig, storePath, create = true, Some(created))
+              created.future.map(_ => true)
 
       // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
       // the control-context onComplete; the prepare closure's combinators run on the control thread
@@ -462,7 +464,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     val stagingRoot = local.devicePath / RebuildingStore.RebuildDirectory
     val staged =
       try
-        if os.isDir(stagingRoot) then os.list(stagingRoot).filter(os.isDir(_)).toList else Nil
+        if FileStat.isDir(stagingRoot) then os.list(stagingRoot).filter(FileStat.isDir(_)).toList else Nil
       catch
         case t: Throwable =>
           logger.warn(s"Failed to list $stagingRoot: $t")

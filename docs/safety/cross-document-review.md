@@ -242,10 +242,20 @@ The premises other subsystems take from this:
   `openDeviceCrl`, and no stream file is created under `mustExist`), the backend opens and FSIF recovery (an
   `IOException` the load retries, never `BackendStateLost`), and the rebuilt store's `acceptor-since` and
   `inherited-votes` reads (the load held back as for the save file). `StoreCopies.delete` reports gone only a copy
-  known absent. Existence tests outside these still use os-lib's `os.exists`/`os.isDir`, which answer absent on a
-  failed stat: `DeviceMarkers.isFailed` (SL-W25), `RebuildingStore.isRebuildCompleteFor` (RB-W22),
-  `DeviceDiscovery.bringIntoService` (P-W10), and others listed in X-W30. A failed stat of a moved store's `ArrivedAtFile` counts as an arrival now (`StoreLoader.readArrivedAt`), keeping its
-  arrival margin. `adoptionClass` and the adoption's `crl/` check throw, failing the adoption for the next scan;
+  known absent. No existence test under `server/` uses os-lib's `os.exists`/`os.isDir`/`os.isFile`, which answer
+  absent on a failed stat (`FileStatUsageSuite` fails on one). Where a false absence would lead the host to act, a
+  failed stat holds back or throws: `DeviceDiscovery.tryLoadDevice` leaves the device unloaded for the next scan, so a
+  `failed` marker it cannot stat never loads a tombstoned device; `DeviceMarkers`' `owning-host` and `shutdown.state`
+  reads throw likewise; an adoption's `bringIntoService` throws before it rewrites `owning-host` when a store
+  directory's stat fails, so every store present gets its `ArrivedAtFile` and the next scan finishes the adoption;
+  `storesIn` throws rather than report a device without stores; `RebuildingStore.isRebuildCompleteFor` throws on a
+  marker it cannot stat or read, so `retireForeignCopy` and `start` wait rather than take a finished copy for a
+  foreign one; `startOut` refuses a transfer whose `rebuild-required` stat fails, never shipping a marked copy;
+  `createNewStore` neither creates nor flips a store whose path stat fails, and `StoreCreation` never renames over a
+  target it cannot stat; `RebuildState.load` fails the pass with the checkpoint kept. Where either answer is safe the
+  site says so: the gossip retransmit state and the join ceiling (`JoinCeiling.FilePersistence.read`: no ceiling gives
+  the higher floor) read a failed stat as none. A failed stat of a moved store's `ArrivedAtFile` counts as an arrival
+  now (`StoreLoader.readArrivedAt`), keeping its arrival margin. `adoptionClass` and the adoption's `crl/` check throw, failing the adoption for the next scan;
   `retireForeignCopy` and `discardLostStore` hold the rebuild for a later check, neither starting it over a copy
   they cannot see nor retiring a finished one; `startIn` neither resumes nor discards an arrived copy whose marker
   cannot be stat'd or read, and refuses a path whose stat fails; `openDeviceCrl` throws before moving `crl/`;
@@ -560,21 +570,4 @@ not recorded here.
 
 ## Open weaknesses
 
-**X-W30 Existence tests that remain on os-lib are unclassified** (CONFIRMED, priority 5, effort M)
-
-`server/host/CLAUDE.md` and 2.2 above state one rule, that every existence test over a store or device directory
-tells a failed stat from an absence (`server.FileStat`). The sites with their own findings are listed in 2.2. The
-rest still use `os.exists`/`os.isDir`/`os.isFile` and have not been checked for what a false absence does there:
-`DeviceShutdown` (`ShutdownStateFile` before a lookup), `DeviceMarkers.readHostId`, `DeviceDiscovery` (device-scan
-directory tests, `storesIn`, `tryLoadDevice`, the config `os.isFile`), `StoreTransfers` (the promotion's
-`transferring-out` test, the `rebuild-complete` test after a repoint), `StoreTransfersOut.startOut` (`rebuild-required`,
-two sites: a marked copy ships with its marker, so the destination declares it), `StoreCopies` (`release`'s
-`pending-delete/` listing and copy test, `deleting/` sweeps), `LocalDevices.discardStoreDirectory`,
-`StoreRebuilds` (the path test before create, the staging root), `RebuildState` (the checkpoint: a false absence
-costs a first pass), `StoreLoader` (`os.isDir` of a device child, the path test after a failed create),
-`JoinCeiling.FilePersistence.read` (fails safe: no ceiling gives the higher floor), `CrlLock`, `HostManager`,
-`GossipRetransmitter` and `FilePreallocation`. Consequence: unknown per site; the ones traced so far range from a
-wasted rebuild to a split decision. Fix direction: replace them all with `FileStat`, deciding at each site whether a
-failed stat waits, throws or is safe either way, and keep it so with a test that fails on any `os.exists`,
-`os.isDir` or `os.isFile` under `server/` outside `FileStat`.
-
+(none)

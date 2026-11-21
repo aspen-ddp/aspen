@@ -89,16 +89,21 @@
   (`retireUnserved`: marked `rebuild-required`, rebuilt as a new incarnation); one that cannot be stat'd, read or
   parsed is left alone and the load retried through `storesAwaitingRetry` (`awaitUnreadRetry`), so a format change
   in a release is an outage, never a fresh identity over a store's data and CRL state
-- Every existence test in host code over a store or device directory uses `server.FileStat`, never `os.exists`
-  (`Files.exists`, false on any stat error): absent only on ENOENT (or a parent that is no directory), otherwise it
-  throws. `tryLoadStore`'s config and marker checks and `handleLoad`'s `crl_save.log`, `acceptor-since` and
+- Every existence test under `server/` uses `server.FileStat`, never `os.exists`/`os.isDir`/`os.isFile`
+  (`Files.exists`, false on any stat error; `FileStatUsageSuite` fails on one): absent only on ENOENT (or a parent
+  that is no directory), otherwise it throws. A new site decides whether a failed stat waits, throws or is safe
+  either way, and says so where it stands. `tryLoadStore`'s config and marker checks and `handleLoad`'s `crl_save.log`, `acceptor-since` and
   `inherited-votes` checks hold a load whose stat fails back through `awaitUnreadRetry` (a rebuilt store loaded
   without its gates would be a full acceptor of its old incarnation's transactions); the Missing Stores pass, `dropLeftoverCrlState` and the Deleted Stores
   pass skip such a store; `StoreCopies.retire` fails rather than report a clear path, and `StoreCopies.delete`
   reports gone only a copy known absent; `DeviceDiscovery.openDeviceCrl`
   throws (device left for the next scan; a child whose config cannot be stat'd counts as a store directory) and so
-  does `holdsOwnState`. `StoreLoader.readArrivedAt` counts a failed stat as an arrival now; `adoptionClass` throws
-  (adoption retried next scan); `retireForeignCopy`/`discardLostStore` and `startIn` wait for a later check (`startIn`
+  does `holdsOwnState`. `tryLoadDevice` leaves a device whose directory, config or `failed` marker cannot be stat'd
+  for the next scan, and `DeviceMarkers`' host-id reads and `storesIn` throw too. `StoreLoader.readArrivedAt` counts
+  a failed stat as an arrival now; `adoptionClass` throws (adoption retried next scan), and so does
+  `bringIntoService` on a store directory it cannot stat, before it rewrites `owning-host`, so no adopted store loads
+  without its `ArrivedAtFile`; `RebuildingStore.isRebuildCompleteFor` throws on a marker it cannot stat or read;
+  `startOut` never ships a store whose `rebuild-required` stat fails; `retireForeignCopy`/`discardLostStore` and `startIn` wait for a later check (`startIn`
   also when the promoted copy's `transferred-in` marker cannot be read: it says nothing of which transfer the copy
   belongs to); reconcile
   passes act on a marker only when a stat finds it. Tests fail a stat with a directory lacking search permission, or

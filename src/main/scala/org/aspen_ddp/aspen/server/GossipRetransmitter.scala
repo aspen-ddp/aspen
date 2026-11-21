@@ -133,9 +133,10 @@ object GossipRetransmitter extends Logging:
       s"  - gossip: ${yamlQuote(encoded)}\n    first-sent: ${yamlQuote(firstSent.toString)}\n"
     "messages:\n" + entries.mkString
 
-  /** The pending messages saved in `file`, or none if there is no file or it cannot be read */
+  /** The pending messages saved in `file`, or none if there is no file or it cannot be stat'd or read: they are
+   *  retransmits of gossip that is safe to lose */
   private[server] def load(file: os.Path): Map[Gossip, Instant] =
-    if !os.exists(file) then
+    if FileStat.existence(file).contains(false) then
       Map()
     else
       try

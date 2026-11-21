@@ -54,10 +54,10 @@ object DurableFiles extends Logging:
         throw e
     syncDirectory(file / os.up)
 
-  /** Removes `file` if present, then forces its directory so the removal is durable too. */
+  /** Removes `file` if present, then forces its directory so the removal is durable too. A failure to remove it, or to
+   *  tell whether it is there, throws. */
   def remove(file: os.Path): Unit =
-    if os.exists(file) then
-      os.remove(file)
+    if os.remove(file, checkExists = false) then
       syncDirectory(file / os.up)
 
   /** Renames `source` (a file or a directory) to `target` atomically, then forces the directory that now names it and,
@@ -70,15 +70,16 @@ object DurableFiles extends Logging:
       syncDirectory(source / os.up)
 
   /** Forces every regular file and directory under `root`, `root` included, to stable storage: files first, then
-   *  each directory below its entries. For a freshly written tree before it is renamed into place. */
+   *  each directory below its entries. For a freshly written tree before it is renamed into place. An entry whose stat
+   *  fails throws (FileStat), so no entry is left unforced for want of a stat. */
   def syncTree(root: os.Path): Unit =
     val entries = os.walk(root, includeTarget = false)
-    entries.filter(os.isFile(_, followLinks = false)).foreach: f =>
+    entries.filter(FileStat.isFile(_, followLinks = false)).foreach: f =>
       val channel = FileChannel.open(f.toNIO, StandardOpenOption.WRITE)
       try channel.force(true)
       finally channel.close()
     // Deepest first, so a directory is forced after the entries it names
-    (entries.filter(os.isDir(_, followLinks = false)) :+ root).sortBy(-_.segmentCount).foreach(syncDirectory)
+    (entries.filter(FileStat.isDir(_, followLinks = false)) :+ root).sortBy(-_.segmentCount).foreach(syncDirectory)
 
   /** Forces a directory's entries to stable storage. Opening a directory for READ and forcing it
    *  is how Linux exposes fsync on a directory.

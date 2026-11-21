@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionHorizon
-import org.aspen_ddp.aspen.server.DurableFiles
+import org.aspen_ddp.aspen.server.{DurableFiles, FileStat}
 import scribe.Logging
 
 import scala.concurrent.duration.*
@@ -110,12 +110,13 @@ object JoinCeiling:
     /** Durably removes the ceiling persisted, if any */
     def remove(): Unit
 
-  /** A file in `dir`, written with DurableFiles. One that cannot be read bounds nothing */
+  /** A file in `dir`, written with DurableFiles. One that cannot be stat'd or read bounds nothing: no ceiling gives
+   *  the higher load floor, so either answer is safe */
   final class FilePersistence(dir: os.Path) extends Persistence:
     private val file = dir / FileName
 
     def read(): Option[Long] =
-      if os.exists(file) then Try(os.read(file).trim.toLong).toOption else None
+      Try(Option.when(FileStat.exists(file))(os.read(file).trim.toLong)).toOption.flatten
 
     def write(ceiling: Long): Unit = DurableFiles.write(file, ceiling.toString)
 

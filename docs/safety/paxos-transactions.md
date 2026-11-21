@@ -876,8 +876,9 @@ changes, overwritten revisions), and memory cannot be infinite. The fix is a tim
   `StoreLoader`. Normally it is `min(load + MaxStartLead, JoinCeiling.boundAtLoad)`: before its load the store may have
   joined, and forgotten, a T started up to `MaxStartLead` ahead of its clock, but never one at or above the join ceiling
   its previous life on this host ran under (below). A store that arrived from another host (a transfer in,
-  `StoreTransfers.clearTransferredInMarker`; an adoption, `DeviceDiscovery.bringIntoService`, but see P-W10) durably
-  writes `StoreLoader.ArrivedAtFile` before it can load here, and a stat or read of that file that fails counts as an
+  `StoreTransfers.clearTransferredInMarker`; an adoption, `DeviceDiscovery.bringIntoService`, before it rewrites `owning-host`, and
+  a store directory whose stat fails leaves the adoption to the next scan) durably writes `StoreLoader.ArrivedAtFile`
+  before it can load here, and a stat or read of that file that fails counts as an
   arrival now (`StoreLoader.readArrivedAt`); a load less than `AcceptorSinceMargin` (10 s) after the arrival uses `load + AcceptorSinceMargin`,
   and a later one keeps `arrival + AcceptorSinceMargin` as a lower bound, covering the other host's clock lead. A store
   this process just created for a pool's Initializing slot (`StoreRebuilds.createNewStore`, `StoreLoader.newStores`)
@@ -1230,25 +1231,4 @@ transaction eventually resolves without operator action given a healthy quorum.
 
 ## Open weaknesses
 
-**P-W10 An adoption skips the arrival file of a store whose directory stat fails** (PLAUSIBLE, priority 5, effort S)
-
-Mechanism: `DeviceDiscovery.bringIntoService` (adoption, `rewriteOwner`) writes `StoreLoader.ArrivedAtFile` only for
-the store directories `os.isDir` reports, and `os.isDir` answers false on a failed stat, so a transient stat error
-skips that store's arrival record and the owner is rewritten anyway. Its later load finds the file known absent
-(`StoreLoader.readArrivedAt`) and passes no arrival, and `Frontend.loadFloorMillis` takes
-`min(load + MaxStartLead, JoinCeiling.boundAtLoad)`. For a store new to this process that bound is this host's
-`JoinCeiling.atStart`, which says nothing of joins on the previous host and may be far in the past, so the load part
-of the floor can fall to that old ceiling and the floor to `now - horizon` (10.10). The other existence tests on the
-store-arrival path use `FileStat` (`readArrivedAt`, the load's marker tests); this one does not.
-
-Trigger: an adoption within the horizon of the store's last service on its previous host, with a stat of that store's
-directory failing transiently during `bringIntoService`, and a prepare (a delayed client retransmit or a recovery
-driver's) for a transaction the store joined and forgot there reaching it after the load.
-
-Consequence: one store may rejoin a transaction it forgot, against the rejoin invariant. That transaction was
-concluded there, so its other acceptors refuse it below their floors or answer from their caches, and a lone rejoined
-acceptor decides nothing: hygiene, as for a failed stat of the arrival file itself.
-
-Fix direction: test each directory with `FileStat` in `bringIntoService`, failing the adoption step (left to the next
-scan, as its other failures are) when a stat fails, so every store directory present gets its arrival record before
-the owner is rewritten.
+(none)

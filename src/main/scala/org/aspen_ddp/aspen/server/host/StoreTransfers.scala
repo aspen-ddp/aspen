@@ -297,7 +297,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                 // TransferringOut, and this entry is Active now, which is all the Completed Rebuilds
                 // pass checks: cleared here, or tryLoadStore keeps the pool's only owner copy offline
                 // until this device's next check. A failed removal is left to that pass, as there.
-                if !os.exists(storePath / RebuildingStore.RebuildCompleteMarkerFile) ||
+                // A marker whose stat fails is removed as a present one is
+                if FileStat.existence(storePath / RebuildingStore.RebuildCompleteMarkerFile).contains(false) ||
                    ctx.rebuilds.clearRebuildCompleteMarker(storeId, storePath)
                 then
                   ctx.loadStoreById(toDeviceid, storeId)
@@ -502,8 +503,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                 else
                   try
                     val marker = stagedPath / StoreTransfer.TransferOutMarkerFile
-                    if os.exists(marker) then
-                      os.remove(marker)
+                    os.remove(marker, checkExists = false)
                     // Durable, marker and move both: a copy that lands during a shutdown is
                     // accepted by an adopter on the strength of this marker alone.
                     DurableFiles.write(stagedPath / StoreTransfer.TransferredInMarkerFile,

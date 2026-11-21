@@ -37,13 +37,13 @@ object UserJarLoader:
     loadDirectory(versionDir(hostDir, version))
 
   def loadDirectory(dir: os.Path): List[RegisteredTypeFactory] =
-    if ! os.exists(dir) then
+    if ! FileStat.exists(dir) then
       throw LoadError(s"Jar directory does not exist: $dir")
 
-    if ! os.isDir(dir) then
+    if ! FileStat.isDir(dir) then
       throw LoadError(s"Jar directory is not a directory: $dir")
 
-    val jars = os.list(dir).filter(p => p.ext == "jar" && os.isFile(p)).toList
+    val jars = os.list(dir).filter(p => p.ext == "jar" && FileStat.isFile(p)).toList
 
     if jars.isEmpty then
       throw LoadError(s"No .jar files found in $dir")

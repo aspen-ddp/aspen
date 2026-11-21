@@ -182,8 +182,9 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
         err(s"Source device ${sourceDs.storageDeviceId} for transfer of store ${m.storeId} is " +
             s"being shut down")
       val markedPath = sourceDs.devicePath / m.storeId.directoryName
+      // A stat that fails throws (FileStat), failing the request: a marked copy never ships
       if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut &&
-         os.exists(markedPath / RebuildingStore.RebuildRequiredMarkerFile) then
+         FileStat.exists(markedPath / RebuildingStore.RebuildRequiredMarkerFile) then
         // A store marked for rebuild (its backend failed, here during an earlier request's close;
         // rebuild-process) has no trustworthy state to ship, and the destination would refuse
         // its missing CRL save file forever. It goes back to the rebuild path instead.
@@ -221,6 +222,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
 
     result.foreach: _ =>
       val storePath = sourceDs.devicePath / m.storeId.directoryName
+      lazy val markedNow = FileStat.existence(storePath / RebuildingStore.RebuildRequiredMarkerFile)
       // Checked again now the close is done: a shutdown that began during it has already
       // run stopDeviceWork, which found no send to cancel, so a send begun here would run
       // on a device being shelved. The store is left closed and unmarked, its state in the
@@ -235,7 +237,12 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
               ctx.loader.opensStarted(m.storeId) != opens then
         // Opened since its close: the open serves it, and a retransmitted request closes it again
         logger.info(s"Not starting the transfer out of store ${m.storeId}: it was opened after its close")
-      else if os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
+      else if markedNow.isEmpty then
+        // Its marker cannot be stat'd (FileStat): never shipped on a guess. Left closed and unmarked, as above, until a
+        // retransmitted request closes it again and looks once more
+        logger.warn(s"Not starting the transfer out of store ${m.storeId}: the stat of its " +
+                    s"${RebuildingStore.RebuildRequiredMarkerFile} marker failed")
+      else if markedNow.contains(true) then
         // Marked while it closed (a BackendFailed for it): as above, never shipped.
         logger.error(s"Not starting the transfer out of store ${m.storeId}: it was marked " +
                      s"rebuild-required while it closed")

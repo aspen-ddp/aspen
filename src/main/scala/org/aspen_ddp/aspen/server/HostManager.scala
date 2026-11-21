@@ -8,6 +8,7 @@ import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem, Secret
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
+import scala.util.Try
 
 /** Creation and on-disk setup of hosts.
  *
@@ -80,7 +81,12 @@ object HostManager:
     val hostConfigFile = hostDir / HostConfig.configFilename
     val storageDevicesDir = hostDir / StorageDeviceManager.StorageDevicesDirName
 
-    if os.exists(hostConfigFile) then
+    // A stat that fails is no absence (FileStat): the setup fails rather than configure a host over one
+    val configured = Try(FileStat.exists(hostConfigFile))
+    if configured.isFailure then
+      Future.failed(new DirectorySetupFailed(hostDir, configured.failed.get))
+
+    else if configured.get then
       Future.failed(new HostAlreadyConfigured(hostDir))
 
     else

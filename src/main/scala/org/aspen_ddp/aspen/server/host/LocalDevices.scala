@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission}
 import scribe.Logging
 
@@ -68,7 +69,8 @@ class LocalDevices extends Logging:
 
       case Some(sds) =>
         val storePath = sds.devicePath / storeId.directoryName
-        if os.exists(storePath) then
+        // A stat that fails is no absence (FileStat): the delete is attempted, and fails rather than report it gone
+        if !FileStat.existence(storePath).contains(false) then
           logger.warn(s"Discarding the copy of store $storeId on device $deviceId. " +
                       s"$reason: $storePath")
           // Rename-first: a failure leaves the copy whole, its marker included, so a restart never loads it.

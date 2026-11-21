@@ -72,13 +72,12 @@ object RebuildingStore:
   /** The content of the rebuild-complete marker of `episode` */
   def rebuildCompleteContent(episode: Option[UUID]): String = episode.map(_.toString).getOrElse("")
 
-  /** Whether `storePath` carries the rebuild-complete marker of `episode`. An unreadable marker names no episode */
+  /** Whether `storePath` carries the rebuild-complete marker of `episode`. A marker whose stat or read fails throws
+   *  (FileStat): its episode is unknown, and the caller waits for a later check rather than take a finished copy for
+   *  a foreign one */
   def isRebuildCompleteFor(storePath: os.Path, episode: Option[UUID]): Boolean =
     val marker = storePath / RebuildCompleteMarkerFile
-    try
-      os.exists(marker) && os.read(marker).trim == rebuildCompleteContent(episode)
-    catch
-      case NonFatal(_) => false
+    FileStat.exists(marker) && os.read(marker).trim == rebuildCompleteContent(episode)
 
   /** In a store directory being discarded: the store's device-CRL entries, saved by CrashRecoveryLog.saveStoreState
    *  before they are dropped from the device CRL, which a rebuild onto the same device would otherwise recover */
@@ -319,7 +318,7 @@ class RebuildingStore(client: AspenClient,
           logger.info(s"Rebuild of $storeId: store already in place at $finalPath")
           cleanupStaging()
           Future.unit
-        else if os.exists(finalPath) then
+        else if FileStat.exists(finalPath) then
           // Not this rebuild's output (no marker, or one of an earlier Rebuilding episode). StoreRebuilds.startRebuild
           // retires such a directory before it starts a rebuild, so this is only a defence: the directory is left
           // alone and the rebuild fails
@@ -335,7 +334,7 @@ class RebuildingStore(client: AspenClient,
 
   private def cleanupStaging(): Unit =
     try
-      if os.exists(stagingPath) then os.remove.all(stagingPath)
+      if FileStat.exists(stagingPath) then os.remove.all(stagingPath)
     catch
       case t: Throwable => logger.warn(s"Rebuild of $storeId: failed to remove $stagingPath: $t")
 
@@ -419,7 +418,7 @@ class RebuildingStore(client: AspenClient,
    *  checkpointed left there: without a checkpoint none of it is used. */
   private def createStaging(cfg: StoreConfig): Future[Unit] =
     try
-      if os.exists(stagingPath) then os.remove.all(stagingPath)
+      if FileStat.exists(stagingPath) then os.remove.all(stagingPath)
       backends.create(cfg, stagingPath, devicePath / StoreCreation.CreatingDirectory)
     catch case NonFatal(t) => Future.failed(t)
 

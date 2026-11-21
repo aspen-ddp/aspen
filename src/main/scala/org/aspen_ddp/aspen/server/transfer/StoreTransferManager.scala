@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server.transfer
 
 import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.common.network.implementations.quic.TlsCredentials
 import org.aspen_ddp.aspen.common.network.tls.TLSContext
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -206,7 +207,7 @@ class StoreTransferManager(port: Int,
       write(encodeHeader(storeId, out.transferUUID), HeaderSize)
 
       // os.spawn leaks a throwing shutdown hook if the process cannot start, so check the cwd first
-      if !os.isDir(sourceDirectory) then
+      if !FileStat.isDir(sourceDirectory) then
         throw new Exception(s"source directory $sourceDirectory does not exist")
       val tmp = os.temp.dir(prefix = "store-transfer-out")
       archiverTmp = Some(tmp)

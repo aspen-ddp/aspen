@@ -59,3 +59,21 @@ class DeviceMarkersSuite extends AnyFunSuite with Matchers:
       DeviceMarkers.readShutdownState(dir) should be(Some(hostB))
       os.list(dir).map(_.last).toSet should be(
         Set(DeviceMarkers.OwningHostFile, DeviceMarkers.ShutdownStateFile))
+
+  test("a marker whose stat fails is never read as absent (SL-W25)"):
+    withDir: dir =>
+      // Each marker a link into a directory this process cannot search: its stat fails (EACCES), as an EIO would
+      val device = dir / "device"
+      val locked = dir / "locked"
+      os.makeDir(device)
+      os.makeDir(locked)
+      List(DeviceMarkers.FailedFile, DeviceMarkers.OwningHostFile, DeviceMarkers.ShutdownStateFile).foreach: name =>
+        os.write(locked / name, hostA.uuid.toString)
+        os.symlink(device / name, locked / name)
+      os.perms.set(locked, "rw-------")
+      try
+        an[java.io.IOException] should be thrownBy DeviceMarkers.isFailed(device)
+        an[java.io.IOException] should be thrownBy DeviceMarkers.readOwningHost(device)
+        an[java.io.IOException] should be thrownBy DeviceMarkers.readShutdownState(device)
+      finally os.perms.set(locked, "rwx------")
+      DeviceMarkers.isFailed(device) should be(true)

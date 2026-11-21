@@ -133,7 +133,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     finally countingCrlFailures = false
 
   private def discoverDevices(): List[StorageDeviceId] =
-    if ! os.isDir(storageDevicesDir) then
+    // A stat that fails loads nothing, as an absent directory does
+    if ! Try(FileStat.isDir(storageDevicesDir)).getOrElse(false) then
       warnOnce(storageDevicesDir, s"Invalid storage devices directory: $storageDevicesDir")
       Nil
     else
@@ -222,10 +223,11 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       // The disk was read before the lookup went out. If it has been pulled, or the file naming
       // the previous host has changed, since then, this result describes a directory that is no
       // longer there to act on; the next scan starts over from what the disk says now.
-      val unchanged = os.isDir(path) && (
+      // A stat that fails throws (FileStat): the next scan starts over.
+      val unchanged = FileStat.isDir(path) && (
         if fromShutdownMarker then DeviceMarkers.readShutdownState(path).contains(previousHost)
         else
-          !os.exists(path / DeviceMarkers.ShutdownStateFile) &&
+          !FileStat.exists(path / DeviceMarkers.ShutdownStateFile) &&
             DeviceMarkers.readOwningHost(path).contains(previousHost))
       if ! unchanged || loadedDirs.contains(path) then
         ()
@@ -283,11 +285,13 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     finally
       releaseMarks(path, marked)
 
-  /** The stores whose directories are under the device directory `path`, by their store configs */
+  /** The stores whose directories are under the device directory `path`, by their store configs. A listing or a
+   *  config stat that fails throws (FileStat): a store it cannot see is never taken for none, so the caller leaves
+   *  the device to the next scan */
   private def storesIn(path: os.Path): Set[StoreId] =
-    Try(os.list(path)).getOrElse(Nil).iterator.flatMap: dir =>
+    os.list(path).iterator.flatMap: dir =>
       val cfgPath = dir / StoreConfig.configFilename
-      if os.isFile(cfgPath) then Try(StoreConfig.loadStoreConfig(cfgPath).storeId).toOption else None
+      if FileStat.isFile(cfgPath) then Try(StoreConfig.loadStoreConfig(cfgPath).storeId).toOption else None
     .toSet
 
   /** Clears the awaiting-device marks of `stores`, unless an adoption of `path` has taken them over */
@@ -449,8 +453,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                                rewriteOwner: Boolean): Unit =
     if rewriteOwner then
       // Each store arrives from another host, whose clock may lead this one's: its load floor must cover that. Before
-      // the owner is rewritten, so that a crash between the two finds the adoption still to finish
-      state.stores.keys.map(storeId => path / storeId.directoryName).filter(os.isDir(_))
+      // the owner is rewritten, so that a crash between the two finds the adoption still to finish. A directory
+      // stat that fails throws (FileStat), leaving the owner unwritten and the adoption to the next scan
+      state.stores.keys.map(storeId => path / storeId.directoryName).filter(FileStat.isDir(_))
         .foreach(StoreLoader.writeArrivedAt)
       DeviceMarkers.writeOwningHost(path, ctx.hostId)
 
@@ -459,16 +464,15 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     }
     active.foreach: (storeId, entry) =>
       val markerFile = path / storeId.directoryName / StoreTransfer.TransferOutMarkerFile
-      if entry.transferDevice.isEmpty && !ctx.storeTransferService.isTransferringOut(storeId) &&
-         os.exists(markerFile) then
-        try os.remove(markerFile)
+      if entry.transferDevice.isEmpty && !ctx.storeTransferService.isTransferringOut(storeId) then
+        // A marker that cannot be removed, or whose stat fails, keeps the store offline as a present one does
+        try os.remove(markerFile, checkExists = false)
         catch case t: Throwable =>
           logger.error(s"Failed to remove the transfer-out marker for store $storeId at $markerFile. " +
                        s"The store stays offline until a later check of its device. Error: $t")
 
     announceOnLoad += path -> active.keySet
-    if os.exists(path / DeviceMarkers.ShutdownStateFile) then
-      DeviceMarkers.removeShutdownState(path)
+    DeviceMarkers.removeShutdownState(path)
 
     tryLoadDevice(path).foreach(ctx.reconciler.checkStorageDevice)
 
@@ -495,46 +499,51 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   private def tryLoadDevice(storageDevicePath: os.Path): Option[StorageDeviceId] =
     val sdCfgPath = storageDevicePath / StorageDeviceConfig.configFilename
 
+    // A stat that fails throws (FileStat) and the device is left for the next scan, never loaded on a false absence:
+    // of the failed marker above all, which would serve a tombstoned device's stores (rebuild-process B19)
+    def isDevice = FileStat.isDir(storageDevicePath) && FileStat.exists(sdCfgPath)
+
     if ctx.devices.closingCrls.contains(storageDevicePath) then
       logger.debug(s"Not loading the device at $storageDevicePath yet: its CRL is still shutting down")
       None
-    else if os.isDir(storageDevicePath) && os.exists(sdCfgPath) && DeviceMarkers.isFailed(storageDevicePath) then
-      warnOnce(storageDevicePath, s"Storage device at $storageDevicePath has been declared failed. Not loading or " +
-                                  s"claiming it")
-      None
-    else if os.isDir(storageDevicePath) && os.exists(sdCfgPath) then
+    else
       try
-        val sdCfg = StorageDeviceConfig.loadStorageDeviceConfig(sdCfgPath)
-        if sdCfg.aspenSystemId != ctx.aspenSystemId then
-          warnOnce(storageDevicePath,
-                   s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
+        if !isDevice then
+          None
+        else if DeviceMarkers.isFailed(storageDevicePath) then
+          warnOnce(storageDevicePath, s"Storage device at $storageDevicePath has been declared failed. Not loading " +
+                                      s"or claiming it")
           None
         else
-          DeviceMarkers.readShutdownState(storageDevicePath) match
-            case Some(markerHost) =>
-              resolveOwnership(storageDevicePath, sdCfg, markerHost, fromShutdownMarker = true)
-              None
-            case None =>
-              DeviceMarkers.readOwningHost(storageDevicePath) match
-                case Some(owner) if owner == ctx.hostId =>
-                  if disownedDirs.contains(storageDevicePath) then
+          val sdCfg = StorageDeviceConfig.loadStorageDeviceConfig(sdCfgPath)
+          if sdCfg.aspenSystemId != ctx.aspenSystemId then
+            warnOnce(storageDevicePath,
+                     s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
+            None
+          else
+            DeviceMarkers.readShutdownState(storageDevicePath) match
+              case Some(markerHost) =>
+                resolveOwnership(storageDevicePath, sdCfg, markerHost, fromShutdownMarker = true)
+                None
+              case None =>
+                DeviceMarkers.readOwningHost(storageDevicePath) match
+                  case Some(owner) if owner == ctx.hostId =>
+                    if disownedDirs.contains(storageDevicePath) then
+                      None
+                    else
+                      loadOwnedDevice(storageDevicePath, sdCfgPath, sdCfg)
+                  case Some(owner) =>
+                    resolveOwnership(storageDevicePath, sdCfg, owner, fromShutdownMarker = false)
                     None
-                  else
-                    loadOwnedDevice(storageDevicePath, sdCfgPath, sdCfg)
-                case Some(owner) =>
-                  resolveOwnership(storageDevicePath, sdCfg, owner, fromShutdownMarker = false)
-                  None
-                case None =>
-                  warnOnce(storageDevicePath, s"Storage device ${sdCfg.storageDeviceId} at $storageDevicePath " +
-                                              s"has no ${DeviceMarkers.OwningHostFile} file. Not loading or " +
-                                              s"claiming it")
-                  None
+                  case None =>
+                    warnOnce(storageDevicePath, s"Storage device ${sdCfg.storageDeviceId} at $storageDevicePath " +
+                                                s"has no ${DeviceMarkers.OwningHostFile} file. Not loading or " +
+                                                s"claiming it")
+                    None
       catch
         case t: Throwable =>
           warnOnce(storageDevicePath, s"Failed to load storage device found at path $storageDevicePath. Error: $t")
           None
-    else
-      None
 
   /** Opens the device's CRL. It is lost when its directory is absent from a device that holds stores, or holds no
    *  stream files there (CrlMissing: stores exist only on a device whose CRL was opened), or when opening it throws

@@ -4,7 +4,7 @@ import java.util.UUID
 
 import scala.util.control.NonFatal
 
-import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
+import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, StoreConfig}
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import scribe.Logging
 
@@ -31,7 +31,8 @@ object StoreCreation extends Logging:
   def createAtomically(storeCfg: StoreConfig, target: os.Path, creatingRoot: os.Path)(init: os.Path => Unit): Unit =
     val scratch = creatingRoot / s"${storeCfg.storeId.directoryName}-${UUID.randomUUID()}"
     try
-      if os.exists(target) then
+      // A stat that fails throws (FileStat): never a rename over a target that may be there
+      if FileStat.exists(target) then
         throw new java.nio.file.FileAlreadyExistsException(target.toString)
       os.makeDir.all(scratch)
       init(scratch)

@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceSetId}
 import java.nio.file.FileAlreadyExistsException
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
+import scala.util.Try
 
 /** Creation and on-disk setup of storage devices.
  *
@@ -86,6 +87,9 @@ object StorageDeviceManager:
     val expectedParent = hostDirectory / StorageDevicesDirName
     val devDir = deviceDirectory
     val configFile = devDir / StorageDeviceConfig.configFilename
+    // (is a directory, holds a config). A stat that fails is no absence (FileStat): the setup fails rather than
+    // configure a device over a config it cannot see
+    lazy val found = Try((FileStat.isDir(devDir), FileStat.exists(configFile)))
 
     if hostConfig.aspenSystemId != aspenSystemId then
       Future.failed(new WrongAspenSystem(aspenSystemId, hostConfig.aspenSystemId))
@@ -94,10 +98,13 @@ object StorageDeviceManager:
     else if devDir.segmentCount == 0 || devDir / os.up != expectedParent then
       Future.failed(new DeviceDirectoryNotUnderHost(devDir, expectedParent))
 
-    else if !os.isDir(devDir) then
+    else if found.isFailure then
+      Future.failed(found.failed.get)
+
+    else if !found.get._1 then
       Future.failed(new DeviceDirectoryNotFound(devDir))
 
-    else if os.exists(configFile) then
+    else if found.get._2 then
       Future.failed(new DeviceAlreadyConfigured(devDir))
 
     else
@@ -105,7 +112,7 @@ object StorageDeviceManager:
         val cfg = StorageDeviceConfig(deviceId, aspenSystemId)
         try
           // os.write, not os.write.over: a full distributed transaction separates the
-          // os.exists guard above from this write, so a config appearing in that window
+          // FileStat.exists guard above from this write, so a config appearing in that window
           // must not be silently clobbered.
           os.write(configFile, cfg.yamlConfig)
           DeviceMarkers.writeOwningHost(devDir, hostConfig.hostId)

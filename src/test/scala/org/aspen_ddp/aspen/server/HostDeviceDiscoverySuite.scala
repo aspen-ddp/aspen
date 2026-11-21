@@ -703,6 +703,31 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).storeLoadAttempts should be(empty)
       recorded(host).deviceDirWarnings.toList.map(_._1) should be(List(deviceDir))
 
+  atest("a device whose failed marker cannot be stat'd is not loaded (SL-W25)"):
+    // A link into a directory this process cannot search: its stat fails (EACCES), as an EIO would, while the device
+    // directory and config stat fine. Refused by the failed-marker test; a persistent failure like this one would
+    // also stop the CRL open's stat of each child (DeviceMarkersSuite pins the marker test alone)
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val locked = os.temp.dir()
+    os.write(locked / DeviceMarkers.FailedFile, "")
+    os.symlink(deviceDir / DeviceMarkers.FailedFile, locked / DeviceMarkers.FailedFile)
+    os.perms.set(locked, "rw-------")
+    val (loadedWhileUnknown, attemptsWhileUnknown, warned) =
+      try
+        val host = newHost(hostRoot)
+        host.control.reconciler.scan()
+        (loadedDevices(host).keySet, recorded(host).storeLoadAttempts.toList,
+         recorded(host).deviceDirWarnings.toList.map(_._1))
+      finally
+        os.perms.set(locked, "rwx------")
+        os.remove.all(locked)
+
+    Future.successful:
+      loadedWhileUnknown should be(empty)
+      attemptsWhileUnknown should be(empty)
+      warned should be(List(deviceDir))
+
   atest("a device carrying shutdown.state is not loaded by the scan"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)

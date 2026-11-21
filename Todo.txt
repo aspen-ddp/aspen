@@ -68,11 +68,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.2 [S] Q-W19: a commit that applies nothing still waits in lock order and for its turn (CONFIRMED). A recovered
-    non-voter, an applied stub or notOwedHere runs awaitLockOrder and holdForTurn in resolvedAndAllObjectsLoaded
-    before doCommit decides to apply nothing, withholding votes (then CollisionWait aborts) and unsettling repair.
-    Fix: decide "applies nothing" first, with one predicate shared with doCommit.
-
 5.3 [S] RB-W23: a rebuilding store's router silence can be cleared and is never restored (CONFIRMED).
     startRebuild marks the router offline once; clearOfflineUnlessHeld looks only at devices' offlineStores, which a
     destination that never held the store does not list (same-host replaceRebuild). The host then answers

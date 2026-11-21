@@ -572,8 +572,11 @@ commit per object.
    changed object that applied, then `heldCommitIssued` removes the Tx from the queues and `commitTurnFree` wakes the
    next. A store holding an applied stub for the transaction, owed nothing through its UnackedCommits entry
    (`notOwedHere`), or holding a recovered Tx without a commit vote (8.5), applies nothing and reports its changed
-   objects (transaction-recovery.md). Such a commit still takes the lock-order wait and its turn before `doCommit`
-   (Q-W19).
+   objects (transaction-recovery.md). That is decided before the waits, by one predicate shared with `doCommit`
+   (`Tx.appliesNothing`): such a commit writes nothing a vote or an earlier commit could be run over by, so it neither
+   waits in lock order nor for its turn (`awaitLockOrder`, `holdForTurn`), and withholds no vote and unsettles nothing
+   for repair meanwhile. One that became such while already waiting leaves the lock-order registration and the queue
+   when it is next woken.
 4. **Complete** (`Frontend.backendOperationComplete`): the count drops; at zero `commitTurnFree` runs last, so a
    synchronous backend completes inside the next transaction's commit safely. It first retries a parked repair (the
    one settled moment), then tells the head held commit, or else every waiting voter. On failure the object enters
@@ -964,21 +967,4 @@ adds the revision check.
 
 ## Open weaknesses
 
-**Q-W19 A commit that applies nothing still waits in lock order and for its turn** (CONFIRMED, priority 5, effort S)
-
-Mechanism. `Tx.resolvedAndAllObjectsLoaded` runs `awaitLockOrder` and `holdForTurn` before `doCommit`, and only
-`doCommit` decides that the commit applies nothing: a recovered Tx without a commit vote (`recoveredNonVoter`), a store
-holding an applied stub (`Frontend.hasAppliedStub`), or one owed nothing (`notOwedHere`). Such a commit registers in
-`lockOrderWaiters` and `heldCommits` like one that writes.
-
-Trigger. After a restart, a recovered Tx without a commit vote learns that its transaction committed while a recovered
-commit vote holds locks its requirements or writes collide with on an object both change. The holder may stay
-unresolved for as long as its UnackedCommits lookup and recovery driver take.
-
-Consequence. Meanwhile every new vote that the waiter "would wait for" is withheld for up to `Tx.CollisionWait` and
-then votes abort (`lockOrderBlocked`), the objects are unsettled for repair (`settledForRepair` checks
-`lockOrderWaiters`), and a held turn delays later commits, all for an apply that writes nothing. Liveness and
-performance only.
-
-Fix direction. Decide "applies nothing" before the waits (one predicate shared with `doCommit`) and take that path at
-once in `resolvedAndAllObjectsLoaded`.
+(none)

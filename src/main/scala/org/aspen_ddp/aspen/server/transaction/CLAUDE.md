@@ -313,7 +313,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   releases (`Frontend.locksReleased`, after the holder applied or aborted), then takes the usual `holdForTurn` path.
   Otherwise a later commit that does not chain on the vote (a refcount change, a key-level write, a repair refcount
   or key proof) would raise the object timestamp, fail the vote's re-check and leave the counted vote standing for
-  neither lock nor update. A lock-only holder is not waited for; a Tx holding its own locks never waits. The wait is
+  neither lock nor update. A lock-only holder is not waited for; a Tx holding its own locks never waits, nor does a
+  commit that applies nothing (`Tx.appliesNothing`, shared with `doCommit`: `notOwedHere`, a recovered non-voter, an
+  applied stub), which skips its turn too (`holdForTurn`). The wait is
   outside `hasPendingCommit`, so the holder's own commit never queues behind it. A new vote waits for it only if the
   waiter would wait for it as a holder: the vote changes an object the waiter changes and the waiter collides with
   the locks it would take (`Tx.lockOrderBlocked`: `RequirementsLocker.plannedLocks` through

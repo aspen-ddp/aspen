@@ -3088,7 +3088,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions.contains(txid1) shouldBe false
   }
 
-  test("a commit recovered Committed waits in lock order for a recovered commit vote it collides with (R-W7)") {
+  test("a commit recovered Committed without a commit vote applies nothing at once, not waiting in lock order for a " +
+       "recovered commit vote it collides with (Q-W19)") {
     val backend = new MapBackend(storeId)
     populate(backend)
     val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
@@ -3098,7 +3099,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       loadedAt = FrontendSuite.longLoaded, deferRecovery = true, onFailStop = err => stops = stops :+ err)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     // txid1, a commit vote overwriting op1; txid2, a later-started refcount change of op1 that collided with it, voted
-    // abort, and was waiting for txid1 in lock order when a save recorded its Committed status
+    // abort, and a save recorded its Committed status
     val first = lockTxd(txid1, List(overwrite(op1)))
     val later = lockTxd(txid2, List(RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 2)))).copy(
       startTimestamp = HLCTimestamp(first.startTimestamp.asLong + (1000L << 16)))
@@ -3106,21 +3107,45 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, PersistentState.initial)
     val resolved = TransactionRecoveryState(storeId, later.serialize(), Nil, TransactionDisposition.VoteAbort,
       TransactionStatus.Committed, PersistentState.initial)
-    // txid2 listed first, so its objects load first
     frontend.recover(StoreRecoveryState(List(resolved, vote), Map()))
 
-    // Applied now, txid2 would fail txid1's re-check: it waits for txid1's vote to relock and resolve
-    committedMessages(net) shouldBe Nil
+    // txid2, recovered without a commit vote, applies nothing (Tx.doCommit, X-W24), so it neither waits for txid1 nor
+    // holds back the votes it would wait for: it reports its object at once, for repair
+    committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe List(txid2 -> List(oid1))
+    frontend.lockOrderWaitersOf(oid1) shouldBe Nil
     backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(1, 1)
 
     commitErrors(frontend, net, txid1) shouldBe Nil
-    // txid2, recovered without a commit vote, applies nothing and reports its object: it may have applied before the
-    // crash (Tx.doCommit, X-W24), so the finalizer marks the store and repair installs the object's current state
-    committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe
-      List(txid1 -> Nil, txid2 -> List(oid1))
     backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
     backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(1, 1)
     stops shouldBe Nil
+  }
+
+  test("a commit recovered Committed without a commit vote does not wait its turn behind an in-flight commit (Q-W19)") {
+    val backend = new DeferredCommitBackend
+    populate(backend)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net,
+      new TestCrl, new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded, deferRecovery = true)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    // txid1 voted commit and was re-saved Committed: it applies on load and its backend commit stays in flight.
+    // txid2, which this store did not vote commit on, was re-saved Committed too
+    val first = committedKV(txid1, TransactionDisposition.VoteCommit, List(KeyValueUpdate.DoesNotExist(k(4))),
+      List(new Insert(k(4), Array[Byte](4))))
+    val second = committedKV(txid2, TransactionDisposition.VoteAbort, List(KeyValueUpdate.DoesNotExist(k(5))),
+      List(new Insert(k(5), Array[Byte](5))), startDelta = 1000L)
+    frontend.recover(StoreRecoveryState(List(first, second), Map()))
+    backend.heldCommits shouldBe 1
+
+    // txid2 applies nothing, so it reports at once rather than queueing behind txid1's backend commit
+    committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe List(txid2 -> List(oid2))
+
+    backend.deliverCommits()
+    backend.heldCommits shouldBe 0
+    kvKeys(backend) should contain (k(4))
+    kvKeys(backend) should not contain k(5)
+    committedMessages(net).map(m => m.transactionId -> m.objectCommitErrors) shouldBe
+      List(txid2 -> List(oid2), txid1 -> Nil)
   }
 
   test("a commit vote recovered Committed after its update persisted applies nothing again and does not fail-stop") {

@@ -527,7 +527,8 @@ class Tx( trs: TransactionRecoveryState,
     * transaction's requirements or writes collide with (RequirementsChecker.lockHolders) on an object both change, it
     * waits for each to release them, having applied its commit or aborted (Frontend.locksReleased). It holds its
     * references, no locks, and new votes it would wait for as holders wait meanwhile (lockOrderBlocked), so it
-    * cannot be starved. The holder's own commit never waits for it (holdForTurn ignores the wait).
+    * cannot be starved. The holder's own commit never waits for it (holdForTurn ignores the wait). A commit that
+    * applies nothing (appliesNothing) runs over no vote and never waits.
     *
     * A Tx holding its own locks never waits: two live votes never hold conflicting locks, and recovered votes
     * sharing a lock (displaced holders) are ordered by what persisted before the crash: the later one voted after the
@@ -538,7 +539,7 @@ class Tx( trs: TransactionRecoveryState,
     * commit as long as its own locks: that needs failures beyond the write threshold's margin, and is alarmed
     */
   private def awaitLockOrder(): Boolean =
-    val held = !(committing || committed || locked) &&
+    val held = !(committing || committed || locked || appliesNothing) &&
       changedHere.exists(oid => objects.get(oid).exists(_.lockHolders.exists(_ != transactionId)))
     val waitFor =
       if !held then Set[TransactionId]()
@@ -601,10 +602,11 @@ class Tx( trs: TransactionRecoveryState,
   private var lockOrderWaitRegistered = false
 
   /** Whether the commit must wait its turn: an earlier commit of an object it changes is in flight, or held. If so, it
-    * is queued in the Frontend, which calls commitPersisted when it may be its turn
+    * is queued in the Frontend, which calls commitPersisted when it may be its turn. A commit that applies nothing
+    * (appliesNothing) has no turn to take: one already queued leaves the queue in doCommit
     */
   private def holdForTurn(): Boolean =
-    if committing || committed then
+    if committing || committed || appliesNothing then
       false
     else if commitQueued then
       !frontend.heldCommitReady(changedHere, this)
@@ -1198,8 +1200,7 @@ class Tx( trs: TransactionRecoveryState,
     // with no repair to follow. Its report marks the store while T's marker has not written; once T is finalized, the
     // store either acknowledged T in its earlier life, so its backend holds the update, or the finalizer marked it. A
     // non-voter is not counted toward the write threshold, so this costs at most a repair pass
-    val recoveredNonVoter = recovered && disposition != TransactionDisposition.VoteCommit
-    if notOwedHere || recoveredNonVoter || frontend.hasAppliedStub(transactionId) then
+    if appliesNothing then
       if notOwedHere then
         logger.info(s"Tx $transactionId. Store $storeId is owed nothing through its UnackedCommits entry: nothing " +
           s"is applied")
@@ -1231,6 +1232,17 @@ class Tx( trs: TransactionRecoveryState,
     if pendingObjectCommits == 0 && !committed then
       allObjectCommitsComplete()
   }
+
+  /** A recovered Tx that did not vote commit: its commit applies nothing (doCommit) */
+  private def recoveredNonVoter: Boolean = recovered && disposition != TransactionDisposition.VoteCommit
+
+  /** Whether a commit here applies nothing (doCommit): the store is owed nothing through its UnackedCommits entry
+    * (notOwedHere), the Tx was recovered without a commit vote, or the store holds an applied stub. Such a commit
+    * writes nothing a vote or an earlier commit could be run over by, so it neither waits in lock order
+    * (awaitLockOrder) nor for its turn (holdForTurn)
+    */
+  private def appliesNothing: Boolean =
+    notOwedHere || recoveredNonVoter || frontend.hasAppliedStub(transactionId)
 
   private def issueCommits(): Unit = {
     val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap

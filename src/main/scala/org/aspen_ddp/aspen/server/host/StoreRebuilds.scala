@@ -719,14 +719,16 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *
    *  Only a collision is retried, as everywhere else in Host. A permanent failure is logged and
    *  left for a later reconcile: the Lost CRL State pass requests it again while the store's
-   *  rebuild-required marker is in place, and the Missing Stores pass (which has no marker) only
-   *  while the store is still missing.
+   *  rebuild-required marker is in place, and the Missing Stores pass (which has no marker) while
+   *  the store it declared stays Active and unserved (LocalStorageDeviceState.declaredMissing),
+   *  its directory back or not.
    */
   def requestRebuild(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
     if !pendingRebuildRequests.contains(storeId) then
       pendingRebuildRequests += storeId
       val f =
         try
+          ctx.rebuildRequestFailure(storeId).foreach(t => throw t)
           // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
           // the control-context onComplete; the prepare closure's combinators run on the control thread
           // A Rebuilding entry found after an attempt that committed but was reported TransactionOutcomeUnknown is

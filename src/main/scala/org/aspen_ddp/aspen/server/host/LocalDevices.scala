@@ -16,6 +16,10 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
                               val admission: CrlAdmission = CrlAdmission.Unlimited):
   var loadedStores: Set[StoreId] = Set()
   var offlineStores: Set[StoreId] = Set()
+  /** Stores the reconcile's Missing Stores pass declared lost on this device, while their entry stays Active here.
+   *  Its rebuild is requested again at each reconcile even once the directory is back, since nothing else would serve
+   *  or rebuild such a store (rebuild-process T14). Held in memory only: a restart's load serves a store that is back. */
+  var declaredMissing: Set[StoreId] = Set()
 
   def totalSize: Long = configFile.toIO.getTotalSpace
   def currentUsage: Long = totalSize - configFile.toIO.getFreeSpace

@@ -154,7 +154,7 @@ write the entry straight to Rebuilding.
 | T11 | transfer out requested for a marked store | `StoreTransfers.returnLostTransferToRebuild` | transfer aborted, entry back to Active, then R1 |
 | T12 | a directory at a Rebuilding store's path that carries neither `rebuild-complete` of the entry's episode nor `rebuild-required` | `StoreRebuilds.retireForeignCopy` | marked (a served one is first fail-stopped through `backendFailed`), then discarded like any lost copy |
 | T13 | operator declares the device dead | `fail-storage-device`, `FailedStorageDeviceDurableTask` | tombstone, then R3 per store |
-| T14 | an Active entry on a loaded, Operational device with no `config.yaml` at the store's path (the config's stat answers absent, `FileStat`: the directory or its config is gone; a stat that fails is no absence, and the store is skipped until one answers), the store neither served, in `loadedStores`, opening nor retiring | the reconcile's Missing Stores pass (`DeviceReconciler.reconcileDeviceState`, before Lost CRL State) | router offline, added to `offlineStores`, `requestRebuild` (R1). The store's device-CRL entries stay: nothing durable records the declaration, and the directory may come back (a restore or mount finishing late) before the flip commits, when a restart's device load serves it as the store it is, with its state. Once the entry is Rebuilding, `retireForeignCopy` (T12) retires a directory that is back (or a configless one), saving them into the copy; the rebuilt copy's empty `crl_save.log` drops whatever is left at its first load (5.6); a re-placement's entry leaving the device makes them leftovers for `dropLeftoverCrlState`. `tryLoadStore` only logs a configless store directory, so no other path notices such a store while its pool counts it writable. Without a restart, a directory back before the flip commits stays offline (no pass loads an unmarked `offlineStores` member with an Active entry) and is retired once the flip commits; a flip that fails permanently leaves it so (RB-W18) |
+| T14 | an Active entry on a loaded, Operational device with no `config.yaml` at the store's path (the config's stat answers absent, `FileStat`: the directory or its config is gone; a stat that fails is no absence, and the store is skipped until one answers), the store neither served, in `loadedStores`, opening nor retiring | the reconcile's Missing Stores pass (`DeviceReconciler.reconcileDeviceState`, before Lost CRL State) | router offline, added to `offlineStores` and to the device's host-local `declaredMissing` record, `requestRebuild` (R1). The store's device-CRL entries stay: nothing durable records the declaration, and the directory may come back (a restore or mount finishing late) before the flip commits, when a restart's device load serves it as the store it is, with its state. Once the entry is Rebuilding, `retireForeignCopy` (T12) retires a directory that is back (or a configless one), saving them into the copy; the rebuilt copy's empty `crl_save.log` drops whatever is left at its first load (5.6); a re-placement's entry leaving the device makes them leftovers for `dropLeftoverCrlState`. `tryLoadStore` only logs a configless store directory, so no other path notices such a store while its pool counts it writable. Without a restart, a directory back before the flip commits stays offline (no pass loads an unmarked `offlineStores` member with an Active entry) and is retired once the flip commits. A request that fails permanently is made again at each reconcile while the declared store's entry stays Active on the device and it is neither served, loaded, opening nor retiring, its directory back or not (`declaredMissing`; dropped once the entry leaves Active or the store is served, and gone with the device's unload or a restart, whose load serves a store that is back) |
 | T15 | the store's `incarnation` file known absent at load (its stat answers absent; every store directory gets one at creation, `StoreCreation`, or at a rebuild's `finish`) | `StoreLoader.handleLoad` ► `retireUnserved` | marker, offline: the store's identity is lost, so it is rebuilt as a new incarnation rather than given a fresh one over its data and CRL state |
 
 The marker written in adoption's prepare closure (T9, T10) is correct whatever the transaction's outcome: the set of
@@ -879,24 +879,6 @@ transfer's promotion fail and retry; its flip then reads TransferringIn and gets
 ---
 
 ## Open weaknesses
-
-### RB-W18: A missing store whose directory returns while its rebuild request fails is left unserved
-Verdict PLAUSIBLE. Priority 4. Effort S.
-Mechanism: the Missing Stores pass (`DeviceReconciler.reconcileDeviceState`) finds an Active entry whose config stats
-absent, marks the store offline in the router, adds it to `offlineStores` and calls `StoreRebuilds.requestRebuild`.
-Its directory comes back (a restore or mount finishing late) and the request's transaction fails with anything but a
-collision (`StopRetrying.collisionRetry`), which is logged and left for "a later reconcile". The next reconcile's
-Missing Stores pass skips the store, whose config now stats present; Lost CRL State needs a `rebuild-required`
-marker, Abandoned Transfers Out a `transferring-out` marker, Completed Transfers In and Completed Rebuilds their
-markers, Cancelled Shutdown a `closedForShutdown` record. No pass loads an unmarked `offlineStores` member with an
-Active entry, and nothing requests the rebuild again.
-Consequence: the store stays offline and unserved until the host restarts, while its pool counts it writable: one
-unit of the write-threshold margin lost to a transient metadata failure, the case the Missing Stores pass exists to
-prevent.
-Fix: keep a host-local record of the stores the Missing Stores pass declared, and while one's entry is still Active
-on the device and the store is neither served, opening nor retiring, request its rebuild again at each reconcile
-(`requestRebuild` needs no marker, and the Rebuilding pass's `retireForeignCopy` retires a returned copy with its
-CRL state saved). Loading the returned copy instead would also be safe, since its device-CRL entries were kept.
 
 ### RB-W20: An out-of-space write in `retryFailures` is recorded as an unreadable object
 Verdict CONFIRMED. Priority 5. Effort S.

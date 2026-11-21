@@ -202,12 +202,22 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // re-placement's entry leaving the device makes them leftovers (dropLeftoverCrlState). A config whose stat
       // fails is no absence (FileStat): the store is skipped until a stat answers. A store served, opening or
       // retiring has its directory, as does one a shutdown closed, so the first three are skipped only as a guard.
+      //
+      // A declared store stays declared (local.declaredMissing) while its entry is Active here and it is not served:
+      // its rebuild is requested again at each reconcile even once its directory is back, since a request that
+      // failed would otherwise leave it offline, with no pass to load or rebuild it, until a restart. The record is
+      // in memory only: a restart's device load serves a store whose directory is back, with its kept CRL entries.
+      def unserved(storeId: StoreId): Boolean =
+        ctx.router.get(storeId).isEmpty && !local.loadedStores.contains(storeId) &&
+          !ctx.loader.isOpening(storeId) && !ctx.copies.isRetiring(storeId)
+      local.declaredMissing = local.declaredMissing.filter(storeId =>
+        remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) && unserved(storeId))
       val missing = remote.stores.collect {
         case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Active &&
+            !local.declaredMissing.contains(storeId) &&
             FileStat.existence(local.devicePath / storeId.directoryName / StoreConfig.configFilename)
               .contains(false) &&
-            ctx.router.get(storeId).isEmpty && !local.loadedStores.contains(storeId) &&
-            !ctx.loader.isOpening(storeId) && !ctx.copies.isRetiring(storeId) =>
+            unserved(storeId) =>
           storeId
       }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
       missing.foreach: storeId =>
@@ -215,6 +225,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                      s"${local.devicePath / storeId.directoryName} holds no store. Rebuilding it")
         ctx.router.markOffline(storeId)
         local.offlineStores += storeId
+        local.declaredMissing += storeId
+      local.declaredMissing.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
         ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
 
       // Any entries a store transferred away left in the device CRL go too

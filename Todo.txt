@@ -62,13 +62,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
-4.2 [RB-W18] A missing store whose directory returns while its rebuild request fails is left unserved.
-    PLAUSIBLE. Effort S. rebuild-process.md.
-    The Missing Stores pass silences the store and calls requestRebuild; if the directory comes back and the request
-    fails other than by collision, nothing asks again and no pass loads an unmarked offlineStores store with an
-    Active entry, so it is unserved until restart while its pool counts it writable. Fix: keep a host-local record of
-    the stores the pass declared and request again while the entry stays Active.
-
 4.3 [CRL-W18] The admission limit's proof fails for small streams in a large ring.
     PLAUSIBLE. Effort S. crash-recovery-log.md, cross-document-review.md section 3.
     (n-2)*S/2 - S/16 satisfies Lemma B only while 118*(n-1) <= S/16 + 8192; CrlSizingDefaults.resolve accepts 1 MiB

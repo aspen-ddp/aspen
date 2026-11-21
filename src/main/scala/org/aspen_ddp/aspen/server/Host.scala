@@ -159,6 +159,9 @@ object Host:
                          /** Writes a store directory's rebuild-required marker (StoreRebuilds.markRebuildRequired), for
                           *  tests of a write that fails and leaves nothing behind */
                          writeRebuildRequiredMarker: Option[os.Path => Unit] = None,
+                         /** A failure for StoreRebuilds.requestRebuild to report instead of running its flip, by
+                          *  store, for tests of a request that fails permanently */
+                         rebuildRequestFailure: StoreId => Option[Throwable] = _ => None,
                          /** Wraps the host's UnackedCommits lookup, for tests that hold, fail or replay lookups */
                          wrapUnackedLookup: Option[UnackedCommitLookup => UnackedCommitLookup] = None,
                          /** How long the stores' Txs wait for a client's prepare (Frontend.missingDataWait), for
@@ -330,6 +333,7 @@ class Host(val client: AspenClient,
     scheduleEndpointRetry = fn => controlScheduler.schedule(Duration(5, SECONDS))(fn()),
     ec = ec,
     writeRebuildRequiredMarker = seams.writeRebuildRequiredMarker.getOrElse(StoreRebuilds.writeRebuildRequiredMarker),
+    rebuildRequestFailure = seams.rebuildRequestFailure,
     unackedLookup = seams.wrapUnackedLookup.fold(unackedLookup)(wrap => wrap(unackedLookup)),
     heldVoteQuery = heldVoteQuery,
     missingDataWait = seams.missingDataWait,

@@ -77,6 +77,9 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val ec: ExecutionContext,
                           /** Writes a store directory's rebuild-required marker (a test seam) */
                           val writeRebuildRequiredMarker: os.Path => Unit = StoreRebuilds.writeRebuildRequiredMarker,
+                          /** A failure for StoreRebuilds.requestRebuild to report instead of running its flip (a test
+                           *  seam, Host.Seams.rebuildRequestFailure) */
+                          val rebuildRequestFailure: StoreId => Option[Throwable] = _ => None,
                           /** Looks up recovered commit votes in their pools' UnackedCommits trees, for the stores */
                           val unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never,
                           /** Asks a rebuilt store's peers for their held votes (Frontend.inheritedVoteLock) */

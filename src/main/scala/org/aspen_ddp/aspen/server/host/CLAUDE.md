@@ -44,7 +44,9 @@
   a failed build) hands the callback to that entry, and any other failure drops it. An unreadable config
   is logged at error once per retry cap. An Active entry on a loaded device with no `config.yaml` at its store path
   (directory or config lost), not served, opening or retiring, is rebuilt by the reconcile's Missing Stores pass:
-  marked offline and `StoreRebuilds.requestRebuild`. Its device-CRL entries stay (nothing durable records the
+  marked offline, recorded in the device's `declaredMissing`, and `StoreRebuilds.requestRebuild`; the request is made
+  again at each reconcile while the entry stays Active and the store unserved, even once its directory is back, so a
+  failed request never leaves it offline until a restart. Its device-CRL entries stay (nothing durable records the
   declaration, and the directory may come back before the flip commits): the rebuild's retire of a copy that is back
   saves them, the rebuilt copy's empty `crl_save.log` drops what is left, and a re-placement's entry leaving the
   device makes them leftovers. Every load path

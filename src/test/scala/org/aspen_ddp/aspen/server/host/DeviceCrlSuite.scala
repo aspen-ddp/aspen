@@ -2394,6 +2394,43 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       leftInCrl should be(Set(txid))
       crl.dropDone.isCompleted should be(false)
 
+  atest("a missing store whose directory returns while its rebuild request fails is rebuilt by a later reconcile (RB-W18)"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    val failRequests = new java.util.concurrent.atomic.AtomicBoolean(true)
+    val requestsFailed = new java.util.concurrent.atomic.AtomicInteger(0)
+    val seams = Host.Seams(rebuildRequestFailure = _ =>
+      if failRequests.get then
+        requestsFailed.incrementAndGet()
+        Some(new RuntimeException("injected rebuild request failure"))
+      else None)
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      aside = deviceDir / os.up / "aside"
+      _ = os.move(storeDir, aside)
+      restarted = newCrlHost(hostRoot, second, seams = seams, rebuilds = rebuilds)
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, requestsFailed.get > 0 && restarted.control.reconciler.activeDeviceChecks.isEmpty)
+      // The directory comes back (a restore finishing late) after the request failed
+      _ = os.move(aside, storeDir)
+      _ = failRequests.set(false)
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
+      state <- client.getStorageDeviceState(deviceA)
+      silenced = restarted.control.router.isOffline(storeId)
+      _ = second.shutdownAll()
+    yield
+      requestsFailed.get should be >= 1
+      state.stores.get(storeId).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      rebuilds.created.map(_.storeId).toList should be(List(storeId))
+      silenced should be(true)
+
   atest("an Active store whose config cannot be stat'd is not taken for missing: no rebuild, its entries kept (X-W18)"):
     given ExecutionContext = executionContext
     val first = newFactory()

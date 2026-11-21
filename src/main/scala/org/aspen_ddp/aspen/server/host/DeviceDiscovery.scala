@@ -321,16 +321,16 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   private def adoptionClass(storeId: StoreId, storePath: os.Path): AdoptionClass =
     if !FileStat.isDir(storePath) then
       AdoptionClass.Unclean
-    else if FileStat.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
-      AdoptionClass.CrlLost
-    else if FileStat.exists(storePath / StoreTransfer.TransferredInMarkerFile) then
-      AdoptionClass.Clean
-    else if FileStat.exists(storePath / StoreTransfer.TransferOutMarkerFile) then
-      CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storePath), storeId) match
-        case Right(_) => AdoptionClass.Clean
-        case Left(_) => AdoptionClass.CrlLost
     else
-      AdoptionClass.Clean
+      StoreDirMarkers.blocker(storePath) match
+        case Some(StoreDirMarkers.Marker.RebuildRequired) =>
+          AdoptionClass.CrlLost
+        case Some(StoreDirMarkers.Marker.TransferOut) =>
+          CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storePath), storeId) match
+            case Right(_) => AdoptionClass.Clean
+            case Left(_) => AdoptionClass.CrlLost
+        case _ =>
+          AdoptionClass.Clean
 
   /** Validates a device last owned by `previousHostId`, shut down or not, and adopts it if its CRL
    *  is on it and every store it serves has its directory. On success the post-commit steps run
@@ -668,7 +668,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       catch
         case t: Throwable if CrashRecoveryLog.isUnreadable(t) => throw t
         case NonFatal(_) => None
-    FileStat.exists(storeDir / RebuildingStore.RebuildCompleteMarkerFile) ||
+    StoreDirMarkers.has(storeDir, StoreDirMarkers.Marker.RebuildComplete) ||
       FileStat.exists(saveFile) && configuredStoreId.exists: storeId =>
         CrashRecoveryLog.loadValidStoreState(saveFile, storeId).isRight
 

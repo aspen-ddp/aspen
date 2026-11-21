@@ -278,7 +278,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         relinquishingDevices -= deviceId
         result match
           case Success(_) =>
-            if ctx.devices.devices.get(deviceId).exists(_ eq local) then
+            if ctx.devices.isLoaded(local) then
               unloadDevice(deviceId)
               logger.info(s"Storage device $deviceId, $unloadedAs, is unloaded")
           case Failure(t) =>
@@ -297,7 +297,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  resumes them from what they left on disk, as after a crash. */
   def crlFailed(local: LocalStorageDeviceState, cause: Throwable): Unit =
     val deviceId = local.storageDeviceId
-    if ctx.devices.devices.get(deviceId).exists(_ eq local) && !relinquishingDevices.contains(deviceId) then
+    if ctx.devices.isLoaded(local) && !relinquishingDevices.contains(deviceId) then
       relinquishingDevices += deviceId
       logger.error(s"The CRL of storage device $deviceId at ${local.devicePath} has failed. None of its stores can " +
                    s"vote: unloading the device until the host restarts", cause)
@@ -311,7 +311,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         relinquishingDevices -= deviceId
         result.failed.foreach(t => logger.error(s"Failed to close the stores of storage device $deviceId, whose CRL " +
                                                 s"has failed. Unloading it anyway: $t"))
-        if ctx.devices.devices.get(deviceId).exists(_ eq local) then
+        if ctx.devices.isLoaded(local) then
           unloadDevice(deviceId)
           logger.info(s"Storage device $deviceId, whose CRL has failed, is unloaded")
 
@@ -356,9 +356,9 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
       // A marker whose stat fails (FileStat) is taken as absent: the load stats it again and holds the store back
       // until it answers (StoreLoader.tryLoadStore)
       val plain = ready.filter: storeId =>
-        List(RebuildingStore.RebuildRequiredMarkerFile, StoreTransfer.TransferOutMarkerFile,
-             StoreTransfer.TransferredInMarkerFile).forall: marker =>
-          !FileStat.existence(storePath(storeId) / marker).contains(true)
+        StoreDirMarkers.Marker.values.forall: marker =>
+          marker == StoreDirMarkers.Marker.RebuildComplete ||
+            !StoreDirMarkers.knownPresent(storePath(storeId), marker)
       plain.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
         logger.info(s"Loading store $storeId on device $deviceId again: the shutdown that closed it was cancelled")
         ctx.tryLoadStore(local, storePath(storeId), Some(() => ctx.gossipStoreOnline(storeId)))

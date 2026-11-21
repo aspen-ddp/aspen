@@ -140,7 +140,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         Future.successful(true)
       else
         ctx.client.getStoragePoolState(storeId.poolId).flatMap: pstate =>
-          if ctx.shutdown.isShuttingDown(deviceId) || ! ctx.devices.devices.get(deviceId).contains(local) then
+          if ctx.shutdown.isShuttingDown(deviceId) || ! ctx.devices.isLoaded(local) then
             logger.info(s"Not creating store $storeId: device $deviceId is being shut down")
             Future.successful(false)
           else
@@ -508,7 +508,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  (StoreTransfers.retireEarlierTenancy). A device unloaded meanwhile is left alone: its next load does the same. A
    *  copy whose stat fails (FileStat) is kept offline as a present one: the Deleted Stores pass stats it again. */
   private def keepUnpromotedCopyOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit =
-    if ctx.devices.devices.get(local.storageDeviceId).contains(local) &&
+    if ctx.devices.isLoaded(local) &&
        !FileStat.existence(local.devicePath / storeId.directoryName).contains(false) then
       ctx.router.markOffline(storeId)
       local.offlineStores += storeId
@@ -527,7 +527,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    */
   private def keepRebuiltStoreOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     ctx.router.markOffline(storeId)
-    if ctx.devices.devices.get(local.storageDeviceId).contains(local) then
+    if ctx.devices.isLoaded(local) then
       local.offlineStores += storeId
     val storePath = local.devicePath / storeId.directoryName
     try
@@ -574,9 +574,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     val ours =
       try
         Some(!FileStat.exists(storePath) ||
-             FileStat.exists(storePath / RebuildingStore.RebuildCompleteMarkerFile) &&
+             StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildComplete) &&
                RebuildingStore.isRebuildCompleteFor(storePath, episode) ||
-             FileStat.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile))
+             StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildRequired))
       catch case NonFatal(t) =>
         logger.error(s"Failed to stat the path of store $storeId at $storePath. Not rebuilding it yet: $t")
         None

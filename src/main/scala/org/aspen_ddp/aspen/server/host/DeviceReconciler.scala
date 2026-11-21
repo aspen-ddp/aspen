@@ -109,7 +109,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
             !crlDropsRunning.contains(storeId) &&
             !ctx.copies.isRetiring(storeId)
         // Only while the device is still loaded: an unloaded one's CRL is shut down
-        if ctx.devices.devices.get(deviceId).exists(_ eq local) then
+        if ctx.devices.isLoaded(local) then
           stores.filter(leftover).toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
             logger.info(s"Dropping the device-CRL entries of store $storeId, which storage device $deviceId no " +
                         s"longer holds")
@@ -240,7 +240,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // directory and rebuilds it. Before the abandoned-transfers-out pass, which would
       // otherwise take a marked store left behind a transfer-out marker for one to reinstate.
       val lostCrl = local.offlineStores.filter(storeId =>
-        hasMarker(local, storeId, RebuildingStore.RebuildRequiredMarkerFile))
+        hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildRequired))
       lostCrl.foreach: storeId =>
         if remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) then
           ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
@@ -279,7 +279,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         remote.stores.get(storeId).exists(entry =>
           entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
         ) &&
-        hasMarker(local, storeId, StoreTransfer.TransferOutMarkerFile)
+        hasMarker(local, storeId, StoreDirMarkers.Marker.TransferOut)
       ).partition(ctx.storeTransferService.isTransferringOut)
       abandonedOut.foreach: storeId =>
         ctx.transfers.reinstateAbandonedOut(local, storeId)
@@ -305,7 +305,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       local.offlineStores.filter(storeId =>
         !ctx.transfers.transferringIn.contains(storeId) &&
         remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
-        hasMarker(local, storeId, StoreTransfer.TransferredInMarkerFile)
+        hasMarker(local, storeId, StoreDirMarkers.Marker.TransferredIn)
       ).foreach: storeId =>
         val storePath = local.devicePath / storeId.directoryName
         logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but still " +
@@ -325,7 +325,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         !ctx.rebuilds.rebuildingStoreIds.contains(storeId) &&
         remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
         (ctx.rebuilds.markerRemovalsPending.contains(storeId) ||
-         hasMarker(local, storeId, RebuildingStore.RebuildCompleteMarkerFile))
+         hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildComplete))
       ).foreach: storeId =>
         val storePath = local.devicePath / storeId.directoryName
         logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but its rebuild-complete marker " +
@@ -435,8 +435,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
 
   /** Whether the directory of `storeId` on `local` is known to carry `marker`. A stat that fails (FileStat) answers
    *  false: the pass acting on the marker waits for a later reconcile, and the load it leads to stats it again */
-  private def hasMarker(local: LocalStorageDeviceState, storeId: StoreId, marker: String): Boolean =
-    FileStat.existence(local.devicePath / storeId.directoryName / marker).contains(true)
+  private def hasMarker(local: LocalStorageDeviceState, storeId: StoreId, marker: StoreDirMarkers.Marker): Boolean =
+    StoreDirMarkers.knownPresent(local.devicePath / storeId.directoryName, marker)
 
   /** The Deleted Stores pass's retire of `storeId`'s copy on `local`, whose entry no longer names it. The store
    *  leaves offlineStores, and its router offline mark goes (unless another device here holds the store offline), only

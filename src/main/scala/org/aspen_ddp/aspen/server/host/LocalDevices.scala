@@ -40,6 +40,10 @@ class LocalDevices extends Logging:
    *  files would corrupt them. */
   var closingCrls: Map[os.Path, Future[Unit]] = Map()
 
+  /** Whether `sds` is still the loaded state of its device (not unloaded, nor replaced by a later load) */
+  def isLoaded(sds: LocalStorageDeviceState): Boolean =
+    devices.get(sds.storageDeviceId).exists(_ eq sds)
+
   /** Deletes a copy that never was its store's owner copy and holds nothing its source lacks, so it needs no retiring
    *  (StoreCopies): the copy a transfer delivered onto a device that turned out to be tombstoned
    *  (TransferOutcome.SourceRestored: the pool still names the source, which still holds the data), or one a rebuild

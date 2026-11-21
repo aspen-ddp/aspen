@@ -462,7 +462,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                 val markerId = try os.read(promotedMarker).trim catch case _: Throwable => ""
                 if !transferId.exists(_.toString == markerId) then
                   Right(Some(s"it belongs to transfer '$markerId', not to the current transfer $transferId"))
-                else if FileStat.exists(finalPath / RebuildingStore.RebuildRequiredMarkerFile) then
+                else if StoreDirMarkers.has(finalPath, StoreDirMarkers.Marker.RebuildRequired) then
                   Right(Some("it is marked rebuild-required"))
                 else
                   CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(finalPath), storeId) match
@@ -494,7 +494,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
 
         // A copy promoted by an earlier attempt -- normally one that crashed before its metadata
         // step finished -- needs no bytes, only that step.
-        else if FileStat.existence(finalPath / StoreTransfer.TransferredInMarkerFile).contains(true) then
+        else if StoreDirMarkers.knownPresent(finalPath, StoreDirMarkers.Marker.TransferredIn) then
           logger.info(s"Store $storeId has already arrived on device $toDeviceid. Resuming its " +
                       s"pool update")
           val transferUUID = UUID.randomUUID()
@@ -503,8 +503,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
 
         // A finished rebuild awaiting its flip or a lost copy, left by an earlier tenancy of the store on this device
         // (rebuild-process FS17): retired, and the transfer starts at the check that follows
-        else if FileStat.existence(finalPath / RebuildingStore.RebuildCompleteMarkerFile).contains(true) ||
-                FileStat.existence(finalPath / RebuildingStore.RebuildRequiredMarkerFile).contains(true) then
+        else if StoreDirMarkers.knownPresent(finalPath, StoreDirMarkers.Marker.RebuildComplete) ||
+                StoreDirMarkers.knownPresent(finalPath, StoreDirMarkers.Marker.RebuildRequired) then
           retireEarlierTenancy(toDevice, storeId)
 
         // Promotion moves the arrived copy here and would fail on an existing directory, after
@@ -754,7 +754,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           // adopting host) reads back. A device unloaded meanwhile -- its shutdown already
           // finished -- is not ours to send from.
           if ctx.shutdown.isShuttingDown(sourceDs.storageDeviceId) ||
-             !ctx.devices.devices.get(sourceDs.storageDeviceId).contains(sourceDs) then
+             !ctx.devices.isLoaded(sourceDs) then
             logger.info(s"Not starting the transfer out of store ${m.storeId}: source device " +
                         s"${sourceDs.storageDeviceId} began shutting down while the store closed")
           else if ctx.router.loaded.contains(m.storeId) || ctx.loader.isOpening(m.storeId) ||
@@ -803,7 +803,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         result.failed.foreach: t =>
           logger.warn(s"Failed to abort the transfer out of store $storeId for its rebuild. A retransmitted " +
                       s"request tries again. Error: $t")
-        if ctx.devices.devices.get(sds.storageDeviceId).exists(_ eq sds) then
+        if ctx.devices.isLoaded(sds) then
           ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
 
   /** Brings a store back online after its transfer out was abandoned rather than completed.

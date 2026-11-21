@@ -72,7 +72,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
     retiring += storeId
     val dropped =
       try
-        if !FileStat.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
+        if !StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildRequired) then
           ctx.writeRebuildRequiredMarker(storePath)
         val lostState = storePath / RebuildingStore.LostCrlStateFile
         val saveFile = Backend.crlSaveFile(storePath)
@@ -101,7 +101,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
         case Success(_) =>
           local.admission.releaseRetained(storeId)
           // A device unloaded meanwhile is retired by whichever load of it comes next
-          Success(ctx.devices.devices.get(local.storageDeviceId).exists(_ eq local) &&
+          Success(ctx.devices.isLoaded(local) &&
                   moveToPendingDelete(local, storeId))
 
   /** Step 4 of retire. Returns whether the path is clear. */

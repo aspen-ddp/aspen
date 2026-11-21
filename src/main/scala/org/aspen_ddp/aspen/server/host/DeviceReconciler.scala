@@ -240,7 +240,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // directory and rebuilds it. Before the abandoned-transfers-out pass, which would
       // otherwise take a marked store left behind a transfer-out marker for one to reinstate.
       val lostCrl = local.offlineStores.filter(storeId =>
-        os.exists(local.devicePath / storeId.directoryName / RebuildingStore.RebuildRequiredMarkerFile))
+        hasMarker(local, storeId, RebuildingStore.RebuildRequiredMarkerFile))
       lostCrl.foreach: storeId =>
         if remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) then
           ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
@@ -279,7 +279,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         remote.stores.get(storeId).exists(entry =>
           entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
         ) &&
-        os.exists(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile)
+        hasMarker(local, storeId, StoreTransfer.TransferOutMarkerFile)
       ).partition(ctx.storeTransferService.isTransferringOut)
       abandonedOut.foreach: storeId =>
         ctx.transfers.reinstateAbandonedOut(local, storeId)
@@ -305,7 +305,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       local.offlineStores.filter(storeId =>
         !ctx.transfers.transferringIn.contains(storeId) &&
         remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
-        os.exists(local.devicePath / storeId.directoryName / StoreTransfer.TransferredInMarkerFile)
+        hasMarker(local, storeId, StoreTransfer.TransferredInMarkerFile)
       ).foreach: storeId =>
         val storePath = local.devicePath / storeId.directoryName
         logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but still " +
@@ -325,7 +325,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         !ctx.rebuilds.rebuildingStoreIds.contains(storeId) &&
         remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
         (ctx.rebuilds.markerRemovalsPending.contains(storeId) ||
-         os.exists(local.devicePath / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile))
+         hasMarker(local, storeId, RebuildingStore.RebuildCompleteMarkerFile))
       ).foreach: storeId =>
         val storePath = local.devicePath / storeId.directoryName
         logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but its rebuild-complete marker " +
@@ -432,6 +432,11 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       //
       // Retired copies whose store is Active on its owner device, and the remains of interrupted deletes
       ctx.copies.release(local, remote)
+
+  /** Whether the directory of `storeId` on `local` is known to carry `marker`. A stat that fails (FileStat) answers
+   *  false: the pass acting on the marker waits for a later reconcile, and the load it leads to stats it again */
+  private def hasMarker(local: LocalStorageDeviceState, storeId: StoreId, marker: String): Boolean =
+    FileStat.existence(local.devicePath / storeId.directoryName / marker).contains(true)
 
   /** The Deleted Stores pass's retire of `storeId`'s copy on `local`, whose entry no longer names it. The store
    *  leaves offlineStores, and its router offline mark goes (unless another device here holds the store offline), only

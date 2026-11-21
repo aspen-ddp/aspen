@@ -225,14 +225,17 @@ The premises other subsystems take from this:
   absence use it too: the Missing Stores pass and the leftover drop skip a store whose stat fails, a retire fails
   rather than report a clear path, the Deleted Stores pass keeps the store offline, and the device CRL's open leaves the
   device unloaded for the next scan rather than declare a `crl/` lost (a child whose config cannot be stat'd counts as
-  a store). Existence tests outside the load still use `os.exists`/`os.isDir`, which answer false on a failed stat.
-  Most only delay: a marker a reconcile pass or `reloadClosedStores` looks for (the load they lead to tests again with
-  `FileStat`), `adoptionClass` (an `Unclean` refusal, or a marked copy classed `Clean` that its load then keeps
-  offline), `retireForeignCopy`/`discardLostStore` (a rebuild whose finish cannot move onto the occupied path),
-  `startIn` (a transfer whose promotion fails on the occupied path), and `openDeviceCrl`'s move of `crl/` (a
-  replacement whose rename fails on it). `StoreTransfers.extractUnloaded` tests the directory and the save file with
-  `FileStat`, failing the extraction on a failed stat. One acts on the absence: `StoreLoader.readArrivedAt`, whose
-  false absence drops the arrival margin from a moved store's load floor (X-W26).
+  a store). The existence tests outside the load use `FileStat` as well, so absence means one thing everywhere. A
+  failed stat of a moved store's `ArrivedAtFile` counts as an arrival now (`StoreLoader.readArrivedAt`), keeping its
+  arrival margin. `adoptionClass` and the adoption's `crl/` check throw, failing the adoption for the next scan;
+  `retireForeignCopy` and `discardLostStore` hold the rebuild for a later check, neither starting it over a copy
+  they cannot see nor retiring a finished one; `startIn` neither resumes nor discards an arrived copy whose marker
+  cannot be stat'd, and refuses a path whose stat fails; `openDeviceCrl` throws before moving `crl/`;
+  `keepUnpromotedCopyOffline` and an unserved `backendFailed` treat the directory as present (kept offline, marked).
+  A marker a reconcile pass looks for counts only when a stat finds it, so the pass waits for a later reconcile,
+  and `reloadClosedStores` loads a store whose marker stat fails, the load then holding it back with its own
+  `FileStat` tests. `StoreTransfers.extractUnloaded` tests the directory and the save file with `FileStat`, failing
+  the extraction on a failed stat.
 * A lost device CRL marks every store directory except those that held nothing in it (`DeviceDiscovery.holdsOwnState`):
   a store whose valid `crl_save.log` is its whole state, and a finished rebuild awaiting its flip (`rebuild-complete`),
   which `tryLoadStore` never serves, so its flip or the Completed Rebuilds pass loads it over the fresh CRL. A copy
@@ -548,20 +551,6 @@ Between a document, scaladoc or guide outside docs/safety and the code:
 ---
 
 ## Open weaknesses
-
-### X-W26: A failed stat of a moved store's arrival file drops its arrival margin
-Verdict PLAUSIBLE. Priority 5. Effort S.
-Mechanism: `StoreLoader.readArrivedAt` tests `arrived-at` with `os.exists`, which answers false on a failed stat, and
-the load then passes no arrival (`handleLoad`). `Frontend.loadFloorMillis` uses the load plus `MaxStartLead`, or the
-host's join ceiling when lower, instead of the arrival plus `AcceptorSinceMargin`, so a store loaded within the margin
-of its arrival may accept a prepare for a transaction it joined and forgot on its previous host, started ahead of this
-host's clock by up to the skew the margin covers. An unreadable file already counts as an arrival now; only the stat
-is unguarded. The other `os.exists`/`os.isDir` decisions outside the load only delay (2.2).
-Consequence: one store rejoins a transaction it forgot. That T was concluded there, so the other acceptors also refuse
-it below their floors or ignore it from their caches, and a lone rejoined acceptor decides nothing: hygiene. Needs a
-failing stat of that one file during the margin and a replayed prepare.
-Fix: `FileStat.exists` in `readArrivedAt`, a failure counting as an arrival now; and `FileStat` for the remaining
-existence tests listed in 2.2, so absence means one thing everywhere.
 
 ### X-W27: A recovered vote's refcount re-check rests on an unenforced update-serial convention
 Verdict PLAUSIBLE. Priority 5. Effort S.

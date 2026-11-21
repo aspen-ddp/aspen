@@ -65,13 +65,16 @@
   (`retireUnserved`: marked `rebuild-required`, rebuilt as a new incarnation); one that cannot be stat'd, read or
   parsed is left alone and the load retried through `storesAwaitingRetry` (`awaitUnreadRetry`), so a format change
   in a release is an outage, never a fresh identity over a store's data and CRL state
-- Existence tests that decide a load or a destructive reconcile step use `server.FileStat`, never `os.exists`
+- Every existence test in host code over a store or device directory uses `server.FileStat`, never `os.exists`
   (`Files.exists`, false on any stat error): absent only on ENOENT (or a parent that is no directory), otherwise it
   throws. `tryLoadStore`'s config and marker checks and `handleLoad`'s `crl_save.log` check hold a load whose stat
   fails back through `awaitUnreadRetry`; the Missing Stores pass, `dropLeftoverCrlState` and the Deleted Stores
   pass skip such a store; `StoreCopies.retire` fails rather than report a clear path; `DeviceDiscovery.openDeviceCrl`
   throws (device left for the next scan; a child whose config cannot be stat'd counts as a store directory) and so
-  does `holdsOwnState`. Tests fail a stat with a directory lacking search permission, or a link into one
+  does `holdsOwnState`. `StoreLoader.readArrivedAt` counts a failed stat as an arrival now; `adoptionClass` throws
+  (adoption retried next scan); `retireForeignCopy`/`discardLostStore` and `startIn` wait for a later check; reconcile
+  passes act on a marker only when a stat finds it. Tests fail a stat with a directory lacking search permission, or
+  a link into one
 - Load time and the forget floor (`server/store/CLAUDE.md`): every Store `StoreLoader` builds records its load
   (`Frontend.loadedAt`), so after a restart, adoption or transfer in it refuses, for good, each transaction it does
   not hold that started before the load plus `MaxStartLead`. A store that arrived from another host had joined by that

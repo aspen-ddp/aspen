@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.runSequentially
 import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.ShutdownOutcome
-import org.aspen_ddp.aspen.server.DeviceMarkers
+import org.aspen_ddp.aspen.server.{DeviceMarkers, FileStat}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -353,9 +353,12 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         closedForShutdown -= deviceId
       else
         closedForShutdown += deviceId -> notYet
+      // A marker whose stat fails (FileStat) is taken as absent: the load stats it again and holds the store back
+      // until it answers (StoreLoader.tryLoadStore)
       val plain = ready.filter: storeId =>
         List(RebuildingStore.RebuildRequiredMarkerFile, StoreTransfer.TransferOutMarkerFile,
-             StoreTransfer.TransferredInMarkerFile).forall(marker => !os.exists(storePath(storeId) / marker))
+             StoreTransfer.TransferredInMarkerFile).forall: marker =>
+          !FileStat.existence(storePath(storeId) / marker).contains(true)
       plain.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
         logger.info(s"Loading store $storeId on device $deviceId again: the shutdown that closed it was cancelled")
         ctx.tryLoadStore(local, storePath(storeId), Some(() => ctx.gossipStoreOnline(storeId)))

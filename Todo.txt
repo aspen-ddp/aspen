@@ -66,13 +66,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.4 [X-W26] A failed stat of a moved store's arrival file drops its arrival margin; remaining os.exists uses.
-    PLAUSIBLE. Effort S. cross-document-review.md 2.2.
-    StoreLoader.readArrivedAt uses os.exists, so a failed stat drops AcceptorSinceMargin from a moved store's load
-    floor. Fix: FileStat there (failure counts as arrival now), and FileStat for the remaining existence tests that
-    cross-document-review 2.2 lists (DeviceDiscovery.adoptionClass, StoreRebuilds.retireForeignCopy /
-    discardLostStore / backendFailed, StoreTransfers.startIn markers, openDeviceCrl), which today only delay.
-
 5.5 [X-W27] A recovered vote's refcount re-check rests on an unenforced update-serial convention.
     PLAUSIBLE. Effort S. cross-document-review.md 2.3, transaction-requirements.md 10.5(c).
     Pins and DescriptionValidator accept a RefcountUpdate that does not advance ObjectRefcount.updateSerial (e.g.

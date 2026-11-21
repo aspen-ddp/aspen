@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.RebuildOutcome
-import org.aspen_ddp.aspen.server.{DurableFiles, Host, StoreConfig}
+import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, Host, StoreConfig}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild}
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.Backend
@@ -505,10 +505,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  retires it if its entry leaves the device before a later rebuild of the store here retires or promotes it, and
    *  the Completed Rebuilds pass loads it once its entry is Active; without it the copy would hold the store's path
    *  until a restart, and an Active one would stay unserved. A transfer of the store onto this device retires it
-   *  (StoreTransfers.retireEarlierTenancy). A device unloaded meanwhile is left alone: its next load does the same. */
+   *  (StoreTransfers.retireEarlierTenancy). A device unloaded meanwhile is left alone: its next load does the same. A
+   *  copy whose stat fails (FileStat) is kept offline as a present one: the Deleted Stores pass stats it again. */
   private def keepUnpromotedCopyOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     if ctx.devices.devices.get(local.storageDeviceId).contains(local) &&
-       os.exists(local.devicePath / storeId.directoryName) then
+       !FileStat.existence(local.devicePath / storeId.directoryName).contains(false) then
       ctx.router.markOffline(storeId)
       local.offlineStores += storeId
 
@@ -565,12 +566,23 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  Rebuilding episode, superseded by a re-placement away and back), or a copy put there by hand. Nothing ties it to the store's
    *  current state, so it is retired as a lost copy: marked rebuild-required, and then kept in pending-delete by
    *  discardLostStore like any other. A served one is first taken out of service as a failed backend is, and its
-   *  rebuild waits for a later check. Returns whether the rebuild may go on now. */
+   *  rebuild waits for a later check. A stat that fails is no absence (FileStat): the rebuild waits for a later
+   *  check, neither starting over a copy it cannot see nor retiring a finished one whose marker it cannot see.
+   *  Returns whether the rebuild may go on now. */
   private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
     val storePath = local.devicePath / storeId.directoryName
-    if !os.exists(storePath) ||
-       RebuildingStore.isRebuildCompleteFor(storePath, episode) ||
-       os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
+    val ours =
+      try
+        Some(!FileStat.exists(storePath) ||
+             FileStat.exists(storePath / RebuildingStore.RebuildCompleteMarkerFile) &&
+               RebuildingStore.isRebuildCompleteFor(storePath, episode) ||
+             FileStat.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile))
+      catch case NonFatal(t) =>
+        logger.error(s"Failed to stat the path of store $storeId at $storePath. Not rebuilding it yet: $t")
+        None
+    if ours.isEmpty then
+      false
+    else if ours.contains(true) then
       true
     else if ctx.loader.isOpening(storeId) then
       false
@@ -700,8 +712,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         // backend, or it was closed. Unless replaced, its directory is marked, so a store closed
         // around the failure is never later served, shipped or adopted as cleanly closed.
         backend match
+          // A directory whose stat fails (FileStat) is marked as a present one: the mark's own write then fails or not
           case Some(b) if served.isEmpty && !ctx.router.loaded.valuesIterator.exists(_.backend.path == b.path) &&
-                          os.isDir(b.path) &&
+                          scala.util.Try(FileStat.isDir(b.path)).getOrElse(true) &&
                           ctx.devices.devices.valuesIterator.exists(_.devicePath == b.path / os.up) =>
             logger.error(s"Store $storeId failed on an I/O error after it stopped being served. Marking it for " +
                          s"rebuild. Error: $err")
@@ -785,8 +798,13 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    */
   private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
     val storePath = local.devicePath / storeId.directoryName
-    if !os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
+    // A stat that fails is no absence (FileStat): the rebuild waits for a later check rather than start over the copy
+    val marked = FileStat.existence(storePath / RebuildingStore.RebuildRequiredMarkerFile)
+    if marked.contains(false) then
       true
+    else if marked.isEmpty then
+      logger.error(s"Failed to stat the rebuild-required marker of store $storeId at $storePath. Not rebuilding it yet")
+      false
     else
       if !droppingCrlState.contains(storeId) then
         droppingCrlState += storeId

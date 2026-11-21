@@ -449,27 +449,30 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         // copy then released, as promotion refuses for a staged copy. Until the pool update
         // commits the source still holds the state, so either is discarded and the transfer
         // started over.
-        // A save file that cannot be read (CrashRecoveryLog.isUnreadable) says nothing of the copy: it is neither
-        // resumed nor discarded, and the next check reads it again.
+        // A save file that cannot be read (CrashRecoveryLog.isUnreadable), or a marker whose stat fails (FileStat),
+        // says nothing of the copy: it is neither resumed nor discarded, and the next check reads it again.
         val promotedMarker = finalPath / StoreTransfer.TransferredInMarkerFile
-        val staleKept = os.exists(promotedMarker) &&
+        val promoted = FileStat.existence(promotedMarker)
+        val staleKept = !promoted.contains(false) &&
           locally:
-            val markerId = try os.read(promotedMarker).trim catch case _: Throwable => ""
             val unusable: Either[Throwable, Option[String]] =
-              if !transferId.exists(_.toString == markerId) then
-                Right(Some(s"it belongs to transfer '$markerId', not to the current transfer $transferId"))
-              else if os.exists(finalPath / RebuildingStore.RebuildRequiredMarkerFile) then
-                Right(Some("it is marked rebuild-required"))
-              else
-                try
+              try
+                if promoted.isEmpty then
+                  FileStat.exists(promotedMarker) // Throws the stat's error, to be logged below
+                val markerId = try os.read(promotedMarker).trim catch case _: Throwable => ""
+                if !transferId.exists(_.toString == markerId) then
+                  Right(Some(s"it belongs to transfer '$markerId', not to the current transfer $transferId"))
+                else if FileStat.exists(finalPath / RebuildingStore.RebuildRequiredMarkerFile) then
+                  Right(Some("it is marked rebuild-required"))
+                else
                   CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(finalPath), storeId) match
                     case Right(_) => Right(None)
                     case Left(err) => Right(Some(s"its CRL save file is no longer usable: $err"))
-                catch case t: Throwable => Left(t)
+              catch case t: Throwable => Left(t)
             unusable match
               case Left(err) =>
-                logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: the CRL save file of " +
-                             s"its arrived copy at $finalPath could not be read. Retrying at a later check: $err")
+                logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: its arrived copy at " +
+                             s"$finalPath could not be checked. Retrying at a later check: $err")
                 true
               case Right(None) => false
               case Right(Some(why)) =>
@@ -491,7 +494,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
 
         // A copy promoted by an earlier attempt -- normally one that crashed before its metadata
         // step finished -- needs no bytes, only that step.
-        else if os.exists(finalPath / StoreTransfer.TransferredInMarkerFile) then
+        else if FileStat.existence(finalPath / StoreTransfer.TransferredInMarkerFile).contains(true) then
           logger.info(s"Store $storeId has already arrived on device $toDeviceid. Resuming its " +
                       s"pool update")
           val transferUUID = UUID.randomUUID()
@@ -500,16 +503,17 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
 
         // A finished rebuild awaiting its flip or a lost copy, left by an earlier tenancy of the store on this device
         // (rebuild-process FS17): retired, and the transfer starts at the check that follows
-        else if os.exists(finalPath / RebuildingStore.RebuildCompleteMarkerFile) ||
-                os.exists(finalPath / RebuildingStore.RebuildRequiredMarkerFile) then
+        else if FileStat.existence(finalPath / RebuildingStore.RebuildCompleteMarkerFile).contains(true) ||
+                FileStat.existence(finalPath / RebuildingStore.RebuildRequiredMarkerFile).contains(true) then
           retireEarlierTenancy(toDevice, storeId)
 
         // Promotion moves the arrived copy here and would fail on an existing directory, after
         // the whole store had been shipped. Whatever is here is not ours to delete, so refuse
-        // before asking for any bytes.
-        else if os.exists(finalPath) then
+        // before asking for any bytes. A stat that fails is no absence (FileStat): it refuses too, until a later
+        // check's stats answer. A marker test above that failed reaches this test, which then fails or finds the path.
+        else if !FileStat.existence(finalPath).contains(false) then
           logger.error(s"Cannot transfer store $storeId onto device $toDeviceid: store path " +
-                       s"already exists. $finalPath")
+                       s"already exists or cannot be stat'd. $finalPath")
         else
           // Fresh per attempt. The sender ignores a request whose timestamp is not newer than the
           // last one it acted on, and the service accepts a connection only for the UUID it is

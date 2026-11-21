@@ -834,11 +834,11 @@ object StoreLoader:
   def writeArrivedAt(storePath: os.Path): Unit =
     DurableFiles.write(storePath / ArrivedAtFile, System.currentTimeMillis().toString)
 
-  /** The store's last arrival from another host, if any. A file that cannot be read counts as an arrival now: later
-   *  than the truth, which only refuses more transactions */
+  /** The store's last arrival from another host, if any. A file that cannot be stat'd or read counts as an arrival
+   *  now: later than the truth, which only refuses more transactions. Only a known absence (FileStat) is none */
   def readArrivedAt(storePath: os.Path): Option[Long] =
     val file = storePath / ArrivedAtFile
-    if !os.exists(file) then
+    if FileStat.existence(file).contains(false) then
       None
     else
       Some(Try(os.read(file).trim.toLong).getOrElse(System.currentTimeMillis()))

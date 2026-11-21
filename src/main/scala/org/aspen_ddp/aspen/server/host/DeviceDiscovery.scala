@@ -315,15 +315,17 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *    during or after the shutdown (keepRebuiltStoreOffline) carries the marker with an empty save file: Clean.
    *  - Any other directory: Clean. The shutdown closed it, or a crash or a pulled drive stopped it,
    *    with its state in the device CRL, which the adopting host opens before loading it.
+   *
+   *  A stat that fails is no absence (FileStat): it throws, failing the adoption for the next scan to retry.
    */
   private def adoptionClass(storeId: StoreId, storePath: os.Path): AdoptionClass =
-    if !os.isDir(storePath) then
+    if !FileStat.isDir(storePath) then
       AdoptionClass.Unclean
-    else if os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
+    else if FileStat.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
       AdoptionClass.CrlLost
-    else if os.exists(storePath / StoreTransfer.TransferredInMarkerFile) then
+    else if FileStat.exists(storePath / StoreTransfer.TransferredInMarkerFile) then
       AdoptionClass.Clean
-    else if os.exists(storePath / StoreTransfer.TransferOutMarkerFile) then
+    else if FileStat.exists(storePath / StoreTransfer.TransferOutMarkerFile) then
       CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storePath), storeId) match
         case Right(_) => AdoptionClass.Clean
         case Left(_) => AdoptionClass.CrlLost
@@ -354,7 +356,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     // is plainly not ready costs no transaction. The check that counts is adoptDevice's own.
     val unclean = uncleanStores(path, state)
 
-    if storesIn(path).nonEmpty && !os.isDir(CrashRecoveryLog.deviceCrlDir(path)) then
+    if storesIn(path).nonEmpty && !FileStat.isDir(CrashRecoveryLog.deviceCrlDir(path)) then
       warnOnce(path, s"Storage device $deviceId at $path, last owned by host $previousHostId, holds stores but its " +
                      s"CRL is not on it (${CrashRecoveryLog.deviceCrlDir(path)}). Not adopting it. Return it to " +
                      s"that host")
@@ -627,7 +629,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                      s"be read to tell whether it holds its own state. Retrying on the next scan: $t")
         throw t
     toMark.foreach(ctx.rebuilds.markRebuildRequired)
-    if os.exists(crlDir) then
+    // A stat that fails throws (FileStat), leaving the device unloaded for the next scan, rather than leave a crl/ in
+    // the replacement's way
+    if FileStat.exists(crlDir) then
       DurableFiles.move(crlDir, devicePath / s"crl.lost-${UUID.randomUUID()}")
     // A fresh CRL, which the stores now marked recover nothing from. Created apart and renamed into place only once
     // finished, so a crash or a failure (ENOSPC while preallocating) leaves no crl/ beside the stores: the next load

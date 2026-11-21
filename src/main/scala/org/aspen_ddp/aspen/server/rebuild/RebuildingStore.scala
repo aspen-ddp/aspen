@@ -809,24 +809,33 @@ class RebuildingStore(client: AspenClient,
           case err =>
             synchronized:
               failed = objectId :: failed
-            logger.warn(s"Rebuild of $storeId: retry of $objectId failed: $err")
+            // A full destination is not an unreadable object: it latches the abort and raises its own alert, as on
+            // the walk, so the pass fails as out of space rather than "incomplete", and never as an accepted loss
+            if isOutOfSpace(err) then
+              latchOutOfSpace(err)
+            else
+              logger.warn(s"Rebuild of $storeId: retry of $objectId failed: $err")
 
       Future.sequence(retries).flatMap: _ =>
-        val remaining = synchronized(failed)
-        if remaining.isEmpty then
-          Future.unit
-        else
-          lossAccepted().flatMap: accepted =>
-            if accepted then
-              recordAcceptedLoss(remaining)
-            else
-              // Best-effort for the same reason the walk path is: a device that fills up here has to
-              // produce the operator alert and the latch, not a generic warning. The pass fails
-              // either way, so the classification is the only thing at stake.
-              checkpointBestEffort("after retries")
-              Future.failed(new Exception(
-                s"Rebuild of $storeId incomplete: ${remaining.size} objects still unreadable. If the pool cannot " +
-                "supply them, `accept-rebuild-loss` lets the rebuild finish without them"))
+        synchronized((failed, abortCause)) match
+          case (_, Some(cause)) =>
+            // Latched during the retries (out of space, a cancel): the pass fails with the latched cause before
+            // lossAccepted is consulted, so no object a peer can supply is recorded as an accepted loss
+            Future.failed(cause)
+          case (Nil, None) =>
+            Future.unit
+          case (remaining, None) =>
+            lossAccepted().flatMap: accepted =>
+              if accepted then
+                recordAcceptedLoss(remaining)
+              else
+                // Best-effort for the same reason the walk path is: a device that fills up here has to
+                // produce the operator alert and the latch, not a generic warning. The pass fails
+                // either way, so the classification is the only thing at stake.
+                checkpointBestEffort("after retries")
+                Future.failed(new Exception(
+                  s"Rebuild of $storeId incomplete: ${remaining.size} objects still unreadable. If the pool cannot " +
+                  "supply them, `accept-rebuild-loss` lets the rebuild finish without them"))
 
   /** Whether an operator has accepted the loss of the objects this rebuild cannot read: the store's entry on this
    *  device is Rebuilding with `acceptLoss` (AspenClient.acceptRebuildLoss). A failed read counts as no. */

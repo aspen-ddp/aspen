@@ -386,8 +386,11 @@ and still counts. The latter needs T to start inside the window between that pee
 deleted since, skipped; present is decoded, read (timed) and restored again, all concurrently. Anything still failing
 either fails the pass ("incomplete", naming `accept-rebuild-loss`, after a best-effort checkpoint) or, with
 `acceptLoss`, is recorded (5.5). It runs only when the abort latch is clear after the sweep. A retry's failure is
-recorded as a failed object whatever its cause: an out-of-space write here latches nothing and logs no
-`REBUILD OUT OF SPACE` (RB-W20).
+recorded as a failed object; an out-of-space one (`Backend.isOutOfSpace`) also latches the abort and logs
+`REBUILD OUT OF SPACE` (`latchOutOfSpace`), as on the walk. The latch is checked once the retries complete, before
+`lossAccepted`: a latched cause (out of space, a cancel) fails the pass with that cause, the checkpoint left in
+staging, so a full destination is never reported as "incomplete" and no object a peer can supply is recorded as an
+accepted loss.
 
 ### 5.5 Accepted loss
 
@@ -880,16 +883,4 @@ transfer's promotion fail and retry; its flip then reads TransferringIn and gets
 
 ## Open weaknesses
 
-### RB-W20: An out-of-space write in `retryFailures` is recorded as an unreadable object
-Verdict CONFIRMED. Priority 5. Effort S.
-Mechanism: `RebuildingStore.retryFailures` runs each retry through `attemptRestore`; any failure, including a
-`Backend.rebuildWrite` that throws ENOSPC or EDQUOT, is caught by its `recover` and put back in `failed`. Unlike the
-walk (`restoreObject`), the sweep (`restorePending`) and `finish`, nothing calls `isOutOfSpace`/`latchOutOfSpace`.
-The pass then either fails "incomplete", naming `accept-rebuild-loss` as the remedy (the trailing
-`checkpointBestEffort` classifies only a failure of its own flush or save), or, with `acceptLoss` set, has
-`recordAcceptedLoss` mark the objects and logs `REBUILD ACCEPTED LOSS` for objects the pool can supply.
-Consequence: a destination that fills during the retries gets the wrong operator alert and remedy (no
-`REBUILD OUT OF SPACE`, so no re-placement prompt), and an acceptance given for genuinely unreadable objects also
-promotes the store without slices that were readable, leaving them to repair onto the same full device.
-Fix: in `retryFailures`' `recover`, latch an out-of-space error with `latchOutOfSpace`, and check the abort latch
-after the retries, before `lossAccepted`, failing the pass with the latched cause.
+(none)

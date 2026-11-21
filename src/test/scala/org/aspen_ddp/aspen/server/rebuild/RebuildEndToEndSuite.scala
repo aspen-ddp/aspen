@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker
 import org.aspen_ddp.aspen.common.objects.Key
-import org.aspen_ddp.aspen.server.store.backend.DefaultBackendOpener
+import org.aspen_ddp.aspen.server.store.backend.{Backend, DefaultBackendOpener}
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.metadata.management.FailedStorageDeviceTestHarness
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -29,9 +29,11 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
     val backends = new DefaultBackendOpener(executionContext)
     val dev = os.temp.dir(prefix = "rebuild-accept-loss")
 
-    def rebuild(failKeys: Set[Key], episode: Option[java.util.UUID]): RebuildingStore =
+    def rebuild(failKeys: Set[Key], episode: Option[java.util.UUID],
+                outOfSpaceKeys: Set[Key] = Set()): RebuildingStore =
       new RebuildingStore(client, storeId, net.secondDeviceId, dev, backends, episode,
-                          testingOnlyFailKeys = failKeys)
+                          testingOnlyFailKeys = failKeys, testingOnlyOutOfSpaceKeys = outOfSpaceKeys)
+    val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
 
     for
       ids <- Future.sequence((0 until 5).toList.map: i =>
@@ -60,6 +62,18 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       _ <- client.acceptRebuildLoss(storeId)
       _ <- waitForTransactionsToComplete()
       flagged <- client.getStorageDeviceState(net.secondDeviceId)
+
+      // RB-W20: a resumed pass past the end of the tree, whose retry of a readable object hits a full destination.
+      // The pass fails as out of space, not as an accepted loss of that object
+      _ = RebuildState.save(staging, RebuildState.load(staging).get.copy(
+            lastRestoredKey = Some(Key(Array.fill[Byte](16)(-1))), failedObjects = List(ids.head, ids(1))))
+      full <- rebuild(Set(doomed), episode, outOfSpaceKeys = Set(Key(ids(1).toBytes))).complete.transform(Success(_))
+      fullPool <- client.getStoragePool(PoolId.BootstrapPoolId)
+      fullEntry <- fullPool.errorTree.get(MissedUpdateMarker.errorKey(storeId, ids(1)))
+      fullLostEntry <- fullPool.errorTree.get(MissedUpdateMarker.errorKey(storeId, ids.head))
+      fullLeft = RebuildState.load(staging).map(_.failedObjects.toSet)
+      fullPlaced = os.exists(dev / storeId.directoryName)
+
       accepted <- rebuild(Set(doomed), episode).complete.transform(Success(_))
 
       pool <- client.getStoragePool(PoolId.BootstrapPoolId)
@@ -74,6 +88,13 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       // The acceptance keeps the entry's episode, so it applies to this rebuild
       flagged.stores(storeId).rebuildEpisode should be(episode)
       episode should not be(None)
+      // A full destination during the retries fails the pass with the out-of-space cause, records nothing as lost, and
+      // leaves both objects in the checkpoint for the next pass
+      Backend.isOutOfSpace(full.failed.get) should be(true)
+      fullPlaced should be(false)
+      fullEntry should be(None)
+      fullLostEntry should be(None)
+      fullLeft should be(Some(Set(ids.head, ids(1))))
       // With it the rebuild finishes, and the lost object, only that one, is recorded for repair
       accepted should be(Success(()))
       os.exists(dev / storeId.directoryName / StoreConfig.configFilename) should be(true)

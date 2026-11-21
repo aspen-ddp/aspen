@@ -58,7 +58,9 @@
   AllocationTree is marked in the ErrorTree against this store (`MissedUpdateMarker.mark`, missed at
   `HLCTimestamp.Zero`), durably before `finish`, and the pass finishes with a `REBUILD ACCEPTED LOSS` error line; repair
   restores the slice if the object becomes readable. A failed mark fails the pass. The `MaxFailedObjects` abort is not
-  lifted by an acceptance
+  lifted by an acceptance. An out-of-space retry latches the abort (`latchOutOfSpace`, `REBUILD OUT OF SPACE`); the
+  latch is checked after the retries, before `lossAccepted`, so the pass fails with the latched cause and a full
+  destination never becomes an accepted loss
 - Timed object reads (rebuild-process.md 5.2): every object read of the walk, the sweep and `retryFailures` goes
   through `client.withReadTimeout(objectReadTimeout)` (default `ObjectReadTimeout`, 30 s). A `ReadTimeout` is a
   failed object like any other read failure: the walk records it and moves on (toward `MaxFailedObjects`, and

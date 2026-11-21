@@ -236,7 +236,7 @@ that every store votes and takes locks.
 
 ### 4.4 The finalizer and at-least-once semantics
 
-`TransactionDriver.onResolution(committed = true)` records the resolution time and calls `startFinalizer`, which
+`TransactionDriver.onResolution(committed = true)` records the resolution time and calls `FinalizerRunner.start`, which
 creates the finalizer (every action executes in `Finalizer`'s constructor), hands it
 `commitVoters(countedCommitVoters, peerIncarnations)` and the `commitErrors` collected so far, and on success calls
 `onFinalized(true, handedOffStores)`. `onFinalized` queues `TxFinalized(outcome, late, owed)` to every data store and
@@ -258,7 +258,7 @@ the client.
   attempt.
 * **Failure path.** A finalizer that cannot be created, or whose `complete` fails, is logged at error and started
   again from scratch after `finalizerRetryDelay` (1 s doubling to 60 s), until one completes, the driver finalizes
-  another way, or it shuts down (`finalizerFailed`). The transaction is never finalized without its actions: without
+  another way, or it shuts down (`FinalizerRunner.failed`). The transaction is never finalized without its actions: without
   the marker's entries a missed store would stay stale and an owed store could not find its entry. A failure that
   repeats forever is a stall, alarmed by `FINALIZATION STALLED`, never a lost mark.
 * **At-least-once, not at-most-once.** Two drivers that both learn commit each run the actions, and a driver that dies
@@ -267,7 +267,7 @@ the client.
   forward).
 * **Second driver.** A driver reached by another driver's non-late commit `TxFinalized` cancels its own finalizer,
   reads the stores its marker had already handed entries off for (`handedOffStores`, failed finalizers' included via
-  `failedHandedOff`), and finalizes at once with `owed` = the received `owed` plus that set. It never waits for its own
+  `FinalizerRunner.failedHandedOff`), and finalizes at once with `owed` = the received `owed` plus that set. It never waits for its own
   marker's write, so it finalizes while the stores that forgot T still hold their finalized cache entries. Its entries
   may land after its `TxFinalized`; a stub may then precede its entry, which is harmless (5.4).
 * **A driver that resolved commit ignores an abort `TxFinalized`** (Committed wins; reported as a split decision).
@@ -738,7 +738,7 @@ lookup that finds no entry.
    -> local proposal fixed; ACCEPT to primary-pool stores (+ prepares every third send); learn-only: no Accept
    -> learner: Accepted quorum   ==> resolved(c)         [or TxResolved / TxFinalized from a peer]
       proof + memoryless post-proof quorum (inside the horizon), or late message ==> resolveLate: finalized, no actions
-   resolved(c): commit => startFinalizer ; abort => finalized at once
+   resolved(c): commit => FinalizerRunner.start ; abort => finalized at once
    -> TxResolved to all data stores + notifyOnResolution + client; re-sent to stores not known resolved
    -> commit: finalizer.complete ==> TxFinalized(owed) to stores, TransactionFinalized to client
       finalizer failed ==> restart after 1 s .. 60 s; unfinalized 60 s after resolution ==> stall alarm

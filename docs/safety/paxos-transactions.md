@@ -237,13 +237,13 @@ nothing. Data
 adopted from a later prepare is saved before a commit applies it (`Tx.adoptedDataUnsaved`, `saveAdoptedData`).
 
 **P14 Finalization ordering.** A driver sends `TxFinalized(commit)` and `TransactionFinalized` only after every
-FinalizationAction completed (`TransactionDriver.startFinalizer`; a failed finalizer is restarted, never skipped).
+FinalizationAction completed (`FinalizerRunner.start`; a failed finalizer is restarted, never skipped).
 `TxFinalized(abort)` is sent at resolution. A store deletes a committed T's CRL record only after `TxFinalized` and its
 backend commits (`Frontend.transactionFinalized`). A commit `TxFinalized` carries `owed`: the stores the finalizer's
 marker handed UnackedCommits entries off for, set with the finalization and empty for aborts and late commits
 (`TransactionDriver.onFinalized(committed, owedStores)`). A store named there replaces its record by an applied stub.
 A driver reached by another driver's non-late commit `TxFinalized` cancels its own finalizer and finalizes at once with
-the received `owed` plus the stores its own markers had handed off (`handedOffStores`, `failedHandedOff`). Its entries
+the received `owed` plus the stores its own markers had handed off (`FinalizerRunner.handedOffStores`, `FinalizerRunner.failedHandedOff`). Its entries
 may then become durable after its `TxFinalized`; the ordering holds for the first finalizer to complete, and the
 repair scan allows for the rest.
 
@@ -362,7 +362,7 @@ Notation: client `C`; primary pool stores `P0..P4`, leader `L = P2`, `t = 3`; on
 | 9 | `Learner.receiveAccepted` counts distinct peers at the highest id; at `t` it fixes the value. | `common/paxos/Learner` |
 | 10 | `onResolution`: commit starts the finalizer; abort finalizes at once. `TxResolved` to every store plus `notifyOnResolution`; `TransactionResolved` to the client. | `TransactionDriver.onResolution` |
 | 11 | Stores apply or abort (9.1). | `Tx.resolved`, `resolvedAndAllObjectsLoaded` |
-| 12 | The finalizer completes: `onFinalized(true, handedOffStores)` sends `TxFinalized` to every store and `TransactionFinalized` to the client; the driver shuts down. | `TransactionDriver.startFinalizer`, `onFinalized` |
+| 12 | The finalizer completes: `onFinalized(true, handedOffStores)` sends `TxFinalized` to every store and `TransactionFinalized` to the client; the driver shuts down. | `FinalizerRunner.start`, `onFinalized` |
 | 13 | Store `TxFinalized`: the Tx is forgotten, the cache entry marked finalized, the CRL record deleted or stubbed once the backend commits are done. | `Tx.receiveFinalized`, `Frontend.transactionFinalized` |
 
 The abort path sends `TxFinalized` (and `TransactionFinalized`) before the `TxResolved` messages, since `onFinalized`
@@ -579,10 +579,10 @@ only replies.
 ### 7.7 Finalization failures
 
 A finalizer that cannot be created, or whose `complete` fails, is logged at error and started again from scratch after
-a backoff (`finalizerFailed`, `finalizerRetryDelay`) until one completes, the driver finalizes another way, or it is
+a backoff (`FinalizerRunner.failed`, `finalizerRetryDelay`) until one completes, the driver finalizes another way, or it is
 shut down. A transaction is never finalized without its actions: the marker's ErrorTree marks and UnackedCommits
 entries are what repair and owed stores rely on. `owed` includes the planned stores of failed finalizers
-(`failedHandedOff`). A committed transaction unfinalized 60 s after its resolution is a finalization stall
+(`FinalizerRunner.failedHandedOff`). A committed transaction unfinalized 60 s after its resolution is a finalization stall
 (`finalizationStall`, `Store.stalledFinalizations`, `FinalizationStallReport`).
 
 ---
@@ -603,7 +603,7 @@ nothing more (`Tx.saveState` requires it; P9).
 | `TxAcceptResponse` | acceptor state with `accepted = (id, v)`, the disposition as it then is | `Tx.receiveAccept` |
 | `TxResolved`, `TransactionResolved` from a driver | `t` `Accepted`, each durable at its acceptor | `TransactionDriver.onResolution` |
 | `TxCommitted` | every backend commit of the store for T completed; the CRL data drop enqueued | `Tx.allObjectCommitsComplete` |
-| `TxFinalized(commit)` | every FinalizationAction completed | `TransactionDriver.startFinalizer` |
+| `TxFinalized(commit)` | every FinalizationAction completed | `FinalizerRunner.start` |
 
 Not durable before sending: a proof (its evidence is the durable backend state), status-cache relays, a deleted
 abort's `TxResolved(false)` (`Tx.answerResolved`), `TxCommitted` re-sends, status replies (10.10; a commit vote is

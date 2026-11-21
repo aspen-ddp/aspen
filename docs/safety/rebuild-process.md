@@ -627,7 +627,7 @@ excluded): key `poolIndex || objectId`, value the timestamp and the object's sto
 A store that never voted gets no UnackedCommits entry, only the ErrorTree mark. Deletes are covered the same way: the
 refcount update is a change to a hosted object, and the entry keeps the store pointer, the only copy once the
 allocation-tree entry is gone. The marker runs in parallel with T's other finalization actions; a marker that fails
-fails the finalizer, which `TransactionDriver.startFinalizer` restarts after a backoff, so the transaction stays
+fails the finalizer, which `FinalizerRunner.start` restarts after a backoff, so the transaction stays
 unfinalized (its stores keep it) until its marks land.
 
 ### 8.2 Processing

@@ -40,7 +40,7 @@ object RegisteredTransactionFinalizerFactory {
     * `complete` settles once every action has settled: it fails with the first failure, or succeeds if none failed. It
     * relies on every action settling (an action that gives up fails its `complete`, never leaves it pending); failing
     * earlier would let the driver cancel the marker before it writes. The driver then starts a fresh finalizer
-    * (TransactionDriver.startFinalizer).
+    * (FinalizerRunner.start).
     */
   class Finalizer(val actions: List[FinalizationAction])(using ec: ExecutionContext) extends TransactionFinalizer {
 

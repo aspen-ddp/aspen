@@ -155,7 +155,7 @@ Details are in [transaction-recovery.md](transaction-recovery.md); what repair r
    another, either kind first).
 6. `writeBatch` is one `replaySafe` transaction over both trees, retried until it succeeds except on
    `TransactionCreationError` or `NodeSizeExceeded` (then the batch fails and the driver re-runs the finalizer with
-   backoff, `TransactionDriver.startFinalizer`). Its puts are conditional (`TKVLInsert.replaces`): an ErrorTree mark
+   backoff, `FinalizerRunner.start`). Its puts are conditional (`TKVLInsert.replaces`): an ErrorTree mark
    replaces a held one only for a later `missedTimestamp`, and otherwise writes the held value again, which moves
    its revision; an UnackedCommits entry is written only where none is held (otherwise it is dropped from the batch
    with no write and no requirement). A replaced or new key carries a

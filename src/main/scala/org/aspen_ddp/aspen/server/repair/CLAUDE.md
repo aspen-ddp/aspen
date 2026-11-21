@@ -1,4 +1,5 @@
 ### Repair
+- Files: `StoreRepairer.scala` (the scan, sweep and per-entry repair, plus `ScanResult`, `SweepResult`, `ScanControl`), `DeferralState.scala` (per-entry lock-deferral and stale-pass counts), `RepairService.scala` (scheduling), `ScanState`/`RepairPolicy`/`HostRepairLimits` (pacing and limits), `RepairProofs.scala`, `RepairTarget.scala`
 - Inputs: ErrorTree entries for stores that missed `errorTimeout` and UnackedCommits entries
   (`client/internal/transaction/CLAUDE.md`), both kept in the pool's metadata trees
 - Repair reconciles exactly (`server.store.Reconcile`): it snapshots the store's copy, reads the object, then

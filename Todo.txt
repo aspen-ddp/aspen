@@ -39,34 +39,7 @@ PRIORITY 0: design rules
 PRIORITY 1: lost committed data, split decisions, device-wide loss
 ------------------------------------------------------------------
 
-Prerequisite: 1.2, 1.3, 2.3, 2.4 and 3.1 are one family with X-W30 (5.1): os-lib existence tests that answer absent on
-a failed stat. Fix them first, individually, with tests that fail a stat via a directory lacking search permission; 5.1
-then sweeps what remains.
-
-1.1 [S] CRL-W19 + X-W28: a closed store's transfer-out extraction loses its CRL state to a load retry
-    (CONFIRMED). StoreTransfersOut.extractFromDirectory saves the state to crl_save.log and queues final
-    deleteTransactions; opensStarted is checked only when CRL calls answer. A StoreLoader.retryFailedLoads load
-    meanwhile gets an empty dropStore that completes at once, its loadStore saves skipped as "after final deletion"
-    (SimpleCRL.skippedAfterFinalDeletion) yet acknowledged, and StoreRouter.crlLoaded removes the save file: the
-    store serves without its promises, accepts and commit votes. Two parts:
-    (a) CRL: an empty dropStore/deleteTransactions completes through whenWritten, a barrier behind earlier entries;
-    (b) host (X-W28): a load retry serves only a store whose device entry is Active or Offline, not declaredMissing,
-        not being extracted or marked for transfer out, not being rebuilt. (b) also closes RB-W21's running-host path.
-    Update cross-document-review 2.1 ("a save acknowledged without being written belongs to a concluded
-    transaction") once the extraction exception is gone.
-
-1.2 [S] SL-W21: the device CRL's open takes a failed stat for missing stream files (CONFIRMED).
-    CrlDirectory.streamFiles (os.isDir), StreamReader (os.exists), DeviceFactory.openCRL and removeUncommittedGrowth
-    use os-lib. A failed first check throws CrlMissing (every store on the device declared lost); a failed check in
-    createStreamsIfNew under mustExist creates new streams and os.move(atomicMove) renames them over the live ones:
-    the CRL opens empty under live stores. Fix: FileStat throughout the open, a failed stat transient
-    (DeviceDiscovery.isTransient path), and createStreamsIfNew never creates under mustExist.
-
-1.3 [S] X-W29: a failed stat of a rebuilt store's acceptor-since or inherited-votes file loads it as a full
-    acceptor (PLAUSIBLE). RebuildingStore.readAcceptorSince / readInheritedVotes use os.exists; StoreLoader.handleLoad
-    passes None into the Store, so within finish + 10 s it joins transactions its old incarnation joined, and before
-    its held-vote round it votes over inherited locks (split decision, RebuiltVoterLockIntegrationSuite shape). Fix:
-    FileStat, a failed stat held back through awaitUnreadRetry like the save and incarnation files.
+(no open items)
 
 (RB-W19, a running host serving a tombstoned device's stores through their rebuild, is an accepted limitation:
 rebuild-process.md B19.)
@@ -90,31 +63,18 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
     (InvalidObject.provesDeletion, type from the FSIF header), or re-read the repaired object first. Cross-check
     rebuild-process FS6, which relies on the same id-checked repair delete.
 
-2.3 [S] SL-W22: FSIF recovery drops, then empties, a next-seq journal whose stat fails (CONFIRMED).
-    FsifRecovery.load reads a failed NioFsifFiles.exists as no journal and replays without seq m+1; step 5 then
-    finds it and truncates it as stale: acknowledged commits lost, replica divergent. Fix: FileStat in NioFsifFiles.
-    Update server/store/backend/fsif/DESIGN.md 3.11 and 4.1.
-
-2.4 [S] SL-W24: StoreCopies.delete reports a copy it could not stat as deleted (CONFIRMED). StoreTransfers.startIn
-    then finds the transferred-in marker with FileStat and resumes the pool update onto the stale or lost copy it
-    just rejected; the source's intact copy is retired. A failed marker read yields an empty id, counted stale. Fix:
-    FileStat in delete (failure is failure), and a marker read error waits rather than counts as stale.
-
 2.5 [S] RB-W21: a copy that serves between rebuild passes leaves the resumed walk's done part stale with no mark
     (PLAUSIBLE). A Missing Stores directory that comes back after the checkpoint is served by a restart's device
-    load (or a load retry, closed by 1.1b), acknowledges commits, and is then retired by retireForeignCopy, but the
-    next pass resumes the checkpoint: its acknowledged updates on walked objects are never marked (t = r, exactly t
-    voters: t - 1 < r copies). Fix: retireForeignCopy deletes the staging directory before marking or fail-stopping
+    load (a load retry waits while the store is declared or Rebuilding), acknowledges commits, and is then retired
+    by retireForeignCopy, but the next pass resumes the checkpoint: its acknowledged updates on walked objects are
+    never marked (t = r, exactly t voters: t - 1 < r copies). Fix: retireForeignCopy deletes the staging directory before marking or fail-stopping
     a foreign copy, forcing a first pass.
 
 
 PRIORITY 3: systemic loss protection
 ------------------------------------
 
-3.1 [S] SL-W23: a failed stat at a backend open declares the store lost (D5) (CONFIRMED). FsifBackend.open (os.isDir,
-    isBlank), FsifRecovery.recover's index and journal loads and RocksDBBackend.openDatabase (os.exists(CURRENT))
-    throw BackendStateLost on a failed stat, marked with no retry; one device hiccup marks every store on it in a
-    scan. Fix: FileStat; a failed stat is an I/O error the load retries (storesAwaitingRetry).
+(no open items)
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
@@ -139,8 +99,7 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.1 [M] X-W30 + P-W10 + RB-W22 + SL-W25: the remaining os-lib existence tests (CONFIRMED). After 1.2, 1.3, 2.3, 2.4
-    and 3.1, replace every os.exists / os.isDir / os.isFile under server/ with FileStat, deciding per site whether a
+5.1 [M] X-W30 + P-W10 + RB-W22 + SL-W25: the remaining os-lib existence tests (CONFIRMED). Replace every os.exists / os.isDir / os.isFile under server/ with FileStat, deciding per site whether a
     failed stat waits, throws or is safe either way, and add a test that fails on any new use outside FileStat.
     Sites with findings: DeviceDiscovery.bringIntoService skips the ArrivedAtFile (P-W10: a lower forget floor after
     adoption); RebuildingStore.isRebuildCompleteFor swallows a read error and retires a finished copy (RB-W22: a

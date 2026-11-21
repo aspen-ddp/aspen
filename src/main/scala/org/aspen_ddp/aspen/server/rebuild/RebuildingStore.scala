@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjec
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.network.PendingAllocation
 import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId}
-import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
+import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.store.{Frontend, StoreIncarnationFile}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, StoreCreation}
@@ -112,10 +112,11 @@ object RebuildingStore:
     DurableFiles.write(storePath / AcceptorSinceFile, at.asLong.toString)
 
   /** The store's acceptor start, if it was rebuilt. A file that cannot be read counts as now plus the margin: later
-   *  than the truth, which only mutes more transactions */
+   *  than the truth, which only mutes more transactions. A stat that fails throws (FileStat): None only for a file known
+   *  absent, never for one that may be there (StoreLoader.handleLoad holds the load back) */
   def readAcceptorSince(storePath: os.Path): Option[HLCTimestamp] =
     val file = storePath / AcceptorSinceFile
-    if !os.exists(file) then
+    if !FileStat.exists(file) then
       None
     else
       Some(scala.util.Try(HLCTimestamp(os.read(file).trim.toLong)).getOrElse(acceptorSinceAfter(HLCTimestamp.now)))
@@ -142,7 +143,8 @@ object RebuildingStore:
    *  horizon and both margins: later than the truth, as the store loads after its rebuild's pass began */
   def readInheritedVotes(storePath: os.Path, horizon: FiniteDuration): Option[Long] =
     val file = storePath / InheritedVotesFile
-    if !os.exists(file) then
+    // A stat that fails throws (FileStat), as readAcceptorSince's does
+    if !FileStat.exists(file) then
       None
     else
       Some(scala.util.Try(os.read(file).trim.toLong)

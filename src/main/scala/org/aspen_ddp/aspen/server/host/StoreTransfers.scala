@@ -365,8 +365,9 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         // copy then released, as promotion refuses for a staged copy. Until the pool update
         // commits the source still holds the state, so either is discarded and the transfer
         // started over.
-        // A save file that cannot be read (CrashRecoveryLog.isUnreadable), or a marker whose stat fails (FileStat),
-        // says nothing of the copy: it is neither resumed nor discarded, and the next check reads it again.
+        // A save file that cannot be read (CrashRecoveryLog.isUnreadable), or a marker whose stat or read fails
+        // (FileStat), says nothing of the copy: it is neither resumed nor discarded, and the next check reads it again.
+        // Nor is one whose delete could not stat it (StoreCopies.delete answers not gone): the copy stays stale-kept.
         val promotedMarker = finalPath / StoreTransfer.TransferredInMarkerFile
         val promoted = FileStat.existence(promotedMarker)
         val staleKept = !promoted.contains(false) &&
@@ -375,7 +376,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
               try
                 if promoted.isEmpty then
                   FileStat.exists(promotedMarker) // Throws the stat's error, to be logged below
-                val markerId = try os.read(promotedMarker).trim catch case _: Throwable => ""
+                // A read that fails says nothing of which transfer the copy belongs to: thrown, so the copy waits
+                val markerId = os.read(promotedMarker).trim
                 if !transferId.exists(_.toString == markerId) then
                   Right(Some(s"it belongs to transfer '$markerId', not to the current transfer $transferId"))
                 else if StoreDirMarkers.has(finalPath, StoreDirMarkers.Marker.RebuildRequired) then

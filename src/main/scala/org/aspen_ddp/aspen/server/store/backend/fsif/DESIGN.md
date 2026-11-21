@@ -404,7 +404,8 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
 
 - **No create on open** (systemic-loss-protection 4.1, row D5; 2.3 creation). A missing
   store directory, or one whose FSIF files are all absent or empty (`FsifRecovery.isBlank`), is `StoreLost` (L0):
-  creation is atomic, so such a directory lost its store. Every other directory is recovered.
+  creation is atomic, so such a directory lost its store. Every other directory is recovered. A stat that fails
+  (`server.FileStat`) is an I/O error, retried, not an absence.
 - **onFatal** posts `BackendFailed`. The routes are listed in section 4.2.
 - **Frozen close.** `ShutdownStore` logs and closes without waiting for space.
 - **`estimateSize`** is the sum of the data, journal and index file sizes.
@@ -562,7 +563,11 @@ under `src/test/scala/org/aspen_ddp/aspen/server/store/backend/fsif/` unless nam
   - it moves the store to a state whose own recovery yields the same objects (step 5: finish the interrupted
     checkpoint by writing index m+1 and emptying journal m and index m, or empty stale files).
 
-  A crash inside recovery followed by another recovery therefore yields the same state.
+  A crash inside recovery followed by another recovery therefore yields the same state. Steps 1 and 5 decide on
+  whether files exist (`FsifFiles.exists`/`size`); `NioFsifFiles` answers them with `server.FileStat`, so a file is
+  absent only when known absent and a stat that fails throws an `IOException` out of the open (4.6). Read as an
+  absence, a failed stat of journal m+1 in step 1 would replay without it, and step 5, finding it again, would empty
+  it as stale.
 - **Tests:** `FsifRecoverySuite` "recover is idempotent across crashes inside recover (30 seeds)", which crashes at
   every op k and then again at a random op; `FsifModelSuite` "crash during recovery"; `FsifRecoverySuite` "index s
   valid, index s+1 torn, journals s and s+1 recover the union and finish the checkpoint".
@@ -631,7 +636,9 @@ step in `FsifRecovery.recover` (the numbered step comments) and the `StoreLost` 
 All of these are thrown from `FsifBackend`'s constructor through `FsifBackend.open`. The host reaction is the same
 for each: `StoreLoader.handleBackendOpened` logs, leaves the store offline, writes `rebuild-required`
 (`StoreRebuilds.markRebuildRequired`), and calls `DeviceReconciler.checkStorageDevice`. The `rebuild-required` marker is acted on as
-described in 4.5. A plain `IOException` from the open is not a loss (4.6).
+described in 4.5. A plain `IOException` from the open is not a loss (4.6). Every absence below is a known one: the
+directory and file tests are `server.FileStat`'s, so a stat that fails is such an `IOException`, never L0 or a
+missing index or journal.
 
 | # | Trigger | Where (`FsifRecovery.recover` unless noted) | Why it is believed to mean loss | What a false trigger from a systemic bug looks like |
 |---|---|---|---|---|

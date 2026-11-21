@@ -156,7 +156,7 @@ class Frontend(val storeId: StoreId,
                  * (RebuildingStore.InheritedVotesFile): from when, in wallClockMillis milliseconds, its peers' held
                  * votes are complete. See inheritedVoteLock. None: none inherited
                  */
-               inheritedVotesAfter: Option[Long] = None,
+               val inheritedVotesAfter: Option[Long] = None,
                /** Asks the pool's other stores for the votes they hold: see inheritedVoteLock */
                val heldVoteQuery: HeldVoteQuery = HeldVoteQuery.Never,
                /** Recovers nothing at construction: transaction messages are held until recover is called. For

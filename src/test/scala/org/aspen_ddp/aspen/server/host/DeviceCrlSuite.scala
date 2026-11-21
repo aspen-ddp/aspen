@@ -1592,6 +1592,39 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       recoveredFromFile should be(true)
       os.exists(Backend.crlSaveFile(storeDir)) should be(false)
 
+  for gate <- List(RebuildingStore.AcceptorSinceFile, RebuildingStore.InheritedVotesFile) do
+    atest(s"a rebuilt store whose $gate file cannot be stat'd at its load is held back, never served as a full acceptor (X-W29)"):
+      given ExecutionContext = executionContext
+      val factory = newFactory()
+      val since = HLCTimestamp(HLCTimestamp.now.asLong + (3600L * 1000 << 16))
+      val gateAfter = System.currentTimeMillis() + 3600L * 1000
+      for
+        (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+        // A rebuilt store: both gates written by its finish. The one under test is reached through a link into a
+        // directory without search permission, so its stat alone fails (EACCES) while the rest of the directory reads
+        _ = RebuildingStore.writeAcceptorSince(storeDir, since)
+        _ = RebuildingStore.writeInheritedVotes(storeDir, gateAfter)
+        locked = hostRoot / "locked"
+        _ = os.makeDir(locked)
+        _ = os.move(storeDir / gate, locked / gate)
+        _ = os.symlink(storeDir / gate, locked / gate)
+        _ = os.perms.set(locked, "rw-------")
+        host = newCrlHost(hostRoot, factory)
+        _ <- pumpUntil(host, host.control.loader.awaitingRetryHasCallback(storeId).isDefined)
+        servedWhileUnreadable = host.control.router.loaded.contains(storeId)
+        _ = os.perms.set(locked, "rwx------")
+        _ = host.control.reconciler.scan()
+        _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+        store = host.control.router.loaded(storeId)
+        loadedSince = store.frontend.acceptorSince
+        loadedGate = store.frontend.inheritedVotesAfter
+        _ <- store.backend.close()
+        _ = factory.shutdownAll()
+      yield
+        servedWhileUnreadable should be(false)
+        loadedSince should be(Some(since))
+        loadedGate should be(Some(gateAfter))
+
   atest("a store whose save file cannot be read at its load is held back and retried, never declared lost (SL-W18)"):
     given ExecutionContext = executionContext
     val factory = newFactory()

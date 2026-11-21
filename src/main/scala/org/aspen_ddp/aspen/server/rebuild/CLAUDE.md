@@ -2,7 +2,9 @@
 - Files: `RebuildingStore.scala` (the pass: walk, restore, retry, finish; the on-disk marker files), `PendingAllocationSweep.scala` (the peer query for allocations held unfinalized and the direct restore of those objects, reaching the pass through callbacks), `RebuildState.scala` (checkpoint), `StoreRebuild.scala`. `RebuildingStore.missMark` builds the ErrorTree mark (missed at `HLCTimestamp.Zero`) every rebuild record uses
 - A rebuilt store lost its Paxos acceptor state. `RebuildingStore.finish` writes `acceptor-since` (finish time plus
   `AcceptorSinceMargin`, 10 s) into its directory; how the Frontend enforces it: `server/store/CLAUDE.md`. The
-  margin covers `Frontend.MaxStartLead` (2 s) plus host-to-host clock skew; client clocks do not enter into it
+  margin covers `Frontend.MaxStartLead` (2 s) plus host-to-host clock skew; client clocks do not enter into it.
+  `readAcceptorSince` and `readInheritedVotes` stat with `server.FileStat`: None only for a file known absent; a
+  failed stat throws, and `StoreLoader.handleLoad` holds the load back. An unreadable file reads late (only mutes more)
 - `finish` also writes `inherited-votes` (`writeInheritedVotes`): the pass start (`passStartMillis`, reset by each
   `runPass`) plus the `horizon` parameter (default `TransactionHorizon.Horizon`, the longest a host uses) plus twice
   `AcceptorSinceMargin`. From then on every vote on a transaction the old incarnation joined has been cast, so the

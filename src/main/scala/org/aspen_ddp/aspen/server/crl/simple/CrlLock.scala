@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
+import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.server.crl.CrlLocked
 
 import java.nio.channels.{FileChannel, FileLock}
@@ -37,7 +38,7 @@ object CrlLock:
   def acquire(dir: os.Path): CrlLock = held.synchronized:
     os.makeDir.all(dir)
     val path = dir / LockFilename
-    if !os.exists(path) then
+    if !FileStat.exists(path) then
       os.write(path, "")
     val attrs = Files.readAttributes(path.toNIO, classOf[BasicFileAttributes])
     val key: AnyRef = Option(attrs.fileKey()).getOrElse(path.toNIO.toRealPath())

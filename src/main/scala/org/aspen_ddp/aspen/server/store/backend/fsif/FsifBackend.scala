@@ -16,6 +16,7 @@ import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectType, ReadError}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitError, CommitState, CompletionHandler, Read,
   RepairSlotOccupied, RetryScheduler, SharedRetryScheduler, UpdateForm}
 
@@ -1732,14 +1733,15 @@ object FsifBackend:
 
   /** Opens the existing store in `path`. Never creates: a store directory exists only once its store was created
     * (StoreCreation), so a missing directory, or one whose FSIF files are all absent or empty (FsifRecovery.isBlank),
-    * lost its store and throws StoreLost (systemic-loss-protection 4.1, row D5), with nothing written.
+    * lost its store and throws StoreLost (systemic-loss-protection 4.1, row D5), with nothing written. Only a known
+    * absence is: a stat that fails throws its IOException (server.FileStat), an I/O error the host's load retries.
     *
     * @throws FsifRecovery.StoreLost if the store's acknowledged state cannot be recovered
     * @throws java.io.IOException    on an I/O error, including running out of space (FsifIo.isOutOfSpace)
     */
   def open(storeId: StoreId, path: os.Path, layout: FsifLayout, io: ExecutionContext,
            onFatal: Throwable => Unit, tuning: FsifTuning = FsifTuning()): FsifBackend =
-    if !os.isDir(path) then
+    if !FileStat.isDir(path) then
       throw new FsifRecovery.StoreLost(s"FSIF store $storeId: its directory $path is missing")
     val files = new NioFsifFiles(path)
     if FsifRecovery.isBlank(files) then

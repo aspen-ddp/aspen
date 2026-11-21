@@ -4,7 +4,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
 
-import org.aspen_ddp.aspen.server.DurableFiles
+import org.aspen_ddp.aspen.server.{DurableFiles, FileStat}
 
 /** A positional-I/O file. Reads see everything written so far; only `force` makes it durable. */
 trait FsifFile:
@@ -21,8 +21,11 @@ trait FsifFile:
 trait FsifFiles:
   /** Creates the file if missing */
   def open(name: String): FsifFile
-  /** The file's current size (including unforced writes), or 0 if it does not exist. Opens nothing. */
+  /** The file's current size (including unforced writes), or 0 if it is known not to exist. Opens nothing. A stat
+   *  that fails throws its IOException, never reads as an absent or empty file */
   def size(name: String): Long
+  /** False only for a file known absent: a stat that fails throws its IOException (server.FileStat), which the host's
+   *  load retries, so recovery never replays without a journal or index that is there (fsif/DESIGN.md 4.1) */
   def exists(name: String): Boolean
 
 object FsifIo:
@@ -44,11 +47,9 @@ final class NioFsifFiles(dir: os.Path) extends FsifFiles:
         throw t
     new NioFsifFile(channel)
 
-  def exists(name: String): Boolean = os.exists(dir / name)
+  def exists(name: String): Boolean = FileStat.exists(dir / name)
 
-  def size(name: String): Long =
-    val path = dir / name
-    if os.exists(path) then os.size(path) else 0L
+  def size(name: String): Long = FileStat.stat(dir / name).map(_.size).getOrElse(0L)
 
 private final class NioFsifFile(channel: FileChannel) extends FsifFile:
 

@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.crl.simple
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
-import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, StorageDeviceConfig}
+import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, FileStat, StorageDeviceConfig}
 import org.aspen_ddp.aspen.server.store.backend.BackendTiming
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlConfigInvalid,
   CrlClosed, CrlFailed, CrlLocked, CrlMissing, CrlSizingDefaults, CrlSizingMismatch, StoreRecoveryState, TransactionRecoveryState}
@@ -65,7 +65,7 @@ object SimpleCRL extends Logging:
       // files without a sizing file are damage, which SimpleCRL.apply refuses (CrlSizingMismatch): a config refusal
       // must not hide that
       val sizing =
-        if os.exists(dir / SizingFile) || streamFiles(dir).nonEmpty then
+        if FileStat.exists(dir / SizingFile) || streamFiles(dir).nonEmpty then
           CrlSizingDefaults.resolveExisting(config, capacity)
         else
           try CrlSizingDefaults.resolve(config, capacity)
@@ -735,11 +735,15 @@ class SimpleCRL private (streamsDir: os.Path,
 
   /** Each id's deletions go to the newest unwritten entry, which is sealed when they would overflow it (W1), and the
     * handler to the last: it runs once every deletion is durable. `resavable` deletions are cancelled by a save of the
-    * same id later in their entry (LogEntry.deleteTxUnlessResaved) */
+    * same id later in their entry (LogEntry.deleteTxUnlessResaved). An empty list is a barrier (whenWritten): it
+    * completes once every earlier request is durable, so earlier deletions of the store's ids (a transfer out's
+    * extraction) are written before a caller saves them again, and those saves create records rather than being
+    * skipped behind a final deletion (skippedAfterFinalDeletion) */
   private def onDeleteTransactions(storeId: StoreId, transactionIds: List[TransactionId], resavable: Boolean,
                                    completionHandler: () => Unit): Unit =
     if transactionIds.isEmpty then
-      complete(completionHandler)
+      whenWritten(completionHandler)
+      startWrite()
     else
       transactionIds.foreach: transactionId =>
         val txid = TxId(storeId, transactionId)

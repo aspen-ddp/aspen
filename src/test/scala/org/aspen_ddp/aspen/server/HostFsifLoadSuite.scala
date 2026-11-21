@@ -544,6 +544,57 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         host.getStoreIds should contain(storeId)
         host.control.router.offlineStores should not contain storeId
 
+  // X-W28: tryLoadStore reads no tree, so a retry waits while the device's latest reconcile found the store's entry
+  // neither Active nor Offline, or the store declared missing, and is dropped once the entry has left the device
+  atest("a load retry waits while the reconciled entry is not Active or Offline, and serves the store once it is (X-W28)"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+      fsif(host).failedOpens = 1
+      load(host)
+      fsif(host).opens should be(1)
+      val sds = host.control.devices.devices(deviceA)
+      def scans(n: Int): Unit = (0 until n).foreach: _ =>
+        host.control.reconciler.scan()
+        host.testingOnlyHandleEvents()
+      def entry(status: StorageDeviceState.StoreStatus): Map[StoreId, StorageDeviceState.StoreEntry] =
+        Map(storeId -> StorageDeviceState.StoreEntry(status, None))
+
+      // A transfer out or a rebuild owns the copy: held, its backoff spent
+      for status <- List(StorageDeviceState.StoreStatus.TransferringOut, StorageDeviceState.StoreStatus.Rebuilding) do
+        sds.reconciledEntries = Some(entry(status))
+        scans(3)
+        fsif(host).opens should be(1)
+        host.control.loader.awaitingRetryWaitScans(storeId) should be(defined)
+      // Declared missing by the Missing Stores pass, its entry still Active
+      sds.reconciledEntries = Some(entry(StorageDeviceState.StoreStatus.Active))
+      sds.declaredMissing += storeId
+      scans(1)
+      fsif(host).opens should be(1)
+      sds.declaredMissing -= storeId
+      scans(1)
+      fsif(host).opens should be(2)
+      host.getStoreIds should contain(storeId)
+
+  atest("a load retry is dropped once the reconciled entries no longer name the store (X-W28)"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+      fsif(host).failedOpens = 1
+      load(host)
+      host.control.devices.devices(deviceA).reconciledEntries = Some(Map())
+      host.control.reconciler.scan()
+      host.testingOnlyHandleEvents()
+      fsif(host).opens should be(1)
+      host.control.loader.awaitingRetryWaitScans(storeId) should be(None)
+      host.getStoreIds should not contain storeId
+
   /** Handles `host`'s events, yielding between rounds, until `condition` holds. Silent on exhaustion: the caller
    *  asserts the end state. */
   private def handleUntil(host: Host, rounds: Int = 100)(condition: => Boolean): Future[Unit] =

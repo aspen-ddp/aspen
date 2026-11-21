@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server.host
 
-import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
+import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.LogRateLimit
 import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, Host, StoreConfig}
@@ -344,12 +345,28 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   /** Called once per device scan. Retries the load of every store in storesAwaitingRetry whose backoff has run
    *  out, whose device is still loaded here and not shutting down, and which is still offline and unloaded. Others
    *  are dropped, with their onServed callback unrun: whatever replaced or removed them has taken over. A retry's
-   *  open takes the callback over from the entry (startOpen). */
+   *  open takes the callback over from the entry (startOpen).
+   *
+   *  tryLoadStore reads no tree, so a retry is also held to what the device's latest reconcile read
+   *  (`reconciledEntries`) and to the host's own work on the store (cross-document-review.md 2.2, load retries). It is dropped
+   *  once that reconcile finds no entry for the store on the device: the Deleted Stores pass retires the copy. It
+   *  waits, its backoff spent, while the entry is neither Active nor Offline (TransferringOut, Rebuilding: the
+   *  transfer or the rebuild owns the copy; before the device's first reconcile no entry is known, and nothing the
+   *  tree drives has started on the store but a transfer out, checked next), while the Missing Stores pass has
+   *  declared the store (declaredMissing), while startOut is closing it for a transfer out (its extraction may still
+   *  be deleting the entries its save file holds, crash-recovery-log CRL C1) or while a rebuild of it runs here. Held
+   *  rather than dropped, so a store whose transfer is aborted before its marker is written, or whose entry returns
+   *  to Active, is still served. */
   def retryFailedLoads(): Unit =
     storesAwaitingRetry.foreach: (storeId, wait) =>
       val deviceId = wait.sds.storageDeviceId
+      val entry = wait.sds.reconciledEntries.map(_.get(storeId))
       if ! ctx.devices.isLoaded(wait.sds) || router.get(storeId).isDefined ||
          ! wait.sds.offlineStores.contains(storeId) || opening.contains(storeId) then
+        storesAwaitingRetry -= storeId
+      else if entry.contains(None) then
+        logger.info(s"Store $storeId awaiting a load retry has no entry on device $deviceId any more. Dropping the " +
+                    s"retry")
         storesAwaitingRetry -= storeId
       else if FileStat.existence(wait.storePath / StoreConfig.configFilename).contains(false) then
         // Nothing left to load. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass. A failed
@@ -359,6 +376,12 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         storesAwaitingRetry -= storeId
       else if wait.scansLeft > 1 then
         storesAwaitingRetry += storeId -> wait.copy(scansLeft = wait.scansLeft - 1)
+      else if ! entry.forall(_.exists(e => e.status == StorageDeviceState.StoreStatus.Active ||
+                                           e.status == StorageDeviceState.StoreStatus.Offline)) ||
+              wait.sds.declaredMissing.contains(storeId) || ctx.transfersOut.isClosingForTransfer(storeId) ||
+              ctx.rebuilds.isRebuilding(storeId) then
+        logger.debug(s"Store $storeId awaiting a load retry is not loaded yet: its entry on device $deviceId is " +
+                     s"${entry.flatten.map(_.status)}, or the host is transferring, rebuilding or has declared it")
       else if ! ctx.shutdown.isShuttingDown(deviceId) then
         ctx.tryLoadStore(wait.sds, wait.storePath, None)
 
@@ -408,6 +431,13 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val incarnation =
       if failed then Failure(new IllegalStateException("not read")) else
         Try(StoreIncarnationFile.load(backend.path, backend.storeId))
+    // A rebuilt store's acceptor start and inherited-vote gate. None only when each file is known absent: one whose
+    // stat fails would load the store as a full acceptor, joining its old incarnation's transactions and voting over
+    // their locks, so the load is held back and retried as for the save and incarnation files
+    val rebuiltGates: Try[(Option[HLCTimestamp], Option[Long])] =
+      if failed then Success((None, None)) else
+        Try((RebuildingStore.readAcceptorSince(backend.path),
+             RebuildingStore.readInheritedVotes(backend.path, ctx.transactionHorizon)))
     // The save file's content, or the error of a read that says nothing of it (CrashRecoveryLog.isUnreadable: EIO,
     // EMFILE, out of memory), which holds the load back as a failed stat does rather than declare the state lost
     val savedRead: Either[Throwable, Either[Exception, Option[StoreRecoveryState]]] =
@@ -436,14 +466,16 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         router.clearLoading(backend.storeId)
         p.failure(err)
 
-      case _ if hasSaveFile.isFailure || savedRead.isLeft || incarnation.failed.toOption.exists(e =>
-          !e.isInstanceOf[StoreIncarnationFile.IncarnationLost]) =>
+      case _ if hasSaveFile.isFailure || savedRead.isLeft || rebuiltGates.isFailure ||
+          incarnation.failed.toOption.exists(e => !e.isInstanceOf[StoreIncarnationFile.IncarnationLost]) =>
         // Not known to be gone, only unread: left offline, its files untouched, and retried with backoff as an
         // unreadable config is. A reload over a served store leaves that store serving
-        val err = hasSaveFile.failed.toOption.orElse(savedRead.left.toOption).orElse(incarnation.failed.toOption).get
+        val err = hasSaveFile.failed.toOption.orElse(savedRead.left.toOption).orElse(rebuiltGates.failed.toOption)
+          .orElse(incarnation.failed.toOption).get
         val replaced = router.entry(backend.storeId).isDefined
         if replaced then
-          logger.warn(s"Not reloading store ${backend.storeId}: its save file or incarnation file could not be read. " +
+          logger.warn(s"Not reloading store ${backend.storeId}: its save, incarnation, acceptor-since or " +
+                      s"inherited-votes file could not be read. " +
                       s"The loaded copy keeps serving. Error: $err")
         abandonLoad(storageDeviceId, backend, replaced, err, p)
         if !replaced then
@@ -515,8 +547,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize,
                 ctx.devices.devices.get(storageDeviceId).map(_.admission).getOrElse(CrlAdmission.Unlimited),
                 ctx.unackedLookup, Some(router.post(backend.storeId)),
-                RebuildingStore.readAcceptorSince(backend.path),
-                inheritedVotesAfter = RebuildingStore.readInheritedVotes(backend.path, ctx.transactionHorizon),
+                rebuiltGates.get._1,
+                inheritedVotesAfter = rebuiltGates.get._2,
                 heldVoteQuery = ctx.heldVoteQuery,
                 incarnationOverride = Some(incarnation.get),
                 poolIDA = poolIDA,

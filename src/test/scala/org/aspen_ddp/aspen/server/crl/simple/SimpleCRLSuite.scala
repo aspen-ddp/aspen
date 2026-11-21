@@ -756,6 +756,32 @@ class SimpleCRLSuite extends FileBasedTests {
     assertThrows[CrlMissing](SimpleCRL(tdir, 3, 1024 * 1024, mustExist = true))
   }
 
+  /** Runs `f` with `hidden`, a directory lacking search permission: a stat of anything under it fails (EACCES) */
+  private def withUnsearchable(f: os.Path => Unit): Unit =
+    val hidden = tdir / "hidden"
+    os.makeDir.all(hidden)
+    os.perms.set(hidden, "rw-------")
+    try f(hidden)
+    finally os.perms.set(hidden, "rwx------")
+
+  test("A CRL directory whose stat fails is no directory without stream files: the stat's error is thrown (SL-W21)") {
+    withUnsearchable: hidden =>
+      an[java.io.IOException] should be thrownBy CrlDirectory.streamFiles(hidden / "crl")
+  }
+
+  test("A stream file whose stat fails is never read as an empty stream (SL-W21)") {
+    withUnsearchable: hidden =>
+      an[java.io.IOException] should be thrownBy new StreamReader(StreamId(0), hidden / "0.crl", UUID.randomUUID())
+  }
+
+  test("Stream files are never created under mustExist, even when the open's first check saw them (SL-W21)") {
+    // The open's first streamFiles saw the streams; this one, after a failed stat, sees none
+    os.makeDir.all(tdir)
+    val streams = (0 until 3).map(i => tdir / s"$i.crl").toList
+    assertThrows[CrlMissing](CrlDirectory.createStreamsIfNew(tdir, streams, 1024 * 1024, mustExist = true))
+    assert(os.list(tdir).isEmpty)
+  }
+
   test("A CRL that must exist and does opens") {
     SimpleCRL(tdir, 3, 1024 * 1024).crl.shutdown()
     SimpleCRL(tdir, 3, 1024 * 1024, mustExist = true).crl.shutdown()
@@ -1480,6 +1506,29 @@ class SimpleCRLSuite extends FileBasedTests {
     val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
     assert(i2.trsList.map(_.storeId) == List(storeId3))
 
+    i2.crl.shutdown()
+  }
+
+  test("An empty dropStore completes only once earlier deletions of the store are durable, so a load behind it keeps its saves (CRL-W19)") {
+    val queue = new LinkedBlockingQueue[String]()
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+
+    // A transfer out's extraction deletes the store's records finally, in an entry the held writer leaves unwritten.
+    // A load of its crl_save.log then drops the store (holding nothing now) and saves the file's records once the
+    // drop completes (StoreLoader.awaitCrlLoad)
+    val gate = holdWriter(i.crl)
+    i.crl.deleteTransactions(storeId, List(transactionId))
+    i.crl.dropStore(storeId).foreach(_ => i.crl.save(transactionId, trsValidTxd, () => queue.put("load")))(
+      using scala.concurrent.ExecutionContext.parasitic)
+    gate.countDown()
+    queue.poll(5, TimeUnit.SECONDS) shouldBe "load"
+
+    // The load's save created a record rather than being skipped behind the extraction's deletion
+    assert(readState(i.crl, storeId).transactions.size == 1)
+    i.crl.shutdown()
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+    assert(i2.trsList.count(_.storeId == storeId) == 1)
     i2.crl.shutdown()
   }
 

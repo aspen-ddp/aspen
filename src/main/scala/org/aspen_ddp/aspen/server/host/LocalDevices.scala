@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.host
 
-import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission}
 import scribe.Logging
@@ -20,6 +20,9 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
    *  Its rebuild is requested again at each reconcile even once the directory is back, since nothing else would serve
    *  or rebuild such a store (rebuild-process). Held in memory only: a restart's load serves a store that is back. */
   var declaredMissing: Set[StoreId] = Set()
+  /** The store entries the device's latest reconcile read from its StorageDeviceState, None before its first. A load
+   *  retry serves only a store whose entry here is Active or Offline (StoreLoader.retryFailedLoads) */
+  var reconciledEntries: Option[Map[StoreId, StorageDeviceState.StoreEntry]] = None
 
   def totalSize: Long = configFile.toIO.getTotalSpace
   def currentUsage: Long = totalSize - configFile.toIO.getFreeSpace

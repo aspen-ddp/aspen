@@ -205,22 +205,23 @@ object StoreCopies extends Logging:
    *  `dir`: an interrupted delete cannot strip a marker from a store copy and leave the rest loadable, nor leave a
    *  partial copy in pending-delete. Used for every delete of a copy outside the device's scratch areas
    *  (`creating/`, `rebuilding/`, transfer staging), which are never loaded and are swept whole at device load.
-   *  Returns whether `dir` is gone; a failed rename is logged and leaves it in place. */
+   *  Returns whether `dir` is gone; a failed rename is logged and leaves it in place. So is a stat of `dir` that fails
+   *  (FileStat): only a known absence is gone, never a copy that may still be there. */
   def delete(devicePath: os.Path, dir: os.Path, why: String): Boolean =
-    if !os.exists(dir) then
-      true
-    else
-      try
+    try
+      if !FileStat.exists(dir) then
+        true
+      else
         val deleting = ensureDirectory(devicePath, DeletingDirectory)
         val target = deleting / s"${dir.last}-${UUID.randomUUID()}"
         logger.info(s"Deleting $dir: $why")
         DurableFiles.move(dir, target)
         removeQuietly(target)
         true
-      catch
-        case t: Throwable =>
-          logger.warn(s"Failed to delete $dir. It stays in place. Error: $t")
-          false
+    catch
+      case t: Throwable =>
+        logger.warn(s"Failed to delete $dir. It stays in place. Error: $t")
+        false
 
   /** Removes whatever an interrupted delete left in the device's deleting directory */
   def sweepDeleting(devicePath: os.Path): Unit =

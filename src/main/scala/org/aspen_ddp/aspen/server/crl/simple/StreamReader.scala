@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
+import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.server.crl.CrlCorrupt
 
 import java.nio.ByteBuffer
@@ -19,8 +20,9 @@ object StreamReader:
 class StreamReader(val streamId: StreamId, val filePath: os.Path, val crlId: UUID):
   import StreamReader.*
 
+  // A stat that fails throws (FileStat): a stream that cannot be stat'd is never read as an empty one
   private val ochannel: Option[FileChannel] =
-    if os.exists(filePath) then
+    if FileStat.exists(filePath) then
       // FileChannel rather than os-lib, for positional reads
       Some(FileChannel.open(filePath.toNIO, java.nio.file.StandardOpenOption.READ))
     else

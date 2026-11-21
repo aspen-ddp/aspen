@@ -40,7 +40,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Rebuild | Transactions | `CurrentAllocationsRequest` lists every unfinalized allocation and every held commit vote (`HeldVote`); reads of the pool's objects complete |
 | Rebuild | Repair | Everything the store missed while rebuilding is marked and repaired after promotion |
 | Rebuild (reassignment) | Host device lifecycle | The tombstoned device's former host stops serving its stores before the drain rebuilds them elsewhere: one best-effort nudge, else its hourly check; a running host that misses the nudge serving through the rebuild is an accepted limitation (rebuild-process.md B19) |
-| Transfer out (closed store) | Host loader | The store stays closed from its extraction until its `transferring-out` marker is written (an open seen meanwhile fails the extraction, or stops `startOut` in the task that would write the marker), and the extraction fails on a failed stat of the directory or save file rather than take it for an absence (crash-recovery-log.md 3.5). An open is seen only when a CRL call answers (`opensStarted`), so nothing keeps a load retry from opening the store while the extraction's final deletions are unwritten (CRL-W19, X-W28) |
+| Transfer out (closed store) | Host loader | The store stays closed from its extraction until its `transferring-out` marker is written (an open seen meanwhile fails the extraction, or stops `startOut` in the task that would write the marker), and the extraction fails on a failed stat of the directory or save file rather than take it for an absence (crash-recovery-log.md 3.5). A load retry waits while `startOut` is closing the store (`StoreTransfersOut.isClosingForTransfer`) or its reconciled entry is TransferringOut, and any load of the save file is queued behind the extraction's final deletions (an empty `dropStore` is a barrier, crash-recovery-log.md 5.8), so its saves create records |
 | Rebuild completion | Transfers | A flip that finds the entry already Active adopts the copy without checking its episode (`DeviceMetadata.markRebuiltStoreActive`); no transfer starts onto an occupied store path, so the copy is this episode's (2.2). A flip retried after `TransactionOutcomeUnknown` that finds the entry moved on (TransferringOut, absent) keeps the copy offline rather than discarding it (`Unconfirmed`, rebuild-process.md 5.7) |
 | Rebuild, CRL | Store lifecycle | A rebuilt copy's first load recovers nothing an earlier copy left under its id in the device CRL: it is a save-file load of the empty state `RebuildingStore.finish` writes, which drops those entries first (rebuild-process.md 5.6) |
 | Lost device CRL | Rebuild | A finished rebuild awaiting its flip (`rebuild-complete`) has never served, so it holds nothing in the device CRL and is not marked (`DeviceDiscovery.holdsOwnState`) |
@@ -113,10 +113,12 @@ The premises other subsystems take from this:
   a late outcome or an expiry discard. A Tx of T that saves after that
   point (the live Tx with `keepAdmission`) works on a transaction whose outcome this store has already concluded. If
   the store then crashes, its reload floor refuses T, which makes it an offline acceptor of a decided transaction;
-  the promise, accept or vote it acknowledged decides nothing that is not decided already. The one final deletion
-  queued for a transaction the store has not concluded is a closed store's transfer-out extraction
-  (`StoreTransfersOut.extractFromDirectory`), which deletes every record it saved into `crl_save.log`; a load of the
-  store before that deletion is written has its saves skipped and acknowledged, and loses the state (CRL-W19).
+  the promise, accept or vote it acknowledged decides nothing that is not decided already. A closed store's
+  transfer-out extraction (`StoreTransfersOut.extractFromDirectory`) also deletes finally, every record it saved into
+  `crl_save.log`, but no save of those ids can meet that deletion unwritten: the store stays closed until its
+  `transferring-out` marker (a load retry waits meanwhile), and a load of the file first drops the store, which,
+  holding nothing, completes only once every earlier request is durable (crash-recovery-log.md 5.8). Its saves then
+  create records.
 * **Repair waits until the store cannot join T.** An entry is left alone while T's start is at or above the store's
   forget floor (`RepairTarget.mayJoinTransaction`) and while the store holds a Tx for T or is loading its CRL
   (`Frontend.mayHoldTransaction`), so no Tx can apply T after a reconcile and have its entry deleted under it. A Tx
@@ -220,6 +222,14 @@ The premises other subsystems take from this:
   recovers its own state. Its entries go when the rebuilt copy's empty `crl_save.log` is first loaded (5.6 of
   rebuild-process.md), when a retire saves them into a copy, or as leftovers once a re-placement takes the entry off the
   device.
+* A load retry (`StoreLoader.retryFailedLoads`, a store left in `storesAwaitingRetry` by a failed open, build or
+  read) offers the store to `tryLoadStore`, which reads no tree, so the retry itself is held to the tree as the
+  device's latest reconcile read it (`LocalStorageDeviceState.reconciledEntries`) and to the host's own work on the
+  store: it waits while the entry is neither Active nor Offline, while the store is in `declaredMissing`, while
+  `startOut` is closing it for a transfer out, or while a rebuild of it runs here, and is dropped once the entry has
+  left the device. Held rather than dropped, so a transfer aborted before its marker, or an entry back to Active,
+  still serves the store. Before a device's first reconcile no entry is known; nothing the tree drives has started on
+  the store then but a transfer out's close, which is checked.
 * Everything a device load serves is decided by files in the store directory alone: the markers `rebuild-required`,
   `transferring-out`, `transferred-in`, `rebuild-complete` (`StoreLoader.tryLoadStore`), the save file and the
   incarnation file (`StoreLoader.handleLoad`). Each is tested with `server.FileStat`, which answers absent only for a
@@ -228,15 +238,17 @@ The premises other subsystems take from this:
   absence use it too: the Missing Stores pass and the leftover drop skip a store whose stat fails, a retire fails
   rather than report a clear path, the Deleted Stores pass keeps the store offline, and the device CRL's open leaves the
   device unloaded for the next scan rather than declare a `crl/` lost (a child whose config cannot be stat'd counts as
-  a store). Existence tests outside these still use os-lib's `os.exists`/`os.isDir`, which answer absent on a failed
-  stat: the CRL open (SL-W21), the backend opens and FSIF recovery (SL-W22, SL-W23), the rebuilt store's
-  `acceptor-since` and `inherited-votes` reads (X-W29), `StoreCopies.delete` (SL-W24), `DeviceMarkers.isFailed`
-  (SL-W25), `RebuildingStore.isRebuildCompleteFor` (RB-W22), `DeviceDiscovery.bringIntoService` (P-W10), and others
-  listed in X-W30. A failed stat of a moved store's `ArrivedAtFile` counts as an arrival now (`StoreLoader.readArrivedAt`), keeping its
+  a store). So do the opens they lead to: the CRL open's own tests (a failed stat throws, transient to
+  `openDeviceCrl`, and no stream file is created under `mustExist`), the backend opens and FSIF recovery (an
+  `IOException` the load retries, never `BackendStateLost`), and the rebuilt store's `acceptor-since` and
+  `inherited-votes` reads (the load held back as for the save file). `StoreCopies.delete` reports gone only a copy
+  known absent. Existence tests outside these still use os-lib's `os.exists`/`os.isDir`, which answer absent on a
+  failed stat: `DeviceMarkers.isFailed` (SL-W25), `RebuildingStore.isRebuildCompleteFor` (RB-W22),
+  `DeviceDiscovery.bringIntoService` (P-W10), and others listed in X-W30. A failed stat of a moved store's `ArrivedAtFile` counts as an arrival now (`StoreLoader.readArrivedAt`), keeping its
   arrival margin. `adoptionClass` and the adoption's `crl/` check throw, failing the adoption for the next scan;
   `retireForeignCopy` and `discardLostStore` hold the rebuild for a later check, neither starting it over a copy
   they cannot see nor retiring a finished one; `startIn` neither resumes nor discards an arrived copy whose marker
-  cannot be stat'd, and refuses a path whose stat fails; `openDeviceCrl` throws before moving `crl/`;
+  cannot be stat'd or read, and refuses a path whose stat fails; `openDeviceCrl` throws before moving `crl/`;
   `keepUnpromotedCopyOffline` and an unserved `backendFailed` treat the directory as present (kept offline, marked).
   A marker a reconcile pass looks for counts only when a stat finds it, so the pass waits for a later reconcile,
   and `reloadClosedStores` loads a store whose marker stat fails, the load then holding it back with its own
@@ -544,37 +556,6 @@ not recorded here.
 ---
 
 ## Open weaknesses
-
-**X-W28 A load retry serves a store whatever its entry says** (CONFIRMED, priority 1, effort S)
-
-`StoreLoader.retryFailedLoads` offers every store in `storesAwaitingRetry` that is offline, unopened and has a
-`config.yaml` to `tryLoadStore`, which reads no tree. Nothing checks that the store's entry on the device is still
-Active or Offline, that the store is not being extracted for a transfer out, or that the Missing Stores pass has not
-declared it (`declaredMissing`) or a rebuild started for it. It is the shared enabler of two findings: a closed store
-whose entry is TransferringOut is opened while its extraction's final deletions are unwritten, and loses its CRL state
-(CRL-W19); a store whose directory came back after its rebuild checkpointed serves with full acceptor state between
-passes, and the resumed walk leaves what it acknowledged unmarked (RB-W21, running-host path). Trigger: any store left
-awaiting a retry (a transient backend open or build failure, no CRL room, a failed save-file removal) whose entry then
-moves. Fix direction: a retry loads only a store whose device entry, read in the reconcile that drives the scan, is
-Active or Offline, which is not in `declaredMissing`, not transferring out (`StoreTransfersOut` extraction or
-marker pending) and not being rebuilt; anything else drops the retry and leaves the store to its pass. CRL-W19's own
-fix (an empty `dropStore`/`deleteTransactions` completing through `whenWritten`) is still needed for a device load
-racing an extraction.
-
-**X-W29 A failed stat of a rebuilt store's `acceptor-since` or `inherited-votes` file loads it as a full acceptor**
-(PLAUSIBLE, priority 1, effort S)
-
-`RebuildingStore.readAcceptorSince` and `readInheritedVotes` test their files with `os.exists`, and `StoreLoader.handleLoad`
-passes the result straight into the `Store`, while it tests the save and incarnation files beside them with
-`FileStat`. A stat that fails (EIO, EACCES, ESTALE) yields `None`: the store has no acceptor start and no
-inherited-vote gate. Until the rebuild's `acceptor-since` (finish plus 10 s) it then promises, votes and answers
-expiry queries as a non-holder in transactions its old incarnation joined (paxos-transactions.md 10.10), and until
-its inherited-vote round it votes on objects its old incarnation's votes lock (2.3): with Replication(3,2), the
-rebuilt store and T's abort voter commit a T' over T's lock, and T can commit after it, a split decision.
-The unreadable-content fallback of both functions errs late, as it should; only the stat errs. Trigger: a transient
-stat failure at the load of a rebuilt store within the horizon plus 20 s of its rebuild pass. Fix direction: test both
-files with `FileStat` and hold the load back through `awaitUnreadRetry` on a failed stat, as the save and incarnation
-files are.
 
 **X-W30 Existence tests that remain on os-lib are unclassified** (CONFIRMED, priority 5, effort M)
 

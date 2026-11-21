@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.metadata.StorageDeviceState
+import org.aspen_ddp.aspen.common.metadata.{HostState, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.{StartStoreTransfer, StoreOffline}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
@@ -24,6 +24,15 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
 
   // Stores marked rebuild-required whose transfer out returnLostTransferToRebuild is aborting.
   private var abortingLostTransfers: Set[StoreId] = Set()
+
+  // Stores startOut is closing for a transfer out: from its close (and CRL extraction) until the control task that
+  // writes the transferring-out marker, or fails the request, has run. A load retry leaves them alone
+  // (StoreLoader.retryFailedLoads), so a store is never served from a save file whose entries the extraction is
+  // still deleting from the device CRL
+  private var closingForTransfer: Set[StoreId] = Set()
+
+  /** Whether startOut is closing the store for a transfer out, its marker not yet written */
+  private[host] def isClosingForTransfer(storeId: StoreId): Boolean = closingForTransfer.contains(storeId)
 
   /** Takes a store out of service for a transfer out, extracting its CRL state into its crl_save.log to travel with
    *  it: closes it (extractCrl) if it is open or opening, else extracts the state of the closed store from the
@@ -183,60 +192,73 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
       if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut then
         // A retransmitted request finds the store already closed, and its going offline already gossiped
         val wasLoaded = ctx.router.loaded.contains(m.storeId)
-        // Nothing keeps the store closed between its close and the marker below, written in a later control task: an
-        // open meanwhile (StoreLoader.retryFailedLoads) serves it, so it is not marked or shipped
+        // The store stays closed between its close and the marker below, written in a later control task, only as far
+        // as this host keeps it so: a load retry waits while it is closingForTransfer, and any other open meanwhile
+        // serves it, so it is not marked or shipped
         val opens = ctx.loader.opensStarted(m.storeId)
-        val fclosed = ctx.closeStoreForTransferOut(m.storeId, sourceDs)
+        closingForTransfer += m.storeId
+        val fclosed =
+          try ctx.closeStoreForTransferOut(m.storeId, sourceDs)
+          catch case t: Throwable => Future.failed(t)
 
-        fclosed.failed.foreach:
-          case e: StoreFailedOnClose =>
-            logger.error(s"Not starting the transfer out of store ${m.storeId}, transfer ${m.transferUUID}: " +
-                         s"its backend failed while closing. Returning it to the rebuild path")
-            returnLostTransferToRebuild(m.storeId, sourceDs)
-          case t =>
-            logger.warn(s"Not starting the transfer out of store ${m.storeId}, transfer ${m.transferUUID}: " +
-                        s"its close failed. Error: $t")
+        fclosed.onComplete: result =>
+          try closedForTransfer(m, devEntry, sourceDs, toHostState, wasLoaded, opens, result)
+          finally closingForTransfer -= m.storeId
 
-        fclosed.foreach: _ =>
-          val storePath = sourceDs.devicePath / m.storeId.directoryName
-          // Checked again now the close is done: a shutdown that began during it has already
-          // run stopDeviceWork, which found no send to cancel, so a send begun here would run
-          // on a device being shelved. The store is left closed and unmarked, its state in the
-          // crl_save.log its close extracted, which its next load (here after a restart, or on an
-          // adopting host) reads back. A device unloaded meanwhile -- its shutdown already
-          // finished -- is not ours to send from.
-          if ctx.shutdown.isShuttingDown(sourceDs.storageDeviceId) ||
-             !ctx.devices.isLoaded(sourceDs) then
-            logger.info(s"Not starting the transfer out of store ${m.storeId}: source device " +
-                        s"${sourceDs.storageDeviceId} began shutting down while the store closed")
-          else if ctx.router.loaded.contains(m.storeId) || ctx.loader.isOpening(m.storeId) ||
-                  ctx.loader.opensStarted(m.storeId) != opens then
-            // Opened since its close: the open serves it, and a retransmitted request closes it again
-            logger.info(s"Not starting the transfer out of store ${m.storeId}: it was opened after its close")
-          else if os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
-            // Marked while it closed (a BackendFailed for it): as above, never shipped.
-            logger.error(s"Not starting the transfer out of store ${m.storeId}: it was marked " +
-                         s"rebuild-required while it closed")
-            returnLostTransferToRebuild(m.storeId, sourceDs)
-          else try
-            // Written before archiving, so it travels with the store and keeps this copy
-            // offline across restarts until the transfer is resolved one way or the other.
-            DurableFiles.write(storePath / StoreTransfer.TransferOutMarkerFile,
-                               devEntry.transferId.map(_.toString).getOrElse(""))
-            ctx.storeTransferService.beginTransferOut(m.storeId, m.transferUUID, storePath,
-              toHostState.address, toHostState.storeTransferPort, m.timestamp)
-            ctx.publishView()
-            // The transfer may have been aborted after the reads above, and the abort's
-            // nudge handled before the marker above existed. No check would then ever see
-            // the marker beside the Active entry, leaving the store dark for a full
-            // checkStorageDevicePeriod while the tree counts it online.
-            ctx.reconciler.scheduleDeviceRecheck(sourceDs.storageDeviceId)
-            if wasLoaded then
-              ctx.services.gossipRetransmitter.broadcast(StoreOffline(m.storeId, HLCTimestamp.now))
-          catch
-            case t: Throwable =>
-              logger.warn(s"Failed to start transfer out of store ${m.storeId}, transfer " +
-                          s"${m.transferUUID}. Error: $t")
+  /** The rest of startOut once the store's close for its transfer out has completed, in that completion's control
+   *  task: either the transferring-out marker is written and the send begun, or the request is refused */
+  private def closedForTransfer(m: StartStoreTransfer, devEntry: StorageDeviceState.StoreEntry,
+                                sourceDs: LocalStorageDeviceState, toHostState: HostState, wasLoaded: Boolean,
+                                opens: Long, result: Try[Unit]): Unit =
+    result.failed.foreach:
+      case e: StoreFailedOnClose =>
+        logger.error(s"Not starting the transfer out of store ${m.storeId}, transfer ${m.transferUUID}: " +
+                     s"its backend failed while closing. Returning it to the rebuild path")
+        returnLostTransferToRebuild(m.storeId, sourceDs)
+      case t =>
+        logger.warn(s"Not starting the transfer out of store ${m.storeId}, transfer ${m.transferUUID}: " +
+                    s"its close failed. Error: $t")
+
+    result.foreach: _ =>
+      val storePath = sourceDs.devicePath / m.storeId.directoryName
+      // Checked again now the close is done: a shutdown that began during it has already
+      // run stopDeviceWork, which found no send to cancel, so a send begun here would run
+      // on a device being shelved. The store is left closed and unmarked, its state in the
+      // crl_save.log its close extracted, which its next load (here after a restart, or on an
+      // adopting host) reads back. A device unloaded meanwhile -- its shutdown already
+      // finished -- is not ours to send from.
+      if ctx.shutdown.isShuttingDown(sourceDs.storageDeviceId) ||
+         !ctx.devices.isLoaded(sourceDs) then
+        logger.info(s"Not starting the transfer out of store ${m.storeId}: source device " +
+                    s"${sourceDs.storageDeviceId} began shutting down while the store closed")
+      else if ctx.router.loaded.contains(m.storeId) || ctx.loader.isOpening(m.storeId) ||
+              ctx.loader.opensStarted(m.storeId) != opens then
+        // Opened since its close: the open serves it, and a retransmitted request closes it again
+        logger.info(s"Not starting the transfer out of store ${m.storeId}: it was opened after its close")
+      else if os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
+        // Marked while it closed (a BackendFailed for it): as above, never shipped.
+        logger.error(s"Not starting the transfer out of store ${m.storeId}: it was marked " +
+                     s"rebuild-required while it closed")
+        returnLostTransferToRebuild(m.storeId, sourceDs)
+      else try
+        // Written before archiving, so it travels with the store and keeps this copy
+        // offline across restarts until the transfer is resolved one way or the other.
+        DurableFiles.write(storePath / StoreTransfer.TransferOutMarkerFile,
+                           devEntry.transferId.map(_.toString).getOrElse(""))
+        ctx.storeTransferService.beginTransferOut(m.storeId, m.transferUUID, storePath,
+          toHostState.address, toHostState.storeTransferPort, m.timestamp)
+        ctx.publishView()
+        // The transfer may have been aborted after the reads above, and the abort's
+        // nudge handled before the marker above existed. No check would then ever see
+        // the marker beside the Active entry, leaving the store dark for a full
+        // checkStorageDevicePeriod while the tree counts it online.
+        ctx.reconciler.scheduleDeviceRecheck(sourceDs.storageDeviceId)
+        if wasLoaded then
+          ctx.services.gossipRetransmitter.broadcast(StoreOffline(m.storeId, HLCTimestamp.now))
+      catch
+        case t: Throwable =>
+          logger.warn(s"Failed to start transfer out of store ${m.storeId}, transfer " +
+                      s"${m.transferUUID}. Error: $t")
 
   /** Takes a TransferringOut store marked rebuild-required back to the rebuild path (rebuild-process). The transfer
    *  is aborted (AspenClient.abortStoreTransfer: the source entry back to Active, or Offline on a device shutting down,

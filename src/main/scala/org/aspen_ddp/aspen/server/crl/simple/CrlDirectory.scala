@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
-import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation}
-import org.aspen_ddp.aspen.server.crl.{CrlSizingMismatch}
+import org.aspen_ddp.aspen.server.{DurableFiles, FilePreallocation, FileStat}
+import org.aspen_ddp.aspen.server.crl.{CrlMissing, CrlSizingMismatch}
 import scribe.Logging
 
 import java.util.UUID
@@ -52,8 +52,11 @@ object CrlDirectory extends Logging:
       yield Sizing(numbers.flatten.map(StreamId(_)), m, id)
 
 
+  /** Every existence test of a CRL's files is FileStat's: a stat that fails throws its IOException, which the device
+    * load retries as transient (DeviceDiscovery.isTransient), rather than read as a missing file. An absence the open
+    * acts on (CrlMissing, a new CRL's creation, a growth's removal) is always a known one */
   private[simple] def streamFiles(streamsDir: os.Path): Set[os.Path] =
-    if os.isDir(streamsDir) then os.list(streamsDir).filter(_.ext == "crl").toSet else Set[os.Path]()
+    if FileStat.isDir(streamsDir) then os.list(streamsDir).filter(_.ext == "crl").toSet else Set[os.Path]()
 
   /** The sizing `streamsDir`'s CRL recorded. A directory with neither a SizingFile nor stream files is a new CRL: it
     * records the requested sizing and a new random id first. A SizingFile with no stream files is a creation that
@@ -61,7 +64,7 @@ object CrlDirectory extends Logging:
   private[simple] def recordedSizing(streamsDir: os.Path, numStreams: Int, maxSizeInBytes: Long,
                              ringForTest: Option[Vector[StreamId]]): Sizing =
     val file = streamsDir / SizingFile
-    if os.exists(file) then
+    if FileStat.exists(file) then
       val recorded = Sizing.decode(os.read(file)).filter(s => s.numStreams >= 3 && s.maxSizeInBytes % 4096 == 0)
         .getOrElse:
           throw CrlSizingMismatch(streamsDir, s"its $SizingFile file is unreadable")
@@ -97,7 +100,9 @@ object CrlDirectory extends Logging:
     * place only on a device holding no stores, and the replacement of a lost CRL on a device that holds stores is
     * created apart (create, in CrashRecoveryLog.replacementCrlDir) and renamed into place once finished. Any other
     * `.crl.tmp` (a stray beside its stream, an unlisted name, or any under `mustExist`) is damage beside a CRL that
-    * may hold entries: CrlSizingMismatch, and nothing is removed.
+    * may hold entries: CrlSizingMismatch, and nothing is removed. Under `mustExist` with no stream files it throws
+    * CrlMissing and creates nothing, so no stream file is ever created, or renamed over one, on a device that holds
+    * stores.
     * A copy-on-write file system allocates on every overwrite, which no preallocation prevents: warned once. */
   private[simple] def createStreamsIfNew(streamsDir: os.Path, streams: List[os.Path], maxSizeInBytes: Long,
                                  mustExist: Boolean): Unit =
@@ -115,6 +120,8 @@ object CrlDirectory extends Logging:
       logger.warn(s"The creation of the CRL in $streamsDir did not finish. Creating its stream files again")
       (leftoverTmps ++ present).foreach(os.remove(_))
     if streamFiles(streamsDir).isEmpty then
+      if mustExist then
+        throw CrlMissing(streamsDir)
       if FilePreallocation.isCopyOnWrite(streamsDir) && warnedCopyOnWrite.compareAndSet(false, true) then
         logger.warn(s"The CRL in $streamsDir is on a copy-on-write file system: its writes allocate, so a full " +
                     s"device can stop it. Use a file system that overwrites in place, or disable copy-on-write " +
@@ -131,11 +138,11 @@ object CrlDirectory extends Logging:
     * would be created under the device's stores */
   private[simple] def removeUncommittedGrowth(streamsDir: os.Path, listed: Set[os.Path]): Unit =
     val ringSize = listed.size
-    val leftovers = List(s"$ringSize.crl", s"$ringSize.crl.tmp").map(streamsDir / _).filter(os.exists(_))
+    val leftovers = List(s"$ringSize.crl", s"$ringSize.crl.tmp").map(streamsDir / _).filter(FileStat.exists)
     if leftovers.nonEmpty then
       val others = os.list(streamsDir).filter(f => f.ext == "crl" || f.last.endsWith(".crl.tmp")).toSet --
         leftovers -- listed
-      if others.nonEmpty || !listed.forall(os.exists(_)) then
+      if others.nonEmpty || !listed.forall(FileStat.exists) then
         throw CrlSizingMismatch(streamsDir, s"it holds ${leftovers.map(_.last).mkString(", ")}, an uncommitted " +
           s"growth, beside ${(streamFiles(streamsDir) -- leftovers).map(_.last).toList.sorted.mkString(", ")}, " +
           s"not the $ringSize streams its ring lists")

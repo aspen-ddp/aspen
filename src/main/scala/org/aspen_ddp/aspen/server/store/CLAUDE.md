@@ -333,7 +333,8 @@
   builds the store, backend initialized and closed plus its config, in a scratch directory under `<device>/creating/`,
   forces the tree and renames it to the store's path. Open never creates: FSIF throws `StoreLost` for a missing
   directory or blank files, RocksDB `RocksDBStateLost` when `CURRENT` is missing, so a store that lost its files is
-  rebuilt, never served empty. A new backend must keep both rules: create only in `init`, and treat an absent or empty
+  rebuilt, never served empty. Only a known absence is lost: those tests (and `NioFsifFiles.exists`/`size`, which
+  FSIF recovery decides on) are `server.FileStat`'s, so a failed stat is an `IOException` the host's load retries. A new backend must keep both rules: create only in `init`, and treat an absent or empty
   store as lost
 - `Reconcile` (exact repair install): `server/repair/CLAUDE.md`; `ReconcileResult.changed` is true only when the
   install was applied (every deferred, stale or no-op path reports false)

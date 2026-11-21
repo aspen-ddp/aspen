@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.store.backend.rocksdb
 
+import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.server.store.backend.*
 import java.nio.ByteBuffer
 import org.aspen_ddp.aspen.common.DataBuffer
@@ -168,9 +169,11 @@ object RocksDBBackend extends Logging {
   /** Opens a database that uses the host-wide shared resources. The database must be closed via closeDatabase so
     * that the background thread pools shrink accordingly. Without `createIfMissing` (every open of a store) a
     * directory with no database throws RocksDBStateLost and nothing is written; only `initializeStore` creates one.
+    * Only a `CURRENT` known absent is: a stat that fails throws its IOException (server.FileStat), which the host's
+    * load retries.
     */
   def openDatabase(dbPath: os.Path, createIfMissing: Boolean = false): RocksDB = {
-    if !createIfMissing && !os.exists(dbPath / CurrentFile) then
+    if !createIfMissing && !FileStat.exists(dbPath / CurrentFile) then
       throw new RocksDBStateLost(s"RocksDB store at $dbPath has no database ($CurrentFile is missing)")
     val (cache, wbm) = getSharedMemory()
     val options = new Options()

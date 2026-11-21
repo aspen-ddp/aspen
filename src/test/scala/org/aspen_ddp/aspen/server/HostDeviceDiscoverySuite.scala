@@ -1804,6 +1804,36 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       os.exists(promoted) should be(false)
       recorded(host2).transferOutcomes.get(t.movingStore) should be(None)
 
+  atest("a promoted copy whose marker cannot be read is neither discarded nor resumed until it reads (SL-W24)"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      _ = recorded(t.host).holdTransferOutcomes()
+      promoted = t.deviceDir / t.movingStore.directoryName
+      marker = promoted / StoreTransfer.TransferredInMarkerFile
+      _ = t.transfers.finishTransferIn(t.movingStore)
+      _ <- pumpUntil(os.exists(promoted))
+      // The marker's stat succeeds and its read fails (EACCES): it says nothing of which transfer the copy belongs to
+      _ = os.perms.set(marker, "---------")
+
+      transfers2 = new StagedTransferService
+      host2 = newHost(t.hostRoot, transferService = transfers2)
+      _ = host2.control.reconciler.checkAll()
+      _ <- pumpUntil(false, rounds = 5)
+      keptWhileUnreadable = os.exists(promoted)
+      shippedWhileUnreadable = transfers2.transfersIn.nonEmpty
+      outcomeWhileUnreadable = recorded(host2).transferOutcomes.get(t.movingStore)
+      _ = os.perms.set(marker, "rw-------")
+      _ = host2.control.reconciler.checkAll()
+      _ <- pumpUntil(recorded(host2).transferOutcomes.contains(t.movingStore))
+    yield
+      keptWhileUnreadable should be(true)
+      shippedWhileUnreadable should be(false)
+      outcomeWhileUnreadable should be(None)
+      transfers2.transfersIn should be(Vector())
+      recorded(host2).transferOutcomes.get(t.movingStore) should be(Some(DeviceMetadata.TransferOutcome.PoolRepointed))
+
   // SL-W12: a promoted copy found lost before its pool update commits (marked rebuild-required by a CRL loss
   // declaration, or its save file damaged since promotion) is not repointed while the source still holds the state
   for (lost, damage) <- List[(String, os.Path => Unit)](

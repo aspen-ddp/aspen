@@ -68,6 +68,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   // failed leaves no marker to select the store by.
   private var pendingMarkerRemovals: Set[StoreId] = Set()
 
+  /** Whether a rebuild of the store runs here, or its lost copy is being discarded for one (discardLostStore) */
+  private[host] def isRebuilding(storeId: StoreId): Boolean =
+    rebuildingStores.contains(storeId) || droppingCrlState.contains(storeId)
+
   /** Rebuilt stores whose rebuild-complete marker removal awaits a retry by the Completed Rebuilds pass */
   private[server] def markerRemovalsPending: Set[StoreId] = pendingMarkerRemovals
 

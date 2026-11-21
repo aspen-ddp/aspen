@@ -79,8 +79,12 @@
   (`DeviceDiscovery.openDeviceCrl`)
 - `openCRL`'s `holdsStores` (`SimpleCRL.apply`'s `mustExist`): the device holds stores, so its CRL must exist. With no
   stream files (only `sizing` or `.crl.tmp` files at most) the open throws `CrlMissing`, writing nothing, and the
-  caller declares the CRL lost instead of creating an empty one under live stores. So anything that creates
+  caller declares the CRL lost instead of creating an empty one under live stores. `createStreamsIfNew` checks it again
+  itself, so nothing is created under `mustExist` whatever an earlier check saw. So anything that creates
   stores on a device not yet loaded (`Main.bootstrap`) creates its CRL first
+- Every existence test of the open (`streamFiles`, `recordedSizing`, `removeUncommittedGrowth`, `CrlLock`,
+  `StreamReader`, `DeviceFactory.openCRL`) is `server.FileStat`'s: a failed stat throws an `IOException` (transient to
+  `DeviceDiscovery.openDeviceCrl`), never a missing stream or an empty one
 - Each entry header carries CRC32Cs of the header and of the body (`LogEntry`). Recovery drops a torn newest entry
   (only the write in flight at a crash can be torn) and throws `CrlCorrupt` for any other failed checksum (the body
   of the entry before a dropped one is checked too, `StreamReader.lastIntactEntry`), or when an
@@ -112,7 +116,9 @@
 - `dropStore` is one CRL-thread request (`DropStore`): it deletes what the store holds when processed, so every
   earlier save is dropped and no later one (crash-recovery-log C14). Its transaction deletions, like a stub save's, are
   cancellable (`LogEntry.deleteTxUnlessResaved`): a same-id save later in the same unwritten entry is written. Every
-  other deletion is final within its entry
+  other deletion is final within its entry. A `dropStore` or `deleteTransactions` with nothing to delete is a barrier
+  (`whenWritten`): it completes only once every earlier request is durable, so a load that saves a `crl_save.log`
+  behind it never has its saves skipped behind a transfer out's unwritten final deletions
 - Stream files are preallocated at creation (`CrlDirectory.createStreamsIfNew`, `server.FilePreallocation`): `fallocate`
   through FFM on Linux, zero-fill elsewhere or on `EOPNOTSUPP`. A CRL write never allocates, so a full device cannot
   fail one (crash-recovery-log 5.1). Each file is written as `<n>.crl.tmp`, renamed, and the directory forced before the

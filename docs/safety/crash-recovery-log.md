@@ -277,7 +277,7 @@ unpins the pieces it does not name).
 |-----------|-----------|--------|
 | Planned device shutdown | stores close with `extractCrl = false`, records stay live; then `crl.shutdown()` | `DeviceShutdown.closeForShutdown`, `shutDownCrl` |
 | Transfer out, store open | on the executor after `closing`: `readStoreState`; `saveStoreState` to `crl_save.log` (tmp, fsync, rename, directory fsync); `store.close()`; then `deleteTransactions(state.entryIds)` and the retained admission released | `StoreLoader.handleClose(extractCrl = true)` |
-| Transfer out, store closed | on the transfer's source device only (the device the pool entry names, whose directory ships; another device of the host may hold an earlier copy of the store, whose entries are its retire's); with a valid `crl_save.log`: the file ships unchanged and `dropStore` removes the device CRL's entries (a copy of part of the file or an earlier tenancy's leftovers, 3.3 step 4), releasing the charge retained when the drop was issued; without one: `readStoreState`, saved, then `deleteTransactions`. Either way the release is of the charge retained when the extraction began (`releaseRetained(storeId, charge)`), never a later one. An unusable save file, or a stat of the directory or the file that fails (`FileStat`), fails it before anything is read; an open started during the read, the deletion or the drop (`opensStarted`) fails it after, leaving the charge to the load. Nothing keeps the store from opening meanwhile (`StoreLoader.retryFailedLoads` offers a store awaiting a load retry at each scan): an open during the drop loads the file behind the drop's cancellable deletions and is safe, but one during the final deletions loads the file just written behind them, and its saves are skipped (CRL-W19). `startOut` checks again (loaded, opening, `opensStarted` unchanged since the close began) in the control task that writes the `transferring-out` marker, which keeps every later open off the store | `StoreTransfersOut.extractUnloaded`, `closeForTransferOut` |
+| Transfer out, store closed | on the transfer's source device only (the device the pool entry names, whose directory ships; another device of the host may hold an earlier copy of the store, whose entries are its retire's); with a valid `crl_save.log`: the file ships unchanged and `dropStore` removes the device CRL's entries (a copy of part of the file or an earlier tenancy's leftovers, 3.3 step 4), releasing the charge retained when the drop was issued; without one: `readStoreState`, saved, then `deleteTransactions`. Either way the release is of the charge retained when the extraction began (`releaseRetained(storeId, charge)`), never a later one. An unusable save file, or a stat of the directory or the file that fails (`FileStat`), fails it before anything is read; an open started during the read, the deletion or the drop (`opensStarted`) fails it after, leaving the charge to the load. A load retry waits while `startOut` is closing the store (`StoreLoader.retryFailedLoads`, `StoreTransfersOut.isClosingForTransfer`). Any other open meanwhile loads the file behind the drop's cancellable deletions, or behind the final deletions once they are durable (an empty `dropStore` is a barrier, 5.8), so its saves create records. `startOut` checks again (loaded, opening, `opensStarted` unchanged since the close began) in the control task that writes the `transferring-out` marker, which keeps every later open off the store | `StoreTransfersOut.extractUnloaded`, `closeForTransferOut` |
 | Retire of a copy no longer its store's owner (a lost store before its rebuild, a transfer out's source, a re-placed rebuild's source, an earlier tenancy's copy at the path of a store transferring in) | a path whose stat fails (`server.FileStat`) fails the retire, retried at a later check, rather than report it clear; marker `rebuild-required` durable; `lost-crl-state.log` kept if present, else the copy's `crl_save.log` renamed to it (any entries `readStoreState` still returns saved first as `lost-crl-entries.log`), else `readStoreState` saved to it; `dropStore`; directory renamed into pending-delete | `StoreCopies.retire` (from `StoreRebuilds.discardLostStore`, `StoreTransfers.retireEarlierTenancy` and the Deleted Stores pass) |
 | Store no longer on the device (safety net: a retire drops first) | `storesWithEntries`; for each store not in the device's tree entry, not loaded, with no directory (a stat that answers absent, `server.FileStat`: one that fails keeps them), no drop and no retire running: `dropStore` | `DeviceReconciler.dropLeftoverCrlState` |
 | Store whose `loadStore` of its `crl_save.log` failed (the file stays) | `dropStore` | `StoreLoader.handleUnloadFailed`, `closeUnloaded(dropDurably = true)` |
@@ -448,8 +448,12 @@ and `SizingFile`, both re-exported by `SimpleCRL`):
 6. `Recovery.recover` (5.7), then the constructor (5.7). A constructor that fails shuts its writer down and waits for
    it before rethrowing, so a retry never runs two writers over the same files.
 
-The open's own file tests (`DeviceFactory.openCRL`, `CrlDirectory.streamFiles`, `recordedSizing`, `StreamReader`) are
-os-lib's, which answer absent on a stat that fails, not `server.FileStat`'s (systemic-loss-protection.md, SL-W21).
+The open's own file tests (`DeviceFactory.openCRL`, `CrlDirectory.streamFiles`, `recordedSizing`,
+`removeUncommittedGrowth`, `CrlLock`, `StreamReader`) are `server.FileStat`'s: a stat that fails throws its
+`IOException`, which `DeviceDiscovery.openDeviceCrl` retries as transient, and is never read as a missing file. Every
+absence the open acts on (`CrlMissing`, a new CRL's creation, a growth's removal, an empty stream) is a known one. And
+`createStreamsIfNew` itself throws `CrlMissing` under `mustExist` when it finds no stream files, so no stream file is
+created, or renamed over a live one, on a device that holds stores, even if its check and step 1's disagree.
 
 `StreamWriter` opens existing files only, with `DSYNC | WRITE`, and refuses one of the wrong size. Because the files
 are preallocated and the file system overwrites in place (AS7), a CRL write never allocates, and a full device cannot
@@ -677,8 +681,9 @@ deletion and a stub deletion (66 bytes per id) in the newest unwritten entry, se
 (W1), with the handler on the last: it runs once every deletion is durable. The records and stubs are removed from the
 live records. `dropStore`'s ids are those of the store held when the request is processed, and its transaction
 deletions are cancellable by a later save in the same entry. An empty list (for `dropStore`, a store holding
-nothing) is handed to the completion thread at once: it waits for no earlier unwritten entry, so earlier deletions of
-the store's ids may still be unwritten when it completes (CRL-W19). `deleteAppliedStub` writes a stub deletion only
+nothing) is a barrier (`whenWritten`): it completes once every earlier request is durable, so every earlier deletion
+of the store's ids, a transfer out's final ones included, is written before it completes, and a load's saves queued
+behind it (`StoreLoader.awaitCrlLoad`) create records rather than being skipped behind a final deletion (W1b). `deleteAppliedStub` writes a stub deletion only
 for a stub held in memory. A deleted transaction's save already in the same entry is taken out of it
 (`LogEntry.deleteTx`, as `deleteStub` does for stubs); saves of it in older unwritten entries stay, are built first, and
 the deletion
@@ -1328,39 +1333,4 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-**CRL-W19 A closed store's extraction loses its state to a load that opens during its deletion** (CONFIRMED,
-priority 1, effort S)
-
-*Mechanism.* `StoreTransfersOut.extractFromDirectory`, for a closed store with no `crl_save.log`, reads the store's
-state (`readStoreState`), writes it to `crl_save.log` and queues `deleteTransactions(state.entryIds)`, all in one
-control task. Those are final deletions (`LogEntry.deleteTx`), and the CRL thread removes the records from its live
-records as soon as it processes the request. Nothing keeps the store from opening before that deletion's entry is
-written: `opensStarted` is checked only when the read and the deletion answer, and `StoreLoader.tryLoadStore` checks
-no extraction. A load that starts then finds the new save file (`StoreLoader.handleLoad`) and runs
-`StoreLoader.awaitCrlLoad`: `dropStore` finds no live record for the store, so `onDeleteTransactions` completes it at
-once (an empty list waits for no unwritten entry), and `loadStore` queues one `SaveTransaction` per record of the file.
-Each meets the extraction's final deletion of the same id in an unwritten entry, the one in flight included, so
-`SimpleCRL.skippedAfterFinalDeletion` skips it: no live record is created, and its handler runs once the deletion is
-durable, so `loadStore` succeeds. `StoreRouter.crlLoaded` then removes the save file durably, and `readAndRecover`
-reads back only the applied stubs (a stub's save after its deletion is written, `LogEntry.addStub`). C1's exception for
-saves behind a final deletion rests on the deletion being the store's own decision to forget a concluded transaction;
-an extraction's deletion moves live state out, and a load of that same state behind it is no such save.
-
-*Trigger.* A store is in `StoreLoader.storesAwaitingRetry` with its entries in the device CRL and no save file: after
-a restart its backend open or Store build failed transiently (`awaitBuildRetry`, a failed open), or its save-file
-removal failed after the unlink succeeded (`handleSaveFileRemovalFailed`). Its pool entry is `TransferringOut` (the
-transfer was set up before the restart), and the destination's retransmitted `StartStoreTransfer` reaches
-`closeForTransferOut`, which extracts it unloaded. The next device scan's `retryFailedLoads` opens it while the
-deletion's entry is still unwritten: a CRL slowed by a busy device, queued sealed entries or rotations (10.6, 10.18)
-keeps it unwritten for longer than a backend open takes.
-
-*Consequence.* The store serves with none of its transactions: its promises and accepted values (a later proposal can
-be accepted against what it promised, a split decision), its commit votes and their object data (a commit decided
-from its vote whose backend commit had not completed or had failed, `keptForReplay`, is never applied here), all with
-the save file gone. `released()` and `startOut` then see the open and do not ship, so nothing reports the loss.
-
-*Fix direction.* Make an empty `dropStore` (and `deleteTransactions`) complete through `whenWritten`, like a barrier,
-so `awaitCrlLoad`'s `loadStore` is queued only once every earlier deletion of the store is durable and its saves
-create new records (`deletesFinally` looks only at unwritten entries). Alternatively, or as well, keep the store from
-opening while `extractFromDirectory` runs (an extraction set that `tryLoadStore` and `retryFailedLoads` check, as
-`opening` is), so the file is never loaded before its entries have left the device CRL.
+(none)

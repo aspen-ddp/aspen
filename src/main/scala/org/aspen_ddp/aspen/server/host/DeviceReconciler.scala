@@ -145,6 +145,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    */
   private def reconcileDeviceState(local: LocalStorageDeviceState,
                                    remote: StorageDeviceState): Unit =
+    local.reconciledEntries = Some(remote.stores)
     if remote.isFailed then
       // An operator has declared this device dead. Its directory can still mount -- a dead
       // controller rather than a dead platter -- and its zeroed host id must not be mistaken for

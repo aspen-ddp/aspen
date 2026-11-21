@@ -60,6 +60,23 @@ class RocksDBBackendResourcesSuite extends AnyFunSuite with Matchers:
     finally
       os.remove.all(dir)
 
+  test("a CURRENT file whose stat fails is an I/O error at open, never a lost database (SL-W23)"):
+    val dir = os.temp.dir()
+    val locked = os.temp.dir()
+    try
+      RocksDBBackend.initializeStore(dir)
+      os.move(dir / RocksDBBackend.CurrentFile, locked / RocksDBBackend.CurrentFile)
+      os.symlink(dir / RocksDBBackend.CurrentFile, locked / RocksDBBackend.CurrentFile)
+      os.perms.set(locked, "rw-------")
+      val t = intercept[Throwable](RocksDBBackend.openDatabase(dir))
+      os.perms.set(locked, "rwx------")
+      t shouldBe a[java.io.IOException]
+      t should not be a[org.aspen_ddp.aspen.server.store.backend.BackendStateLost]
+    finally
+      os.perms.set(locked, "rwx------")
+      os.remove.all(dir)
+      os.remove.all(locked)
+
   test("a store directory without its database is lost, and open creates nothing (SL D5)"):
     val dir = os.temp.dir()
     try

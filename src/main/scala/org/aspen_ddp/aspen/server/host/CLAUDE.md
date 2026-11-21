@@ -54,7 +54,12 @@
   throws before its open (an unreadable `config.yaml`, `StoreLoader.awaitUnreadRetry`), one whose executor slot
   an earlier close still holds (`HostThreading.AlreadyAssigned`) and one whose Store fails to build in `handleLoad`
   (`awaitBuildRetry`, backoff per build failure in a row, kept in `buildRetryWaits` until an install) are left
-  offline and retried the same way; a retry
+  offline and retried the same way. `tryLoadStore` reads no tree, so a retry is held to the entries the device's
+  latest reconcile read (`LocalStorageDeviceState.reconciledEntries`, set by `reconcileDeviceState`) and to the
+  host's own work: it waits while that entry is neither Active nor Offline, the store is `declaredMissing`,
+  `StoreTransfersOut.isClosingForTransfer` (from `startOut`'s close until its marker task has run) or
+  `StoreRebuilds.isRebuilding`, and is dropped once the entry has left the device (before a first reconcile only the
+  host-work checks apply). A retry
   keeps the waiting load's `onServed` (e.g. its `StoreMoved` gossip) for the open that serves it. A load's `onServed`
   runs only once its LoadStore has installed and recovered the store (`StoreLoader.awaitServed`), never at backend
   open; a LoadStore that leaves the store awaiting a retry (no CRL room, no executor slot, a failed save-file removal,
@@ -84,12 +89,16 @@
   in a release is an outage, never a fresh identity over a store's data and CRL state
 - Every existence test in host code over a store or device directory uses `server.FileStat`, never `os.exists`
   (`Files.exists`, false on any stat error): absent only on ENOENT (or a parent that is no directory), otherwise it
-  throws. `tryLoadStore`'s config and marker checks and `handleLoad`'s `crl_save.log` check hold a load whose stat
-  fails back through `awaitUnreadRetry`; the Missing Stores pass, `dropLeftoverCrlState` and the Deleted Stores
-  pass skip such a store; `StoreCopies.retire` fails rather than report a clear path; `DeviceDiscovery.openDeviceCrl`
+  throws. `tryLoadStore`'s config and marker checks and `handleLoad`'s `crl_save.log`, `acceptor-since` and
+  `inherited-votes` checks hold a load whose stat fails back through `awaitUnreadRetry` (a rebuilt store loaded
+  without its gates would be a full acceptor of its old incarnation's transactions); the Missing Stores pass, `dropLeftoverCrlState` and the Deleted Stores
+  pass skip such a store; `StoreCopies.retire` fails rather than report a clear path, and `StoreCopies.delete`
+  reports gone only a copy known absent; `DeviceDiscovery.openDeviceCrl`
   throws (device left for the next scan; a child whose config cannot be stat'd counts as a store directory) and so
   does `holdsOwnState`. `StoreLoader.readArrivedAt` counts a failed stat as an arrival now; `adoptionClass` throws
-  (adoption retried next scan); `retireForeignCopy`/`discardLostStore` and `startIn` wait for a later check; reconcile
+  (adoption retried next scan); `retireForeignCopy`/`discardLostStore` and `startIn` wait for a later check (`startIn`
+  also when the promoted copy's `transferred-in` marker cannot be read: it says nothing of which transfer the copy
+  belongs to); reconcile
   passes act on a marker only when a stat finds it. Tests fail a stat with a directory lacking search permission, or
   a link into one
 - Load time and the forget floor (`server/store/CLAUDE.md`): every Store `StoreLoader` builds records its load
@@ -276,8 +285,10 @@
   store is extracted on the transfer's source device only (`startOut` passes `sourceDs`), never on another copy of it
   another device of the host holds. Its directory and save file are tested with `FileStat`: a failed stat fails the
   extraction rather than read as an absence (which would write the CRL's entries over a valid file). The store must
-  stay closed from the extraction to the `transferring-out` marker: an open started meanwhile (`opensStarted`, checked
-  as each CRL call answers) fails the extraction, and `startOut` re-checks loaded / opening / `opensStarted` in the
+  stay closed from the extraction to the `transferring-out` marker: a load retry waits throughout
+  (`isClosingForTransfer`), an open started meanwhile by any other path (`opensStarted`, checked as each CRL call
+  answers) fails the extraction, and a load of the save file queues its saves behind the extraction's final deletions
+  (its empty `dropStore` is a CRL barrier, `server/crl/CLAUDE.md`), so they create records rather than being skipped, and `startOut` re-checks loaded / opening / `opensStarted` in the
   control task that writes the marker. The extraction releases only the charge retained when it began
   (`releaseRetained(storeId, charge)`).
   `DeviceReconciler.dropLeftoverCrlState` drops the entries of a store with no entry on the device, no directory

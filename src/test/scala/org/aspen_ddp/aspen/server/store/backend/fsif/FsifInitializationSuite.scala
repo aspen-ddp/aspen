@@ -110,6 +110,42 @@ class FsifInitializationSuite extends FileBasedTests:
     os.list(dir).map(_.last).toSet shouldBe Set(StoreConfig.configFilename, FsifRecovery.DataFile)
     os.size(dir / FsifRecovery.DataFile) shouldBe 0
 
+  /** `link` made a link to `target` in `locked`, a directory then left without search permission, so every stat of
+   *  `link` fails (EACCES) while the target is intact; `f` runs, and the permission is restored */
+  private def withUnstatable(locked: os.Path)(f: => Unit): Unit =
+    os.perms.set(locked, "rw-------")
+    try f
+    finally os.perms.set(locked, "rwx------")
+
+  test("a store directory whose stat fails is an I/O error at open, never StoreLost (SL-W23)"):
+    val locked = tdir / "locked"
+    os.makeDir.all(locked)
+    DefaultBackendOpener.createStore(fsifCfg, locked / "store", tdir / StoreCreation.CreatingDirectory)
+    os.symlink(tdir / "store", locked / "store")
+    withUnstatable(locked):
+      val t = intercept[Throwable](FsifBackend.open(storeId, tdir / "store", layout, io, _ => ()))
+      t shouldBe a[java.io.IOException]
+      t should not be a[FsifRecovery.StoreLost]
+    close(FsifBackend.open(storeId, tdir / "store", layout, io, _ => ()))
+
+  test("an FSIF file whose stat fails is neither absent nor empty to recovery (SL-W22)"):
+    val dir = tdir / "store"
+    val locked = tdir / "locked"
+    os.makeDir.all(dir)
+    os.makeDir.all(locked)
+    // The journal of seq m + 1, present after a checkpoint that was switching journals
+    os.write(locked / "journal", Array.fill[Byte](100)(3))
+    os.symlink(dir / FsifRecovery.JournalFiles(1), locked / "journal")
+    val files = new NioFsifFiles(dir)
+    withUnstatable(locked):
+      an[java.io.IOException] should be thrownBy files.exists(FsifRecovery.JournalFiles(1))
+      an[java.io.IOException] should be thrownBy files.size(FsifRecovery.JournalFiles(1))
+      an[java.io.IOException] should be thrownBy FsifRecovery.isBlank(files)
+    files.exists(FsifRecovery.JournalFiles(1)) shouldBe true
+    files.size(FsifRecovery.JournalFiles(1)) shouldBe 100
+    files.exists(FsifRecovery.JournalFiles(0)) shouldBe false
+    files.size(FsifRecovery.JournalFiles(0)) shouldBe 0
+
   test("a directory with non-empty files and no valid index is lost and left untouched"):
     val dir = tdir / "store"
     os.makeDir.all(dir)

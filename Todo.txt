@@ -51,15 +51,8 @@ PRIORITY 1: lost committed data, split decisions, device-wide loss
     Fix: do the open check and the marker write in one control task and re-check after the deletion; release the
     identity-checked charge; FileStat for the save file, a failed stat failing the extraction.
 
-1.2 [RB-W19] A running host keeps serving a tombstoned device's stores through their rebuild elsewhere.
-    PLAUSIBLE. Effort M. rebuild-process.md, systemic-loss-protection.md (S10), cross-document-review.md.
-    FailedStorageDeviceDurableTask.tombstone nudges the former host once, best-effort; a running host that misses it
-    serves until its hourly check, and peers (MetadataManager) keep routing to it until the flip's StoreMoved. With
-    t = r a commit the old copy voted for during the rebuild ends with t-1 < r copies: lost committed data from
-    asynchrony alone. The rebuilt acceptor's acceptor-since / inheritedVotesAfter also assume the old incarnation
-    stopped. Design question first: the no-fencing rule covers restarted or partition-healed hosts, not a running
-    reachable one. Fix (rare path only): a host receiving StoreOffline/StoreMoved for a store it serves checks its
-    device; the drain waits for the old host to record the device retired, or for that host to be known down.
+(RB-W19, a running host serving a tombstoned device's stores through their rebuild, is an accepted limitation:
+rebuild-process.md B19.)
 
 
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence

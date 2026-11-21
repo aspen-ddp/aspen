@@ -752,9 +752,25 @@ is never repaired (5.2's locked copies are marked for this reason).
   (`DeviceShutdown.retireFailedDevice`: a durable `failed` marker, then unloaded like a relinquished device), and no
   host loads a device carrying the marker. Residual: until its first reconcile, a restarted or partition-healed old
   host may still answer peers holding a stale store-to-host mapping (the no-fencing trade-off accepted for adoption).
-  A running old host reconciles the device on the tombstone's one best-effort nudge or at its periodic check (1 h);
-  peers map the store to it until the rebuilt copy's flip gossips `StoreMoved`, so the window spans the rebuild
-  (RB-W19).
+  A running old host reconciles the device on the tombstone's one best-effort nudge or at its periodic check (1 h).
+  **Accepted limitation, deliberately not addressed in code: a running host that misses the nudge keeps serving the
+  device's stores through their rebuild elsewhere.** `FailedStorageDeviceDurableTask.tombstone` sends the former host
+  a single best-effort `CheckStorageDevice`; a host that misses it (partitioned at that moment, or the message lost)
+  retires the device (`DeviceShutdown.retireFailedDevice`) only at its periodic check (`Main.CheckStorageDevicesPeriod`)
+  or a restart, and the drain nudges only destinations. Meanwhile the drain (`DefaultPollPeriod`, 2 min) moves each
+  store Rebuilding to another device, and peers route by the store-to-host mapping their `MetadataManager` caches,
+  changed only by the flip's `StoreMoved` (the rebuild's `StoreOffline` changes availability, not the mapping, and no
+  host reacts to gossip about a store it serves). So for the whole rebuild, and after the flip until peers apply
+  `StoreMoved`, the old host votes, acknowledges and applies for that store index with full acceptor state. A commit
+  it acknowledges after the walk read the object leaves the rebuilt copy stale with no ErrorTree mark; in a pool with
+  `t = r` such an update is held, once the old copy is retired, by `t - 1 < r` copies, so a later read restores the
+  earlier revision; and past `acceptor-since` there are briefly two acceptor states for one store index (the
+  inherited-vote gate and `acceptor-since`, 6.4, assume the old incarnation stopped joining at the rebuild's start).
+  Decision: this is not a practical problem and is not addressed in code. It needs an operator to run
+  `fail-storage-device` on a device that is still serving, on a host that is up and reachable, and the one nudge to
+  that host to be lost. A fix would make the drain wait for the old host to record the device retired, or to be known
+  down (re-sent nudges and a check of its own device on `StoreOffline`/`StoreMoved` gossip would only shorten the
+  window).
 * **B20 A rebuilt store never joins a transaction its old incarnation may have joined** (6.4), up to the clock-skew
   residual.
 * **B21 A rebuilt store grants no commit vote over a lock its old incarnation's vote may still back** (6.4, inherited
@@ -881,38 +897,6 @@ Fix: keep a host-local record of the stores the Missing Stores pass declared, an
 on the device and the store is neither served, opening nor retiring, request its rebuild again at each reconcile
 (`requestRebuild` needs no marker, and the Rebuilding pass's `retireForeignCopy` retires a returned copy with its
 CRL state saved). Loading the returned copy instead would also be safe, since its device-CRL entries were kept.
-
-### RB-W19: A running host keeps serving a tombstoned device's stores through their rebuild elsewhere
-Verdict PLAUSIBLE. Priority 1. Effort M.
-Mechanism: `FailedStorageDeviceDurableTask.tombstone` sends the former host a single best-effort `CheckStorageDevice`.
-A host that misses it (partitioned at that moment, or the message lost) reconciles the device, and retires it
-(`DeviceShutdown.retireFailedDevice`), only at its periodic check (`Main.CheckStorageDevicesPeriod`, 1 h) or a
-restart; the drain sends nudges only to destinations. Meanwhile the drain (`DefaultPollPeriod`, 2 min) moves the
-store Rebuilding to another device. Peers route by the store-to-host mapping their `MetadataManager` caches, changed
-only by `StoreMoved` gossip, which comes at the rebuilt copy's flip; the `StoreOffline` the new host gossips at the
-rebuild's start changes availability, not the mapping, and no host reacts to gossip about a store it serves. So for
-the whole rebuild, peers' prepares, commits and reads for that index reach the old host, which still serves its
-copy with full acceptor state. A commit it applies and acknowledges after the walk read the object leaves the rebuilt
-copy stale with no ErrorTree mark (its finalizer saw the store acknowledge); after the flip, until the old host's
-check, peers that have not yet applied `StoreMoved` still reach the old copy, a second acceptor for the same store
-index next to the rebuilt one.
-Consequence: a rebuilt copy silently missing committed updates (permanent divergence, consuming the margin of every
-object it touches), and, past `acceptor-since`, two acceptor states for one store index. The old copy's commit votes
-count toward `t` while its copy is already being replaced, so an update it acknowledged during the rebuild is held,
-once it is retired, by only `t - 1` durable copies: in a pool with `t = r` (Replication(3,2), and every pool whose
-data tolerance is zero) that is below the read threshold, and a later read restores the earlier revision from the
-non-voters and the rebuilt copy, silently losing the committed update. No store failure is involved, only an
-operator command and a lost message, so this is margin loss from asynchrony, not a failure beyond the margin.
-`fail-storage-device` on a device that is still running (suspect media, 4.1) is a supported use; systemic-loss S10
-states the residual.
-Fix: on the rare path only. Have a host that receives `StoreOffline` or `StoreMoved` gossip for a store it serves
-check that store's device (`DeviceReconciler.checkStorageDevice`), which reads the tombstone and retires the device;
-and have the drain re-send the tombstone's nudge to the former host (recorded in the task's state) on every pass
-until the store map is empty. Those shorten the window but do not close it, since the drain may move a store before
-any nudge lands. To close it for a host that is up and reachable, have `retireFailedDevice` record that it retired
-the device (in the tombstone's device state, which hosts already poll) and have the drain move no store before that
-record exists or the former host is known down; an unreachable but serving host is then the accepted no-fencing
-residual (B19), bounded by the drain's own wait.
 
 ### RB-W20: An out-of-space write in `retryFailures` is recorded as an unreadable object
 Verdict CONFIRMED. Priority 5. Effort S.

@@ -39,7 +39,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Repair proofs | Requirements | A committed proof's requirements cover every part the reconcile then treats as proven; a DataObject's object-level proof covers its refcount only (repair-process.md RP-W11) |
 | Rebuild | Transactions | `CurrentAllocationsRequest` lists every unfinalized allocation and every held commit vote (`HeldVote`); reads of the pool's objects complete |
 | Rebuild | Repair | Everything the store missed while rebuilding is marked and repaired after promotion |
-| Rebuild (reassignment) | Host device lifecycle | The tombstoned device's former host stops serving its stores before the drain rebuilds them elsewhere: one best-effort nudge, else its hourly check (rebuild-process.md RB-W19) |
+| Rebuild (reassignment) | Host device lifecycle | The tombstoned device's former host stops serving its stores before the drain rebuilds them elsewhere: one best-effort nudge, else its hourly check; a running host that misses the nudge serving through the rebuild is an accepted limitation (rebuild-process.md B19) |
 | Transfer out (closed store) | Host loader | The store stays closed from its extraction until its `transferring-out` marker is written (crash-recovery-log.md CRL-W17), and the extraction tells a failed stat of the save file from its absence (systemic-loss-protection.md SL-W20) |
 | Rebuild completion | Transfers | A flip that finds the entry already Active adopts the copy without checking its episode (`DeviceMetadata.markRebuiltStoreActive`); no transfer starts onto an occupied store path, so the copy is this episode's (2.2). A flip retried after `TransactionOutcomeUnknown` that finds the entry moved on (TransferringOut, absent) keeps the copy offline rather than discarding it (`Unconfirmed`, rebuild-process.md 5.7) |
 | Rebuild, CRL | Store lifecycle | A rebuilt copy's first load recovers nothing an earlier copy left under its id in the device CRL: it is a save-file load of the empty state `RebuildingStore.finish` writes, which drops those entries first (rebuild-process.md 5.6) |
@@ -166,7 +166,8 @@ The premises other subsystems take from this:
   holding a stale store-to-host mapping (the no-fencing trade-off accepted for adoption). A running, reachable old
   host that misses the tombstone's single nudge is outside that trade-off: it serves the device's stores, voting and
   acknowledging, until its hourly check while the drain rebuilds them elsewhere, and peers keep routing to it until
-  the flip's `StoreMoved` (rebuild-process.md RB-W19). The rebuild's inherited-vote gate and `acceptor-since` assume
+  the flip's `StoreMoved`. This is an accepted limitation, deliberately not addressed in code
+  (rebuild-process.md B19). The rebuild's inherited-vote gate and `acceptor-since` assume
   the old incarnation stopped joining at the rebuild's start; there it does not.
 * A device whose CRL fails is disowned and unloaded until the host restarts, its rebuilds left running
   (`DeviceShutdown.crlFailed`). A rebuild that finishes meanwhile flips its entry Active (`Adopt`) and its load finds
@@ -528,11 +529,8 @@ Terms the documents share mean the same in each:
 Between the documents, each disagreement found is corrected where it stood:
 
 * systemic-loss-protection.md S10 described `fail-storage-device` as only for a drive whose data is already gone,
-  while rebuild-process.md 4.1 uses it to move a rebuild off suspect media and RB-W19 calls a running device a
-  supported use. S10 now says that nothing checks that the device is unserved, and points to RB-W19.
-* rebuild-process.md RB-W19 gave the old copy's continued service priority 2 (divergence). In a pool with `t = r` a
-  commit the old copy voted for during the rebuild is left with `t - 1 < r` copies, a lost committed update: it is
-  priority 1, and its fix needs the drain to wait for the old host (effort M).
+  while rebuild-process.md 4.1 uses it to move a rebuild off suspect media. S10 now says that nothing checks that the
+  device is unserved, and points to the accepted limitation in rebuild-process.md B19.
 * transaction-recovery.md 4.2 (a resolved, unfinalized cache entry) and 2.6 here said a prepare below the floor
   creates nothing; the rebuilt store's muted Tx is now excepted in both.
 * transaction-requirements.md 10.5(c) says a refcount requirement fails at a store that applied a later chained

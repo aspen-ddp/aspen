@@ -161,7 +161,8 @@ These are facts about the current code. They define the problem; none of them is
   `shutdownStorageDevice`, which refuses when a pool would drop below its write threshold. Nothing checks that the
   device is no longer served: the command is also the way to move a rebuild off suspect media (rebuild-process 4.1),
   and a host still serving the device keeps answering for its stores until it reconciles the device, which the
-  tombstone's single nudge may not trigger for up to an hour (rebuild-process RB-W19).
+  tombstone's single nudge may not trigger for up to an hour: an accepted limitation, not addressed in code
+  (rebuild-process B19).
 
 ### Protections that would be needed (tracked in Backlog.txt)
 

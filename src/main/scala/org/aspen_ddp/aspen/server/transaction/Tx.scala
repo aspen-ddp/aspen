@@ -398,13 +398,9 @@ class Tx( trs: TransactionRecoveryState,
     * recorded. Its waits end, its locks and objects are released. The Frontend deletes its CRL state and forgets it
     */
   def expire(): Unit =
-    waitingOn = Set()
-    pendingCollisionPrepare = None
+    endVoteWaits()
     delayedPrepare = None
     heldAborts = Nil
-    if awaitingCommits.nonEmpty then
-      frontend.stopAwaitingCommits(awaitingCommits, this)
-      awaitingCommits = Set()
     unlock()
     releaseObjects()
 
@@ -779,8 +775,7 @@ class Tx( trs: TransactionRecoveryState,
       now - lockWaitBlockStart >= Tx.CollisionWait.toNanos then
       // Withheld too long for a commit waiting in lock order: see lockWaitBlocked
       lockWaitBlockExpired = true
-      frontend.stopAwaitingCommits(awaitingCommits, this)
-      awaitingCommits = Set()
+      stopAwaitingInFlightCommits()
       endCollisionWait()
 
   /** Decides the vote now that the holders, or the in-flight commits, are gone, unless another takes their place, and
@@ -795,6 +790,18 @@ class Tx( trs: TransactionRecoveryState,
       pendingCollisionPrepare.foreach: m =>
         pendingCollisionPrepare = None
         answerPrepare(m)
+
+  /** Stops waiting for the in-flight commits the vote was withheld for */
+  private def stopAwaitingInFlightCommits(): Unit =
+    if awaitingCommits.nonEmpty then
+      frontend.stopAwaitingCommits(awaitingCommits, this)
+      awaitingCommits = Set()
+
+  /** Ends every wait the vote had: once an outcome is known (or the Tx is expired) the vote no longer matters */
+  private def endVoteWaits(): Unit =
+    waitingOn = Set()
+    pendingCollisionPrepare = None
+    stopAwaitingInFlightCommits()
 
   /** Releases the locks and answers the reads parked on them (Frontend.answerParkedReads) */
   private def unlock(): Unit = if locked then
@@ -1024,9 +1031,7 @@ class Tx( trs: TransactionRecoveryState,
     // A frozen Tx never decides a vote: "frozen, loaded and undecided" is then a final non-voter, as its status reply
     // reports it (receiveStatusRequest). Whatever it was waiting for is moot
     waitingOn = Set()
-    if awaitingCommits.nonEmpty then
-      frontend.stopAwaitingCommits(awaitingCommits, this)
-      awaitingCommits = Set()
+    stopAwaitingInFlightCommits()
     logger.trace(s"Tx $transactionId on store $storeId is frozen past expiry: it decides no vote")
   } else {
     val failed = pointersById.keysIterator.filter(frontend.commitFailed).toList
@@ -1426,12 +1431,7 @@ class Tx( trs: TransactionRecoveryState,
     // the Tx concludes as any resolved Tx does (TxFinalized, a late outcome, or expiry: mayExpire)
     lateCommitHeld = false
 
-    // The vote no longer matters
-    waitingOn = Set()
-    pendingCollisionPrepare = None
-    if awaitingCommits.nonEmpty then
-      frontend.stopAwaitingCommits(awaitingCommits, this)
-      awaitingCommits = Set()
+    endVoteWaits()
 
     txStatus = if (committed)
       TransactionStatus.Committed
@@ -1707,13 +1707,8 @@ class Tx( trs: TransactionRecoveryState,
   private def applyNothing(committed: Boolean, finalMessage: Boolean, late: Boolean): Unit =
     lateCommitHeld = false
     heldAborts = Nil
-    // The vote no longer matters
-    waitingOn = Set()
-    pendingCollisionPrepare = None
+    endVoteWaits()
     delayedPrepare = None
-    if awaitingCommits.nonEmpty then
-      frontend.stopAwaitingCommits(awaitingCommits, this)
-      awaitingCommits = Set()
     if oresolution.isEmpty then
       oresolution = Some(committed)
       txStatus = if committed then TransactionStatus.Committed else TransactionStatus.Aborted

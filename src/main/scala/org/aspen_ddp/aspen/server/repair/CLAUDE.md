@@ -89,9 +89,11 @@
   and the scan goes on to later entries. Tree reads (`foreachInRange`, `allocationTree.get`) stay untimed; the scan
   deadline bounds them
 - A repair write that meets a foreign occupant of the object's slot (`backend.RepairSlotOccupied`, FSIF slot reuse
-  over a missed delete) drops the occupant with an id-checked `repairDelete` once the AllocationTree does not list it.
-  The object was just read live, and two live objects never share a slot. The entry stays (stale), and the next pass
-  installs the object. A listed occupant is logged as an error and left (repair-process 6.5)
+  over a missed delete) drops the occupant with an id-checked `repairDelete` once the AllocationTree does not list it
+  and a re-read of the object, taken after the occupant was found, shows it still live (`stillLive`: restored with no
+  object-level lock, or else an object-level proof of the re-read commits). Two live objects never share a slot, but
+  the first read may predate a deletion that freed the index for a live, not-yet-listed allocation. The entry stays
+  (stale), and the next pass installs the object. A listed occupant is logged as an error and left (repair-process 6.5)
 - A deletion the store refuses because the object is in use (`Frontend.RepairDeleteDeferred`) counts as deferred: the
   entry stays for a later pass
 - Repair fence: a repair scan runs only while the store's pool entry names both this host and the device the store

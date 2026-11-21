@@ -478,6 +478,27 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       result.deferred shouldBe 1
       stillThere shouldBe true
 
+  test("a repair over a foreign occupant leaves it when the repaired object was deleted after its read"):
+    // repair-process 6.5: the slot freed by that deletion may hold a live object the allocation tree does not list yet
+    val occupant = ObjectId(new UUID(23, 23))
+    val target = occupiedTarget(occupant)
+    val repairer = StoreRepairer(client, target, testingOnlyBeforeReconcile = (_, ptr) =>
+      client.read(ptr.asInstanceOf[KeyValueObjectPointer]).flatMap: os =>
+        client.transactUntilSuccessful: tx =>
+          tx.setRefcount(ptr, os.refcount, ObjectRefcount(os.refcount.updateSerial + 1, 0))
+          Future.unit
+      .flatMap(_ => net.waitForTransactionsToComplete()))
+    for
+      ptr <- allocateObjectPointer()
+      _ <- seedErrorEntry(ptr.id, ptr.storePointer)
+      result <- repairer.scan(storeId, RepairPolicy.Default)
+      stillThere <- errorEntryExists(ptr.id)
+    yield
+      target.repairs shouldBe List(ptr.id)
+      target.deletions shouldBe Nil
+      result.deferred shouldBe 1
+      stillThere shouldBe true
+
   test("a repair over a foreign occupant the allocation tree still lists leaves the occupant"):
     for
       occupant <- allocateObjectPointer()

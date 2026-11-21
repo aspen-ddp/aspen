@@ -505,25 +505,54 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
     case kp: KeyValueObjectPointer => reader.read(kp)
     case dp: DataObjectPointer => reader.read(dp)
 
-  /** The store's slot for `ptr`, a live object (just read), holds `occupant` (Backend.RepairSlotOccupied): FSIF slot
-    * reuse over a missed delete of the occupant (repair-process 6.5, rebuild-process 12 FS6). Two live objects never
-    * share a slot, so the occupant is dead; it is dropped once the allocation tree does not list it either, by an
-    * id-checked repairDelete. The repair of `ptr` is left stale, so its entry stays and the next pass installs it. A
-    * listed occupant is an inconsistency nothing here can settle: it is logged and left.
+  /** The store's slot for `ptr` holds `occupant` (Backend.RepairSlotOccupied): FSIF slot reuse over a missed delete
+    * of the occupant (repair-process 6.5, rebuild-process 12 FS6). The repair's read showed `ptr` live only when it was
+    * taken: `ptr` may since have been deleted, its index reused and `occupant` allocated there, a live object the
+    * allocation tree does not list until its AllocationFinalizationAction lands. So the occupant is dropped, by an
+    * id-checked repairDelete, only when the tree does not list it and a read of `ptr` taken after the occupant was
+    * found shows `ptr` still live (stillLive): two live objects never share a slot, and `ptr`'s index was not freed
+    * before that read. The repair of `ptr` is left stale, so its entry stays and the next pass installs it, or proves
+    * `ptr` deleted. A listed occupant is an inconsistency nothing here can settle: it is logged and left.
     */
   private def dropOccupant(storeId: StoreId, ptr: ObjectPointer, occupant: ObjectId): Future[Unit] =
     for
       pool <- client.getStoragePool(ptr.poolId)
       listed <- pool.allocationTree.get(Key(occupant.toBytes))
+      live <- if listed.isDefined then Future.successful(false) else stillLive(storeId, ptr, occupant)
       _ <-
         if listed.isDefined then
           logger.error(s"Repair of ${ptr.id} on $storeId: its slot holds $occupant, which the allocation tree " +
                        s"still lists. Leaving both")
           Future.unit
-        else
+        else if live then
           logger.warn(s"Repair of ${ptr.id} on $storeId: its slot holds $occupant, a deleted object. Dropping it")
           repairDeletion(storeId, occupant, ptr.storePointer).map(_ => ())
+        else
+          Future.unit
     yield ()
+
+  /** True when `ptr` is shown live after `occupant` was found in its slot, so its index was never freed for
+    * `occupant` to reuse. A deletion of `ptr` committed before the occupant's allocation was voted by at least
+    * writeThreshold stores, each holding its exclusive object lock until it applies; a read restores from at least the
+    * read threshold of matching live stores, and `t + r > w` puts a voter that has not applied among them. So a read
+    * that restores `ptr` with no object-level lock reported proves it; a reported lock (a deletion, or any refcount or
+    * DataObject write) is settled by an object-level proof of the read (RepairProofs.proveObjectLevel), whose commit
+    * shows `ptr` live at that later time.
+    */
+  private def stillLive(storeId: StoreId, ptr: ObjectPointer, occupant: ObjectId): Future[Boolean] =
+    readObject(ptr)
+      .flatMap: os =>
+        if os.readLocks.objectLevel then RepairProofs.proveObjectLevel(client, os) else Future.successful(true)
+      .recover:
+        case err =>
+          logger.info(s"Repair of ${ptr.id} on $storeId: its slot holds $occupant, but a re-read does not show " +
+                      s"${ptr.id} still live ($err). Leaving the occupant")
+          false
+      .map: live =>
+        if !live then
+          logger.info(s"Repair of ${ptr.id} on $storeId: its slot holds $occupant, and ${ptr.id} may have been " +
+                      s"deleted since its read. Leaving the occupant")
+        live
 
   /** Reconciles the store's copy of the object with a read of it (Reconcile): snapshot the store, read, then install
     * what still matches the snapshot. A read older than `minTimestamp`, the update the entry records, comes back as a

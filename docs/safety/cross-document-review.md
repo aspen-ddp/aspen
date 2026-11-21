@@ -397,7 +397,8 @@ The premises other subsystems take from this:
   2.3: if its outcome reaches the holder first, it waits for the holder's vote in lock order (2.3), so T applies
   first.
 * A repair write never overwrites a different occupant of an FSIF slot (`RepairSlotOccupied`); the repairer drops a
-  dead occupant with an id-checked `repairDelete`, only when the AllocationTree does not list it.
+  dead occupant with an id-checked `repairDelete`, only when the AllocationTree does not list it and a re-read of the
+  repaired object after the occupant was found shows it still live (repair-process 6.5).
 * A failed repair write restores the fields it changed to the settled pre-repair state, the backend's
   (`Frontend.repairWriteComplete`), keeping the instance lock holders reference, so their committed apply holds. A
   repair of an object the store did not hold discards its state.

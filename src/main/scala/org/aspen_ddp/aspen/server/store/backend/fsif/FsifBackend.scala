@@ -1290,7 +1290,8 @@ class FsifBackend(val storeId: StoreId,
     val occupant = index.ids(x)
     // Frontend repairs a missed allocation with allocating = false, so a repair allocates an unmapped X.
     // A repair never overwrites a different occupant: it reports the occupant (RepairSlotOccupied), and the repairer
-    // drops it through repairDelete once the allocation tree no longer lists it (cross-document-review 2.4).
+    // drops it through repairDelete once the allocation tree no longer lists it and the repaired object is shown
+    // still live (StoreRepairer.dropOccupant).
     val allocating = if repairing then slot < 0 else state.allocating
     if abandoned then
       () // released from behind a gate after an abandoning close: never completes, as if the store had crashed

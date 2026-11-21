@@ -553,8 +553,19 @@ reconciles the whole object from a later read.
 
 A repair write that finds another object in the slot (`backend.RepairSlotOccupied`, FSIF slot reuse over a missed
 delete) drops the occupant (`StoreRepairer.dropOccupant`) with an id-checked `repairDelete`, but only when the
-AllocationTree does not list it: the object was just read live, and two live objects never share a slot (the read can
-predate a deletion of the object, after which its slot may be reused: RP-W12). The repair is stale, so the entry stays and the next pass installs. A listed occupant is logged as an error and left.
+AllocationTree does not list it and a re-read of the repaired object, taken after the occupant was found, shows it
+still live (`stillLive`). Two live objects never share a slot, but the repair's first read shows the object live only
+when it was taken: an FSIF deletion frees the index in its own transaction (`FsifIndexAllocationStrategy`), so the
+object may since have been deleted and the slot reused by a live allocation the AllocationTree does not list until its
+`AllocationFinalizationAction` lands. The re-read closes that: a deletion committed before the occupant's allocation
+was voted by at least `w` stores, each holding its exclusive object lock until it applies, and a restoring read
+matches at least `r` live stores, so (`t + r > w`) it includes a voter that has not applied and reports an
+object-level lock. A re-read restoring the object with no object-level lock therefore proves it was not deleted
+first; a reported lock (a deletion, or any refcount or DataObject write) is settled by an object-level proof
+(`RepairProofs.proveObjectLevel`) of the re-read, whose commit shows the object live after the occupant was found. A
+re-read that fails, or a proof that aborts, leaves the occupant. The cost is one read (and at most one proof) on this
+rare path only. Either way the repair is stale, so the entry stays and the next pass installs the object or proves it
+deleted. A listed occupant is logged as an error and left.
 
 ---
 
@@ -925,32 +936,4 @@ its read threshold stalls the scan until the deadline.
 
 ## 14. Open weaknesses
 
-**RP-W12 Dropping a slot's occupant can delete a live object allocated after the repaired object's deletion**
-(PLAUSIBLE, priority 2, effort S)
-
-Mechanism: `StoreRepairer.dropOccupant` takes a `RepairSlotOccupied` from an FSIF repair write as proof that the
-occupant is dead, on the grounds that the object being repaired was just read live and two live objects never share a
-slot (6.5). The read only shows the object live when it was taken. An FSIF pool's deleting transaction clears the
-object's index bit in the same transaction (`FsifIndexAllocationStrategy` `prepareCommit`, `updateBits`), so the index
-can be handed to a new allocation as soon as the deletion commits, and the new object's `AllocationFinalizationAction`
-lists it in the AllocationTree only after its own commit. The only check `dropOccupant` makes on the occupant is that
-absence; `Frontend.deleteObjectForRepair` refuses only while the occupant is in use, and an allocation's state is
-retained unshared (`Frontend.retain`, `shared = false`), so once the allocating commit has persisted nothing refuses.
-
-Trigger: store S missed the allocation of P, so it holds no copy and has an entry for P. A pass snapshots P as missing
-on S and reads P live. Before the reconcile reaches S's executor (a parked reconcile waits up to `RepairSettleWait`; a
-proof pass runs its proof transactions between the read and the second reconcile), P is deleted, the index is reused
-for a new object C, and C's allocation commits and applies on S. The reconcile plans a new copy of P (current and
-snapshot both missing, live refcount) and `backend.repair` fails with `RepairSlotOccupied(C)`. `dropOccupant` finds C
-absent from the AllocationTree (its `AllocationFinalizationAction` has not landed, which a slow metadata pool can
-prolong) and `repairDeletion` removes C's slice from S, id-checked against C.
-
-Consequence: a committed, live object loses its slice on S with no entry recording it. S may have been a counted
-commit voter of C's allocation, so this spends the `t - r` margin silently, and an object never written again stays
-short on S for good (no read-driven repair, 10.2). P's own entry is then settled normally by a later pass proving P's
-deletion.
-
-Fix direction: before dropping the occupant, re-read the repaired object (or let the next pass decide): only an object
-still live after the occupant was found shows the slot was not freed and reused meanwhile. Alternatively drop the
-occupant only on a read proving its own deletion (`InvalidObject.provesDeletion`), with its type taken from the FSIF
-header that `RepairSlotOccupied` could carry, since a read of the wrong type answers `ObjectMismatch`.
+(none)

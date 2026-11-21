@@ -48,14 +48,6 @@ rebuild-process.md B19.)
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.2 [S] RP-W12: repair's dropOccupant can delete a live object (PLAUSIBLE). An FSIF index freed by a deletion is
-    reusable in the same transaction (FsifIndexAllocationStrategy); a repair install meeting RepairSlotOccupied(C)
-    reads the AllocationTree, finds C unlisted (its AllocationFinalizationAction not yet landed), and its later
-    repairDeletion can arrive after C's Tx was finalized and left Frontend.referenced: C's slice is deleted with no
-    mark, silently spending the t - r margin. Fix: drop the occupant only on a read proving its own deletion
-    (InvalidObject.provesDeletion, type from the FSIF header), or re-read the repaired object first. Cross-check
-    rebuild-process FS6, which relies on the same id-checked repair delete.
-
 2.5 [S] RB-W21: a copy that serves between rebuild passes leaves the resumed walk's done part stale with no mark
     (PLAUSIBLE). A Missing Stores directory that comes back after the checkpoint is served by a restart's device
     load (a load retry waits while the store is declared or Rebuilding), acknowledges commits, and is then retired

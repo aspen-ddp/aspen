@@ -165,8 +165,8 @@ table:
 
 For `repair`, `allocating` is `slot < 0`. A repair allocates an unmapped X and never overwrites a different
 occupant. Over a different occupant it fails with `RepairSlotOccupied(objectId, occupant)` instead of a
-plain `ObjectMismatch`, so the repairer can drop the occupant once the AllocationTree no longer lists it
-(cross-document-review 2.4, repair and transactions).
+plain `ObjectMismatch`, so the repairer can drop the occupant once the AllocationTree no longer lists it and the
+repaired object is shown still live (repair-process 6.5; cross-document-review 2.4).
 
 **Journaled** (`journaled`, `appendDelta`).
 - **Update of the current occupant:** append `Delta(X, slot, header, ranges)`. The ranges come from `rangesOf`:

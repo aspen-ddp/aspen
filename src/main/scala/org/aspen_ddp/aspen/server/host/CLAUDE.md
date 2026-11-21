@@ -1,3 +1,20 @@
+### Code organization
+- `Host` is a thin shell. `DeviceControl` wires the control-thread components, each a lazy val taking the
+  `DeviceControl` (`ctx`) and importing its control context: `DeviceDiscovery` (device scan, load, adoption, device
+  CRL open), `DeviceReconciler` (device checks: `reconcileDeviceState` dispatches one method per pass over the
+  tree's entries for the device), `DeviceShutdown` (shutdown, relinquish, CRL failure, Failed retirement),
+  `DeviceMetadata` (the tree and pool transactions), `StoreLoader` (loads, opens, closes, load retries), `StoreRebuilds`
+  (rebuilds, backend failures), `StoreTransfers` (the receiving end of a transfer), `StoreTransfersOut` (the sending
+  end: close with CRL extraction, answering a receiver's request, reinstating an abandoned transfer), `StoreCopies`
+  (retire, release and rename-first delete of store copies) and `LocalDevices` (the loaded devices). `StoreRouter`,
+  `StoreThreadPool`/`StoreMailbox`/`StoreBalancer` and `HostStoreView` are the store-side and cross-thread pieces
+- `StoreDirMarkers` is the single source for the marker files a store directory carries (`rebuild-required`,
+  `transferred-in`, `transferring-out`, `rebuild-complete`) and for which wins when several are present
+  (`StoreDirMarkers.blocker`, in that order). Its tests are FileStat's: `has` throws on a failed stat, `knownPresent`
+  answers false for a pass that waits for a later one. `tryLoadStore`, `adoptionClass` and the marker tests go through it
+- `DeviceControl.markStoreOffline`/`clearStoreOffline` keep the router's offline mark and the device's
+  `offlineStores` together; `LocalDevices.isLoaded(sds)` says whether a device state is still the loaded one
+
 ### Host threading model
 - `HostThreading` decides where a host's work runs. It is a `Host` constructor parameter, chosen in
   code. The default strategy, which `Main` passes, is `StoreThreadPool`: each store's executor is its own
@@ -252,7 +269,7 @@
   Every rename of a copy, of a store's CRL state, or of a lost device CRL goes through `DurableFiles.move`, which
   forces both directories. Without the marker on disk, a store's entries stay in the device CRL. A transfer out reads
   them (`readStoreState`, leaving them live) into `crl_save.log`, whether the store is loaded or not
-  (`StoreTransfers.closeForTransferOut`), and deletes them from the device CRL (`deleteTransactions`) only once that
+  (`StoreTransfersOut.closeForTransferOut`), and deletes them from the device CRL (`deleteTransactions`) only once that
   file is durable: a crash or failed save before that leaves the device CRL holding them. A closed store that already
   has a valid `crl_save.log` ships it unchanged: the file is its whole state, so its device-CRL entries are copies or
   an earlier tenancy's leftovers, dropped (`dropStore`) as its load would drop them (`extractUnloaded`). A closed

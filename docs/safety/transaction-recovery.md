@@ -533,10 +533,9 @@ Ordering (`Frontend.recoveredTransactionLoaded`, `Tx.completeLoad`):
    with a restored commit resolution then applies in the same `completeLoad`, holding them until `doCommit` releases
    them: its backend commit may not have completed before the crash, and until it applies the locks order the
    transactions behind it and show readers and repair that it has yet to apply (transaction-requirements.md R13). A
-   restored commit without a commit vote here takes no locks and resolves in its `completeLoad`, waiting in lock order
-   (`Tx.awaitLockOrder`) for the holders it collides with and for its turn (`holdForTurn`), then applies nothing and
-   reports every object it changes (`Tx.doCommit`, 7.4). Every recovered commit vote has relocked by then (step 2), so
-   its wait sees every holder.
+   restored commit without a commit vote here takes no locks and resolves in its `completeLoad`: it applies nothing,
+   so it neither waits in lock order nor for its turn (`Tx.appliesNothing`), and reports every object it changes
+   (`Tx.doCommit`, 7.4).
 4. `completeLoad` requests the UnackedCommits lookup if `needsUnackedCheck` (7.5).
 5. Held messages are released only once nothing is holding.
 

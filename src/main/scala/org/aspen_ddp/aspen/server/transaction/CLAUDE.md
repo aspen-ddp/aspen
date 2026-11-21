@@ -169,12 +169,14 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
 - A recovered Tx whose saved status is resolved (re-saved by a prepare or accept after the resolution) restores it
   into `oresolution` and needs no lookup. A restored commit with a commit vote relocks (`Tx.lock`: locks and slice
   reservation, no check) and counts as relocking (`Frontend.recoveringTransactions`), holding them until `doCommit`
-  releases them: its backend commit may not have completed, and without them a restored non-voter could apply first
-  and fail its re-check, which `recoveredApplied` would take as applied, and reads and repair would see no lock for an
+  releases them: its backend commit may not have completed, and without them a committed transaction with no vote
+  here whose prepare arrives after the restart could apply first and fail its re-check, which `recoveredApplied` would
+  take as applied, a new vote could check the state before the update, and reads and repair would see no lock for an
   update not yet applied (transaction-requirements R13). Any other restored resolution takes no locks: once its
   objects load and every relocking recovered commit vote has relocked (`Frontend.recoveredTransactionLoaded` defers
-  its `completeLoad`, so lock order sees every holder) it applies the commit with the recovered re-check rules, or
-  deletes the abort's state. Either then waits for TxFinalized as a live resolved Tx does.
+  its `completeLoad` with the other recovered Txs, so one without a vote decides it only after them) a commit applies
+  nothing (a recovered non-voter, `Tx.appliesNothing`) and reports its objects, and an abort deletes its state. Either
+  then waits for TxFinalized as a live resolved Tx does.
   A resolution learned from the tree (`unackedCommitFound`, `unackedCommitNotOwed`) saves `Unresolved`
   (`Tx.savedStatus`): restored as resolved it would seed the host cache with a non-finalized `Committed` for a T its
   peers forgot and lose `notOwedHere`; restored unresolved it looks its entry up again (transaction-recovery 7.2)
@@ -268,7 +270,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   abort is the chosen value, and an acceptor that promises and accepts nothing can help choose no other
 
 #### Applied stubs
-- A durable (store, txid) record in the device CRL, charged to `CrlAdmission`, meaning the store holds
+- A durable (store, txid) record in the device CRL, charged to the device's admission through `StoreAdmission`
+  (`CrlAdmission.AppliedStubBytes` each), meaning the store holds
   that transaction's update. It carries T's start timestamp (from the Tx's txd, or `TxFinalized.startTimestamp` when
   the store holds no Tx). Written where the Tx's CRL state would be deleted, after its commits persist: on an
   owed-listing `TxFinalized` (`owed`), on applying through an UnackedCommits entry, and by a lookup when the Tx is
@@ -277,9 +280,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   a stub may precede its entry. A commit at a store with a stub applies nothing; a non-late one reports its objects in
   `objectCommitErrors`. The store drops a stub itself (`Frontend.expireStubs`, at heartbeat) once T is past the
   horizon plus the expiry margin and it holds no Tx for T (live, deferred or awaiting backend commits):
-  below the floor no prepare creates a Tx for T, so the stub can suppress nothing (crash-recovery-log 3.6). A queue
-  ordered by expiry (`stubExpiry`, stale entries skipped) means a heartbeat looks only at the stubs due, and a stub a
-  Tx keeps past its expiry waits in `heldStubs` without blocking the rest. Stubs are so
+  below the floor no prepare creates a Tx for T, so the stub can suppress nothing (crash-recovery-log 3.6). `AppliedStubs.dueForDrop`
+  keeps a queue ordered by expiry (stale entries skipped), so a heartbeat looks only at the stubs due, and a stub a Tx
+  keeps past its expiry waits in its `kept` set, rechecked each heartbeat, without blocking the rest. Stubs are so
   bounded by their rate times ~30 s whatever the repair scans do; the scan neither reads nor drops them. An entry with
   no stub is harmless at a store that saw T: it never
   rejoins T, so no replay Tx exists there to apply through it (a second driver's lost TxFinalized included). Residual:

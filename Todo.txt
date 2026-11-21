@@ -80,8 +80,4 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.1 [S] server/transaction/CLAUDE.md (Applied stubs) cites the removed stubExpiry / heldStubs (now
-    Frontend.expireStubs, AppliedStubs.dueForDrop, charges in StoreAdmission), and its "a restored non-voter could
-    apply first and fail its re-check" rationale predates the recovered-non-voter rule (Tx.doCommit applies nothing).
-    The scaladoc of Frontend.recoveredTransactionLoaded gives the same stale reason; the remaining one is the order
-    of votes decided later.
+(no open items)

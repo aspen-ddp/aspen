@@ -999,10 +999,9 @@ class Frontend(val storeId: StoreId,
   /** A recovered transaction has loaded (or failed to load) all its objects. A commit vote that relocks (unresolved,
     * or with a restored Committed resolution, which it then applies) completes its load at once, taking its locks
     * again. Every other one completes only once every recovered commit vote that relocks has done so, those with a
-    * persisted vote first. One applying a restored commit resolution earlier would
-    * find no lock holder to wait for in lock order (Tx.awaitLockOrder) and could apply over a vote's update first,
-    * failing its re-check (transaction-recovery.md 7.2); one deciding its vote earlier could take locks that conflict
-    * with a recovered vote's.
+    * persisted vote first: one deciding its vote earlier could take locks that conflict with a recovered vote's
+    * (transaction-recovery.md 7.2). A restored commit resolution among them has no commit vote here, so it applies
+    * nothing (Tx.appliesNothing) and needs no lock holder to order behind.
     */
   def recoveredTransactionLoaded(tx: Tx, hasVote: Boolean): Unit =
     val relocks = recoveringTransactions.getOrElse(tx.transactionId, false)
@@ -1091,7 +1090,7 @@ class Frontend(val storeId: StoreId,
   /** Drops every applied stub whose transaction is past the horizon plus the expiry margin  and for
     * which the store holds no Tx, whether live, waiting on a held commit (deferredFinalizations), on its backend
     * commits (txCommits). Called at heartbeat (expiryHeartbeat). Only the
-    * stubs due are looked at (stubExpiry), plus those a Tx kept past theirs (heldStubs), so a heartbeat costs
+    * stubs due are looked at, plus those a Tx kept past theirs (AppliedStubs.dueForDrop), so a heartbeat costs
     * O(k log n) for k stubs due, not a pass over all n.
     *
     * A stub only ever keeps a Tx for its transaction at this store from applying the update again. Past the margin T is

@@ -295,9 +295,6 @@ class Frontend(val storeId: StoreId,
     */
   @volatile var transactions: Map[TransactionId, Tx] = Map()
 
-  /** Transactions waiting for a lock holder, by holder. See Tx.awaitableHolders */
-  private val collisionWaiters = scala.collection.mutable.HashMap[TransactionId, List[Tx]]()
-
   /** The transaction started more than MaxStartLead ahead of this host's wall clock, or at or above the host's join
     * ceiling (a renewal fell behind, JoinCeiling.mayJoin): a prepare for it, if unknown, is muted (see MaxStartLead),
     * and its designated leader does not drive it (Store) */
@@ -551,14 +548,6 @@ class Frontend(val storeId: StoreId,
     heldVoteQueryNotBefore = wallClockMillis() + heldVoteQueryInterval
     heldVoteQueryInterval = math.min(heldVoteQueryInterval * 2, InheritedVoteQueryMaxInterval.toMillis)
 
-  def awaitLocksReleased(holder: TransactionId, waiter: Tx): Unit =
-    val others = collisionWaiters.getOrElse(holder, Nil).filterNot(_ eq waiter)
-    collisionWaiters(holder) = waiter :: others
-
-  /** `holder` released its locks, so the transactions waiting for it decide their votes */
-  def locksReleased(holder: TransactionId): Unit =
-    collisionWaiters.remove(holder).foreach(_.foreach(_.collisionHolderReleased(holder)))
-
   // ---- One in-flight transaction commit per object ----
   //
   // An object accepts its next transaction only once the previous transaction commit to it has been persisted by the
@@ -567,11 +556,33 @@ class Frontend(val storeId: StoreId,
   // completes or fails), and a committed transaction holds its own commit until it is its turn on every object it
   // changes. Locks still release when a commit is applied in memory: the in-flight marker, not the lock, orders the
   // followers. An object a transaction only checks or locks gets no commit and so is never in flight
+  //
+  // Four things a Tx can wait for, each with its own queue:
+  //   - lock holders (collisionWaiters, by holder): a vote that collides with a holder's locks, or a committed
+  //     transaction waiting to apply over a vote's locks, until the holder releases them (awaitLocksReleased)
+  //   - an in-flight commit (commitWaiters, by object): a vote withheld until no commit of the object is in flight
+  //     (awaitCommitPersisted)
+  //   - its turn (heldCommits, by object): a committed transaction holding its commit behind those in flight and
+  //     those held earlier (holdCommit)
+  //   - lock order (lockWaitingCommits, by object): a committed transaction waiting to apply, which new votes whose
+  //     locks it would wait for must queue behind (awaitLockHolders, lockWaiters)
+
+  /** Transactions waiting for a lock holder, by holder. See Tx.awaitableHolders */
+  private val collisionWaiters = scala.collection.mutable.HashMap[TransactionId, List[Tx]]()
+
+  /** `waiter` waits until `holder` releases its locks (locksReleased -> Tx.collisionHolderReleased) */
+  def awaitLocksReleased(holder: TransactionId, waiter: Tx): Unit =
+    val others = collisionWaiters.getOrElse(holder, Nil).filterNot(_ eq waiter)
+    collisionWaiters(holder) = waiter :: others
+
+  /** `holder` released its locks, so the transactions waiting for it decide their votes */
+  def locksReleased(holder: TransactionId): Unit =
+    collisionWaiters.remove(holder).foreach(_.foreach(_.collisionHolderReleased(holder)))
 
   /** Outstanding backend commits of transactions' changes, deletions included, by object: commit with
     * `commit`, and repair writes (see reconcile)
     */
-  private val txCommitsInFlight = scala.collection.mutable.HashMap[ObjectId, Int]()
+  private val txCommitsInFlight = new ObjectCounts
 
   /** Committed transactions holding their commit until it is their turn, by object, oldest first. See holdCommit */
   private val heldCommits = scala.collection.mutable.HashMap[ObjectId, List[Tx]]()
@@ -696,7 +707,7 @@ class Frontend(val storeId: StoreId,
   /** Outstanding backend commits deleting each object. Reads that would reach the backend get the answer it will give
     * once the deletion is applied
     */
-  private val deleting = scala.collection.mutable.HashMap[ObjectId, Int]()
+  private val deleting = new ObjectCounts
 
   /** The states of outstanding non-deletion backend commits of each object, newest first. A backend read completing
     * meanwhile may return the state such a commit replaces, so it is never cached. See backendReadComplete
@@ -1475,12 +1486,12 @@ class Frontend(val storeId: StoreId,
     val key = (cs.objectId, txid)
     inFlight(key) = inFlight.getOrElse(key, Nil) :+ InFlight(os, System.nanoTime(), deletes)
     if deletes then
-      deleting(os.objectId) = deleting.getOrElse(os.objectId, 0) + 1
+      deleting.increment(os.objectId)
     else
       committing(os.objectId) = os :: committing.getOrElse(os.objectId, Nil)
     // Before the backend commit: a synchronous backend completes inside it
     txCommits.getOrElseUpdate(txid, new TxCommits(0, false, false)).outstanding += 1
-    txCommitsInFlight(os.objectId) = txCommitsInFlight.getOrElse(os.objectId, 0) + 1
+    txCommitsInFlight.increment(os.objectId)
     // A deletion reaches the backend only once no allocation's CRL state can bring the object back
     // (crash-recovery-log 3.4), and a key's deletion only once no blind Insert's CRL state can bring the key back
     // (awaitBlindInsertsDurable). Until then it is in flight like any commit: reads, snapshots and transactions see the
@@ -1786,20 +1797,15 @@ class Frontend(val storeId: StoreId,
           transactionCommitComplete(c.transactionId, c.result.isLeft)
           if c.result.isRight then
             failedCommits += c.objectId
-          val n = txCommitsInFlight.getOrElse(c.objectId, 1) - 1
-          if n == 0 then
-            txCommitsInFlight.remove(c.objectId)
+          if txCommitsInFlight.decrement(c.objectId) then
             turnFree = true
-          else
-            txCommitsInFlight(c.objectId) = n
           if !f.deletes then
             committingComplete(f.os)
           c.result match
             case Left(_) =>
               release(f.os)
               if f.deletes then
-                val n = deleting.getOrElse(c.objectId, 1) - 1
-                if n == 0 then deleting.remove(c.objectId) else deleting(c.objectId) = n
+                deleting.decrement(c.objectId)
                 inheritedGrowthDeleted(c.objectId)
             case Right(err) =>
               // The state stays pinned and served, and a deletion keeps answering ObjectNotFound, while the store is
@@ -2034,12 +2040,11 @@ class Frontend(val storeId: StoreId,
     else
       logger.trace(s"Repairing missed deletion of object $objectId")
       discard(objectId)
-      deleting(objectId) = deleting.getOrElse(objectId, 0) + 1
+      deleting.increment(objectId)
       val done = Promise[Unit]()
       done.future.onComplete { result =>
         post: () =>
-          val n = deleting.getOrElse(objectId, 1) - 1
-          if n == 0 then deleting.remove(objectId) else deleting(objectId) = n
+          deleting.decrement(objectId)
           if result.isSuccess then
             inheritedGrowthDeleted(objectId)
         completion.complete(result)
@@ -2206,7 +2211,7 @@ class Frontend(val storeId: StoreId,
       objectCache.insert(os)
       retain(os, shared = true)
       committing(objectId) = os :: committing.getOrElse(objectId, Nil)
-      txCommitsInFlight(objectId) = txCommitsInFlight.getOrElse(objectId, 0) + 1
+      txCommitsInFlight.increment(objectId)
       val done = Promise[Unit]()
       done.future.onComplete { result =>
         post(() => repairWriteComplete(os, result.isSuccess, prior))
@@ -2281,12 +2286,8 @@ class Frontend(val storeId: StoreId,
         case None =>
           logger.warn(s"Store $storeId: repair write of object $objectId failed. Its state is reloaded from the backend")
           discard(objectId)
-    val n = txCommitsInFlight.getOrElse(objectId, 1) - 1
-    if n == 0 then
-      txCommitsInFlight.remove(objectId)
+    if txCommitsInFlight.decrement(objectId) then
       commitTurnFree(objectId)
-    else
-      txCommitsInFlight(objectId) = n
 
   def backendReadComplete(objectId: ObjectId,
                           result: Either[ReadState, ReadError.Value]): Unit = {

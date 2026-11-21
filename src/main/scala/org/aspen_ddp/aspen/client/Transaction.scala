@@ -185,8 +185,4 @@ trait Transaction {
   /** The ids of every pool holding an object this transaction requires, updates or allocates */
   private[aspen] def referencedPoolIds: Set[PoolId]
 
-  /** Sets the delay in Milliseconds after which peers will be marked as having missed the commit of the transaction
-    */
-  protected[client] def setMissedCommitDelayInMs(msec: Int): Unit
-
 }

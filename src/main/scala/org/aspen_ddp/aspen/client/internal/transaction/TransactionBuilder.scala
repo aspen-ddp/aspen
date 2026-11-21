@@ -7,7 +7,6 @@ import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction.*
-import org.aspen_ddp.aspen.common.util.printStack
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{AppendableIDA, IDA, RangeEdit}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -60,8 +59,17 @@ class TransactionBuilder(
   /** Tests use this to see every transaction this builder builds, pinned or not */
   private[aspen] var onBuilt: Option[Built => Unit] = None
   private  var addMissedUpdateTrackingFA = true
-  private  var missedCommitDelayInMs = 1000
   private  val minimumTimestamp = HLCTimestamp.now
+
+  /** Marks `pointer` as updated by this transaction. An object is updated at most once and cannot also be
+    * exclusively revision-locked.
+    */
+  private def claimForUpdate(pointer: ObjectPointer): Unit =
+    if updatingObjects.contains(pointer) then
+      throw MultipleDataUpdatesToObject(pointer)
+    if exclusiveRevisionLocks.contains(pointer) then
+      throw ConflictingRequirements(pointer)
+    updatingObjects += pointer
 
   def isEmpty: Boolean =
     requirements.isEmpty &&
@@ -135,7 +143,7 @@ class TransactionBuilder(
     val originatingClient = Some(clientId)
 
     if (addMissedUpdateTrackingFA)
-      finalizationActions = MissedUpdateFinalizationAction.createSerializedFA(missedCommitDelayInMs) :: finalizationActions
+      finalizationActions = MissedUpdateFinalizationAction.createSerializedFA() :: finalizationActions
 
     val txd = TransactionDescription(transactionId, startTimestamp, primaryObject, designatedLeaderUID,
       requirements, finalizationActions, originatingClient, notifyOnResolution.toList,
@@ -243,21 +251,12 @@ class TransactionBuilder(
     addMissedUpdateTrackingFA = false
   }
 
-  def setMissedCommitDelayInMs(msec: Int): Unit = synchronized {
-    missedCommitDelayInMs = msec
-  }
-
   /** Appends data at the given position. Whether the pool's IDA supports appends is checked when the
     * transaction is built, since the IDA is not known here.
     */
   def append(position: AppendPosition, data: DataBuffer): Unit = synchronized {
     val objectPointer = position.pointer
-    if (updatingObjects.contains(objectPointer))
-      throw MultipleDataUpdatesToObject(objectPointer)
-    if (exclusiveRevisionLocks.contains(objectPointer))
-      throw ConflictingRequirements(objectPointer)
-
-    updatingObjects += objectPointer
+    claimForUpdate(objectPointer)
     appendUpdates += (objectPointer -> (position, data))
     requirements  = DataUpdate(objectPointer, position.revision, DataUpdateOperation.Append) :: requirements
   }
@@ -278,28 +277,15 @@ class TransactionBuilder(
     sorted.zip(sorted.tail).foreach: (prev, next) =>
       require(prev.end <= next.offset, s"Ranged write at ${next.offset} overlaps the write at ${prev.offset}")
 
-    if updatingObjects.contains(objectPointer) then
-      throw MultipleDataUpdatesToObject(objectPointer)
-    if exclusiveRevisionLocks.contains(objectPointer) then
-      throw ConflictingRequirements(objectPointer)
-
     val edits = sorted.map(w => RangeEdit(w.offset, w.data, state.oldBytes(w.offset, w.data.length)))
 
-    updatingObjects += objectPointer
+    claimForUpdate(objectPointer)
     rangedUpdates += (objectPointer -> RangedUpdate(state.length, edits, zeroFill))
     requirements  = DataUpdate(objectPointer, state.revision, DataUpdateOperation.WriteRange) :: requirements
   }
 
   def overwrite(objectPointer: ObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = synchronized {
-    //println(s"   TXB Overwrite txid $transactionUUID object ${objectPointer.uuid}")
-    if (updatingObjects.contains(objectPointer)) {
-      //printStack()
-      throw MultipleDataUpdatesToObject(objectPointer)
-    }
-    if (exclusiveRevisionLocks.contains(objectPointer))
-      throw ConflictingRequirements(objectPointer)
-
-    updatingObjects += objectPointer
+    claimForUpdate(objectPointer)
     dataObjectUpdates += (objectPointer -> data)
     requirements  = DataUpdate(objectPointer, requiredRevision, DataUpdateOperation.Overwrite) :: requirements
   }
@@ -342,20 +328,11 @@ class TransactionBuilder(
               contentLock: Option[FullContentLock],
               requirements: List[KeyValueUpdate.KeyRequirement],
               operations: List[KeyValueOperation]): Unit = synchronized {
-    //println(s"   TXB KV Append txid $transactionUUID object ${pointer.uuid}")
-    if (updatingObjects.contains(pointer)) {
-      //printStack()
-      throw MultipleDataUpdatesToObject(pointer)
-    }
-    if (exclusiveRevisionLocks.contains(pointer))
-      throw ConflictingRequirements(pointer)
-
-    updatingObjects += pointer
+    claimForUpdate(pointer)
     keyValueUpdates += (pointer -> KVUpdate(pointer, requiredRevision, contentLock, requirements, operations))
   }
 
   def setRefcount(objectPointer: ObjectPointer, requiredRefcount: ObjectRefcount, refcount: ObjectRefcount): Unit = synchronized {
-    //println(s"   TXB SetRef txid $transactionUUID object ${objectPointer.uuid}")
     if (refcountUpdates.contains(objectPointer))
       throw MultipleRefcountUpdatesToObject(objectPointer)
 
@@ -372,18 +349,11 @@ class TransactionBuilder(
   def deletedObjects: List[ObjectPointer] = synchronized { deletingObjects.reverse }
 
   def bumpVersion(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = synchronized {
-    //println(s"   TXB BumpVersion txid $transactionUUID object ${objectPointer.uuid}")
-    if (updatingObjects.contains(objectPointer))
-      throw MultipleDataUpdatesToObject(objectPointer)
-    if (exclusiveRevisionLocks.contains(objectPointer))
-      throw ConflictingRequirements(objectPointer)
-
-    updatingObjects += objectPointer
+    claimForUpdate(objectPointer)
     requirements = VersionBump(objectPointer, requiredRevision) :: requirements
   }
 
   def exclusiveLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = synchronized {
-    //println(s"   TXB ExclusiveLockRevision txid $transactionUUID object ${objectPointer.uuid}")
     if (updatingObjects.contains(objectPointer) || sharedRevisionLocks.contains(objectPointer))
       throw ConflictingRequirements(objectPointer)
 

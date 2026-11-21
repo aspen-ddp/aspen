@@ -313,7 +313,7 @@ object MissedUpdateFinalizationAction extends RegisteredTypeFactory with Finaliz
     new MissedUpdateFinalizationAction(client, txd)
   }
 
-  def createSerializedFA(missedCommitDelayInMs: Int): SerializedFinalizationAction = {
+  def createSerializedFA(): SerializedFinalizationAction = {
     SerializedFinalizationAction(FinalizationActionId(typeUUID), Array[Byte]())
   }
 

@@ -118,8 +118,6 @@ class TransactionImpl(val client: AspenClient,
 
   def disableMissedUpdateTracking(): Unit = modify(_.disableMissedUpdateTracking())
 
-  def setMissedCommitDelayInMs(msec: Int): Unit = modify(_.setMissedCommitDelayInMs(msec))
-
   def append(position: AppendPosition, data: DataBuffer): AppendPosition = doAppend(false, position, data)
 
   def rangedWrites(state: RangedWriteState, writes: List[RangedWrite], zeroFill: Boolean = false): Unit =
@@ -262,8 +260,6 @@ class TransactionImpl(val client: AspenClient,
     private[aspen] def missedUpdateTrackingEnabled: Boolean = hookModify(_.missedUpdateTrackingEnabled)
 
     private[aspen] def referencedPoolIds: Set[PoolId] = hookModify(_.allReferencedPoolIds)
-
-    protected[client] def setMissedCommitDelayInMs(msec: Int): Unit = hookModify(_.setMissedCommitDelayInMs(msec))
 
   /** Adds any pools referenced by the builder that are missing from `known` */
   private def resolvePools(known: Map[PoolId, StoragePool])(using ExecutionContext): Future[Map[PoolId, StoragePool]] =

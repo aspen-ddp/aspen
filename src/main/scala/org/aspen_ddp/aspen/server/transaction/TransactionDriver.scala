@@ -287,16 +287,14 @@ abstract class TransactionDriver(
   }
 
   private val startNanos: Long = System.nanoTime()
-  private var lastStuckReport: Option[Long] = None
+  private val stuckThrottle = new StuckReportThrottle(startNanos)
 
   /** Logs a driver that has not finalized long after it started, with the stores it has yet to hear from. Repeats
     * every `Tx.StuckReportEvery`. Returns whether it logged.
     */
   def reportIfStuck(now: Long = System.nanoTime()): Boolean = synchronized {
-    val due = !finalized && now - startNanos >= Tx.StuckReportAfter.toNanos &&
-      lastStuckReport.forall(last => now - last >= Tx.StuckReportEvery.toNanos)
+    val due = stuckThrottle.due(now, stuck = !finalized)
     if (due) {
-      lastStuckReport = Some(now)
       val unresolvedStores = allDataStores.filterNot(knownResolved.contains).map(_.poolIndex).mkString(",")
       val votes = peerDispositions.values.groupBy(identity).map((d, l) => s"$d=${l.size}").mkString(",")
       logger.warn(s"Stuck driver of Tx ${txd.transactionId} on store $storeId. " +

@@ -1,4 +1,15 @@
 ### Transaction protocol
+**Files.** `Tx` is one store's participant in a transaction (acceptor, vote, apply, finalization), a single state
+machine on the store's executor; its mutable state is shared by every phase, so it is one class, sectioned by `// ----`
+headers: CRL saves, expiry, stuck/late reporting, locks and collision waits, object loading, voting, applying a commit
+(`doCommit`, `issueCommits`, with `blindReinsertObjects` and `checkVoteCommitApplied` as its pure-ish steps), Paxos
+messages, finalization/late commits/UnackedCommits. It was not split into files because each phase reads and writes
+the same flags. `TransactionDriver` is the per-transaction proposer/learner that tallies votes, runs Paxos and starts
+the finalizer (`SimpleTransactionDriver` is its factory with the retransmit backoff and failed-driver timing); `ExpiryTally` is the pure expiry decision
+over peers' status replies; `TransactionFinalizer` is the finalizer interface; `TransactionStatusCache` is the host's
+outcome cache; `StuckReportThrottle` is the shared age/repeat throttle behind `Tx.reportIfStuck` and
+`TransactionDriver.reportIfStuck`; `AbortVoteReport` and `FinalizationStallReport` are the periodic log summaries.
+
 Store-local mechanics (locks, collisions, in-flight commits, admission): `server/store/CLAUDE.md`. Client-side
 pin rule and finalizer entries: `client/internal/transaction/CLAUDE.md`. Safety arguments: `docs/safety/`.
 Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forget floor, expiry),

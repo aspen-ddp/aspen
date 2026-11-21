@@ -127,6 +127,8 @@ class Tx( trs: TransactionRecoveryState,
     * decided abort (answerResolved), and late object data is not adopted */
   private var stateDeleted: Boolean = false
 
+  // ---- Saving state to the CRL ----
+
   private def saveState(state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
     require(!stateDeleted, s"Tx $transactionId on store $storeId: a save after its CRL state was deleted is uncharged")
     savedToCrl = true
@@ -619,6 +621,8 @@ class Tx( trs: TransactionRecoveryState,
 
   def durationSinceLastEvent: Duration = Duration(System.nanoTime() - lastEvent, NANOSECONDS)
 
+  // ---- Stuck and late reporting ----
+
   private def stateSummary(now: Long): String =
     val age = Duration(now - startNanos, NANOSECONDS).toMillis
     val idle = Duration(now - lastEvent, NANOSECONDS).toMillis
@@ -632,7 +636,7 @@ class Tx( trs: TransactionRecoveryState,
       s"Last proposer: $lastProposer. " +
       s"Object revisions: $revisions"
 
-  private var lastStuckReport: Option[Long] = None
+  private val stuckThrottle = new StuckReportThrottle(startNanos)
 
   /** Logs a transaction whose store has not applied it long after it started: it holds its locks, has a held commit,
     * withholds its vote for in-flight commits, or is waiting on the backend. Repeats every `Tx.StuckReportEvery`.
@@ -640,10 +644,8 @@ class Tx( trs: TransactionRecoveryState,
     */
   def reportIfStuck(now: Long = System.nanoTime()): Boolean =
     val stuck = locked || commitHeld || awaitingCommits.nonEmpty || (committing && !committed)
-    val due = stuck && now - startNanos >= Tx.StuckReportAfter.toNanos &&
-      lastStuckReport.forall(last => now - last >= Tx.StuckReportEvery.toNanos)
+    val due = stuckThrottle.due(now, stuck)
     if due then
-      lastStuckReport = Some(now)
       logger.warn(s"Stuck Tx $transactionId on store $storeId. ${stateSummary(now)}")
     due
 
@@ -663,6 +665,8 @@ class Tx( trs: TransactionRecoveryState,
       logger.warn(s"Late client prepare for Tx $transactionId on store $storeId, ${ageMillis}ms after the transaction " +
         s"started. ${stateSummary(System.nanoTime())}")
     late
+
+  // ---- Locks and collision waits (awaitableHolders, lockWaitBlocked) ----
 
   /** Holds the requirement locks from a commit vote until the transaction resolves, so that this store votes abort
     * on conflicting transactions in the meantime. A live Tx locks only while unresolved: once it learns the outcome its
@@ -869,6 +873,8 @@ class Tx( trs: TransactionRecoveryState,
     allocatedHere.contains(objectId) && disposition == TransactionDisposition.VoteCommit && !committing &&
       !committed && !oresolution.contains(false)
 
+  // ---- Object loading ----
+
   /** The store's state of `os.objectId`, from its cache or backend. For an object this transaction allocates, the
     * object already exists here. See allocatedOver
     */
@@ -970,6 +976,8 @@ class Tx( trs: TransactionRecoveryState,
     if needsUnackedCheck then
       frontend.requestUnackedLookup(this)
   }
+
+  // ---- Voting (determineDisposition, proofs) ----
 
   private def sendDelayedPrepare(): Unit = {
     if muted then
@@ -1170,6 +1178,8 @@ class Tx( trs: TransactionRecoveryState,
   private def sendProof(to: StoreId): Unit =
     net.sendTransactionMessage(TxResolved(to, storeId, transactionId, committed = true, late = false, proof = true))
 
+  // ---- Applying a commit ----
+
   private def doCommit(): Unit = if (!committed && !committing && allObjectsLoaded) {
     committing = true
 
@@ -1234,32 +1244,7 @@ class Tx( trs: TransactionRecoveryState,
         s"earlier backend commit of it failed")
     }
 
-    // Objects on which this apply writes back a key the store may have held deleted: a blind Insert of a key now
-    // absent, where a repair wrote, or found current, a state newer than this transaction's start (repairInstalled),
-    // where this Tx did not vote commit here (it held no key lock that kept a later deletion out) and a committed
-    // Delete of the key started since applied here, a no-op over the absent key included (Frontend.keyDeletedSince),
-    // or, for a recovered commit vote, whose marks were lost with the crash, where any write newer than its start
-    // reached the object. The state may hold a later transaction's deletion of the key at a store that never held T's
-    // update. The apply still runs, and reports the object, so the finalizer marks the store and repair installs the
-    // object's current state (transaction-requirements 9.4, 10.5c). A non-voter is not counted toward the write
-    // threshold, so its report costs a repair pass, not margin. A non-voter's Insert of a key no deletion reached
-    // reports nothing, and a commit voter applied normally checks nothing here
-    val nonVoter = disposition != TransactionDisposition.VoteCommit
-    val reinserts = requirements.iterator.collect {
-      case r: KeyValueUpdate if r.requiredRevision.isEmpty => r.objectPointer.id
-    }.filter { oid =>
-      objects.get(oid).exists { state =>
-        val suspect = repairedUnder.contains(oid) || (recovered && state.metadata.timestamp > txd.startTimestamp)
-        // An undecodable update fails its re-check and is skipped and reported by the apply: it writes nothing back
-        (suspect || nonVoter) && !failedHere.contains(oid) && state.kvState.exists { kvs =>
-          ou.get(oid).exists(u => scala.util.Try(opsOf(u)).toOption.exists(_.exists {
-            case o: Insert => !kvs.content.contains(o.key) &&
-              (suspect || frontend.keyDeletedSince(oid, o.key, txd.startTimestamp))
-            case _ => false
-          }))
-        }
-      }
-    }.toSet
+    val reinserts = blindReinsertObjects(ou, failedHere)
 
     val result = RequirementsApplyer.apply(transactionId, txd.startTimestamp, requirements,
       objects -- failedHere, ou, frontend.maxSliceSize, frontend.maxKVSliceSize, allocatedOver, txd.allocatingObjects)
@@ -1300,40 +1285,7 @@ class Tx( trs: TransactionRecoveryState,
         s"Vote: $disposition. Client prepare seen: $clientPrepared. Revision on store: $current")
     }
 
-    // A commit voter that cannot hold the update it voted for has already dropped its locks (doCommit): its vote, which
-    // may count towards the write threshold, would then stand for neither.
-    //
-    // An apply that threw fail-stops the store (Frontend.failStop): its in-memory state is corrupt.
-    //
-    // A live voter's changed object whose re-check fails is an invariant violation: a committed write that does not
-    // depend on this one never applies over this vote's locks before it (awaitLockHolders), so the state changed under
-    // the locks (Frontend.discard) or two conflicting transactions committed; a size re-check cannot fail, as the votes
-    // held together fit together (RequirementsChecker.checkKVSliceSize). It is logged as one, naming the
-    // transaction the object now shows, skipped and reported, so the finalizer marks the store for repair.
-    // Not an allocation the backend missed (allocatedHere): the store holds no copy of it, so no lock was lost, and
-    // every other transaction on it misses and votes abort.
-    //
-    // A lock-only object whose re-check fails has no update to lose: it is skipped, logged and reported. A later commit
-    // applied first over the lock explains it, as a lock-only vote is not waited for: a fence takeover over a block
-    // commit's SharedRevisionLock, an allocator's follow-up write. A rebuilt
-    // store votes abort on the objects its lost incarnation's votes may back (Frontend.inheritedVoteLock), so a lock
-    // lost to a rebuild is not a cause.
-    if disposition == TransactionDisposition.VoteCommit then
-      val threw = result.failed -- failedHere
-      if threw.nonEmpty then
-        frontend.failStop(s"Tx $transactionId voted commit but its update of objects $threw threw")
-      else
-        def shows(oid: ObjectId): String =
-          val now = objects.get(oid).map(_.metadata.revision.lastUpdateTxUUID.toString).getOrElse("not loaded")
-          s"${result.skippedReasons.get(oid).map(_.toString).getOrElse("not applied")}; now shows Tx $now"
-        val skipped = result.uncommittable -- alreadyApplied -- failedHere
-        val invalidated = skipped.filter(oid => changed.contains(oid) && objects.contains(oid) &&
-          !allocatedHere.contains(oid))
-        if !recovered && invalidated.nonEmpty then
-          logger.error(s"INVARIANT VIOLATION: Tx $transactionId on store $storeId voted commit and committed, but " +
-            s"its requirements no longer hold on objects " +
-            s"${invalidated.toList.map(oid => s"$oid (${shows(oid)})").mkString(", ")}: the state changed under its " +
-            s"locks, or two conflicting transactions committed. Skipped and reported")
+    checkVoteCommitApplied(result, failedHere, alreadyApplied, changed)
 
     val uncommittable = result.uncommittable -- alreadyApplied
 
@@ -1373,6 +1325,73 @@ class Tx( trs: TransactionRecoveryState,
       frontend.commit(os, cs, transactionId, () => deletedKeys)
     }
   }
+
+  /** A commit voter that cannot hold the update it voted for has already dropped its locks (doCommit): its vote, which
+    * may count towards the write threshold, would then stand for neither.
+    *
+    * An apply that threw fail-stops the store (Frontend.failStop): its in-memory state is corrupt.
+    *
+    * A live voter's changed object whose re-check fails is an invariant violation: a committed write that does not
+    * depend on this one never applies over this vote's locks before it (awaitLockHolders), so the state changed under
+    * the locks (Frontend.discard) or two conflicting transactions committed; a size re-check cannot fail, as the votes
+    * held together fit together (RequirementsChecker.checkKVSliceSize). It is logged as one, naming the
+    * transaction the object now shows, skipped and reported, so the finalizer marks the store for repair.
+    * Not an allocation the backend missed (allocatedHere): the store holds no copy of it, so no lock was lost, and
+    * every other transaction on it misses and votes abort.
+    *
+    * A lock-only object whose re-check fails has no update to lose: it is skipped, logged and reported. A later commit
+    * applied first over the lock explains it, as a lock-only vote is not waited for: a fence takeover over a block
+    * commit's SharedRevisionLock, an allocator's follow-up write. A rebuilt
+    * store votes abort on the objects its lost incarnation's votes may back (Frontend.inheritedVoteLock), so a lock
+    * lost to a rebuild is not a cause.
+    */
+  private def checkVoteCommitApplied(result: RequirementsApplyer.Result, failedHere: Set[ObjectId],
+                                     alreadyApplied: Set[ObjectId], changed: Set[ObjectId]): Unit =
+    if disposition == TransactionDisposition.VoteCommit then
+      val threw = result.failed -- failedHere
+      if threw.nonEmpty then
+        frontend.failStop(s"Tx $transactionId voted commit but its update of objects $threw threw")
+      else
+        def shows(oid: ObjectId): String =
+          val now = objects.get(oid).map(_.metadata.revision.lastUpdateTxUUID.toString).getOrElse("not loaded")
+          s"${result.skippedReasons.get(oid).map(_.toString).getOrElse("not applied")}; now shows Tx $now"
+        val skipped = result.uncommittable -- alreadyApplied -- failedHere
+        val invalidated = skipped.filter(oid => changed.contains(oid) && objects.contains(oid) &&
+          !allocatedHere.contains(oid))
+        if !recovered && invalidated.nonEmpty then
+          logger.error(s"INVARIANT VIOLATION: Tx $transactionId on store $storeId voted commit and committed, but " +
+            s"its requirements no longer hold on objects " +
+            s"${invalidated.toList.map(oid => s"$oid (${shows(oid)})").mkString(", ")}: the state changed under its " +
+            s"locks, or two conflicting transactions committed. Skipped and reported")
+
+  /** Objects on which this apply writes back a key the store may have held deleted: a blind Insert of a key now
+    * absent, where a repair wrote, or found current, a state newer than this transaction's start (repairInstalled),
+    * where this Tx did not vote commit here (it held no key lock that kept a later deletion out) and a committed
+    * Delete of the key started since applied here, a no-op over the absent key included (Frontend.keyDeletedSince),
+    * or, for a recovered commit vote, whose marks were lost with the crash, where any write newer than its start
+    * reached the object. The state may hold a later transaction's deletion of the key at a store that never held T's
+    * update. The apply still runs, and reports the object, so the finalizer marks the store and repair installs the
+    * object's current state (transaction-requirements 9.4, 10.5c). A non-voter is not counted toward the write
+    * threshold, so its report costs a repair pass, not margin. A non-voter's Insert of a key no deletion reached
+    * reports nothing, and a commit voter applied normally checks nothing here
+    */
+  private def blindReinsertObjects(ou: Map[ObjectId, DataBuffer], failedHere: Set[ObjectId]): Set[ObjectId] =
+    val nonVoter = disposition != TransactionDisposition.VoteCommit
+    requirements.iterator.collect {
+      case r: KeyValueUpdate if r.requiredRevision.isEmpty => r.objectPointer.id
+    }.filter { oid =>
+      objects.get(oid).exists { state =>
+        val suspect = repairedUnder.contains(oid) || (recovered && state.metadata.timestamp > txd.startTimestamp)
+        // An undecodable update fails its re-check and is skipped and reported by the apply: it writes nothing back
+        (suspect || nonVoter) && !failedHere.contains(oid) && state.kvState.exists { kvs =>
+          ou.get(oid).exists(u => scala.util.Try(opsOf(u)).toOption.exists(_.exists {
+            case o: Insert => !kvs.content.contains(o.key) &&
+              (suspect || frontend.keyDeletedSince(oid, o.key, txd.startTimestamp))
+            case _ => false
+          }))
+        }
+      }
+    }.toSet
 
   private def allObjectCommitsComplete(): Unit = {
     committed = true
@@ -1460,6 +1479,8 @@ class Tx( trs: TransactionRecoveryState,
       if !muted then
         adoptedDataUnsaved = true
         saveAdoptedData()
+
+  // ---- Paxos messages ----
 
   def receivePrepare(m: TxPrepare): Unit = if stateDeleted then answerResolved(m.from) else {
     logger.trace(s"*** Got Prepare: ${m.transactionId}")
@@ -1634,6 +1655,8 @@ class Tx( trs: TransactionRecoveryState,
       else
         finalized(m.committed)
         true
+
+  // ---- Finalization, late commits and UnackedCommits ----
 
   private def finalized(committed: Boolean): Unit =
     resolved(committed)

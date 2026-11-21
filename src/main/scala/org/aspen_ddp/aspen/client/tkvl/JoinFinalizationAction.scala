@@ -21,6 +21,13 @@ class JoinFinalizationAction(val client: AspenClient,
 
   def complete: Future[Unit] = completionPromise.future
 
+  /** True if `node` holds `deleteMinimum` with `deleteNode`'s pointer as its value. The delete that follows is checked
+    * against the revision as read (the key's `KeyRevision`, or the DataObject node's revision), so an entry replaced
+    * after this read aborts it and the retry reads again.
+    */
+  private def namesDeleteNode(node: ListNode): Boolean =
+    node.get(deleteMinimum).exists(v => java.util.Arrays.equals(v.bytes, deleteNode.toArray))
+
   def execute(): Unit = {
 
     val fcomplete = client.retryStrategy.retryUntilSuccessful {
@@ -69,7 +76,9 @@ class JoinFinalizationAction(val client: AspenClient,
             case Left(_) => Future.failed(new BrokenTree)
             case Right(node) =>
 
-              if (node.get(deleteMinimum).isEmpty)
+              // Only the deleted node's own entry: a later split at the same minimum indexes its new node under this
+              // key, and a repeat or late run must not remove that entry
+              if (!namesDeleteNode(node))
                 Future.unit
               else {
                 given tx: Transaction = client.newTransaction()
@@ -104,7 +113,7 @@ class JoinFinalizationAction(val client: AspenClient,
           case Some(rootNode) =>
             // The root must still hold the deleted node's entry: this action runs at least once, and a repeat run
             // after the tree grew back to this tier would otherwise collapse a new two-entry root
-            if (tier == rootTier && rootNode.size == 2 && rootNode.get(deleteMinimum).isDefined)
+            if (tier == rootTier && rootNode.size == 2 && namesDeleteNode(rootNode))
               setNewRoot(rootTier, ordering, rootNode)
             else
               deleteFromExistingTier(rootTier, ordering, rootNode)

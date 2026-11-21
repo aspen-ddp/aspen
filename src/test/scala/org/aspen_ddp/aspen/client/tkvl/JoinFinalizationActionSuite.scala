@@ -65,7 +65,9 @@ class JoinFinalizationActionSuite extends IntegrationTestSuite:
     def encode(): Array[Byte] = inner.encode()
     def typeId: RootManagerTypeId = inner.typeId
 
-  /** Tier 2 root t over the tier-1 list u1 -> u2 -> u3. Completes with the root manager, u2, u3 and t */
+  /** Tier 2 root t over the tier-1 list u1 -> u2 -> u3. Completes with the root manager, u2, u3, t and the placeholder
+    * child every tier-1 entry names (the node a tier-1 join action's entry names)
+    */
   private def twoTierTree() =
     for
       ikvos <- client.read(radicle)
@@ -95,15 +97,15 @@ class JoinFinalizationActionSuite extends IntegrationTestSuite:
                 Root(2, IntegerKeyOrdering, Some(t), nodeAllocator))(using tx1)
       _ <- tx1.commit()
       mgr <- fmgr
-    yield (mgr, u2, u3, t)
+    yield (mgr, u2, u3, t, child)
 
   // The upper-tier delete of a join reads the right node before it stages anything, so a commit
   // that does not wait for the staged delete commits without it.
   atest("An upper-tier join commits only after its delete is staged"):
     for
-      (mgr, u2, u3, t) <- twoTierTree()
+      (mgr, u2, u3, t, child) <- twoTierTree()
       // Deleting u2's only key joins u3 into it
-      action = new JoinFinalizationAction(client, null, mgr, 1, k5, u2)
+      action = new JoinFinalizationAction(client, null, mgr, 1, k5, child)
       _ = action.execute()
       _ <- action.complete
       _ <- waitForTransactionsToComplete()
@@ -120,14 +122,14 @@ class JoinFinalizationActionSuite extends IntegrationTestSuite:
 
   atest("an upper-tier join deletes under KeyRevision, and a second run completes without a transaction"):
     for
-      (mgr, u2, _, _) <- twoTierTree()
+      (mgr, _, _, _, child) <- twoTierTree()
       audit = new PinAudit(client)
-      action = new JoinFinalizationAction(client, null, mgr, 1, k5, u2)
+      action = new JoinFinalizationAction(client, null, mgr, 1, k5, child)
       _ = action.execute()
       _ <- action.complete
       _ <- waitForTransactionsToComplete()
       first = audit.builtExceptMarks
-      again = new JoinFinalizationAction(client, null, mgr, 1, k5, u2)
+      again = new JoinFinalizationAction(client, null, mgr, 1, k5, child)
       _ = again.execute()
       _ <- again.complete
       _ <- waitForTransactionsToComplete()
@@ -182,3 +184,40 @@ class JoinFinalizationActionSuite extends IntegrationTestSuite:
       rootTier shouldBe 2
       orootNode.map(_.pointer) shouldBe Some(t)
       tState.map(_.contents.keySet) shouldBe Some(Set(Key.AbsoluteMinimum, k9))
+
+  // A later split at the joined node's minimum indexes its new node under the same key; a repeat or late run of the
+  // join's action must leave that entry in place
+  atest("an upper-tier join leaves an entry at its key that names another node"):
+    for
+      (mgr, u2, u3, _, _) <- twoTierTree()
+      audit = new PinAudit(client)
+      // u2's k5 entry names a placeholder child, not u3
+      action = new JoinFinalizationAction(client, null, mgr, 1, k5, u3)
+      _ = action.execute()
+      _ <- action.complete
+      _ <- waitForTransactionsToComplete()
+      _ = audit.stop()
+      u2State <- client.read(u2)
+      u3State <- client.readOptional(u3)
+    yield
+      audit.builtExceptMarks shouldBe empty
+      assert(u2State.contents.keySet == Set(k5))
+      assert(u3State.isDefined)
+
+  atest("a root join leaves a two-entry root whose entry at its key names another node"):
+    for
+      (mgr, u1, _, t) <- collapsibleTree(List(k5), linkU3 = false)
+      audit = new PinAudit(client)
+      // t's k5 entry names u3, not u1
+      action = new JoinFinalizationAction(client, null, mgr, 2, k5, u1)
+      _ = action.execute()
+      _ <- action.complete
+      _ <- waitForTransactionsToComplete()
+      _ = audit.stop()
+      (rootTier, _, orootNode) <- mgr.getFreshRootNode()
+      tState <- client.readOptional(t)
+    yield
+      audit.builtExceptMarks shouldBe empty
+      rootTier shouldBe 2
+      orootNode.map(_.pointer) shouldBe Some(t)
+      tState.map(_.contents.keySet) shouldBe Some(Set(Key.AbsoluteMinimum, k5))

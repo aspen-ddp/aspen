@@ -66,12 +66,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.3 [X-W25] The join finalization action removes an upper-tier entry by its key alone.
-    PLAUSIBLE. Effort S. cross-document-review.md.
-    JoinFinalizationAction re-run (or delayed) after a later split at the same minimum deletes that split's index
-    entry; lookups still follow links, so performance only. Fix: delete only when the value is deleteNode's pointer,
-    under the key's revision as read.
-
 5.4 [X-W26] A failed stat of a moved store's arrival file drops its arrival margin; remaining os.exists uses.
     PLAUSIBLE. Effort S. cross-document-review.md 2.2.
     StoreLoader.readArrivedAt uses os.exists, so a failed stat drops AcceptorSinceMargin from a moved store's load

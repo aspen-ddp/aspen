@@ -449,7 +449,8 @@ sibling store of T on the same host shares the cache, so it relays no non-finali
 once the object is deleted, and records nothing for one proven deleted; the deletion action removes the entry of an id
 never allocated again; the split action indexes the new node only if it still reads and its entry is absent, under
 its revision lock; the tail removal acts only on a node still present and empty; the join action removes the entry
-at its key, checking the key but not the node it names (X-W25, a performance cost only); the missed-update marker
+at its key only while it names the joined node, under the key's revision as read, so a later split's entry at the
+same minimum stays; the missed-update marker
 writes marks and entries for stores that no longer hold T, which repair consumes as no-ops (below the floor, no Tx),
 and the stubs its `TxFinalized` has stores write expire (`Frontend.expireStubs`). No compute or durable-task code
 registers a finalization action. A recovered commit voter that re-applies on such a non-late outcome is safe by the
@@ -547,18 +548,6 @@ Between a document, scaladoc or guide outside docs/safety and the code:
 ---
 
 ## Open weaknesses
-
-### X-W25: The join finalization action removes an upper-tier entry by its key alone
-Verdict PLAUSIBLE. Priority 5. Effort S.
-Mechanism: `JoinFinalizationAction.deleteFromExistingTier` deletes `deleteMinimum` from its tier node whenever the
-node holds that key, without checking that the entry names `deleteNode`. A later split of the absorbing node at the
-same minimum indexes its new node N under that key (`SplitFinalizationAction` replaces an entry naming another node
-with a checked insert). A run of the join's action after that, a delayed first run, a recovery driver's finalizer, or
-a run after T was finalized and forgotten (paxos-transactions.md 10.5), removes N's entry.
-Consequence: N is unindexed in the tier above until it is joined away. Lookups still reach it through its
-predecessor's link (the target-tier scan of `TierEngine.fetchContainingNodePath` follows links), so only scans of that
-range lengthen; no data is affected.
-Fix: delete the entry only when its value is `deleteNode`'s pointer, under the key's revision as read.
 
 ### X-W26: A failed stat of a moved store's arrival file drops its arrival margin
 Verdict PLAUSIBLE. Priority 5. Effort S.

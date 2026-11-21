@@ -23,7 +23,9 @@
   `SplitFinalizationAction` takes the new node to be gone (a later join) only when its read proves the deletion
   (`InvalidObject.provesDeletion`). A read that fails otherwise is retried, and one straight after the split
   resolves, which the stores answer `AllocationPending`, waits for them to apply it, so the new node always gets its
-  upper-tier entry (transaction-requirements 9.4)
+  upper-tier entry (transaction-requirements 9.4).
+  `JoinFinalizationAction` removes its key's entry only while the entry names the joined node, under the revision as
+  read, so a repeat or late run leaves the entry a later split at the same minimum added.
 - Left to right navigation in a tier is guaranteed to be consistent. Navigation between tiers is not
 - The entry walks (`foreach*`, through `TierEngine.walk`) survive joins: a right-neighbour read that fails because a
   join deleted the neighbour (often caused by `fn` itself deleting what it visits) descends again to the node holding

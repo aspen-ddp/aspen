@@ -21,7 +21,7 @@ object Tx {
   val StuckReportEvery: FiniteDuration = FiniteDuration(5, SECONDS)
 
   /** How long a transaction waits for a lock holder it is built on (`Tx.awaitableHolders`), or for a colliding
-    * committed transaction waiting in lock order (`Tx.lockWaitBlocked`), before voting abort. Checked at the store's
+    * committed transaction waiting in lock order (`Tx.lockOrderBlocked`), before voting abort. Checked at the store's
     * heartbeat, so a wait that times out lasts up to one heartbeat (1 s) longer
     */
   val CollisionWait: FiniteDuration = FiniteDuration(500, MILLISECONDS)
@@ -198,18 +198,18 @@ class Tx( trs: TransactionRecoveryState,
   private var pendingCollisionPrepare: Option[TxPrepare] = None
 
   /** The objects whose in-flight commits this transaction waits for before voting: see determineDisposition */
-  private var awaitingCommits: Set[ObjectId] = Set()
+  private var awaitingInFlightCommits: Set[ObjectId] = Set()
 
-  /** When this vote was first withheld for a colliding commit waiting in lock order (lockWaitBlocked), or 0 while it
+  /** When this vote was first withheld for a colliding commit waiting in lock order (lockOrderBlocked), or 0 while it
     * is not. Once that has lasted Tx.CollisionWait (checkCollisionWait) the vote aborts instead (lockWaitBlockExpired)
     */
-  private var lockWaitBlockStart: Long = 0L
+  private var lockOrderBlockStart: Long = 0L
   private var lockWaitBlockExpired = false
   /** The commit is queued in the Frontend behind earlier commits of the objects it changes: see holdForTurn */
   private var commitQueued = false
   /** TxFinalized arrived while the commit was held for its turn: the Frontend is told once the commit is issued */
   private var finalizeDeferred = false
-  /** The commit votes this committed transaction waits for before applying: see awaitLockHolders */
+  /** The commit votes this committed transaction waits for before applying: see awaitLockOrder */
   private var applyWaitingOn: Set[TransactionId] = Set()
 
   /** The latest abort resolution held until a UnackedCommits lookup started after the first completes. See
@@ -526,7 +526,7 @@ class Tx( trs: TransactionRecoveryState,
     * the stores lacking the update could reach the read threshold. So while another Tx here holds locks this
     * transaction's requirements or writes collide with (RequirementsChecker.lockHolders) on an object both change, it
     * waits for each to release them, having applied its commit or aborted (Frontend.locksReleased). It holds its
-    * references, no locks, and new votes it would wait for as holders wait meanwhile (lockWaitBlocked), so it
+    * references, no locks, and new votes it would wait for as holders wait meanwhile (lockOrderBlocked), so it
     * cannot be starved. The holder's own commit never waits for it (holdForTurn ignores the wait).
     *
     * A Tx holding its own locks never waits: two live votes never hold conflicting locks, and recovered votes
@@ -537,7 +537,7 @@ class Tx( trs: TransactionRecoveryState,
     * update to lose and is not waited for. A holder that never resolves (an undecidable expiry tally) holds this
     * commit as long as its own locks: that needs failures beyond the write threshold's margin, and is alarmed
     */
-  private def awaitLockHolders(): Boolean =
+  private def awaitLockOrder(): Boolean =
     val held = !(committing || committed || locked) &&
       changedHere.exists(oid => objects.get(oid).exists(_.lockHolders.exists(_ != transactionId)))
     val waitFor =
@@ -547,21 +547,21 @@ class Tx( trs: TransactionRecoveryState,
         RequirementsChecker.lockHolders(transactionId, requirements, objects, writes, changedHere)
           .filter(h => frontend.holdsLocks(h) && changedHere.exists(frontend.changes(h, _)))
     if waitFor.nonEmpty then
-      if !lockWaitRegistered then
+      if !lockOrderWaitRegistered then
         logger.info(s"Tx $transactionId on store $storeId committed: its apply waits for the commit votes of " +
           s"$waitFor, which hold locks on objects it changes")
-      lockWaitRegistered = true
+      lockOrderWaitRegistered = true
       applyWaitingOn = waitFor
-      frontend.awaitLockHolders(changedHere, waitFor, this)
+      frontend.awaitLockOrder(changedHere, waitFor, this)
       true
     else
       applyWaitingOn = Set()
-      if lockWaitRegistered then
-        lockWaitRegistered = false
-        frontend.lockWaitEnded(changedHere, this)
+      if lockOrderWaitRegistered then
+        lockOrderWaitRegistered = false
+        frontend.lockOrderWaitEnded(changedHere, this)
       false
 
-  /** Whether this committed transaction, waiting to apply (awaitLockHolders), would wait for `holder` once it held
+  /** Whether this committed transaction, waiting to apply (awaitLockOrder), would wait for `holder` once it held
     * `locks` on `oid`: the holder changes an object this transaction changes (`holderChanges`), and its locks collide
     * with this transaction's requirements or writes there. A lock-only holder has no update to lose and is not waited
     * for
@@ -574,8 +574,8 @@ class Tx( trs: TransactionRecoveryState,
         o => if o == oid then Some(locks) else None).contains(holder)
     }
 
-  /** The objects on which a committed transaction waiting to apply (awaitLockHolders) collides with this vote's
-    * locks, each with one such waiter. The vote waits for those waits to end (Frontend.lockWaitWakeVoters), so a
+  /** The objects on which a committed transaction waiting to apply (awaitLockOrder) collides with this vote's
+    * locks, each with one such waiter. The vote waits for those waits to end (Frontend.lockOrderWaitWakeVoters), so a
     * waiter cannot be starved. Any other vote decides now, on the state before the waiter's apply, which changes
     * nothing its requirements or writes depend on, as for two votes holding compatible locks. A vote changing none of a
     * waiter's objects (lock-only there) is one the waiter would not wait for, so it decides now. A waiter may itself wait
@@ -583,8 +583,8 @@ class Tx( trs: TransactionRecoveryState,
     * that one for this vote's transaction: so a vote is never withheld for a waiter it does not collide with, and a
     * colliding one is withheld for at most Tx.CollisionWait (checkCollisionWait), then votes abort
     */
-  private def lockWaitBlocked(): Map[ObjectId, TransactionId] =
-    val waited = pointersById.keySet.filter(oid => frontend.lockWaiters(oid).exists(_ ne this))
+  private def lockOrderBlocked(): Map[ObjectId, TransactionId] =
+    val waited = pointersById.keySet.filter(oid => frontend.lockOrderWaitersOf(oid).exists(_ ne this))
     if waited.isEmpty then Map()
     else
       val writes = KVWrites.from(requirements, objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap)
@@ -593,12 +593,12 @@ class Tx( trs: TransactionRecoveryState,
       waited.iterator.flatMap: oid =>
         planned.get(oid).flatMap: p =>
           val locks = RequirementsChecker.PlannedLocks(transactionId, objects(oid), p)
-          frontend.lockWaiters(oid).find(w => (w ne this) && w.wouldWaitFor(transactionId, oid, locks, changes))
+          frontend.lockOrderWaitersOf(oid).find(w => (w ne this) && w.wouldWaitFor(transactionId, oid, locks, changes))
             .map(w => oid -> w.transactionId)
       .toMap
 
-  /** This Tx is registered in the Frontend as a committed transaction waiting to apply: see awaitLockHolders */
-  private var lockWaitRegistered = false
+  /** This Tx is registered in the Frontend as a committed transaction waiting to apply: see awaitLockOrder */
+  private var lockOrderWaitRegistered = false
 
   /** Whether the commit must wait its turn: an earlier commit of an object it changes is in flight, or held. If so, it
     * is queued in the Frontend, which calls commitPersisted when it may be its turn
@@ -608,7 +608,7 @@ class Tx( trs: TransactionRecoveryState,
       false
     else if commitQueued then
       !frontend.heldCommitReady(changedHere, this)
-    else if changedHere.exists(frontend.commitInFlight) then
+    else if changedHere.exists(frontend.hasPendingCommit) then
       commitQueued = true
       frontend.holdCommit(changedHere, this)
       true
@@ -631,7 +631,7 @@ class Tx( trs: TransactionRecoveryState,
     s"Age: ${age}ms. Idle: ${idle}ms. Vote: $disposition. Resolution: $oresolution. Finalized: $ofinalized. " +
       s"Locked: $locked. CommitHeld: $commitHeld. Committing: $committing. Committed: $committed. " +
       s"PendingLoads: $pendingObjectLoads. PendingCommits: $pendingObjectCommits. ClientPrepared: $clientPrepared. " +
-      s"Recovered: $recovered. Waiting on: $waitingOn. Awaiting commits of: $awaitingCommits. " +
+      s"Recovered: $recovered. Waiting on: $waitingOn. Awaiting commits of: $awaitingInFlightCommits. " +
       s"Commit queued: $commitQueued. Apply waits for: $applyWaitingOn. Held aborts: ${heldAborts.size}. " +
       s"Last proposer: $lastProposer. " +
       s"Object revisions: $revisions"
@@ -643,7 +643,7 @@ class Tx( trs: TransactionRecoveryState,
     * Returns whether it logged.
     */
   def reportIfStuck(now: Long = System.nanoTime()): Boolean =
-    val stuck = locked || commitHeld || awaitingCommits.nonEmpty || (committing && !committed)
+    val stuck = locked || commitHeld || awaitingInFlightCommits.nonEmpty || (committing && !committed)
     val due = stuckThrottle.due(now, stuck)
     if due then
       logger.warn(s"Stuck Tx $transactionId on store $storeId. ${stateSummary(now)}")
@@ -666,7 +666,7 @@ class Tx( trs: TransactionRecoveryState,
         s"started. ${stateSummary(System.nanoTime())}")
     late
 
-  // ---- Locks and collision waits (awaitableHolders, lockWaitBlocked) ----
+  // ---- Locks and collision waits (awaitableHolders, lockOrderBlocked) ----
 
   /** Holds the requirement locks from a commit vote until the transaction resolves, so that this store votes abort
     * on conflicting transactions in the meantime. A live Tx locks only while unresolved: once it learns the outcome its
@@ -708,7 +708,7 @@ class Tx( trs: TransactionRecoveryState,
   private def waitingForCollision: Boolean = waitingOn.nonEmpty
 
   /** The vote is withheld: waiting out a collision, or for in-flight commits of this transaction's objects */
-  private def withholdingVote: Boolean = waitingForCollision || awaitingCommits.nonEmpty
+  private def withholdingVote: Boolean = waitingForCollision || awaitingInFlightCommits.nonEmpty
 
   /** The lock holders this transaction may wait for instead of voting abort: every failed requirement is a collision
     * with a holder that this transaction is built on, one whose revision of the object it requires, and each holder
@@ -746,22 +746,22 @@ class Tx( trs: TransactionRecoveryState,
       waitingOn -= holder
       if waitingOn.isEmpty then
         endCollisionWait()
-    // A committed transaction waiting to apply (awaitLockHolders): it re-checks for holders, then applies or queues
+    // A committed transaction waiting to apply (awaitLockOrder): it re-checks for holders, then applies or queues
     if applyWaitingOn.contains(holder) then
       applyWaitingOn -= holder
       if applyWaitingOn.isEmpty then
         releaseHeldCommit()
-        // New votes colliding with it waited for it (lockWaitBlocked): whatever it did, they may decide now
+        // New votes colliding with it waited for it (lockOrderBlocked): whatever it did, they may decide now
         if applyWaitingOn.isEmpty then
-          frontend.lockWaitWakeVoters(changedHere)
+          frontend.lockOrderWaitWakeVoters(changedHere)
 
   /** The Frontend: no commit of `oid` is in flight any more. A transaction waiting to vote decides once none of its
     * objects has one; a held commit is issued if it is now its turn on every object it changes
     */
   def commitPersisted(oid: ObjectId): Unit =
-    if awaitingCommits.contains(oid) then
-      awaitingCommits -= oid
-      if awaitingCommits.isEmpty then
+    if awaitingInFlightCommits.contains(oid) then
+      awaitingInFlightCommits -= oid
+      if awaitingInFlightCommits.isEmpty then
         endCollisionWait()
     // Not an else: a vote wait must never hide the release of a held commit
     if commitQueued then
@@ -775,9 +775,9 @@ class Tx( trs: TransactionRecoveryState,
       collisionWaitExpired = true
       waitingOn = Set()
       endCollisionWait()
-    else if lockWaitBlockStart != 0L && awaitingCommits.nonEmpty &&
-      now - lockWaitBlockStart >= Tx.CollisionWait.toNanos then
-      // Withheld too long for a commit waiting in lock order: see lockWaitBlocked
+    else if lockOrderBlockStart != 0L && awaitingInFlightCommits.nonEmpty &&
+      now - lockOrderBlockStart >= Tx.CollisionWait.toNanos then
+      // Withheld too long for a commit waiting in lock order: see lockOrderBlocked
       lockWaitBlockExpired = true
       stopAwaitingInFlightCommits()
       endCollisionWait()
@@ -797,9 +797,9 @@ class Tx( trs: TransactionRecoveryState,
 
   /** Stops waiting for the in-flight commits the vote was withheld for */
   private def stopAwaitingInFlightCommits(): Unit =
-    if awaitingCommits.nonEmpty then
-      frontend.stopAwaitingCommits(awaitingCommits, this)
-      awaitingCommits = Set()
+    if awaitingInFlightCommits.nonEmpty then
+      frontend.stopAwaitingInFlightCommits(awaitingInFlightCommits, this)
+      awaitingInFlightCommits = Set()
 
   /** Ends every wait the vote had: once an outcome is known (or the Tx is expired) the vote no longer matters */
   private def endVoteWaits(): Unit =
@@ -1032,8 +1032,8 @@ class Tx( trs: TransactionRecoveryState,
     * unchecked. One that has seen no client prepare votes abort, or proves the commit, its requirements unchecked
     * (prefer-abort, see awaitingClientPrepare). An object whose backend commit failed on this store, or that a rebuilt store's inherited votes may lock (Frontend.inheritedVoteLock) gets an abort
     * vote. One with a commit in flight, whether or not this transaction builds on it, makes the transaction wait with
-    * its vote withheld and no locks taken (see Frontend.commitInFlight); the requirements are checked against the state
-    * as it is once the commit persists. Otherwise the requirements are checked now, and a collision may be waited out.
+    * its vote withheld and no locks taken (see Frontend.hasPendingCommit); the requirements are checked against the
+    * state as it is once the commit persists. Otherwise the requirements are checked now, and a collision may be waited out.
     */
   private def determineDisposition(): Unit = if undecidedFrozen then {
     // A frozen Tx never decides a vote: "frozen, loaded and undecided" is then a final non-voter, as its status reply
@@ -1044,14 +1044,14 @@ class Tx( trs: TransactionRecoveryState,
   } else {
     val failed = pointersById.keysIterator.filter(frontend.commitFailed).toList
     val inherited = pointersById.keysIterator.filter(frontend.inheritedVoteLock).toList
-    val lockWaits = lockWaitBlocked()
-    val inFlight = pointersById.keysIterator.filter(frontend.commitInFlight).toSet ++ lockWaits.keySet
+    val lockWaits = lockOrderBlocked()
+    val inFlight = pointersById.keysIterator.filter(frontend.hasPendingCommit).toSet ++ lockWaits.keySet
 
     if muted && oresolution.isEmpty && !outcomeKnown then
       // Not checked and so not waiting on anything. It never votes commit, and the abort it holds is never sent: it
       // proves the commit if an object shows it, and is otherwise forgotten unanswered (respondToPrepare)
       waitingOn = Set()
-      awaitingCommits = Set()
+      awaitingInFlightCommits = Set()
       disposition = TransactionDisposition.VoteAbort
       if mayProve && appliedHere.nonEmpty then
         proveCommitted()
@@ -1059,22 +1059,22 @@ class Tx( trs: TransactionRecoveryState,
       // Prefer-abort (see awaitingClientPrepare): only driver prepares were seen and the wait for the client's is over,
       // or the outcome is known. The requirements are not checked; an object showing the update still proves the commit
       waitingOn = Set()
-      awaitingCommits = Set()
+      awaitingInFlightCommits = Set()
       decideDisposition(Map(), List(NoClientPrepare()))
     else if invalidDescription.nonEmpty then
       waitingOn = Set()
-      awaitingCommits = Set()
+      awaitingInFlightCommits = Set()
       decideDisposition(Map(), List(InvalidDescription(invalidDescription.get)))
     else if failed.nonEmpty || inherited.nonEmpty then
       waitingOn = Set()
-      awaitingCommits = Set()
+      awaitingInFlightCommits = Set()
       decideDisposition(inherited.map(_ -> InheritedVoteLock()).toMap ++
         failed.map(_ -> BackendCommitFailed()), Nil)
     else if lockWaits.nonEmpty && lockWaitBlockExpired && oresolution.isEmpty && !outcomeKnown then
       // Withheld for Tx.CollisionWait by commits waiting in lock order that still wait: an abort vote, which is always
-      // safe, ends any cycle of such waits across stores (lockWaitBlocked)
+      // safe, ends any cycle of such waits across stores (lockOrderBlocked)
       waitingOn = Set()
-      awaitingCommits = Set()
+      awaitingInFlightCommits = Set()
       logger.info(s"Tx $transactionId on store $storeId votes abort: committed transactions waiting in lock order " +
         s"to apply over the objects ${lockWaits.keySet} withheld its vote for ${Tx.CollisionWait}")
       decideDisposition(lockWaits.map((oid, waiter) => oid -> TransactionCollision(waiter)), Nil)
@@ -1082,15 +1082,15 @@ class Tx( trs: TransactionRecoveryState,
       // Once the outcome is known the vote no longer matters, so nothing waits for it: a resolved transaction may
       // decide here only because its objects finished loading after the resolution
       waitingOn = Set()
-      awaitingCommits = inFlight
+      awaitingInFlightCommits = inFlight
       if lockWaits.isEmpty then
-        lockWaitBlockStart = 0L
-      else if lockWaitBlockStart == 0L then
-        lockWaitBlockStart = System.nanoTime()
-      frontend.awaitCommitPersisted(inFlight, this)
+        lockOrderBlockStart = 0L
+      else if lockOrderBlockStart == 0L then
+        lockOrderBlockStart = System.nanoTime()
+      frontend.awaitInFlightCommits(inFlight, this)
       logger.trace(s"Tx $transactionId waits for the in-flight commits of $inFlight before voting")
     else
-      awaitingCommits = Set()
+      awaitingInFlightCommits = Set()
       val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
       val (checked, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, requirements, objects, ou,
@@ -1262,7 +1262,7 @@ class Tx( trs: TransactionRecoveryState,
     //
     // A recovered commit vote's changed object that fails its re-check holds the update too: the vote held its locks
     // until it applied, and relocked them at recovery, so the object changed only through this update and the writes
-    // after it in lock order (awaitLockHolders; at recovery every commit vote relocks before a Tx that does not relock
+    // after it in lock order (awaitLockOrder; at recovery every commit vote relocks before a Tx that does not relock
     // completes its load, Frontend.recoveredTransactionLoaded). The store applied the update before the crash and a
     // later transaction superseded it, or the update leaves no trace (a refcount, key deletes), or its data was dropped
     // from the CRL state once applied (persistWithoutUpdateOf, after a deletion of the object or of a key it inserts).
@@ -1332,7 +1332,7 @@ class Tx( trs: TransactionRecoveryState,
     * An apply that threw fail-stops the store (Frontend.failStop): its in-memory state is corrupt.
     *
     * A live voter's changed object whose re-check fails is an invariant violation: a committed write that does not
-    * depend on this one never applies over this vote's locks before it (awaitLockHolders), so the state changed under
+    * depend on this one never applies over this vote's locks before it (awaitLockOrder), so the state changed under
     * the locks (Frontend.discard) or two conflicting transactions committed; a size re-check cannot fail, as the votes
     * held together fit together (RequirementsChecker.checkKVSliceSize). It is logged as one, naming the
     * transaction the object now shows, skipped and reported, so the finalizer marks the store for repair.
@@ -1408,7 +1408,7 @@ class Tx( trs: TransactionRecoveryState,
     if committed && commitAwaitsData then
       logger.trace(s"Holding the commit of $transactionId until its object data arrives")
       commitHeld = true
-    else if committed && awaitLockHolders() then
+    else if committed && awaitLockOrder() then
       logger.trace(s"Holding the commit of $transactionId until the commit votes it would run over resolve")
       commitHeld = true
     else if committed && holdForTurn() then
@@ -1524,7 +1524,7 @@ class Tx( trs: TransactionRecoveryState,
       // completeLoad left the vote undecided if the Tx was waiting for the client's prepare then. A wait for in-flight
       // commits ends only when they persist. A recovered Tx left undecided decides here too, once completeLoad ran
       if loadCompleted && oresolution.isEmpty && disposition == TransactionDisposition.Undetermined &&
-        awaitingCommits.isEmpty then
+        awaitingInFlightCommits.isEmpty then
         determineDisposition()
         lock()
 

@@ -498,15 +498,15 @@ commit per object.
 * `txCommitsInFlight: ObjectId -> count`: outstanding backend commits of transactions (deletions included) and repair
   writes (`reconcileSettled`).
 * `heldCommits: ObjectId -> List[Tx]`: committed transactions waiting their turn, oldest first.
-* `commitWaiters: ObjectId -> List[Tx]`: transactions withholding their vote, for a commit in flight or held, or for
-  a committed transaction waiting there in lock order (`Tx.lockWaitBlocked`).
-* `collisionWaiters: TransactionId -> List[Tx]`: transactions waiting out a lock holder (8.4), by holder.
-* `commitInFlight(oid) = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)`.
-* `lockWaitingCommits: ObjectId -> List[Tx]`: committed transactions waiting to apply in lock order (8.3), by object
-  they change (`Frontend.lockWaiters`). Not part of `commitInFlight`.
+* `inFlightCommitWaiters: ObjectId -> List[Tx]`: transactions withholding their vote, for a commit in flight or held, or for
+  a committed transaction waiting there in lock order (`Tx.lockOrderBlocked`).
+* `lockReleaseWaiters: TransactionId -> List[Tx]`: transactions waiting out a lock holder (8.4), by holder.
+* `hasPendingCommit(oid) = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)`.
+* `lockOrderWaiters: ObjectId -> List[Tx]`: committed transactions waiting to apply in lock order (8.3), by object
+  they change (`Frontend.lockOrderWaitersOf`). Not part of `hasPendingCommit`.
 * `adoptedDataSaves: ObjectId -> List[Tx]`: transactions saving object data adopted from a later prepare
   (`Tx.saveAdoptedData`), by object they change, from the save's issue until it completes and a commit waiting for it
-  has applied or moved to one of the lists above. Not part of `commitInFlight`; only repair consults it.
+  has applied or moved to one of the lists above. Not part of `hasPendingCommit`; only repair consults it.
 * `failedCommits`: never cleared; the store reloads with a new Frontend.
 * `allocationRecords`/`allocationsOf` and `blindInsertRecords`/`blindInsertsOf`: transactions whose CRL state may
   still hold an allocation or a blind KeyValue update of an object here (9.4).
@@ -519,11 +519,11 @@ commit per object.
    client's prepare is over or the outcome is known); an invalid description votes `InvalidDescription`; a hosted object
    that is failed (`commitFailed`) or covered by a rebuilt store's inherited votes (`Frontend.inheritedVoteLock`,
    cross-document-review.md 2.3) votes abort, one error per such object; a hosted object with a commit in flight or held
-   (`commitInFlight`), or whose locks a committed transaction waiting there to apply in lock order would collide with
-   (`Tx.lockWaitBlocked`, below), while the outcome is unknown makes the Tx wait (`awaitingCommits`,
-   `Frontend.awaitCommitPersisted`), with no locks and, for a commit in flight, no timer, until `commitPersisted` has
+   (`hasPendingCommit`), or whose locks a committed transaction waiting there to apply in lock order would collide with
+   (`Tx.lockOrderBlocked`, below), while the outcome is unknown makes the Tx wait (`awaitingInFlightCommits`,
+   `Frontend.awaitInFlightCommits`), with no locks and, for a commit in flight, no timer, until `commitPersisted` has
    arrived for each (from `commitTurnFree`, at a backend completion, a held commit's issue, or the end of a lock-order
-   wait, `Frontend.lockWaitWakeVoters`); otherwise the requirements are checked, and a collision may be waited out
+   wait, `Frontend.lockOrderWaitWakeVoters`); otherwise the requirements are checked, and a collision may be waited out
    (8.4). After the check, a rebuilt store holding inherited growth guards adds `InheritedGrowthLock` for every growing
    KeyValue update of a guarded object (R16). The in-flight test covers every hosted object, lock-only ones included; a
    lock-only object has a commit in flight only when another transaction changes it.
@@ -533,19 +533,19 @@ commit per object.
    or held, the Tx joins every changed object's queue in one `holdCommit` call and keeps its locks and references.
    Queues are appended to together, so the oldest held commit heads every queue it is in, and held commits cannot wait
    on each other in a cycle. Before that, a committed Tx that holds no locks here waits in lock order
-   (`Tx.awaitLockHolders`, R15): while another Tx holds locks (`Frontend.holdsLocks`) that its requirements or writes on
+   (`Tx.awaitLockOrder`, R15): while another Tx holds locks (`Frontend.holdsLocks`) that its requirements or writes on
    an object it changes collide with (`RequirementsChecker.lockHolders` over `changedHere`, displaced holders included),
    and that holder itself changes one of the objects it changes (`Frontend.changes`), it is held (`commitHeld`, no
-   locks, references kept, `Frontend.awaitLockHolders`) until each such holder has released them
+   locks, references kept, `Frontend.awaitLockOrder`) until each such holder has released them
    (`Frontend.locksReleased`, after the holder applied or aborted). The holder set is then computed again, and with none
    left it takes the ordinary path, queueing behind the holder's in-flight commit. A lock-only holder is not waited for:
    it has no update to lose. A Tx holding its own locks never waits: two live votes never hold conflicting locks (R4),
    and recovered votes sharing a lock (section 3) are ordered by what persisted before the crash (the later one voted
    after the earlier one's update persisted, 10.5a). A recovered Tx that does not relock completes its load only after
    every recovered commit vote has relocked (transaction-recovery.md 7.2), so it finds every holder it must wait for.
-   The wait is not counted by `commitInFlight`, so the holder's own commit never queues behind it. A new vote waits for
+   The wait is not counted by `hasPendingCommit`, so the holder's own commit never queues behind it. A new vote waits for
    it only if the waiter would wait for it as a holder: the vote changes an object the waiter changes, and the waiter's
-   requirements or writes collide with the locks the vote would take on one of its objects (`Tx.lockWaitBlocked`:
+   requirements or writes collide with the locks the vote would take on one of its objects (`Tx.lockOrderBlocked`:
    `RequirementsLocker.plannedLocks` seen through `RequirementsChecker.PlannedLocks`, tested by the waiter's
    `Tx.wouldWaitFor` with the same `lockHoldersIn` rule and `Frontend.changes` filter as its own holder set), so it
    cannot be starved. A vote that is lock-only on the waiter's objects is not withheld. Any other new vote decides at
@@ -554,7 +554,7 @@ commit per object.
    can decide only with a vote withheld at another store, by a waiter there that waits for this vote's transaction: four
    contending multi-key writers and two delayed prepares suffice. So a vote is never withheld for a waiter it does not
    collide with, and a colliding one at most `Tx.CollisionWait` (`Tx.checkCollisionWait` at the 1 s store heartbeat, so
-   up to about 1.5 s, `lockWaitBlockStart`): it then votes abort, a `TransactionCollision` naming the waiter, on the
+   up to about 1.5 s, `lockOrderBlockStart`): it then votes abort, a `TransactionCollision` naming the waiter, on the
    state before the waiter's apply. A Tx whose such wait expired (`lockWaitBlockExpired`) never waits for a lock-order
    waiter again: it votes abort at once if one still collides, and otherwise waits for real in-flight commits as usual.
    An abort vote is always safe, and it ends any such cycle: the holder its transaction would have needed decides

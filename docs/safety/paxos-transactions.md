@@ -389,11 +389,11 @@ decided in `Tx.determineDisposition`, in this order:
 3. Invalid description (6.5): `VoteAbort` with `InvalidDescription` for every object.
 4. A hosted object whose earlier backend commit failed or that was poisoned (`BackendCommitFailed`), or that a
    rebuilt store's inherited votes may lock (`InheritedVoteLock`, 10.10): `VoteAbort`.
-5. A hosted object with a commit in flight or held for its turn (`Frontend.commitInFlight`), or changed by a committed
-   Tx waiting to apply in lock order (9.1) that would wait for this vote (`Tx.lockWaitBlocked`, `wouldWaitFor`: the
+5. A hosted object with a commit in flight or held for its turn (`Frontend.hasPendingCommit`), or changed by a committed
+   Tx waiting to apply in lock order (9.1) that would wait for this vote (`Tx.lockOrderBlocked`, `wouldWaitFor`: the
    vote changes an object the waiter changes, and its locks collide with the waiter's requirements or writes), outcome
    unknown: the vote is withheld and the Tx registers to be told when the object is free
-   (`Frontend.awaitCommitPersisted`). A wait for an in-flight commit has no timer (a backend commit always completes or
+   (`Frontend.awaitInFlightCommits`). A wait for an in-flight commit has no timer (a backend commit always completes or
    fails); a wait for a colliding lock-order waiter lasts at most `Tx.CollisionWait` (`Tx.checkCollisionWait`), then
    the Tx votes abort with a `TransactionCollision` naming the waiter, which ends any cycle of such waits across
    stores.
@@ -642,13 +642,13 @@ every prepare and accept response, retransmits included: write amplification, no
     missing, or adopted data not yet durable): held without `TxCommitted`, so the driver does not yet count the store as
     having missed the update. Released by the data's save, a client prepare, or `TxFinalized`; after `TxFinalized` the
     store applies without the data, reports the object as uncommittable and repair restores it;
-  * lock order (`Tx.awaitLockHolders`): a committed Tx holding no locks here does not apply while another Tx here holds
+  * lock order (`Tx.awaitLockOrder`): a committed Tx holding no locks here does not apply while another Tx here holds
     commit-vote locks its requirements or writes collide with (`RequirementsChecker.lockHolders`) on an object both
     change; it waits, holding its references, until each holder releases (`Frontend.locksReleased`), and new votes it
-    would wait for in the same way wait for it, up to `Tx.CollisionWait` before voting abort (`Tx.lockWaitBlocked`);
+    would wait for in the same way wait for it, up to `Tx.CollisionWait` before voting abort (`Tx.lockOrderBlocked`);
     other new votes, lock-only ones on its objects included, decide at once. Otherwise a non-chaining commit applied
     over a vote's locks would fail that vote's re-check, and the counted vote would stand for neither its lock nor its update. A lock-only holder
-    is not waited for, and the wait is outside `commitInFlight`, so the holder's own commit never queues behind it
+    is not waited for, and the wait is outside `hasPendingCommit`, so the holder's own commit never queues behind it
     (`transaction-requirements.md`);
   * an earlier commit of an object it changes is in flight or held (`Tx.holdForTurn`): queued per object in the
     Frontend (`transaction-requirements.md`).

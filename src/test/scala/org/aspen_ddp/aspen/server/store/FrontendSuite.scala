@@ -713,7 +713,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   // cross-document-review X-W23: TxFinalized during the save of adopted data defers the commit and drops the Tx from
-  // `transactions`; the commit is in neither heldCommits nor lockWaitingCommits, so without its own record a repair
+  // `transactions`; the commit is in neither heldCommits nor lockOrderWaiters, so without its own record a repair
   // would find the object settled and consume the store's ErrorTree mark before the update applies
   test("a commit finalized while it waits for its adopted data's save leaves its object unsettled for repair") {
     withDataless(): (frontend, backend, net, crl) =>
@@ -2202,7 +2202,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions.contains(txid2) shouldBe false
     backend.issued shouldBe List(txid1)
 
-    // txid3, built on txid2's write of op1: op1's commit is held (commitInFlight), so txid3 withholds its vote, its
+    // txid3, built on txid2's write of op1: op1's commit is held (hasPendingCommit), so txid3 withholds its vote, its
     // requirements unchecked, rather than meet txid2's locks with no live holder to wait for and vote abort
     sendPrepare(frontend, lockTxd(txid3, List(overwriteAfter(txid2))))
     prepareResponses(net, txid3) shouldBe empty
@@ -5338,7 +5338,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   }
 
   /** txid1 holds a commit vote overwriting op1. txid2, committed by the other stores, overwrites op1 and blind-Inserts
-    * key 4 of kvPtr: it voted abort here on op1, and waits in lock order for txid1 (Tx.awaitLockHolders), whose locks
+    * key 4 of kvPtr: it voted abort here on op1, and waits in lock order for txid1 (Tx.awaitLockOrder), whose locks
     * lie on op1 only
     */
   def blindInsertWaitsInLockOrderOnAnotherObject(frontend: Frontend, net: TestNet): Unit =

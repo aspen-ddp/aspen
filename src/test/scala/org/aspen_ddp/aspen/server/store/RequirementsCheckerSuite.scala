@@ -1447,7 +1447,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       lockThenCheckKV(mk(), write(tx1), req(tx2)) shouldBe Map(oid1 -> TransactionCollision(tx1))
   }
 
-  test("a vote's planned locks collide exactly as the locks it takes (Tx.lockWaitBlocked)") {
+  test("a vote's planned locks collide exactly as the locks it takes (Tx.lockOrderBlocked)") {
     val kinds: List[TransactionId => KVTx] = List(
       insertPresent, insertAbsent,
       KVTx(_, List(KeyRevision(kk1, rev1)), Nil),

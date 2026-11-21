@@ -119,8 +119,8 @@ The premises other subsystems take from this:
   (`Frontend.mayHoldTransaction`), so no Tx can apply T after a reconcile and have its entry deleted under it. A Tx
   finalized while its commit is held has left `transactions` (`Frontend.finalizationDeferred`), so
   `mayHoldTransaction` is false for it, and a reloaded store's floor covers it; repair still cannot lose its update. A
-  commit held for its turn is in `heldCommits`, part of `commitInFlight`, and a commit waiting in lock order is in
-  `lockWaitingCommits`, each under every object it changes wherever the locks or commits it waits for lie, so those
+  commit held for its turn is in `heldCommits`, part of `hasPendingCommit`, and a commit waiting in lock order is in
+  `lockOrderWaiters`, each under every object it changes wherever the locks or commits it waits for lie, so those
   objects are unsettled (`Frontend.settledForRepair`) and no reconcile installs or completes there until it has
   applied. A committed non-voter waiting for object data it adopted from a late client prepare to be saved
   (`Tx.commitAwaitsData`, `adoptedDataUnsaved`), which `TxFinalized` can also defer, is in `adoptedDataSaves` under
@@ -275,7 +275,7 @@ The premises other subsystems take from this:
   (`Frontend.parkAllocationRead`, `Frontend.allocationPending`).
 * A committed apply ignores other transactions' locks (`RequirementsChecker.check` with `applying = true`), but a
   committed transaction holding no locks at a store waits to apply while another transaction there holds locks it
-  collides with on an object both change (`Tx.awaitLockHolders`, transaction-requirements.md 8.3, R15). So a commit
+  collides with on an object both change (`Tx.awaitLockOrder`, transaction-requirements.md 8.3, R15). So a commit
   voter of T whose outcome is late applies T before a later commit T2 that does not chain on T's revision (a
   `RefcountUpdate`, a key-level write, a repair proof, 2.4), and T2's raised object timestamp never fails T's
   re-check. Reads choose the revision by count alone (`BaseObjectReader.getStoreStates`, per key in
@@ -292,7 +292,7 @@ The premises other subsystems take from this:
   turn keeps its locks after a `TxFinalized` takes it out of `Frontend.transactions` (`finalizationDeferred`); a
   lock-order waiter that then skips it (`Frontend.holdsLocks` is false) is still queued behind it on every object both
   change (`heldCommits`, `holdForTurn`), so it applies first. A prepare built on it never meets its locks: it builds on
-  an object the held commit changes, which is in `heldCommits` and so in `commitInFlight`, and a vote touching such an
+  an object the held commit changes, which is in `heldCommits` and so in `hasPendingCommit`, and a vote touching such an
   object waits, its requirements unchecked, until the commit persists, by when the held commit has applied and
   released its locks (`Tx.determineDisposition`). A recovered voter whose re-check fails therefore
   holds T already (transaction-requirements.md 8.5); for a refcount the converse, that a re-check passing means T is
@@ -309,20 +309,20 @@ The premises other subsystems take from this:
 * `awaitBlindInsertsDurable` takes a covering Tx that voted commit as holding its update (`Tx.holdsUpdateOf`) and saves
   its state without the update, although it may not have applied yet. That is sound because no deletion of the key
   applies at this store before that vote's own apply: a transaction deleting it votes abort on the vote's key lock
-  here, and its commit, holding no locks here, waits in lock order (`Tx.awaitLockHolders`); a repair defers every key
+  here, and its commit, holding no locks here, waits in lock order (`Tx.awaitLockOrder`); a repair defers every key
   the store's own locks cover (`ObjectState.lockedKeys`, `Frontend.reconcileSettled`); a recovered deletion waits for
   the recovered vote to relock. The one exception, a recovered vote sharing the lock cast after T's update persisted
   (transaction-requirements.md 10.5a), is one whose update is applied.
 * A lock-order wait has no timer, and while it lasts every new vote whose locks the waiter collides with waits
-  (`Tx.lockWaitBlocked`); other votes decide at once. A colliding vote waits at most `Tx.CollisionWait`, then votes
+  (`Tx.lockOrderBlocked`); other votes decide at once. A colliding vote waits at most `Tx.CollisionWait`, then votes
   abort naming the waiter, so waits at two stores that withhold the votes each other's holders need end in about
   1.5 s: each holder's driver then sees an abort vote and decides (transaction-requirements.md 8.3). A holder that
   cannot decide otherwise ends by expiry (`ExpiryTally.decideUnknown`), and one whose tally is undecidable holds the
   waiter as long as its own locks (transaction-requirements.md section 12).
 * A vote is withheld only for a waiter that would wait for it: one changing none of the waiter's objects (lock-only
   there, such as a repair proof or a vdisk fence lock) decides at once (transaction-requirements.md 8.3). That also
-  guards a restored commit voter: once the store stops `holding`, it is issued, held for its turn (`commitInFlight`
-  withholds every new vote on its objects and unsettles them for repair) or waits in lock order (`lockWaitBlocked`), so
+  guards a restored commit voter: once the store stops `holding`, it is issued, held for its turn (`hasPendingCommit`
+  withholds every new vote on its objects and unsettles them for repair) or waits in lock order (`lockOrderBlocked`), so
   no new transaction, repair proofs included, commits over it at this store, and its relocked locks (R13) show reads
   and repair that it has yet to apply.
 * A lock-only vote is not waited for, and a repair install may change an object under one: shared revision locks are

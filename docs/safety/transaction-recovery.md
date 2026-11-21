@@ -92,7 +92,7 @@ retransmit 1 s. `TestNetwork` builds recovery drivers with 10 ms / 100 ms.
 | `errorTimeout` | 2 s | `MissedUpdateFinalizationAction.errorTimeout` | Marker waits this long after it executes for `TxCommitted`s before marking |
 | Finalizer restart | 1 s doubling to 60 s | `TransactionDriver.finalizerRetryDelay` | Backoff of a failed finalizer |
 | `FinalizationStallAfter` | 60 s | `TransactionDriver.finalizationStall`, `FinalizationStallReport` | `FINALIZATION STALLED` logged once a minute per store |
-| `Tx.CollisionWait` | 500 ms (+ up to 1 s granularity) | `Tx.checkCollisionWait` | Vote withheld for a lock holder the Tx builds on, or for a committed Tx waiting in lock order whose wait collides with the vote's locks (`Tx.lockWaitBlocked`, `lockWaitBlockStart`); then it votes abort |
+| `Tx.CollisionWait` | 500 ms (+ up to 1 s granularity) | `Tx.checkCollisionWait` | Vote withheld for a lock holder the Tx builds on, or for a committed Tx waiting in lock order whose wait collides with the vote's locks (`Tx.lockOrderBlocked`, `lockOrderBlockStart`); then it votes abort |
 | `Frontend.MissingDataWait` | 5 s | `Tx.awaitingClientPrepare` | A Tx that has seen no client prepare withholds promise and vote this long (from its creation), then votes abort (`NoClientPrepare`), requirements unchecked |
 | `Frontend.UnackedLookupTimeout` | 5 s | `Frontend.retryUnackedLookups` | Logs an UnackedCommits lookup still unanswered (it is not re-issued); a failed one is retried at the next heartbeat |
 | `prepareResponseCache` | 10 s, 1000 entries | `Store` | Prepare responses arriving before the store's driver exists, replayed into it |
@@ -532,7 +532,7 @@ Ordering (`Frontend.recoveredTransactionLoaded`, `Tx.completeLoad`):
    them: its backend commit may not have completed before the crash, and until it applies the locks order the
    transactions behind it and show readers and repair that it has yet to apply (transaction-requirements.md R13). A
    restored commit without a commit vote here takes no locks and applies in its `completeLoad`, waiting in lock order
-   (`Tx.awaitLockHolders`) for the holders it collides with. Every recovered commit vote has relocked by then (step 2),
+   (`Tx.awaitLockOrder`) for the holders it collides with. Every recovered commit vote has relocked by then (step 2),
    so it never applies over a recovered vote's update before that vote applies.
 4. `completeLoad` requests the UnackedCommits lookup if `needsUnackedCheck` (7.5).
 5. Held messages are released only once nothing is holding.
@@ -550,10 +550,10 @@ saved data.
 * Locks live on shared `ObjectState` instances kept by `Frontend.referenced`, so every transaction sees the same lock
   table whatever the cache does.
 * A commit voter holds its locks until it learns the outcome or is forgotten; `doCommit` drops them before applying,
-  and the in-flight-commit marker (`Frontend.commitInFlight`) orders the transactions that follow.
+  and the in-flight-commit marker (`Frontend.hasPendingCommit`) orders the transactions that follow.
 * A committed Tx holding no locks does not apply while another Tx holds locks it collides with on an object both
-  change (`Tx.awaitLockHolders`, transaction-requirements.md R15): it is held (`commitHeld`) until each holder
-  releases (`Frontend.locksReleased`). A new vote it would wait for as a holder (`Tx.lockWaitBlocked`: the vote changes an object the
+  change (`Tx.awaitLockOrder`, transaction-requirements.md R15): it is held (`commitHeld`) until each holder
+  releases (`Frontend.locksReleased`). A new vote it would wait for as a holder (`Tx.lockOrderBlocked`: the vote changes an object the
   waiter changes, the `Frontend.changes` filter, and its planned locks, `RequirementsLocker.plannedLocks`, collide with
   the waiter's requirements or writes, the waiter's `wouldWaitFor`) withholds its vote meanwhile, no locks
   taken, for at most `Tx.CollisionWait`, then votes abort naming the waiter (`TransactionCollision`): the waiter's
@@ -565,8 +565,8 @@ saved data.
   `repairInstalled` notices and the `keyDeletions` pruning no longer see it, and its `TxCommitted` comes after T's
   marks were written. The store was marked for T (it had not acknowledged T when T was finalized), and that mark is what
   repairs its copy. A repair of an object the held commit changes does not consume that mark while the commit waits:
-  a commit held for its turn is listed in `heldCommits` under every object it changes, part of `commitInFlight`, and
-  a commit waiting in lock order is listed in `lockWaitingCommits` under every object it changes, wherever the locks
+  a commit held for its turn is listed in `heldCommits` under every object it changes, part of `hasPendingCommit`, and
+  a commit waiting in lock order is listed in `lockOrderWaiters` under every object it changes, wherever the locks
   it waits for lie, and a commit waiting for the save of object data it adopted from a late client prepare
   (`Tx.commitAwaitsData`) is listed in `adoptedDataSaves` under every object it changes until the save completes and
   the commit has applied or taken one of the other two holds. Each makes the object unsettled (`Frontend.settledForRepair`), so the reconcile parks or answers
@@ -713,7 +713,7 @@ lookup that finds no entry.
                     |
    TxResolved(c) / proof-holding driver / own entry -> resolved(c): statusCache(c) unless from the tree
         abort:  CRL state deleted at once (held for a lookup if needsUnackedCheck)
-        commit: commitAwaitsData? awaitLockHolders? holdForTurn? -> doCommit -> backend commits -> TxCommitted -> data dropped in memory
+        commit: commitAwaitsData? awaitLockOrder? holdForTurn? -> doCommit -> backend commits -> TxCommitted -> data dropped in memory
                     |
    TxFinalized(c) -> finalized(c): statusCache finalized; CRL state deleted once backend commits succeed
                      (or replaced by an applied stub: owed names the store, or it applied T

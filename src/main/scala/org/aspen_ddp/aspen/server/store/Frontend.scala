@@ -558,26 +558,26 @@ class Frontend(val storeId: StoreId,
   // followers. An object a transaction only checks or locks gets no commit and so is never in flight
   //
   // Four things a Tx can wait for, each with its own queue:
-  //   - lock holders (collisionWaiters, by holder): a vote that collides with a holder's locks, or a committed
+  //   - lock holders (lockReleaseWaiters, by holder): a vote that collides with a holder's locks, or a committed
   //     transaction waiting to apply over a vote's locks, until the holder releases them (awaitLocksReleased)
-  //   - an in-flight commit (commitWaiters, by object): a vote withheld until no commit of the object is in flight
-  //     (awaitCommitPersisted)
+  //   - an in-flight commit (inFlightCommitWaiters, by object): a vote withheld until no commit of the object is in
+  //     flight (awaitInFlightCommits)
   //   - its turn (heldCommits, by object): a committed transaction holding its commit behind those in flight and
   //     those held earlier (holdCommit)
-  //   - lock order (lockWaitingCommits, by object): a committed transaction waiting to apply, which new votes whose
-  //     locks it would wait for must queue behind (awaitLockHolders, lockWaiters)
+  //   - lock order (lockOrderWaiters, by object): a committed transaction waiting to apply, which new votes whose
+  //     locks it would wait for must queue behind (awaitLockOrder, lockOrderWaitersOf)
 
   /** Transactions waiting for a lock holder, by holder. See Tx.awaitableHolders */
-  private val collisionWaiters = scala.collection.mutable.HashMap[TransactionId, List[Tx]]()
+  private val lockReleaseWaiters = scala.collection.mutable.HashMap[TransactionId, List[Tx]]()
 
   /** `waiter` waits until `holder` releases its locks (locksReleased -> Tx.collisionHolderReleased) */
   def awaitLocksReleased(holder: TransactionId, waiter: Tx): Unit =
-    val others = collisionWaiters.getOrElse(holder, Nil).filterNot(_ eq waiter)
-    collisionWaiters(holder) = waiter :: others
+    val others = lockReleaseWaiters.getOrElse(holder, Nil).filterNot(_ eq waiter)
+    lockReleaseWaiters(holder) = waiter :: others
 
   /** `holder` released its locks, so the transactions waiting for it decide their votes */
   def locksReleased(holder: TransactionId): Unit =
-    collisionWaiters.remove(holder).foreach(_.foreach(_.collisionHolderReleased(holder)))
+    lockReleaseWaiters.remove(holder).foreach(_.foreach(_.collisionHolderReleased(holder)))
 
   /** Outstanding backend commits of transactions' changes, deletions included, by object: commit with
     * `commit`, and repair writes (see reconcile)
@@ -588,39 +588,39 @@ class Frontend(val storeId: StoreId,
   private val heldCommits = scala.collection.mutable.HashMap[ObjectId, List[Tx]]()
 
   /** Transactions withholding their vote until no commit of the object is in flight, oldest first */
-  private val commitWaiters = scala.collection.mutable.HashMap[ObjectId, List[Tx]]()
+  private val inFlightCommitWaiters = scala.collection.mutable.HashMap[ObjectId, List[Tx]]()
 
   /** Objects a transaction's backend commit failed to write. Never cleared: the store reloads with a new Frontend */
   private val failedCommits = scala.collection.mutable.HashSet[ObjectId]()
 
   /** A transaction's commit of `oid` is outstanding, or a committed transaction holds one waiting its turn */
-  def commitInFlight(oid: ObjectId): Boolean = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)
+  def hasPendingCommit(oid: ObjectId): Boolean = txCommitsInFlight.contains(oid) || heldCommits.contains(oid)
 
-  /** Committed transactions waiting to apply for the commit votes they would run over (Tx.awaitLockHolders), by
+  /** Committed transactions waiting to apply for the commit votes they would run over (Tx.awaitLockOrder), by
     * object they change
     */
-  private val lockWaitingCommits = scala.collection.mutable.HashMap[ObjectId, List[Tx]]()
+  private val lockOrderWaiters = scala.collection.mutable.HashMap[ObjectId, List[Tx]]()
 
-  /** The committed transactions changing `oid` that wait to apply (Tx.awaitLockHolders), oldest first. A new vote
-    * whose locks one of them would wait for waits for it (Tx.lockWaitBlocked), so it cannot be starved; any other new
-    * vote proceeds. These waits are left out of commitInFlight, which orders held commits: the votes they wait for
+  /** The committed transactions changing `oid` that wait to apply (Tx.awaitLockOrder), oldest first. A new vote
+    * whose locks one of them would wait for waits for it (Tx.lockOrderBlocked), so it cannot be starved; any other new
+    * vote proceeds. These waits are left out of hasPendingCommit, which orders held commits: the votes they wait for
     * must never queue their own commits behind them
     */
-  def lockWaiters(oid: ObjectId): List[Tx] = lockWaitingCommits.getOrElse(oid, Nil)
+  def lockOrderWaitersOf(oid: ObjectId): List[Tx] = lockOrderWaiters.getOrElse(oid, Nil)
 
   /** `tx`, committed, waits to apply its changes of `oids` until each of `holders` releases its locks
     * (locksReleased -> Tx.collisionHolderReleased)
     */
-  def awaitLockHolders(oids: Set[ObjectId], holders: Set[TransactionId], tx: Tx): Unit =
-    oids.foreach(oid => lockWaitingCommits(oid) = lockWaitingCommits.getOrElse(oid, Nil).filterNot(_ eq tx) :+ tx)
+  def awaitLockOrder(oids: Set[ObjectId], holders: Set[TransactionId], tx: Tx): Unit =
+    oids.foreach(oid => lockOrderWaiters(oid) = lockOrderWaiters.getOrElse(oid, Nil).filterNot(_ eq tx) :+ tx)
     holders.foreach(awaitLocksReleased(_, tx))
 
   /** `tx` no longer waits to apply: it is applying, or queued for its turn */
-  def lockWaitEnded(oids: Set[ObjectId], tx: Tx): Unit = oids.foreach(oid => removeFrom(lockWaitingCommits, oid, tx))
+  def lockOrderWaitEnded(oids: Set[ObjectId], tx: Tx): Unit = oids.foreach(oid => removeFrom(lockOrderWaiters, oid, tx))
 
   /** Transactions saving object data adopted from a later prepare (Tx.saveAdoptedData), by object they change. A
     * commit waits for that save, and a TxFinalized meanwhile drops the Tx from `transactions` (finalizationDeferred)
-    * while it is in neither heldCommits nor lockWaitingCommits, so this keeps its objects unsettled for repair
+    * while it is in neither heldCommits nor lockOrderWaiters, so this keeps its objects unsettled for repair
     * (settledForRepair) until the save completes and the commit takes one of those paths or applies
     */
   private val adoptedDataSaves = scala.collection.mutable.HashMap[ObjectId, List[Tx]]()
@@ -634,10 +634,10 @@ class Frontend(val storeId: StoreId,
     oids.foreach(oid => removeFrom(adoptedDataSaves, oid, tx))
     oids.foreach(retryParkedRepair)
 
-  /** A committed transaction's wait to apply ended: the votes withheld for it (lockWaiters) decide, unless a commit of
-    * the object is now in flight, whose completion tells them instead
+  /** A committed transaction's wait to apply ended: the votes withheld for it (lockOrderWaitersOf) decide, unless a
+    * commit of the object is now in flight, whose completion tells them instead
     */
-  def lockWaitWakeVoters(oids: Set[ObjectId]): Unit = oids.foreach(commitTurnFree)
+  def lockOrderWaitWakeVoters(oids: Set[ObjectId]): Unit = oids.foreach(commitTurnFree)
 
   /** Whether the Tx `holder` changes `oid` here (Tx.changes) */
   def changes(holder: TransactionId, oid: ObjectId): Boolean = transactions.get(holder).exists(_.changes(oid))
@@ -654,12 +654,13 @@ class Frontend(val storeId: StoreId,
   /** `waiter` withholds its vote until each of `oids` has no commit in flight: it is then told through
     * Tx.commitPersisted, once per object
     */
-  def awaitCommitPersisted(oids: Set[ObjectId], waiter: Tx): Unit =
-    oids.foreach(oid => commitWaiters(oid) = commitWaiters.getOrElse(oid, Nil).filterNot(_ eq waiter) :+ waiter)
+  def awaitInFlightCommits(oids: Set[ObjectId], waiter: Tx): Unit =
+    oids.foreach: oid =>
+      inFlightCommitWaiters(oid) = inFlightCommitWaiters.getOrElse(oid, Nil).filterNot(_ eq waiter) :+ waiter
 
   /** `waiter` no longer waits: it resolved */
-  def stopAwaitingCommits(oids: Set[ObjectId], waiter: Tx): Unit =
-    oids.foreach(oid => removeFrom(commitWaiters, oid, waiter))
+  def stopAwaitingInFlightCommits(oids: Set[ObjectId], waiter: Tx): Unit =
+    oids.foreach(oid => removeFrom(inFlightCommitWaiters, oid, waiter))
 
   /** Queues `tx`'s commit of `oids` behind the commits of them in flight and those already held. Queues are appended to
     * together, so the oldest held commit heads the queue of every object it changes and the held commits cannot
@@ -695,7 +696,7 @@ class Frontend(val storeId: StoreId,
       if !txCommitsInFlight.contains(oid) then
         heldCommits.get(oid) match
           case Some(next :: _) => next.commitPersisted(oid)
-          case _ => commitWaiters.remove(oid).foreach(_.foreach(_.commitPersisted(oid)))
+          case _ => inFlightCommitWaiters.remove(oid).foreach(_.foreach(_.commitPersisted(oid)))
 
   /** Outstanding backend commits, oldest first. Each holds a reference to its state (see retain) from commit until
     * the backend reports it complete, so the state is served and checked from memory rather than read from a backend
@@ -999,7 +1000,7 @@ class Frontend(val storeId: StoreId,
     * or with a restored Committed resolution, which it then applies) completes its load at once, taking its locks
     * again. Every other one completes only once every recovered commit vote that relocks has done so, those with a
     * persisted vote first. One applying a restored commit resolution earlier would
-    * find no lock holder to wait for in lock order (Tx.awaitLockHolders) and could apply over a vote's update first,
+    * find no lock holder to wait for in lock order (Tx.awaitLockOrder) and could apply over a vote's update first,
     * failing its re-check (transaction-recovery.md 7.2); one deciding its vote earlier could take locks that conflict
     * with a recovered vote's.
     */
@@ -1977,7 +1978,7 @@ class Frontend(val storeId: StoreId,
                             completion: Promise[Unit]): Unit =
     if stopped then
       completion.failure(new IllegalStateException(s"Store $storeId fail-stopped"))
-    else if holding || pendingReads.contains(objectId) || commitInFlight(objectId) || committing.contains(objectId) ||
+    else if holding || pendingReads.contains(objectId) || hasPendingCommit(objectId) || committing.contains(objectId) ||
       deleting.contains(objectId) || referenced.contains(objectId) then
       completion.failure(new Frontend.RepairDeleteDeferred(
         s"Store $storeId: object $objectId is in use; its missed deletion is repaired on a later pass"))
@@ -2059,15 +2060,15 @@ class Frontend(val storeId: StoreId,
     *
     * While holding for recovered transactions, their locks are not all taken: the store's own locks would not defer
     * what they cover. A committed transaction that changes the object and has yet to apply here, held for its turn
-    * (heldCommits, within commitInFlight) or waiting in lock order for a commit vote whose locks may lie on another
-    * object only (lockWaitingCommits), or waiting for the save of object data it adopted from a later prepare
+    * (heldCommits, within hasPendingCommit) or waiting in lock order for a commit vote whose locks may lie on another
+    * object only (lockOrderWaiters), or waiting for the save of object data it adopted from a later prepare
     * (adoptedDataSaves), is unsettled work too: a completed pass would consume the store's ErrorTree mark for it, and
     * its later blind Insert of an absent key could write back a key a later transaction deleted, with no mark left
-    * (transaction-recovery 7.4). A parked repair runs once the wait ends and the commit persists (lockWaitWakeVoters,
-    * commitTurnFree, adoptedDataSaved)
+    * (transaction-recovery 7.4). A parked repair runs once the wait ends and the commit persists
+    * (lockOrderWaitWakeVoters, commitTurnFree, adoptedDataSaved)
     */
   private def settledForRepair(objectId: ObjectId): Boolean =
-    !(holding || commitInFlight(objectId) || lockWaitingCommits.contains(objectId) ||
+    !(holding || hasPendingCommit(objectId) || lockOrderWaiters.contains(objectId) ||
       adoptedDataSaves.contains(objectId) || commitFailed(objectId) || committing.contains(objectId) ||
       deleting.contains(objectId))
 

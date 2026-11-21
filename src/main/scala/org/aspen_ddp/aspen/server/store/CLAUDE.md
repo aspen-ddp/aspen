@@ -4,7 +4,7 @@
   charges and the admit decision), `CrlStateRecords` (two instances: allocations and blind inserts whose CRL state may
   still hold an update; deletions wait on them), `AppliedStubs` (stub set and expiry queue), `ParkedReads` (parked
   client reads), `ObjectCounts` (in-flight commits and deletions per object). Parked repairs, the wait queues
-  (`collisionWaiters`, `commitWaiters`, `heldCommits`, `lockWaitingCommits`, described together above
+  (`lockReleaseWaiters`, `inFlightCommitWaiters`, `heldCommits`, `lockOrderWaiters`, described together above
   `txCommitsInFlight`) and the expiry rounds stay in `Frontend`
 - The transaction protocol the Frontend takes part in (votes, proofs, late resolution, UnackedCommits, applied
   stubs, status cache): `server/transaction/CLAUDE.md`. Read both when changing `Frontend` or `Tx`
@@ -196,17 +196,17 @@
 #### Commits
 - A store keeps a committed transaction's CRL state until its backend commits succeed; a failed commit keeps it (and
   the pinned object state, still served) while the store is loaded
-- One in-flight transaction commit per object (`Frontend.commitInFlight`): a transaction touching an object whose
+- One in-flight transaction commit per object (`Frontend.hasPendingCommit`): a transaction touching an object whose
   commit is in flight, whether or not it builds on it, withholds its vote with no locks and no timer until the commit
   persists, then checks its requirements against the state as it is then. A follower resolved committed meanwhile
   holds its commit (queued per object, oldest first) until earlier commits of its objects persist. A held commit is
-  in `commitInFlight` too, so a prepare built on it waits for it even once a `TxFinalized` has moved it out of
+  in `hasPendingCommit` too, so a prepare built on it waits for it even once a `TxFinalized` has moved it out of
   `transactions` (`deferredFinalizations`, where `holdsLocks` does not look). Locks still
   release when a commit is applied in memory: the in-flight marker orders followers. A committed transaction holding
   no locks here applies in lock order: it waits while another transaction holds locks it collides with on an object
-  both change (`Tx.awaitLockHolders`, `RequirementsChecker.lockHolders`; `server/transaction/CLAUDE.md`, Lock order),
+  both change (`Tx.awaitLockOrder`, `RequirementsChecker.lockHolders`; `server/transaction/CLAUDE.md`, Lock order),
   and new votes it would wait for as holders (changing an object it changes, with colliding locks) wait for it, at most `Tx.CollisionWait` before voting abort
-  (`lockWaiters`, `Tx.lockWaitBlocked`; other votes decide at once; the wait is not in `commitInFlight`, which orders held commits). `RequirementsLocker.plannedLocks` is the one
+  (`lockOrderWaitersOf`, `Tx.lockOrderBlocked`; other votes decide at once; the wait is not in `hasPendingCommit`, which orders held commits). `RequirementsLocker.plannedLocks` is the one
   source of the locks a vote takes, for both `lock` and that test. After a failed backend commit
   every transaction on that object votes abort (`BackendCommitFailed`) until the store reloads. Objects a
   transaction only checks or locks get no backend commit, so concurrent `SharedRevisionLock` holders never wait
@@ -339,7 +339,7 @@
   install was applied (every deferred, stale or no-op path reports false)
 - Parked repairs (repair-process 8.2): a reconcile whose `RepairSnapshot.awaitSettle` is set, finding its object
   unsettled (`settledForRepair`: a commit or repair write in flight or held, a committed transaction changing it
-  waiting in lock order, `lockWaitingCommits`, or saving object data it adopted from a late client prepare,
+  waiting in lock order, `lockOrderWaiters`, or saving object data it adopted from a late client prepare,
   `adoptedDataSaves` (a `TxFinalized` meanwhile drops the Tx from `transactions` with its commit still to apply), a
   failed commit, a deletion, holding for recovery), waits in
   `parkedRepairs` (at most one per object, a newer one answers the older stale) instead of answering stale.

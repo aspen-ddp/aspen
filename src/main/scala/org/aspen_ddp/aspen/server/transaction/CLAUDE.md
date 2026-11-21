@@ -307,16 +307,16 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   and reported only
 - Lock order (transaction-requirements 8.3, R15): a committed Tx holding no locks at a store does not apply while
   another Tx there holds locks its requirements or writes collide with (`RequirementsChecker.lockHolders`) on an
-  object both change. It is held (`Tx.awaitLockHolders`, `commitHeld`, no locks, references kept) until each holder
+  object both change. It is held (`Tx.awaitLockOrder`, `commitHeld`, no locks, references kept) until each holder
   releases (`Frontend.locksReleased`, after the holder applied or aborted), then takes the usual `holdForTurn` path.
   Otherwise a later commit that does not chain on the vote (a refcount change, a key-level write, a repair refcount
   or key proof) would raise the object timestamp, fail the vote's re-check and leave the counted vote standing for
   neither lock nor update. A lock-only holder is not waited for; a Tx holding its own locks never waits. The wait is
-  outside `commitInFlight`, so the holder's own commit never queues behind it. A new vote waits for it only if the
+  outside `hasPendingCommit`, so the holder's own commit never queues behind it. A new vote waits for it only if the
   waiter would wait for it as a holder: the vote changes an object the waiter changes and the waiter collides with
-  the locks it would take (`Tx.lockWaitBlocked`: `RequirementsLocker.plannedLocks` through
+  the locks it would take (`Tx.lockOrderBlocked`: `RequirementsLocker.plannedLocks` through
   `RequirementsChecker.PlannedLocks`, tested by the waiter's `wouldWaitFor` with the `Frontend.changes` filter), so it
-  cannot be starved; any other vote, lock-only ones included, decides at once. A colliding vote waits at most `Tx.CollisionWait` (`checkCollisionWait`, `lockWaitBlockStart`),
+  cannot be starved; any other vote, lock-only ones included, decides at once. A colliding vote waits at most `Tx.CollisionWait` (`checkCollisionWait`, `lockOrderBlockStart`),
   then votes abort naming the waiter: a waiter may wait on a holder that needs a vote another store's waiter
   withholds, and the abort ends such a cross-store cycle. A holder that never resolves (undecidable expiry tally)
   holds the waiter for as long as its locks: beyond the write threshold's margin, alarmed, no way out

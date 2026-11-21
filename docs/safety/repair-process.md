@@ -387,7 +387,7 @@ otherwise loads it from the backend (`SnapshotRead`). A snapshot is a fresh copy
 `Frontend.reconcile` refuses to write unless the object is settled:
 
 ```
-unsettled = holding || commitInFlight(obj) || lockWaitingCommits.contains(obj) || adoptedDataSaves.contains(obj)
+unsettled = holding || hasPendingCommit(obj) || lockOrderWaiters.contains(obj) || adoptedDataSaves.contains(obj)
          || commitFailed(obj) || committing.contains(obj) || deleting.contains(obj)
          || another in-memory state of the object is the one served or referenced
 if unsettled && snapshot.awaitSettle: park (8.2)
@@ -395,9 +395,9 @@ elif unsettled: stale, nothing written
 else reconcileSettled
 ```
 
-`commitInFlight` covers outstanding transaction commits, repair writes and committed transactions holding their
-commit for their turn (`heldCommits`). `lockWaitingCommits` lists committed transactions waiting to apply in lock order
-(`Tx.awaitLockHolders`) under every object they change, wherever the locks they wait for lie. `adoptedDataSaves` lists
+`hasPendingCommit` covers outstanding transaction commits, repair writes and committed transactions holding their
+commit for their turn (`heldCommits`). `lockOrderWaiters` lists committed transactions waiting to apply in lock order
+(`Tx.awaitLockOrder`) under every object they change, wherever the locks they wait for lie. `adoptedDataSaves` lists
 transactions saving object data adopted from a late client prepare (`Tx.saveAdoptedData`), which a commit waits for,
 until the save completes and that commit has applied or taken one of the holds above. A committed transaction
 finalized before it applies here relies on the store's ErrorTree mark for its object, and a completed pass would

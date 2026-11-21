@@ -25,7 +25,7 @@ object RequirementsChecker extends Logging {
     *                 store's state satisfies the requirements. A lock holder whose requirements conflict with this
     *                 transaction's can no longer commit, so enforcing its lock would only turn this store's part of
     *                 a committed update into a missed update. One that may still commit (it changes an object this
-    *                 transaction changes) is waited for before the apply instead (lockHolders, Tx.awaitLockHolders).
+    *                 transaction changes) is waited for before the apply instead (lockHolders, Tx.awaitLockOrder).
     * @param nanoTime Clock for the exclusive preference window
     * @param allocatedOver Objects the transaction allocates whose load found an existing state (in memory or in the
     *                 backend) rather than a fresh one. A replayed allocation must never overwrite a live object
@@ -295,7 +295,7 @@ object RequirementsChecker extends Logging {
   /** The other transactions holding locks on `only` that this transaction's requirements and KeyValue writes would
     * collide with in a non-applying check (transaction-requirements 4), whatever the state's revisions, refcounts and
     * keys. Displaced holders count (ObjectState.displacedLocks). For a committed transaction that holds no locks
-    * here, these are the votes its apply may run over (Tx.awaitLockHolders). The exclusive preference window is no
+    * here, these are the votes its apply may run over (Tx.awaitLockOrder). The exclusive preference window is no
     * lock and is not reported.
     *
     * @param kvWrites what the transaction's KeyValue operations change (KVWrites.from)

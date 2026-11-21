@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.repair
 
-import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, Transaction, TransactionAborted}
-import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectPointer, ObjectRefcount, ObjectRevision}
+import org.aspen_ddp.aspen.client.{AspenClient, ObjectState, Transaction, TransactionAborted}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
 import scribe.Logging
 
@@ -17,11 +17,11 @@ import scala.util.control.NonFatal
   * scan reconciles them from it (still under the snapshot check). An abort means they were changing; a later pass
   * tries again.
   *
-  * The object-level proof is a pure lock and changes nothing. The key and refcount proofs change no content (only the
-  * object's timestamp moves). So all of them disable missed-update tracking (`AspenClient.newRepairTransaction`) and
-  * cannot create repair entries. Each completes with true when the proof committed, false otherwise.
+  * The key and object-level proofs change no content (only the object's timestamp moves, for the object-level proof's
+  * refcount update). So all of them disable missed-update tracking (`AspenClient.newRepairTransaction`) and cannot
+  * create repair entries. Each completes with true when the proof committed, false otherwise.
   *
-  * None carries a pin (the refcount proof sets the refcount it requires), and none needs one: a replay changes
+  * None carries a pin (the object-level proof sets the refcount it requires), and none needs one: a replay changes
   * nothing either, so every proof is marked `replaySafe`.
   */
 object RepairProofs extends Logging:
@@ -36,19 +36,25 @@ object RepairProofs extends Logging:
       case None => DoesNotExist(key)
     prove(client, s"key of ${ptr.id}")(_.update(ptr, None, None, List(requirement), Nil))
 
-  /** A ExclusiveRevisionLock of the read's revision. It takes the exclusive object lock, which collides with every lock a
-    * write of the object level or of any key holds, and changes nothing: no revision, timestamp or backend commit.
-    * Keys and the refcount have proofs of their own
+  /** The object level of either object type: its refcount and its revision (a DataObject's data, a KeyValue object's
+    * min, max, left and right), proven together in one transaction, as of one moment. Neither part covers the other:
+    * a refcount change moves no revision, and a write moving the revision leaves the refcount as it was.
+    *
+    *  - A `RefcountUpdate` requiring the read's refcount and setting that same refcount. Its exclusive object lock is
+    *    the one every refcount change takes. It is a real write: a backend commit that raises the object timestamp.
+    *  - A `SharedRevisionLock` of the read's revision. Its check fails at every store that applied a later write moving
+    *    the revision (a DataObject's data write; a KeyValue object's min, max, left or right change, each of which
+    *    requires a revision, Q8). The refcount update's exclusive lock already collides with every write lock, so a
+    *    shared lock suffices: it adds the revision check and, beside the transaction's own exclusive lock, excludes
+    *    nothing more an exclusive one would.
+    *
+    * A lock beside an update of one object is refused, but a refcount update is not an update in that sense
+    * (`TransactionBuilder`, `DescriptionValidator`), so both fit in one transaction. Keys have proofs of their own
     */
-  def proveObjectLevel(client: AspenClient, read: KeyValueObjectState): Future[Boolean] =
-    prove(client, s"object level of ${read.pointer.id}"):
-      _.exclusiveLockRevision(read.pointer, read.revision)
-
-  /** A RefcountUpdate requiring `refcount` and setting that same refcount. Its exclusive object lock is the one every
-    * refcount change takes
-    */
-  def proveRefcount(client: AspenClient, ptr: ObjectPointer, refcount: ObjectRefcount): Future[Boolean] =
-    prove(client, s"refcount of ${ptr.id}")(_.setRefcount(ptr, refcount, refcount))
+  def proveObjectLevel(client: AspenClient, read: ObjectState): Future[Boolean] =
+    prove(client, s"object level of ${read.pointer.id}"): tx =>
+      tx.setRefcount(read.pointer, read.refcount, read.refcount)
+      tx.sharedLockRevision(read.pointer, read.revision)
 
   /** The transaction a proof is built on: missed-update tracking disabled */
   private[repair] def newProofTransaction(client: AspenClient): Transaction = client.newRepairTransaction()

@@ -36,7 +36,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Allocation and split finalizers | Client reads | A read proving deletion means the object is not live, so it needs no tree entry (2.5) |
 | Repair | Paxos, requirements | A read's unlocked parts reflect every committed transaction (quorum overlap plus lock reporting) |
 | Repair | Rebuild, transfers | The ownership fence (host and device) keeps superseded copies from consuming entries |
-| Repair proofs | Requirements | A committed proof's requirements cover every part the reconcile then treats as proven; a DataObject's object-level proof covers its refcount only (repair-process.md RP-W11) |
+| Repair proofs | Requirements | A committed proof's requirements cover every part the reconcile then treats as proven: the object level (refcount and revision) by one transaction requiring both (repair-process.md 8.3) |
 | Rebuild | Transactions | `CurrentAllocationsRequest` lists every unfinalized allocation and every held commit vote (`HeldVote`); reads of the pool's objects complete |
 | Rebuild | Repair | Everything the store missed while rebuilding is marked and repaired after promotion |
 | Rebuild (reassignment) | Host device lifecycle | The tombstoned device's former host stops serving its stores before the drain rebuilds them elsewhere: one best-effort nudge, else its hourly check; a running host that misses the nudge serving through the rebuild is an accepted limitation (rebuild-process.md B19) |
@@ -364,10 +364,9 @@ The premises other subsystems take from this:
 * A repair install is an in-flight write of the object (`Frontend.reconcileSettled`): transactions wait behind it as
   behind a commit, and it is refused while a commit is in flight, held, failed or being deleted.
 * Repair proofs are untracked, `replaySafe` transactions; every requirement on a refcount-0 or missing object fails
-  `MissingObject`, so no proof revives a deleted object. A KeyValue object's object-level proof
-  (`RepairProofs.proveObjectLevel`, an `ExclusiveRevisionLock`) changes nothing. A DataObject's object level (refcount
-  and data revision) is proven by the refcount proof alone, which no committed `DataUpdate` fails (repair-process.md
-  RP-W11). The refcount proof (`RefcountUpdate(rc -> rc)`) and the key proof (a KeyValue update with no operations,
+  `MissingObject`, so no proof revives a deleted object. The object-level proof
+  (`RepairProofs.proveObjectLevel`: `RefcountUpdate(rc -> rc)` beside a `SharedRevisionLock` of the read's revision,
+  repair-process.md 8.3) and the key proof (a KeyValue update with no operations,
   `KeyRevision` or `DoesNotExist`) are real writes: each changes the object (a backend commit, the object timestamp raised to the proof's start) and, once committed, applies at the stores that
   voted abort on it once the commit votes it collides with there have resolved. A proof is attempted precisely when
   an object stays locked across passes (`proofAfterDeferrals`), so where the lock is a commit vote of a

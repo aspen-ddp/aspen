@@ -48,14 +48,6 @@ rebuild-process.md B19.)
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.1 [RP-W11] A DataObject's object-level repair proof proves the refcount only, yet reconcile treats the data as proven.
-    PLAUSIBLE. Effort S. repair-process.md, cross-document-review.md 2.4.
-    StoreRepairer.prove runs only RepairProofs.proveRefcount for a DataObject and sets ReadLocks.objectLevel; a
-    DataUpdate committed after the read does not fail checkRefcount, so reconcile installs only the refcount over a
-    stale revision and deletes the entry carrying the update's mark: the store is left permanently without it.
-    Fix: also prove ExclusiveRevisionLock(read.revision) for a DataObject (generalise proveObjectLevel); object level
-    proven only if both commit. Update server/repair/CLAUDE.md and RepairProofs' scaladoc.
-
 2.2 [X-W23, X-W24] A commit applied after T's finalization with no ErrorTree mark left for the store.
     PLAUSIBLE (both). Effort S each. cross-document-review.md, transaction-requirements.md 9.4,
     transaction-recovery.md 7.4.

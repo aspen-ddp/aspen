@@ -1293,7 +1293,7 @@ class Tx( trs: TransactionRecoveryState,
     //
     // A lock-only object whose re-check fails has no update to lose: it is skipped, logged and reported. A later commit
     // applied first over the lock explains it, as a lock-only vote is not waited for: a fence takeover over a block
-    // commit's SharedRevisionLock, an allocator's follow-up write, a writer after repair's object-level proof. A rebuilt
+    // commit's SharedRevisionLock, an allocator's follow-up write. A rebuilt
     // store votes abort on the objects its lost incarnation's votes may back (Frontend.inheritedVoteLock), so a lock
     // lost to a rebuild is not a cause.
     if disposition == TransactionDisposition.VoteCommit then

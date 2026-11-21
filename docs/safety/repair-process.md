@@ -632,21 +632,24 @@ one at a time (parallel proofs of one object would collide), each a `replaySafe`
 | Deferred part | Proof | Code |
 |---------------|-------|------|
 | each deferred key (KeyValue) | an update with no operations requiring `KeyRevision(key, readRevision)`, or `DoesNotExist(key)` when the read lacked it | `RepairProofs.proveKey` |
-| object level, KeyValue | `RefcountUpdate(required = rc, new = rc)`, then `ExclusiveRevisionLock(read.revision)` | `proveRefcount`, `proveObjectLevel` |
-| object level, DataObject | `RefcountUpdate(required = rc, new = rc)` | `proveRefcount` |
+| object level (either type) | one transaction: `RefcountUpdate(required = rc, new = rc)` and `SharedRevisionLock(read.revision)` | `RepairProofs.proveObjectLevel` |
 
-Each completes true only on commit; an abort or error is false. If any object-level proof fails, the object level is
-unproven. A committed proof means a write threshold of stores agreed with the read on that part at that moment and
-none held a conflicting lock (the requirements take the same locks a real write would). Any other committed write of
+Each completes true only on commit; an abort or error is false. A committed proof means a write threshold of stores
+agreed with the read on that part at that moment and none held a conflicting lock (the requirements take the same
+locks a real write would). Any other committed write of
 that part needed a vote from a store in the proof's set, which would have collided or mismatched, so the read was
 current on it at proof time. The scan then reconciles from the same read with `snapshot.proven` set: the read's locks
-on proven parts are ignored, the store's own locks still defer, and the snapshot check still applies. A DataObject's
-object level is its refcount and its data revision, but its proof requires only the refcount: a `DataUpdate` that
-committed after the read leaves the refcount as it was and does not fail it, so the data revision is not proven
-(RP-W11).
+on proven parts are ignored, the store's own locks still defer, and the snapshot check still applies. An object's
+object level is its refcount and its revision (a DataObject's data, a KeyValue object's min, max, left and right), and
+neither requirement covers the other: a refcount change moves no revision, and a write that moves the revision leaves
+the refcount as it was. One transaction requires both, so both are proven as of one moment. That fits the structural
+rules: a lock beside an update of one object is refused, but a `RefcountUpdate` is not an update in that sense
+(`TransactionBuilder`, `DescriptionValidator`). The `RefcountUpdate`'s X lock already collides with every write lock on
+the object, so the revision lock need not be exclusive: the shared one adds only the revision check, and beside the
+transaction's own X lock an exclusive one would exclude nothing more.
 
-The KeyValue object-level proof compares the revision only, which suffices because every min/max/left/right change moves the
-revision (Q8). Every requirement on a refcount-0 or missing object fails `MissingObject`
+The revision lock compares the revision only, which suffices because every data write and every min/max/left/right
+change moves the revision (Q8). Every requirement on a refcount-0 or missing object fails `MissingObject`
 (`RequirementsChecker.loaded`), so no proof revives a deleted object: a proof from a pre-deletion read aborts, the entry
 stays, and the next pass's read proves the deletion.
 
@@ -919,27 +922,4 @@ its read threshold stalls the scan until the deadline.
 
 ## 14. Open weaknesses
 
-### RP-W11: A DataObject's object-level proof proves the refcount only, yet its reconcile treats the data as proven
-Verdict PLAUSIBLE. Priority 2. Effort S.
-
-Mechanism: for a DataObject whose read reports the object level locked, `StoreRepairer.prove` runs only
-`RepairProofs.proveRefcount` (`RefcountUpdate(required = rc, new = rc)`), and a commit sets
-`ReadLocks.objectLevel = true`. `Frontend.reconcileSettled` then ignores the read's object-level lock for the whole
-object level, and `Reconcile.planData` compares revisions with `locks.objectLevel` false. The refcount requirement
-(`RequirementsChecker.checkRefcount`) does not check the revision, so a `DataUpdate` D that committed and applied at
-the proof's voters does not fail the proof. Example, replication `w = 5`, `t = r = 3`: D commits with voters A, B, E;
-A and B apply it, E is slow to apply and holds D's object lock (a commit waiting in lock order, say); S and S' miss D,
-and S's ErrorTree entry holds D's mark (`missedTimestamp` = D's start). A `RefcountUpdate` R started after D commits
-on A, B, S' (Q6: it checks no object timestamp). Every read then restores the pre-D revision from E, S', S (A and B
-alone cannot reach `r`), reports E's lock, and carries R's start as its timestamp (the maximum over the matching
-stores, S' included), so it passes the completion gate (`repairUpdate`, M14). Once the entry has been lock-deferred
-`proofAfterDeferrals` passes, the refcount proof commits on A, B, S', and the reconcile installs R's refcount at S,
-leaves its data at the pre-D revision (equal to the read's), and returns complete. `deleteIfStillOwned` removes the
-entry, whose revision no later mark moved.
-Consequence: S keeps a DataObject copy without D's data and no entry names it, a permanent replica divergence that
-costs the object one store of margin (reads stay correct through the other copies). Needs a DataUpdate voter that
-stays locked for about ten passes together with a later refcount-only update applied by a non-voter.
-Fix: prove a DataObject's object level with its revision too: run `ExclusiveRevisionLock(read.revision)` (as
-`RepairProofs.proveObjectLevel` does for KeyValue objects, generalised to any `ObjectState`) after the refcount proof,
-and treat the object level as proven only if both commit. The lock collides with any data write's lock, and its
-`checkRevision` fails at every store that applied a later DataUpdate.
+(none)

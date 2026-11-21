@@ -48,7 +48,11 @@
   bootstrap pool is unreadable, a bootstrap store's scan and sweep each run to their 90 s deadline, so it holds a scan
   slot most of each floor interval (spec-mandated)
 - After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes since the last complete one, `RepairProofs` commits a no-op
-  transaction proving the read state, and reconciles from it
+  transaction proving the read state, and reconciles from it. A deferred object level (either object type: refcount
+  plus revision, a DataObject's data or a KeyValue object's min/max/left/right) is proven by one transaction,
+  `proveObjectLevel`: `RefcountUpdate(rc -> rc)` beside a `SharedRevisionLock` of the read's revision. Neither
+  requirement covers the other's part (a refcount change moves no revision; a data write leaves the refcount). The
+  refcount update's X lock already excludes every writer, so the lock need not be exclusive (repair-process 8.3)
 - A proof cannot help a `stale` pass (the store's own copy is busy or changed), so stale passes escalate by waiting
   (repair-process 8.2): `DeferralState.recordStale` counts them per entry, and from `StoreRepairer.ParkAfterStalePasses`
   (3) on the repair sets `RepairSnapshot.awaitSettle`, so the store parks the reconcile until the object settles (up to

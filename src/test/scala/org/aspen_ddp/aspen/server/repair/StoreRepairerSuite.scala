@@ -1955,6 +1955,50 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       storeRefcount(2, dataPtr) shouldBe Some(expected)
       remaining shouldBe empty
 
+  // RP-W11: a DataObject's object level is its refcount and its data revision. A DataUpdate committed after the read
+  // leaves the refcount as read, so a refcount proof alone would prove the stale revision too, and the reconcile would
+  // return complete over a copy that lacks the update
+  test("a DataObject's object-level proof fails when a data write committed after the read"):
+    @volatile var armed = false
+    @volatile var proofs = List[ReadLocks]()
+    val target = SeamTarget()
+    val repairer = StoreRepairer(client, target,
+      testingOnlyBeforeReconcile = (s, ptr) =>
+        if armed && s == sid(2) then
+          armed = false
+          // The pass has read the object: the write commits after the read, missed by store 2
+          val dataPtr = ptr.asInstanceOf[DataObjectPointer]
+          client.read(dataPtr).flatMap: now =>
+            missedBy(2)(_.overwrite(dataPtr, now.revision, DataBuffer(Array[Byte](2))))
+        else
+          Future.unit,
+      testingOnlyOnProof = (_, _, proven) => proofs = proven :: proofs)
+    val deferral = DeferralState()
+    val n = RepairPolicy.Default.proofAfterDeferrals
+    for
+      dataPtr <- sharedDataObject()
+      before <- client.read(dataPtr)
+      expected = before.refcount.setCount(before.refcount.count + 1)
+      _ <- missedByCrashedVoter(2, dataPtr)(_.setRefcount(dataPtr, before.refcount, expected))
+      _ <- dropErrorEntries(2)
+      _ = target.objectLocked += dataPtr.id
+      _ <- passes(n - 1, 2, repairer, deferral)
+      _ = armed = true
+      _ <- pass(2, repairer, deferral)
+      remaining <- unackedEntries(2)
+      dataAfterProof = stored(2, dataPtr.id).map(_.data.getByteArray.toSeq)
+      _ = target.objectLocked -= dataPtr.id
+      _ <- scanUntilQuiet(2, repairer)
+      after <- client.read(dataPtr)
+    yield
+      armed shouldBe false
+      proofs.map(_.objectLevel) shouldBe List(false)
+      dataAfterProof shouldBe Some(Seq[Byte](1))
+      remaining should not be empty
+      stored(2, dataPtr.id).map(_.data.getByteArray.toSeq) shouldBe Some(Seq[Byte](2))
+      stored(2, dataPtr.id).map(_.metadata.revision) shouldBe Some(after.revision)
+      storeRefcount(2, dataPtr) shouldBe Some(expected)
+
   test("a future dated entry is never eligible for deletion repair"):
     Future.successful:
       val now = HLCTimestamp(1_756_742_400_000L << 16)
@@ -2022,7 +2066,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       target.deletions.map(_._1) shouldBe objectIds
       tier shouldBe 0
 
-  test("repair proofs of a key and of a refcount are marked replay-safe"):
+  test("repair proofs of a key and of a DataObject's object level are marked replay-safe"):
     val target = SeamTarget()
     val repairer = StoreRepairer(client, target)
     val deferral = DeferralState()
@@ -2036,7 +2080,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       dataPtr <- sharedDataObject()
       before <- client.read(dataPtr)
       audit2 = new PinAudit(client)
-      proven <- RepairProofs.proveRefcount(client, dataPtr, before.refcount)
+      proven <- RepairProofs.proveObjectLevel(client, before)
       _ = audit2.stop()
     yield
       audit.unpinned shouldBe empty

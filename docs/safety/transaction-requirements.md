@@ -187,7 +187,7 @@ the object relies on the flag, which is sound because a false flag draws abort v
 store of its pool. The blind-write rule is enforced at every check, vote and apply re-check (`refuseBlindWrites`):
 outside an allocated object's initial content, a key Delete needs a `KeyRevision` on that key or a content lock, an
 object-level change needs a required revision (a content lock does not move the revision that a repair proof's
-`ExclusiveRevisionLock` locks), and a key Insert needs a required revision, a content lock, or a requirement that
+`SharedRevisionLock` locks), and a key Insert needs a required revision, a content lock, or a requirement that
 checks its key's state (`KeyValueUpdate.checkedKeys`: `KeyRevision`, `Exists`, `DoesNotExist`, the timestamp
 requirements; not `MayExist`, `WithinRange` or `KeyObjectRevision`). A required revision does not cover a Delete: an
 Insert moves no revision, so a Delete checked only by it passes its re-check at a store that applied an Insert of its
@@ -614,9 +614,9 @@ the re-check after the wait only costs time.
 * a skipped lock-only object has no update to lose: it is skipped, logged and reported, never fail-stopped. The usual
   cause is a later commit applied first over the lock: a fence takeover after a vdisk block
   commit's `SharedRevisionLock`, an allocator's follow-up write after an `AllocationFinalizationAction`'s
-  `SharedRevisionLock`, a writer after repair's object-level proof (`RepairProofs.proveObjectLevel`, an
-  `ExclusiveRevisionLock`, which changes nothing). Repair's refcount and key proofs change the object, so they wait
-  for a vote holding it in lock order like any committed write. A rebuilt store votes abort on the
+  `SharedRevisionLock`. Repair's object-level and key proofs change the object (the object-level proof's
+  `RefcountUpdate` beside its `SharedRevisionLock`), so they wait for a vote holding it in lock order like any
+  committed write. A rebuilt store votes abort on the
   objects its lost incarnation's votes may back (`InheritedVoteLock`), so a lock lost to a rebuild is not a cause.
 
 A recovered Insert of a key now absent passes its re-check and applies: a key's deletion reaches the backend only once
@@ -908,8 +908,9 @@ collides with any other X holder, any S holder, and every part lock (K, N, C, R)
 `RequirementsLocker.plannedLocks`, taken by `take`). It applies nothing and is not in `changedObjects`, so it never
 starts a backend commit. The builder throws if the object is also updated or shared-locked. Unlike `VersionBump` it
 leaves the revision unchanged, so a later transaction can still require that revision. `SharedRevisionLock` is the
-non-exclusive sibling. Repair's object-level proof is an `ExclusiveRevisionLock`
-(`server/repair/RepairProofs.proveObjectLevel`).
+non-exclusive sibling. Repair's object-level proof (`server/repair/RepairProofs.proveObjectLevel`) takes one beside a
+`RefcountUpdate(rc -> rc)` of the same object: the update's X lock already excludes every writer, and the shared lock
+adds the revision check.
 
 ## 12. Accepted limitations
 

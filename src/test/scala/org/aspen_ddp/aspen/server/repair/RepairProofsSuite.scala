@@ -84,7 +84,7 @@ class RepairProofsSuite extends IntegrationTestSuite:
       unchanged shouldBe true
       changed shouldBe false
 
-  test("a refcount proof commits without changing the refcount and aborts on a stale refcount"):
+  test("a DataObject's object-level proof commits on an unchanged object and aborts after a data write"):
     for
       ptr <- client.transactUntilSuccessful: tx =>
                given Transaction = tx
@@ -95,14 +95,40 @@ class RepairProofsSuite extends IntegrationTestSuite:
                yield p
       _ <- net.waitForTransactionsToComplete()
       read <- client.read(ptr)
-      proven <- RepairProofs.proveRefcount(client, ptr, read.refcount)
+      unchanged <- RepairProofs.proveObjectLevel(client, read)
       _ <- net.waitForTransactionsToComplete()
       after <- client.read(ptr)
-      stale <- RepairProofs.proveRefcount(client, ptr, ObjectRefcount(read.refcount.updateSerial - 1,
-                                                                       read.refcount.count))
+      // A data write leaves the refcount as it was: only the revision shows it
+      _ <- client.transactUntilSuccessful: tx =>
+             tx.overwrite(ptr, read.revision, DataBuffer(Array[Byte](2)))
+             Future.unit
+      _ <- net.waitForTransactionsToComplete()
+      changed <- RepairProofs.proveObjectLevel(client, read)
     yield
-      proven shouldBe true
+      unchanged shouldBe true
+      after.revision shouldBe read.revision
       after.refcount shouldBe read.refcount
+      after.data.getByteArray.toSeq shouldBe Seq[Byte](1)
+      changed shouldBe false
+
+  test("an object-level proof aborts after a refcount change, which moves no revision"):
+    for
+      ptr <- client.transactUntilSuccessful: tx =>
+               given Transaction = tx
+               tx.replaySafe("test")
+               for
+                 pool <- client.getStoragePool(PoolId.BootstrapPoolId)
+                 p <- new PoolObjectAllocator(client, pool).allocateDataObject(DataBuffer(Array[Byte](1)))
+               yield p
+      _ <- net.waitForTransactionsToComplete()
+      read <- client.read(ptr)
+      _ <- client.transactUntilSuccessful: tx =>
+             tx.setRefcount(ptr, read.refcount, read.refcount.increment())
+             Future.unit
+      _ <- net.waitForTransactionsToComplete()
+      after <- client.read(ptr)
+      stale <- RepairProofs.proveObjectLevel(client, read)
+    yield
       after.revision shouldBe read.revision
       stale shouldBe false
 
@@ -127,7 +153,7 @@ class RepairProofsSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
     yield ()
 
-  test("an object-level proof changes nothing, so a store that misses it is not marked"):
+  test("an object-level proof changes no content, so a store that misses it is not marked"):
     val s2 = net.storeId2
     for
       ptr <- kvObject()
@@ -146,14 +172,13 @@ class RepairProofsSuite extends IntegrationTestSuite:
     yield
       proven shouldBe true
       after.revision shouldBe read.revision
-      after.timestamp shouldBe read.timestamp
       after.refcount shouldBe read.refcount
       after.contents.keySet shouldBe read.contents.keySet
       isMarked shouldBe false
 
   // Repair 13.3 question 4: a repair that read an object before a delete set its refcount to zero proves from that
-  // read. Every requirement on a refcount-0 or missing object fails (MissingObject), so each kind of proof aborts, a
-  // refcount proof at the deleted refcount included, and none brings the object back
+  // read. Every requirement on a refcount-0 or missing object fails (MissingObject), so each kind of proof aborts, and
+  // none brings the object back
   test("every proof from a read taken before the object's deletion aborts, and the object stays deleted"):
     for
       ptr <- kvObject()
@@ -165,16 +190,12 @@ class RepairProofsSuite extends IntegrationTestSuite:
       presentKey <- RepairProofs.proveKey(client, ptr, k0, Some(read.contents(k0).revision))
       absentKey <- RepairProofs.proveKey(client, ptr, k1, None)
       objectLevel <- RepairProofs.proveObjectLevel(client, read)
-      readRefcount <- RepairProofs.proveRefcount(client, ptr, read.refcount)
-      deletedRefcount <- RepairProofs.proveRefcount(client, ptr, read.refcount.setCount(0))
       _ <- net.waitForTransactionsToComplete()
       after <- client.read(ptr).failed
     yield
       presentKey shouldBe false
       absentKey shouldBe false
       objectLevel shouldBe false
-      readRefcount shouldBe false
-      deletedRefcount shouldBe false
       after match
         case io: org.aspen_ddp.aspen.client.InvalidObject => io.provesDeletion shouldBe true
         case other => fail(s"the read after the proofs ended $other, not a proven deletion")

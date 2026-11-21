@@ -60,7 +60,7 @@ object RequirementsChecker extends Logging {
       * diverge unreported (transaction-requirements R15). A blind Delete leaves no tombstone and object-level parts carry no
       * timestamp, so neither can be ordered against other writes, and repair cannot see them: a no-op blind Delete
       * leaves no trace for its snapshot and an object-level change that does not move the revision escapes a repair
-      * proof's ExclusiveRevisionLock (repair-process 1.2, Q8; transaction-requirements 2.5). A required revision does
+      * proof's revision lock (repair-process 1.2, Q8; transaction-requirements 2.5). A required revision does
       * not cover a Delete: an Insert of the key moves no revision, so a Delete applied after it here, in lock order
       * or as a non-voter, would pass its re-check and remove the key unreported (transaction-requirements 9.3, R15).
       * Enforced here too so a client that bypasses the builder cannot issue one

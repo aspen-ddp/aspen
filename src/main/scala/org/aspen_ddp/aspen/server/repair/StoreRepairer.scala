@@ -713,22 +713,12 @@ class StoreRepairer(client: AspenClient, target: RepairTarget,
                   .map(Option.when(_)(key))
       case _ => Nil
 
-    // A refcount deferred under an object lock is proven on either object type; a KeyValue object's revision, min,
-    // max, left and right by an ExclusiveRevisionLock as well (RepairProofs.proveObjectLevel)
-    val objectProofs: List[() => Future[Boolean]] =
-      if !result.objectLevelDeferred then Nil
-      else read match
-        case kv: KeyValueObjectState =>
-          List(() => RepairProofs.proveRefcount(client, kv.pointer, kv.refcount),
-               () => RepairProofs.proveObjectLevel(client, kv))
-        case _ =>
-          List(() => RepairProofs.proveRefcount(client, read.pointer, read.refcount))
-
     for
       keys <- keyProofs.foldLeft(Future.successful(Set[Key]())): (f, proof) =>
                 f.flatMap(proven => proof().map(proven ++ _))
-      objectLevel <- objectProofs.foldLeft(Future.successful(objectProofs.nonEmpty)): (f, proof) =>
-                       f.flatMap(proven => if proven then proof() else Future.successful(false))
+      // The object level of either type: its refcount and its revision, in one proof
+      objectLevel <- if result.objectLevelDeferred then RepairProofs.proveObjectLevel(client, read)
+                     else Future.successful(false)
     yield
       ReadLocks(keys, objectLevel)
 

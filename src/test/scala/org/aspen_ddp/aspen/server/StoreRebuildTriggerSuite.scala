@@ -883,6 +883,39 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
       host.control.router.offlineStores should not contain storeN(0)
 
+  atest("an unpromoted rebuilt copy does not silence the store served from another device here (X-W31)"):
+    // The store came to be served from another device of this host (a same-host transfer or re-placement) while this
+    // device's rebuild ran. The copy left unpromoted is recorded offline on its own device only: marking the router
+    // by store id would stop the served store's repair scans and keep its own device's shutdown from closing it
+    val hostRoot = newHostDir()
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+
+    // Not registered in the tree, so the flip's getStorageDevicePointer fails permanently
+    val synthetic = StorageDeviceId(UUID.fromString("cccccccc-0000-0000-0000-000000000005"))
+    val deviceDir = hostRoot / "storage-devices" / "synth-e"
+    os.makeDir.all(deviceDir)
+    val local = new LocalStorageDeviceState(synthetic, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL())
+    injectLoadedDevice(host, local)
+    val storeDir = deviceDir / storeN(0).directoryName
+
+    val first = recorded(host).armLookup(synthetic)
+    host.control.reconciler.checkAll()
+    first.success(deviceState(synthetic, Map(rebuilding(storeN(0)))))
+
+    for
+      _ <- yieldUntil(factory.created.size == 1)
+      _ = installServedElsewhere(host, storeN(0))
+      _ = os.makeDir.all(storeDir)
+      _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, "")
+      _ = factory.created.head.promise.success(())
+      _ <- yieldUntil(scheduler(host).pending.contains(Host.RebuildRetryInitialDelay), 400)
+    yield
+      local.offlineStores should contain(storeN(0))
+      host.control.router.get(storeN(0)).isDefined should be(true)
+      host.control.router.isOffline(storeN(0)) should be(false)
+      host.control.currentView.repairable should contain(storeN(0))
+
   /** Pumps transactions until `factory` has created a rebuild. Silent on exhaustion: callers
    *  assert on it. */
   private def completeRebuildsStarted(factory: RecordingRebuildFactory, rounds: Int = 50): Future[Unit] =

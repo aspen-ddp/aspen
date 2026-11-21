@@ -35,7 +35,9 @@
   `awaitingDevice` while its device's shutdown-marker lookup (or adoption) decides. Neither mark is `offline`.
   The router's `offline` mark is by store id, but two devices of one host can each hold a copy of a store (a transfer
   between them, an earlier tenancy's copy at the destination's path): `tryLoadStore` keeps a marked copy offline on
-  its device without silencing a store served or opening here (`keepMarkedCopyOffline`), and a pass that removes a
+  its device without silencing a store served or opening here (`keepMarkedCopyOffline`), as does a rebuild's
+  unpromoted copy (`StoreRebuilds.keepUnpromotedCopyOffline`; both through `DeviceControl.markCopyOffline`, never
+  `markStoreOffline`, which marks unconditionally), and a pass that removes a
   copy clears the mark only if no other loaded device holds the store offline (`StoreRouter.clearOfflineUnlessHeld`)
 - Backend opens are backend-neutral: `BackendOpener.open` (`server.store.backend`) returns a Future and decides where
   the open runs (RocksDB inline, FSIF on `FsifOpenEc`); `StoreLoader.startOpen` handles an already-completed one

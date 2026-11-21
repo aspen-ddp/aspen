@@ -462,8 +462,9 @@ since. It answers `Unconfirmed` instead. The host acts only after the decision:
   directory), then `loadStoreById`. The committed flip gossips `StoreMoved` (`HostServices.gossipStoreOnline`),
   clearing the `StoreOffline` gossiped at the start. A failed removal leaves the store unloaded and router-offline,
   records it in `StoreRebuilds.pendingMarkerRemovals` and in the device's `offlineStores` (`keepUnpromotedCopyOffline`,
-  through `DeviceControl.markStoreOffline`, which sets the router's mark too; a copy whose stat fails counts as
-  present), so the reconcile's Completed Rebuilds pass (`DeviceReconciler.completeRebuilds`, for a store not
+  through `DeviceControl.markCopyOffline`, which sets the router's mark too unless a copy of the store is served or
+  opening here, say from another device of this host after a same-host transfer or re-placement; a copy whose stat
+  fails counts as present), so the reconcile's Completed Rebuilds pass (`DeviceReconciler.completeRebuilds`, for a store not
   rebuilding here), finding the entry Active and the marker present or the removal pending,
   retries the removal and the load at each device check. The pending record is what selects a store whose unlink
   succeeded but whose directory sync failed, and the retry forces the directory even with the marker already gone; a

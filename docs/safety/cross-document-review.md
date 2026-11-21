@@ -267,7 +267,9 @@ The premises other subsystems take from this:
   entry here over this rebuild's copy was made Active by this episode. The retire waits for a copy served from the
   destination's path or a store opening, never for the transfer's source served from another device of this host,
   which closes only for the StartStoreTransfer sent past the retire; a marked copy's load leaves the store served there
-  unsilenced (`StoreLoader.keepMarkedCopyOffline`), and a removed copy clears the router's offline mark only when no
+  unsilenced (`StoreLoader.keepMarkedCopyOffline`), as does an unpromoted rebuilt copy whose flip settles after the
+store came to be served from another device here (`StoreRebuilds.keepUnpromotedCopyOffline`; both through
+`DeviceControl.markCopyOffline`), and a removed copy clears the router's offline mark only when no
   other device here holds the store offline (`StoreRouter.clearOfflineUnlessHeld`). A rebuilt copy carries an empty
   `crl_save.log` (`RebuildingStore.writeEmptyCrlState`), so its first load (by the flip, the Completed Rebuilds pass,
   a restart, a reinstatement or an adoption) drops whatever device-CRL entries an earlier copy left under its id
@@ -576,14 +578,3 @@ wasted rebuild to a split decision. Fix direction: replace them all with `FileSt
 failed stat waits, throws or is safe either way, and keep it so with a test that fails on any `os.exists`,
 `os.isDir` or `os.isFile` under `server/` outside `FileStat`.
 
-**X-W31 `keepUnpromotedCopyOffline` silences a store served from another device of this host** (PLAUSIBLE,
-priority 4, effort S)
-
-`StoreRebuilds.keepUnpromotedCopyOffline` marks through `DeviceControl.markStoreOffline`, setting the router's
-offline mark by store id, while `StoreLoader.keepMarkedCopyOffline` spares a store served or opening here. A rebuilt
-copy whose flip comes back `Unconfirmed` or `Superseded` after the store is served from another device of the same
-host (the `Unconfirmed` copy shipped by a same-host transfer, or a same-host re-placement) sets the mark over the
-served store: `HostStoreView` reports it non-repairable, so its repair scans stop, and `DeviceShutdown.storesToClose`
-skips stores the router reports offline. Trigger uncertain: it needs the other device's copy served before the
-settling flip attempt completes. Fix direction: mark the router only when no copy of the store is served or opening
-here, as `keepMarkedCopyOffline` does.

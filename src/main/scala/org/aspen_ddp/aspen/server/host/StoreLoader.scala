@@ -142,14 +142,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         logger.error(s"Not loading $potentialStoreFile: it has no ${StoreConfig.configFilename}")
       case Right(false) => ()
 
-  /** Records a store directory a marker keeps from loading as offline on its device, and silences the store unless it
-   *  is served or opening here. The router's mark is by store id, and the store may be served from another device of
-   *  this host (the source of a transfer onto this one, whose path holds an earlier tenancy's copy): marking it would
-   *  report that store offline (HostStoreView) and keep the shutdown of its own device from closing it. */
+  /** Records a store directory a marker keeps from loading as offline on its device, silencing the store unless it is
+   *  served or opening here (DeviceControl.markCopyOffline) */
   private def keepMarkedCopyOffline(sds: LocalStorageDeviceState, storeId: StoreId): Unit =
-    if router.get(storeId).isEmpty && !opening.contains(storeId) then
-      router.markOffline(storeId)
-    sds.offlineStores += storeId
+    ctx.markCopyOffline(sds, storeId)
 
   /** A load that threw before any open started: its config could not be read (an I/O error, a resource limit, a
    *  corrupt file), or the stat of its config or a marker failed (FileStat). Also a LoadStore whose save file or

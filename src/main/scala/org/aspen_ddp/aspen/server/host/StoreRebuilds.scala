@@ -514,11 +514,13 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  the Completed Rebuilds pass loads it once its entry is Active; without it the copy would hold the store's path
    *  until a restart, and an Active one would stay unserved. A transfer of the store onto this device retires it
    *  (StoreTransfers.retireEarlierTenancy). A device unloaded meanwhile is left alone: its next load does the same. A
-   *  copy whose stat fails (FileStat) is kept offline as a present one: the Deleted Stores pass stats it again. */
+   *  copy whose stat fails (FileStat) is kept offline as a present one: the Deleted Stores pass stats it again. The
+   *  router is marked only when no copy of the store is served or opening here (DeviceControl.markCopyOffline): a
+   *  same-host transfer or re-placement may serve it from another device of this host by the time the flip settles. */
   private def keepUnpromotedCopyOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     if ctx.devices.isLoaded(local) &&
        !FileStat.existence(local.devicePath / storeId.directoryName).contains(false) then
-      ctx.markStoreOffline(local, storeId)
+      ctx.markCopyOffline(local, storeId)
 
   /** Keeps a rebuilt store whose entry was written Offline (RebuildOutcome.AdoptOffline) out of
    *  service: it is not loaded, and it is recorded offline behind an empty transfer-out marker

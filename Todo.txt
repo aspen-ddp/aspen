@@ -62,12 +62,6 @@ PRIORITY 3: systemic loss protection
 PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
-4.2 [S] X-W31: keepUnpromotedCopyOffline silences a store served from another device of this host (PLAUSIBLE).
-    It sets the router's offline mark by store id (DeviceControl.markStoreOffline), unlike
-    StoreLoader.keepMarkedCopyOffline: the served store turns non-repairable (HostStoreView) and
-    DeviceShutdown.storesToClose skips it. Trigger: an Unconfirmed/Superseded settle after a same-host transfer or
-    re-placement served the store elsewhere. Fix: mark the router only when no copy is served or opening here.
-
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
 

@@ -66,14 +66,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.1 [R-W12] A sibling store on the same host relays a stale non-finalized commit, re-running T's finalization actions.
-    CONFIRMED. Effort S. transaction-recovery.md, paxos-transactions.md 10.2.
-    Store.handleTransactionMessage's sender relay (msg.from != msg.to && !entry.finalized) ignores the self-send rule,
-    so a same-host sibling answers an idle recovery driver with a non-late TxResolved from the shared status cache;
-    actions re-run and, without a late answer within errorTimeout, marks, entries and stubs are written for every
-    store. Safe (cross-document-review 2.6 checks every shipped action), but wasteful.
-    Fix: skip the sender relay of a non-finalized entry when the sender is a store of this host.
-
 5.2 [RB-W20] An out-of-space write in retryFailures is recorded as an unreadable object.
     CONFIRMED. Effort S. rebuild-process.md.
     RebuildingStore.retryFailures never calls latchOutOfSpace, so the pass fails "incomplete" pointing at

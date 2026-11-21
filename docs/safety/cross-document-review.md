@@ -44,7 +44,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Rebuild completion | Transfers | A flip that finds the entry already Active adopts the copy without checking its episode (`DeviceMetadata.markRebuiltStoreActive`); no transfer starts onto an occupied store path, so the copy is this episode's (2.2). A flip retried after `TransactionOutcomeUnknown` that finds the entry moved on (TransferringOut, absent) keeps the copy offline rather than discarding it (`Unconfirmed`, rebuild-process.md 5.7) |
 | Rebuild, CRL | Store lifecycle | A rebuilt copy's first load recovers nothing an earlier copy left under its id in the device CRL: it is a save-file load of the empty state `RebuildingStore.finish` writes, which drops those entries first (rebuild-process.md 5.6) |
 | Lost device CRL | Rebuild | A finished rebuild awaiting its flip (`rebuild-complete`) has never served, so it holds nothing in the device CRL and is not marked (`DeviceDiscovery.holdsOwnState`) |
-| Status-cache relay | Finalization actions | Every shipped action is safe to run again after T was finalized and forgotten, which a same-host relay makes happen (transaction-recovery.md R-W12; 2.6) |
+| Status-cache relay | Finalization actions | Every shipped action is safe to run again after T was finalized and forgotten, which a second driver's resent `TxResolved` makes happen (paxos-transactions.md 10.5; 2.6) |
 | Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit; a tree-learned resolution is reported `Unresolved` until finalized (`Tx.statusForExpiry`) |
 | Expiry tallies | Recovery | A reported `votedCommit` stands for a voter holding T's locks, or for a committed T (a tree-learned or not-owed resolution, whose locks are released) (2.1) |
 | Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a pass, or retried (2.2); one whose directory or config is missing is rebuilt, its device-CRL entries kept (2.2). A device load serves every store directory its markers do not hold back without reading the tree, so the markers, the save file and the incarnation file are read with stats that tell a failure from an absence (`server.FileStat`), and an incarnation file is never written by a load (2.2) |
@@ -76,8 +76,7 @@ The premises other subsystems take from this:
   it cancels a running marker that may still write entries: the first `TxFinalized`'s `owed` is the authoritative stub
   list, a store outside it acknowledged that driver and holds no Tx to consume an extra entry, and repair's reconcile
   of a copy that holds T is a no-op. A non-late commit can still reach a driver after T was finalized and forgotten,
-  from a sibling store's relay on the same host (transaction-recovery.md R-W12) or a second driver's resent
-  `TxResolved` (paxos-transactions.md 10.5), and its finalizer then runs T's actions again until a late answer
+  from a second driver's resent `TxResolved` (paxos-transactions.md 10.5), and its finalizer then runs T's actions again until a late answer
   cancels it; every shipped action tolerates that (2.6). A `TxResolved` reaching a store after its `TxFinalized` (an
   abort's broadcast is queued after it) creates no Tx and only refreshes a monotone status-cache entry
   (`TransactionStatusCache.updateStatus`).
@@ -444,9 +443,9 @@ delivered after the Tx the prepare creates and any driver started for it exist, 
 floor the Frontend refuses the prepare and nothing is created but a rebuilt store's muted Tx (2.1). The entry may be
 the store's own Tx's, so no self-relay is sent while that Tx is resolved: after a lost `TxFinalized` its idle driver
 would take it as a non-late commit and run T's finalization actions again; it learns the outcome from its peers. A
-sibling store of T on the same host shares the cache and still relays the entry, non-late, to that driver's prepare
-(transaction-recovery.md R-W12), so T's actions can run after T was finalized and forgotten. Each shipped action
-tolerates it: the allocation action finds its entry, or records a live object under a shared revision lock that fails
+sibling store of T on the same host shares the cache, so it relays no non-finalized entry to a sender on its host
+(`Store.onThisHost`). T's actions can still run after T was finalized and forgotten, from a second driver's resent
+`TxResolved` (paxos-transactions.md 10.5). Each shipped action tolerates it: the allocation action finds its entry, or records a live object under a shared revision lock that fails
 once the object is deleted, and records nothing for one proven deleted; the deletion action removes the entry of an id
 never allocated again; the split action indexes the new node only if it still reads and its entry is absent, under
 its revision lock; the tail removal acts only on a node still present and empty; the join action removes the entry
@@ -555,7 +554,7 @@ Mechanism: `JoinFinalizationAction.deleteFromExistingTier` deletes `deleteMinimu
 node holds that key, without checking that the entry names `deleteNode`. A later split of the absorbing node at the
 same minimum indexes its new node N under that key (`SplitFinalizationAction` replaces an entry naming another node
 with a checked insert). A run of the join's action after that, a delayed first run, a recovery driver's finalizer, or
-a run after T was finalized and forgotten (transaction-recovery.md R-W12), removes N's entry.
+a run after T was finalized and forgotten (paxos-transactions.md 10.5), removes N's entry.
 Consequence: N is unindexed in the tier above until it is joined away. Lookups still reach it through its
 predecessor's link (the target-tier scan of `TierEngine.fetchContainingNodePath` follows links), so only scans of that
 range lengthen; no data is affected.

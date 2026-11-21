@@ -735,7 +735,9 @@ repair, no safety effect.
   Tx's own (`Tx.resolved`), and its idle driver, started after a lost `TxFinalized`, would take it as a non-late
   resolution and re-run T's finalization actions. That driver learns from its peers instead (late from their
   finalized relay, or by Paxos while they hold T) and from its own Tx's answer (a promise with its accepted value, or
-  a deleted abort's `TxResolved(false)`). For a finalized entry the copy to itself always goes, late if committed,
+  a deleted abort's `TxResolved(false)`). The copy to the sender is withheld when the sender is another store of the
+  same host (`Store.onThisHost`): it shares the cache, and its own store's copy to itself is decided by the rule
+  above. For a finalized entry the copy to itself always goes, late if committed,
   beside the `TxFinalized` to the sender (previous bullet). A non-finalized
   `Committed` entry stems only from a Paxos, relayed or expiry-commit resolution, never from a tree-learned one, whose
   saved status, and status replies until finalized (`Tx.statusForExpiry`), are `Unresolved` (6.4,

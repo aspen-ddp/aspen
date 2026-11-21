@@ -186,9 +186,10 @@ answers in this order:
    store sends itself nothing when its own Tx for T is already resolved: that resolution is no news to its driver,
    and the idle driver a store starts after its `TxFinalized` was lost would take it as a non-late commit and run T's
    finalization actions again. That driver learns the outcome from its peers instead: late from their finalized relay
-   (`TxFinalized(late)`, then `resolveLate`), or by Paxos while they still hold T. The rule covers only the self-send:
-   the relay to the sender goes whatever this store holds, so a sibling store of T on the same host, which shares
-   the cache, still answers that driver with the non-late entry (R-W12).
+   (`TxFinalized(late)`, then `resolveLate`), or by Paxos while they still hold T. Nor does a store relay a
+   non-finalized entry to a sender on its own host (`Store.onThisHost`, the router's installed stores): that sender
+   shares the cache, so its own store's relay already decided, under the rule above, what its driver may learn from
+   the entry; a sibling store of T answering with the non-late entry would re-run T's actions.
 3. **Live `Tx`** (`Tx.receivePrepare`): it answers with its fixed vote and an acceptor promise, sent only after the
    CRL save of that state completes (or after its objects load, then the save). A Tx that already applied the commit
    also resends `TxCommitted` to the proposer.
@@ -868,8 +869,8 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
   `TxResolved`+`TxFinalized(late)`; the driver resolves late, finalizes with no actions, and a commit voter that
   already applied looks its entry up only for its stub. The store's own host entry, a non-finalized `Committed` unless
   a store of T on the same host saw `TxFinalized`, does not answer the driver's prepare to its own store: the relay
-  sends no self `TxResolved` while the store's own Tx is resolved. A sibling store of T on that host still relays the
-  entry, non-late, to the driver's prepare, which then re-runs T's actions until the late answer cancels it (R-W12).
+  sends no self `TxResolved` while the store's own Tx is resolved, and a sibling store of T on that host relays no
+  non-finalized entry to a sender on its own host.
   If the caches' window passes, nothing is re-decided: the Tx ends by expiry, concluding its known outcome once more
   than `w - t` primary acceptors no longer hold T.
 * **Clock skew**: no clock decides replay. Clocks remain in the forget floor's time leg (a step back of more than about
@@ -907,28 +908,4 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-### R-W12: a sibling store on the same host relays a stale non-finalized commit, re-running T's finalization actions
-Verdict CONFIRMED. Priority 5. Effort S.
-Mechanism: the status cache is one per host (`TransactionStatusCache`, shared by the host's stores). A Tx resolved
-committed records a non-finalized `Committed` there (`Tx.resolved`), and a recovered Tx whose saved status is
-`Committed` seeds it from its constructor. Let S and S2 be stores of T on host H (two pools of T, or one store that
-never got a Tx for T), and let the `TxFinalized` of T to both be lost (one burst of loss to H; the finalizing driver's
-heartbeat re-sends it only until its own store gets it), or let H restart after T was finalized elsewhere with S's
-saved status `Committed`. S's idle Tx gets a driver (`Store.heartbeat`); its prepare to S2 reaches
-`Store.handleTransactionMessage`, whose relay of a non-finalized entry sends `TxResolved(committed, late = entry.late
-= false)` to the sender whenever `msg.from != msg.to`, whatever S2 holds: the rule that suppresses the relay while
-the store's own Tx is resolved (`frontend.transactions.get(txid).forall(_.knownOutcome.isEmpty)`) guards only the
-self-send. After a restart S2 is below its load floor and refuses the prepare, but the relay precedes the Frontend.
-S's driver takes the message as resolution (`TransactionDriver.receiveTxResolved` ->
-`onResolution(sendResolutionMessage = false)`) and starts a finalizer, whose actions execute at once
-(`RegisteredTransactionFinalizerFactory.Finalizer`); the remote peers' finalized relay (`TxFinalized(late)`) arrives after the same-host answer and `resolveLate` cancels it.
-Consequence: T's non-marker finalization actions run again after T was finalized and forgotten, against
-`resolveLate`'s premise that no action runs once an acceptor forgot T; if no late answer comes within `errorTimeout`
-(remote peers unreachable), the marker writes ErrorTree marks for every store of T and voter-unknown UnackedCommits
-entries for every store but S, and the `TxFinalized` that follows has every store write a stub. The shipped actions
-tolerate a late re-run: no safety effect.
-Fix: in the relay, do not send a non-finalized entry to a sender on the same host (the router knows the host's
-stores): it shares the cache, so the relay tells it nothing its own store's relay did not already decide under the
-self-send rule. The paxos-transactions 10.2 takeover (a leader whose host recorded another host's resolution) is the
-self-send and is unchanged. One local-store lookup on the relay of a resolved, unfinalized entry; nothing on the hot
-path.
+(none)

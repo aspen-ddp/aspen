@@ -76,7 +76,9 @@ class Store(val storageDeviceId: StorageDeviceId,
             /** The IDA of the store's pool (Frontend.poolIDA). None: unchecked, tests only */
             poolIDA: Option[IDA] = None,
             /** The store's CRL admission lane (Frontend.admissionTier) */
-            admissionTier: AdmissionTier = AdmissionTier.Data) extends Logging {
+            admissionTier: AdmissionTier = AdmissionTier.Data,
+            /** Whether a store is installed on this host, sharing its status cache (StoreRouter.get). Any thread */
+            onThisHost: StoreId => Boolean = _ => false) extends Logging {
 
   /** How long past the horizon an unresolved Tx starts its status queries: Frontend.expiryMargin */
   val expiryMargin: FiniteDuration = Frontend.expiryMargin(
@@ -298,11 +300,13 @@ class Store(val storageDeviceId: StorageDeviceId,
           // (paxos-transactions 10.2). Not to itself when its own Tx is resolved: the entry may be that Tx's own
           // (Tx.resolved), no news to its driver, which after a lost TxFinalized would take it as a non-late resolution
           // and run T's finalization actions again. That driver learns the outcome from its peers instead: late from
-          // their finalized relay, or by Paxos while they still hold T (transaction-recovery 4.2)
+          // their finalized relay, or by Paxos while they still hold T (transaction-recovery 4.2). Nor to a sender
+          // on this host: it shares the cache, so its own store's relay already decided what its driver learns from
+          // the entry under the rule above
           r.foreach { resolved =>
             if (entry.finalized || frontend.transactions.get(m.txd.transactionId).forall(_.knownOutcome.isEmpty))
               net.sendTransactionMessage(resolved)
-            if (msg.from != msg.to && !entry.finalized)
+            if (msg.from != msg.to && !entry.finalized && !onThisHost(msg.from))
               net.sendTransactionMessage(resolved.copy(to = msg.from, from = msg.to))
           }
 

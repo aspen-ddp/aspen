@@ -41,13 +41,14 @@ class StoreSuite extends AnyFunSuite with Matchers:
                       loadedAt: Option[Long] = FrontendSuite.longLoaded,
                       wallClockMillis: () => Long = () => System.currentTimeMillis(),
                       unackedLookup: UnackedCommitLookup = UnackedCommitLookup.Never,
-                      net: TestNet = new TestNet) =
+                      net: TestNet = new TestNet,
+                      onThisHost: StoreId => Boolean = _ => false) =
     val backend = backendOverride.getOrElse(new MapBackend(id))
     val crl = new TestCrl
     val store = new Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.global, backend,
       new HostObjectCache(1024 * 1024).forStore(id), net, backgroundTasks, crl, statusCache,
       null, driverFactory, heartbeatTimeout, None, unackedLookup = unackedLookup, loadedAt = loadedAt,
-      wallClockMillis = wallClockMillis)
+      wallClockMillis = wallClockMillis, onThisHost = onThisHost)
     backend.setCompletionHandler(op => store.frontend.backendOperationComplete(op))
     val os = mkObjectState(oid1)
     backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
@@ -134,6 +135,26 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.receiveTransactionMessage(prepare(storeId, peer))
 
     net.sentTx.collect { case r: TxResolved => (r.to, r.from, r.late) } shouldBe List((peer, storeId, false))
+  }
+
+  // transaction-recovery 4.2: a store of T on the same host shares the status cache, so its relay of a non-finalized
+  // entry tells the sender's recovery driver nothing the sender's own relay did not already decide; sent, it would be
+  // taken as a non-late resolution and re-run T's finalization actions
+  test("the relay of a non-finalized entry tells nothing to a sender on the same host") {
+    val statusCache = new TransactionStatusCache()
+    val (store, _, _) = mkStore(storeId, statusCache, Duration(40, SECONDS))
+    val (sibling, net, _) = mkStore(peer, statusCache, Duration(40, SECONDS), onThisHost = Set(storeId, peer))
+    store.receiveTransactionMessage(prepare(storeId, leader))
+    store.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true, late = false, proof = false))
+    statusCache.getStatus(txid1).map(e => (e.status, e.finalized)) shouldBe Some((TransactionStatus.Committed, false))
+
+    sibling.receiveTransactionMessage(prepare(peer, storeId))
+    net.sentTx.collect { case r: TxResolved => (r.to, r.from) } shouldBe List((peer, storeId))
+
+    // A sender on another host still learns the outcome
+    net.sentTx = Nil
+    sibling.receiveTransactionMessage(prepare(peer, leader))
+    net.sentTx.collect { case r: TxResolved => (r.to, r.from) }.toSet should contain((leader, peer))
   }
 
   // paxos-transactions 10.6: a sibling store's delayed resolution no longer downgrades the host's finalized entry, so

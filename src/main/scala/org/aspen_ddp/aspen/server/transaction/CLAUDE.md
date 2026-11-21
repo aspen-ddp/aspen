@@ -330,7 +330,9 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   `outcomeDecided` Tx that prepare creates and the store's own driver learn it too (paxos-transactions 10.2). Not to
   itself while its own Tx for T is resolved: the entry may be that Tx's (`Tx.resolved`), and after a lost TxFinalized
   its idle driver would take it as a non-late commit and re-run T's finalization actions; it learns from its peers
-  (late from their finalized relay, or by Paxos) (transaction-recovery 4.2)
+  (late from their finalized relay, or by Paxos) (transaction-recovery 4.2). Nor to a sender on the same host
+  (`Store.onThisHost`, the router's installed stores): it shares the cache, so its own store's self-relay rule already
+  decided what it learns from the entry
 - `TransactionStatusCache.updateStatus` keeps Committed over an opposite outcome (P19). Under the horizon an
   opposite outcome should never arise: one that does is logged as an error ("Split decision") and counted
   (`splitDecisions`)

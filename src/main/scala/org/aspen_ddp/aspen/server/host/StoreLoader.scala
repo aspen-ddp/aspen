@@ -520,6 +520,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 incarnationOverride = Some(incarnation.get),
                 poolIDA = poolIDA,
                 admissionTier = admissionTier,
+                onThisHost = id => router.get(id).isDefined,
                 // Its backend's completion handler is set below, after the Store is built: recovered transactions read
                 // their objects once it is installed (awaitCrlLoad)
                 deferRecovery = true,

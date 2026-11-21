@@ -832,15 +832,18 @@ class Frontend(val storeId: StoreId,
           case _ =>
             crl.whenDurable(storeId, () => post(() => oneDone()))
 
-  /** A transaction whose KeyValue update of objects here has no required revision, so it may Insert keys blindly
-    * (`KeyValueUpdate.DoesNotExist`, `MayExist` or no requirement on the key), and whose CRL state may still hold that
-    * update. Kept, as an AllocationRecord is, until the state's deletion or stub is durable
+  /** A transaction whose KeyValue update of objects here has no required revision, and whose CRL state may still
+    * hold that update. Its Inserts are checked only at the key (`KeyRevision`, `Exists`, `DoesNotExist`, a timestamp
+    * requirement) or by a content lock, so a recovered commit vote's re-check of them may pass again after a later
+    * deletion of their keys (transaction-requirements 9.4, 10.5c). Kept, as an AllocationRecord is, until the state's
+    * deletion or stub is durable
     */
   private final class BlindInsertRecord(var tx: Tx, var objects: Set[ObjectId], var concluded: Boolean)
 
-  /** Transactions that may Insert keys blindly into objects here and whose CRL state may still hold the update, by
-    * txid and by object (transaction-requirements 9.4). Filled by the update's shape alone; its keys are decoded only
-    * when a key deletion meets it (awaitBlindInsertsDurable). Empty for every object no recent blind write covers
+  /** Transactions with a KeyValue update of objects here that has no required revision and whose CRL state may still
+    * hold the update, by txid and by object (transaction-requirements 9.4). Filled by the update's shape alone; its
+    * keys are decoded only when a key deletion meets it (awaitBlindInsertsDurable). Empty for every object no recent
+    * such update covers
     */
   private val blindInsertRecords = scala.collection.mutable.HashMap[TransactionId, BlindInsertRecord]()
   private val blindInsertsOf = scala.collection.mutable.HashMap[ObjectId, Set[TransactionId]]()

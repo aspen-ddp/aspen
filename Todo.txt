@@ -78,8 +78,4 @@ PRIORITY 6: coverage gaps (analysis and tests still to be written)
 PRIORITY 7: documentation corrections
 -------------------------------------
 
-7.1 [Q-W17] The blind-insert index's scaladoc still describes unchecked Inserts.
-    CONFIRMED. Effort S. transaction-requirements.md.
-    Frontend.BlindInsertRecord's scaladoc says indexed transactions Insert keys with "DoesNotExist, MayExist or no
-    requirement on the key"; those are now refused, and the index covers every KeyValueUpdate without a required
-    revision (KeyRevision- or content-lock-checked Inserts included). Fix: reword the scaladoc.
+(no open items)

@@ -943,15 +943,4 @@ adds the revision check.
 
 ## Open weaknesses
 
-### Q-W17: The blind-insert index's scaladoc still describes unchecked Inserts
-Verdict CONFIRMED. Priority 7. Effort S.
-Mechanism: `Frontend.BlindInsertRecord`'s scaladoc says the indexed transactions "may Insert keys blindly
-(`KeyValueUpdate.DoesNotExist`, `MayExist` or no requirement on the key)". Both `refuseBlindWrites` copies
-(`TransactionBuilder`, `RequirementsChecker.check`) refuse an Insert with only `MayExist` or no requirement on its key;
-what `registerBlindInserts` indexes, by shape, is every `KeyValueUpdate` without a required revision, whose Inserts are
-checked by `KeyRevision`, `Exists`, `DoesNotExist`, a timestamp requirement or a content lock (2.5, 9.4).
-Consequence: none at run time; a reader of the code is told that unchecked Inserts exist and that a `KeyRevision`- or
-content-lock-checked Insert is not covered, which is the case 10.5c depends on (a content-locked Insert of a key that
-was absent passes its re-check again once a later Delete restores the content).
-Fix: reword the scaladoc: a transaction whose KeyValue update of an object here has no required revision, so a
-recovered commit vote's re-check of its Inserts may pass again after a later deletion of their keys.
+(no open items)

@@ -1,4 +1,5 @@
 ### Crash Recovery Log
+- Files (`crl/simple`): `SimpleCRL.scala` (the CRL thread, rotation, growth, record handling), `CrlRequests.scala` (the requests queued for the CRL thread; re-exported by `SimpleCRL`), `CrlDirectory.scala` (`Sizing`/`SizingFile` and the stateless creation, check and uncommitted-growth cleanup of a CRL directory; both re-exported by `SimpleCRL`), `LogEntry`/`LogContent` (entry format), `Recovery`/`StreamReader`/`StreamWriter`/`Stream` (recovery and I/O). Growth and rotation stay in `SimpleCRL`: both read and write the CRL thread state (ring, streams, writer)
 - Similar to a write-ahead-log in traditional databases
 - Stores the state necessary for Paxos as well as the TransactionDescription, commit/abort vote, and object data
 - A record's saved `TransactionStatus` is persisted (bits 3-4 of the static record's Paxos mask byte), so disk
@@ -112,7 +113,7 @@
   earlier save is dropped and no later one (crash-recovery-log C14). Its transaction deletions, like a stub save's, are
   cancellable (`LogEntry.deleteTxUnlessResaved`): a same-id save later in the same unwritten entry is written. Every
   other deletion is final within its entry
-- Stream files are preallocated at creation (`SimpleCRL.createStreamsIfNew`, `server.FilePreallocation`): `fallocate`
+- Stream files are preallocated at creation (`CrlDirectory.createStreamsIfNew`, `server.FilePreallocation`): `fallocate`
   through FFM on Linux, zero-fill elsewhere or on `EOPNOTSUPP`. A CRL write never allocates, so a full device cannot
   fail one (crash-recovery-log 5.1). Each file is written as `<n>.crl.tmp`, renamed, and the directory forced before the
   writer starts. A `.crl.tmp` at open is a creation that wrote nothing, and it starts over, only when `holdsStores`

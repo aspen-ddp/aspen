@@ -389,12 +389,14 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
     offline.remove(storeId)
     ctx.publishView()
 
-  /** Clears a store's offline mark unless a loaded device of this host still holds the store offline. The mark is by
-   *  store id, and two devices of one host can each hold a copy (a transfer between them, an earlier tenancy's copy):
-   *  a copy that leaves one device's offlineStores does not unsilence the other's. Callers remove it from their own
-   *  device's offlineStores first. */
+  /** Clears a store's offline mark unless a loaded device of this host still holds the store offline, or a Rebuilding
+   *  entry here does (`StoreRebuilds.silencedStores`, rebuild-process 6.2). The mark is by store id, and two devices
+   *  of one host can each hold a copy (a transfer between them, an earlier tenancy's copy, a rebuild re-placed between
+   *  them): a copy that leaves one device's offlineStores does not unsilence the other's, nor a rebuild's destination,
+   *  which never held the store and so lists it in no offlineStores. Callers remove it from their own record first. */
   private[host] def clearOfflineUnlessHeld(storeId: StoreId): Unit =
-    if !ctx.devices.devices.values.exists(_.offlineStores.contains(storeId)) then
+    if !ctx.devices.devices.values.exists(_.offlineStores.contains(storeId)) &&
+       !ctx.rebuilds.silencedStores.contains(storeId) then
       clearOffline(storeId)
 
   /** Marks a store whose load is under way, so its messages are dropped rather than answered UnknownStore. Not part

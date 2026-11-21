@@ -527,9 +527,10 @@ dropped before the rebuild (4.3), so nothing on the device recovers them.
 
 `StoreRouter` answers "unknown" only for a store that is neither installed nor `offline`, `loading` or
 `awaitingDevice`. `startRebuild` marks the store offline (`router.markOffline`, recorded in `silenced`) at the first
-reconcile that sees its Rebuilding entry, queued for a slot or running, so the host drops its messages; later
-reconciles find it in `silenced` and do not mark it again, so a mark another path clears meanwhile
-(`StoreRouter.clearOfflineUnlessHeld`, which consults the devices' `offlineStores` only) stays cleared (RB-W23). The mark ends
+reconcile that sees its Rebuilding entry, queued for a slot or running, so the host drops its messages. No other path
+clears it meanwhile: a pass removing a copy clears the mark through `StoreRouter.clearOfflineUnlessHeld`, which keeps
+it for a store in `silenced` as well as one a device's `offlineStores` holds, so a rebuild re-placed between two
+devices of this host (R4) stays silent when the source's Deleted Stores pass forgets the old copy. The mark ends
 with the outcome: an adopted store's install clears it; `AdoptOffline`, `NotOwned` and `Unconfirmed` keep it (out of
 `silenced`);
 `Superseded` keeps it in `silenced` for the current episode; `Discard`, a cancel
@@ -919,19 +920,4 @@ an old episode's copy.
 
 ## Open weaknesses
 
-**RB-W23 A rebuilding store's router silence can be cleared and is never restored** (CONFIRMED, priority 5, effort S)
-
-Mechanism: `StoreRebuilds.startRebuild` calls `router.markOffline` only when the store is not yet in `silenced`.
-`StoreRouter.clearOfflineUnlessHeld` clears the mark unless some loaded device's `offlineStores` holds the store, and
-a destination that never held the store does not list it there. The Deleted Stores pass's `retireUnowned` on another
-device of the host (its `forget`) calls it for that device's old copy.
-
-Trigger: `replaceRebuild` (R4) moves a store's rebuild between two devices of one host; the destination's reconcile
-silences the store before the source device's Deleted Stores pass finishes retiring (or finds absent) the old copy.
-
-Consequence: for the rest of the rebuild the host answers `StoreNotFound`/`TxUnknownStore` for the store: readers
-re-read it at once and drop its route, drivers drop the route, so each read and transaction costs extra messages and
-route lookups. No decision changes (an unknown store answers no allocation query and is not counted as an absence).
-
-Fix direction: mark the router offline on every reconcile that sees the Rebuilding entry (idempotent), or have
-`clearOfflineUnlessHeld` also keep a store in `StoreRebuilds.silenced`.
+(none)

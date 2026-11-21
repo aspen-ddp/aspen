@@ -950,6 +950,39 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       host.control.router.isOffline(storeN(0)) should be(false)
       host.control.currentView.repairable should contain(storeN(0))
 
+  atest("a rebuilding store stays silent when another device here retires its old copy (RB-W23)"):
+    // replaceRebuild moved the store's rebuild between two devices of this host. The destination never held the store,
+    // so no offlineStores lists it there; the source's Deleted Stores pass forgetting its old copy must not unsilence it
+    val hostRoot = newHostDir()
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+
+    def synthetic(n: Int): LocalStorageDeviceState =
+      val id = StorageDeviceId(UUID.fromString(s"cccccccc-0000-0000-0000-00000000010$n"))
+      val dir = hostRoot / "storage-devices" / s"synth-w23-$n"
+      os.makeDir.all(dir)
+      new LocalStorageDeviceState(id, dir, dir / "dummy.file", new TestNetwork.TestCRL())
+    val source = synthetic(0)
+    val destination = synthetic(1)
+    source.offlineStores = Set(storeN(0))
+    injectLoadedDevice(host, source)
+    injectLoadedDevice(host, destination)
+
+    val firstSource = recorded(host).armLookup(source.storageDeviceId)
+    val firstDestination = recorded(host).armLookup(destination.storageDeviceId)
+    host.control.reconciler.checkAll()
+    // The destination reconciles first, so the source's forget is the last word
+    firstDestination.success(deviceState(destination.storageDeviceId, Map(rebuilding(storeN(0)))))
+    firstSource.success(deviceState(source.storageDeviceId, Map()))
+
+    for
+      _ <- yieldUntil(factory.created.nonEmpty)
+      _ <- yieldUntil(!source.offlineStores.contains(storeN(0)))
+      _ <- yieldUntil(host.control.reconciler.activeDeviceChecks.isEmpty)
+    yield
+      host.control.rebuilds.silencedStores should contain(storeN(0))
+      host.control.router.offlineStores should contain(storeN(0))
+
   /** Pumps transactions until `factory` has created a rebuild. Silent on exhaustion: callers
    *  assert on it. */
   private def completeRebuildsStarted(factory: RecordingRebuildFactory, rounds: Int = 50): Future[Unit] =

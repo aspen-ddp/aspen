@@ -38,7 +38,9 @@
   its device without silencing a store served or opening here (`keepMarkedCopyOffline`), as does a rebuild's
   unpromoted copy (`StoreRebuilds.keepUnpromotedCopyOffline`; both through `DeviceControl.markCopyOffline`, never
   `markStoreOffline`, which marks unconditionally), and a pass that removes a
-  copy clears the mark only if no other loaded device holds the store offline (`StoreRouter.clearOfflineUnlessHeld`)
+  copy clears the mark only if no other loaded device holds the store offline and no Rebuilding entry here silences
+  it (`StoreRebuilds.silencedStores`: a rebuild's destination never held the store, so lists it in no
+  `offlineStores`; `StoreRouter.clearOfflineUnlessHeld`)
 - Backend opens are backend-neutral: `BackendOpener.open` (`server.store.backend`) returns a Future and decides where
   the open runs (RocksDB inline, FSIF on `FsifOpenEc`); `StoreLoader.startOpen` handles an already-completed one
   inline and otherwise posts `BackendOpened`. A rebuild's staging store opens through the same opener (passed by

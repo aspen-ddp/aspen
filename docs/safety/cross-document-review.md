@@ -280,7 +280,7 @@ The premises other subsystems take from this:
   unsilenced (`StoreLoader.keepMarkedCopyOffline`), as does an unpromoted rebuilt copy whose flip settles after the
 store came to be served from another device here (`StoreRebuilds.keepUnpromotedCopyOffline`; both through
 `DeviceControl.markCopyOffline`), and a removed copy clears the router's offline mark only when no
-  other device here holds the store offline (`StoreRouter.clearOfflineUnlessHeld`). A rebuilt copy carries an empty
+  other device here holds the store offline and no Rebuilding entry here silences it (`StoreRouter.clearOfflineUnlessHeld`). A rebuilt copy carries an empty
   `crl_save.log` (`RebuildingStore.writeEmptyCrlState`), so its first load (by the flip, the Completed Rebuilds pass,
   a restart, a reinstatement or an adoption) drops whatever device-CRL entries an earlier copy left under its id
   (`StoreLoader.awaitCrlLoad`), and a transfer out of the unloaded copy ships the file and drops them

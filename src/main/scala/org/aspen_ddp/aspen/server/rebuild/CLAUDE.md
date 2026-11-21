@@ -77,10 +77,12 @@
   `REBUILD OUT OF SPACE` (from any write of the walk, the sweep, a checkpoint, or `finish`'s flush and completion
   files), and a warning for a store with no recorded usage. The remedy for either is re-placement,
   `transfer-store` on the Rebuilding store (`server/host/CLAUDE.md`)
-- Silence (rebuild-process 6.2): `StoreRebuilds.startRebuild` marks a store offline in the router on every reconcile
-  that sees its Rebuilding entry, queued or running (`silenced`), so its host drops its messages rather than answering
-  UnknownStore. An adopted store's load clears the mark; `Discard`, a cancel for an entry that left the device, and
-  `abandonUnlisted` for a queued one clear it unless a device's `offlineStores` holds it; other outcomes keep it
+- Silence (rebuild-process 6.2): `StoreRebuilds.startRebuild` marks a store offline in the router at the first
+  reconcile that sees its Rebuilding entry, queued or running (`silenced`), so its host drops its messages rather than
+  answering UnknownStore. While it is in `silenced`, no other path clears the mark (`StoreRouter.clearOfflineUnlessHeld`
+  keeps it, e.g. for another device's Deleted Stores pass after a same-host re-placement). An adopted store's load
+  clears it; `Discard`, a cancel for an entry that left the device, and `abandonUnlisted` for a queued one clear it
+  unless a device's `offlineStores` holds it; other outcomes keep it
 - A rebuild's staging store opens through the same `BackendOpener` as a normal load (passed by
   `StoreRebuildFactory.createRebuild`). A first pass (no checkpoint) discards whatever staging holds and creates a
   fresh staging store atomically (`BackendOpener.create`); a resume only opens it, and one whose backend is lost

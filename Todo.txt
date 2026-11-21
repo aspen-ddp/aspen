@@ -68,11 +68,7 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.3 [S] RB-W23: a rebuilding store's router silence can be cleared and is never restored (CONFIRMED).
-    startRebuild marks the router offline once; clearOfflineUnlessHeld looks only at devices' offlineStores, which a
-    destination that never held the store does not list (same-host replaceRebuild). The host then answers
-    StoreNotFound for the rest of the rebuild: re-reads and dropped routes only. Fix: count running rebuilds in
-    clearOfflineUnlessHeld, or re-mark at each reconcile while the rebuild runs.
+(no open items)
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)

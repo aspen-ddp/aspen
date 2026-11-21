@@ -62,12 +62,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
-4.3 [CRL-W18] The admission limit's proof fails for small streams in a large ring.
-    PLAUSIBLE. Effort S. crash-recovery-log.md, cross-document-review.md section 3.
-    (n-2)*S/2 - S/16 satisfies Lemma B only while 118*(n-1) <= S/16 + 8192; CrlSizingDefaults.resolve accepts 1 MiB
-    streams up to 1024 streams (broken past 625), so a W6 fail-stop within admission unloads the device until
-    restart. Fix: subtract 118*(n-1) in limitAt, or refuse/cap such configs.
-
 
 PRIORITY 5: performance and hygiene
 -----------------------------------

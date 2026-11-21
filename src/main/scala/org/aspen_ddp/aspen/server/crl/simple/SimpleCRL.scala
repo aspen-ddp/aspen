@@ -36,6 +36,15 @@ object SimpleCRL extends Logging:
   /** What maxTransactionBytes keeps back from half a stream for the entry's own headers and record framing */
   val EntryOverheadReserve: Long = 8192
 
+  /** `H`, an entry's fixed bytes: its static header and trailing stream UUID (crash-recovery-log 6.1) */
+  val EntryFixedBytes: Long = LogEntry.StaticEntryHeaderSize + 16
+
+  /** `(n − 2) · S/2 − S/16 − H · (n − 1)` for `n` streams of `S` bytes (crash-recovery-log 6.1, "The limit"). Charging
+    * the fixed bytes of the `n − 1` evacuation entries a head may wait behind keeps the room left for unoffset stubs
+    * at `S/16 + 8192` whatever the ring size, so no stream size and ring size the config accepts can break Lemma B */
+  def admissionLimitFor(numStreams: Int, streamSize: Long): Long =
+    (numStreams - 2) * streamSize / 2 - streamSize / 16 - EntryFixedBytes * (numStreams - 1)
+
   sealed abstract class ActionRequest()
 
   case class SaveTransaction(txid: TransactionId,
@@ -244,7 +253,7 @@ object SimpleCRL extends Logging:
     else if streamFiles(streamsDir).nonEmpty then
       throw CrlSizingMismatch(streamsDir, s"it holds stream files but no $SizingFile file")
     else
-      // The admission limit, (n − 2) · S/2 − S/16, needs a third stream (crash-recovery-log 6.1). The proof that every
+      // The admission limit, (n − 2) · S/2 − S/16 − H · (n − 1), needs a third stream (crash-recovery-log 6.1). The proof that every
       // entry is written rests on whole 4 KiB pages: S and every entry are multiples of 4096 (S1)
       require(numStreams >= 3, s"A CRL needs at least 3 streams, not $numStreams")
       require(maxSizeInBytes % 4096 == 0, s"A CRL's stream size must be a multiple of 4096, not $maxSizeInBytes")
@@ -350,7 +359,7 @@ class SimpleCRL private (streamsDir: os.Path,
     * newest unwritten entry past it seals that entry. A lone transaction, at most maxTransactionBytes, always fits */
   val maxEntryBytes: Long = maxSizeInBytes / 2
 
-  /** `(n − 2) · S/2 − S/16` for `n` streams of `S` bytes (crash-recovery-log 6.1, "The limit"): with it, every
+  /** `admissionLimitFor(n, S)` for `n` streams of `S` bytes (crash-recovery-log 6.1, "The limit"): with it, every
     * evacuation fits an empty stream and every sealed entry is written within `n − 1` rotations, as long as the
     * unoffset stubs outstanding stay within the `S/16` reserve's margin. Past that the CRL fails (W6) */
   override def admissionLimitBytes: Long = limitAt(numStreams)
@@ -360,7 +369,7 @@ class SimpleCRL private (streamsDir: os.Path,
     * disabled, so a state above it is one that does not fit yet, never one that cannot (crash-recovery-log 6.1, A3) */
   override def maxAdmissionLimitBytes: Long = limitAt(math.max(numStreams, CrlSizingDefaults.MaxMaxStreams))
 
-  private def limitAt(streams: Int): Long = (streams - 2) * maxSizeInBytes / 2 - maxSizeInBytes / 16
+  private def limitAt(streams: Int): Long = admissionLimitFor(streams, maxSizeInBytes)
 
   /** Half a stream, less EntryOverheadReserve for the headers of the entry that holds it, so one transaction's entry
     * always fits in a stream. A larger one would kill the CRL at writeHead's require (crash-recovery-log 10.20)

@@ -776,7 +776,7 @@ class SimpleCRLSuite extends FileBasedTests {
     for (n, size) <- List((2, 1024L * 1024), (4, 1024L * 1024), (3, 2L * 1024 * 1024)) do
       val i2 = SimpleCRL(tdir, n, size)
       assert(i2.trsList.map(_.storeId) == List(storeId))
-      assert(i2.crl.admissionLimitBytes == 1024 * 1024 * 7 / 16)
+      assert(i2.crl.admissionLimitBytes == 1024 * 1024 * 7 / 16 - 2 * 118)
       i2.crl.shutdown()
     assert(os.list(tdir).filter(_.ext == "crl").map(_.last).toSet == Set("0.crl", "1.crl", "2.crl"))
   }
@@ -784,7 +784,7 @@ class SimpleCRLSuite extends FileBasedTests {
   test("A sizing file without stream files is a CRL whose creation crashed: it is created with that sizing") {
     os.write(tdir / SimpleCRL.SizingFile, SimpleCRL.Sizing.inOrder(4, 1024 * 1024, UUID.randomUUID()).encode)
     val i = SimpleCRL(tdir, 3, 2 * 1024 * 1024)
-    assert(i.crl.admissionLimitBytes == 1024 * 1024 * 15 / 16)
+    assert(i.crl.admissionLimitBytes == 1024 * 1024 * 15 / 16 - 3 * 118)
     i.crl.shutdown()
     assert(os.list(tdir).filter(_.ext == "crl").size == 4)
   }
@@ -2716,8 +2716,9 @@ class SimpleCRLSuite extends FileBasedTests {
     r.crl.shutdown()
   }
 
-  test("The admission limit is (n - 2) * S/2 - S/16: 15S/16 for 4 streams, 9S - S/16 for 20") {
-    for (n, expected) <- List((4, ringStreamSize * 15 / 16), (20, 9 * ringStreamSize - ringStreamSize / 16)) do
+  test("The admission limit is (n - 2) * S/2 - S/16 - 118 * (n - 1): 15S/16 - 354 for 4 streams") {
+    for (n, expected) <- List((4, ringStreamSize * 15 / 16 - 3 * 118),
+                              (20, 9 * ringStreamSize - ringStreamSize / 16 - 19 * 118)) do
       val dir = tdir / s"streams-$n"
       val i = SimpleCRL(dir, n, ringStreamSize)
       assert(i.crl.admissionLimitBytes == expected)
@@ -2726,13 +2727,29 @@ class SimpleCRLSuite extends FileBasedTests {
 
   test("The most limit is that of MaxMaxStreams streams, whatever crl-max-streams this open allows (CRL-W6, CRL-W9)") {
     val s = growthStreamSize
-    val most = (CrlSizingDefaults.MaxMaxStreams - 2) * s / 2 - s / 16
+    val most = (CrlSizingDefaults.MaxMaxStreams - 2) * s / 2 - s / 16 - 118L * (CrlSizingDefaults.MaxMaxStreams - 1)
     for (name, policy) <- List("growing" -> growthPolicy(maxStreams = 12), "at-ring" -> growthPolicy(maxStreams = 4),
                                "disabled" -> GrowthPolicy.Disabled) do
       val c = openGrowing(policy, tdir / name)
       assert(c.crl.maxAdmissionLimitBytes == most)
       assert(c.crl.maxAdmissionLimitBytes > c.crl.admissionLimitBytes)
       c.crl.shutdown()
+  }
+
+  test("Every ring and stream size leaves Lemma B the S/16 + 8192 room for unoffset stubs (CRL-W18)") {
+    // Lemma C bounds the image's footprint by limit + T + 41 * N; Lemma B places every head while it is at most
+    // (n - 1) * (S/2 - H). Without charging H per evacuation, 1 MiB streams broke it past 625 streams
+    assert(SimpleCRL.EntryFixedBytes == 118)
+    val h = SimpleCRL.EntryFixedBytes
+    for
+      s <- List(32L * 1024, 1L << 20, 1736L * 1024, 64L << 20, 1L << 30)
+      n <- 3 to CrlSizingDefaults.MaxMaxStreams
+    do
+      val limit = SimpleCRL.admissionLimitFor(n, s)
+      val t = s / 2 - SimpleCRL.EntryOverheadReserve
+      val room = (n - 1) * (s / 2 - h) - (limit + t)
+      assert(room == s / 16 + SimpleCRL.EntryOverheadReserve, s"$n streams of $s bytes")
+      assert(limit > 0, s"$n streams of $s bytes")
   }
 
   test("A new CRL's streams are a multiple of 4096 bytes, and at least 3 (S1)") {
@@ -3014,10 +3031,10 @@ class SimpleCRLSuite extends FileBasedTests {
     val fill = Filler(i.crl)
     fill.until(2)
     i.crl.requestGrowth()
-    assert(nextRaise(raised) == 3 * s / 2 - s / 16)
+    assert(nextRaise(raised) == 3 * s / 2 - s / 16 - 4 * 118)
     assert(recordedRing() == Vector(0, 1, 2, 4, 3))
     assert(i.crl.numStreams == 5)
-    assert(i.crl.admissionLimitBytes == 3 * s / 2 - s / 16)
+    assert(i.crl.admissionLimitBytes == 3 * s / 2 - s / 16 - 4 * 118)
     assert(os.size(tdir / "4.crl") == s)
     assert(!os.exists(tdir / "4.crl.tmp"))
     assert(nextStreams(i.crl, fill, 1) == List(4))
@@ -3140,7 +3157,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val r = SimpleCRL(tdir, 4, s)
     assert(r.crl.numStreams == 5)
     assert(r.crl.currentStreamNumber == 2)
-    assert(r.crl.admissionLimitBytes == 3 * s / 2 - s / 16)
+    assert(r.crl.admissionLimitBytes == 3 * s / 2 - s / 16 - 4 * 118)
     assert(recoveredById(r)(x._1).objectUpdates == x._2.objectUpdates)
     assert(nextStreams(r.crl, Filler(r.crl), 1) == List(4))
     r.crl.shutdown()
@@ -3221,7 +3238,7 @@ class SimpleCRLSuite extends FileBasedTests {
     // The second growth inserts stream 5 after the active stream 4
     val raised1 = limitsRaised(r1.crl)
     r1.crl.requestGrowth()
-    assert(nextRaise(raised1) == 4 * growthStreamSize / 2 - growthStreamSize / 16)
+    assert(nextRaise(raised1) == 4 * growthStreamSize / 2 - growthStreamSize / 16 - 5 * 118)
     assert(recordedRing(crash1) == Vector(0, 1, 2, 4, 5, 3))
     val fill1 = Filler(r1.crl)
     assert(nextStreams(r1.crl, fill1, 1) == List(5))

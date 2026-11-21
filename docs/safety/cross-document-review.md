@@ -472,9 +472,8 @@ and lower-tier load cannot prevent a transaction's finalization. `TxFinalized` i
 Charges made without a check (one transaction crossing its ceiling, data arriving after admission, records recovered
 at load, applied stubs) are bounded by the transactions already admitted, plus 41 bytes per unoffset stub
 (crash-recovery-log.md, Lemma C), and one transaction's bytes on a store by `maxTransactionBytes`, past which its
-prepare is dropped (crash-recovery-log.md section 6, Oversized). The proof that live bytes within the limit always
-leave room for the rotations' evacuation headers holds for the default stream size but not for small streams in a
-large ring (crash-recovery-log.md CRL-W18), where admission itself can reach W6. The device reconciler's leftover drop
+prepare is dropped (crash-recovery-log.md section 6, Oversized). The limit charges the rotations' evacuation headers, so live bytes within it
+always leave room for them, at every stream and ring size (crash-recovery-log.md 6.1, "The limit"). The device reconciler's leftover drop
 (`DeviceReconciler.dropLeftoverCrlState`) releases only the charge retained for the store when it was issued, and only
 if it is unchanged when the drop completes, so a store landing meanwhile keeps its loaded state counted until its
 recovery counts it (crash-recovery-log.md 3.5). What can still fill a lane is the tier's own traffic,

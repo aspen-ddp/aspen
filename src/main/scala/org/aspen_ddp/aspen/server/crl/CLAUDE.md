@@ -144,7 +144,8 @@
   handler delays every later one on the device. One that throws fails the CRL (`HandlerFailed`). `BackendTiming`
   logs the `crl write` and `crl handlers` stages. Tests hold a written entry unacknowledged with
   `entryWrittenForTest` (`SimpleCRLSuite.holdEntryOf`), never with a blocking handler
-- `admissionLimitBytes` (SimpleCRL: `(n − 2) · S/2 − S/16` for `n` streams of `S` bytes, 15S/16 at 4 streams: with it
+- `admissionLimitBytes` (SimpleCRL `admissionLimitFor`: `(n − 2) · S/2 − S/16 − H · (n − 1)` for `n` streams of `S`
+  bytes, `H = EntryFixedBytes` (118) per evacuation entry a head may wait behind, so it holds at every ring size: with it
   every evacuation fits and every head is written within `n − 1` rotations, safety 6.1) sizes the device's
   `CrlAdmission`, which drops prepares for unseen transactions past it. It rises with each committed growth
   (`onAdmissionLimitRaised`, `CrlAdmission.raiseLimit`). `maxAdmissionLimitBytes` is the limit at

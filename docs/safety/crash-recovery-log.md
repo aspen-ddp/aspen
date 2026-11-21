@@ -63,8 +63,8 @@ store; an applied stub is a `TransactionId` with its transaction's start `HLCTim
 | `recoveredBytesByStore` | What the open recovered for each store, as admission counts it (section 6). |
 | `failed: Future[Throwable]` | Completes, with the cause, if the CRL dies (5.10). |
 | `shutdown()` | Blocks until the CRL's thread and writer have stopped and its files are closed. Handlers already handed to the completion thread run first; every Future not answered by then, and every later one, fails with `CrlClosed` (5.10). Idempotent. |
-| `admissionLimitBytes` | The device's admission limit (section 6): `(n − 2) · S/2 − S/16` in SimpleCRL, for `n` streams of `S` bytes. |
-| `maxAdmissionLimitBytes` | The most admission limit the CRL can reach under any device config: `(m − 2) · S/2 − S/16` in SimpleCRL for `m = CrlSizingDefaults.MaxMaxStreams` (1024), whatever `crl-max-streams` this open allows. A loaded state is judged never to fit against it (A3), so no config edit can declare a state lost. |
+| `admissionLimitBytes` | The device's admission limit (section 6): `(n − 2) · S/2 − S/16 − H · (n − 1)` in SimpleCRL, for `n` streams of `S` bytes (`H = 118`, `SimpleCRL.admissionLimitFor`). |
+| `maxAdmissionLimitBytes` | The most admission limit the CRL can reach under any device config: `(m − 2) · S/2 − S/16 − H · (m − 1)` in SimpleCRL for `m = CrlSizingDefaults.MaxMaxStreams` (1024), whatever `crl-max-streams` this open allows. A loaded state is judged never to fit against it (A3), so no config edit can declare a state lost. |
 | `maxTransactionBytes` | The most bytes, as admission counts them, one store's transaction may hold: `S/2 − 8192` in SimpleCRL. A prepare past it is dropped unsaved (section 6, Oversized). |
 | `requestGrowth()` | Asks for more room; cheap, idempotent, from any thread. SimpleCRL adds one stream if its growth policy allows (5.11). |
 | `onAdmissionLimitRaised(f)` | Registers `f`, called on the CRL thread with the new `admissionLimitBytes` after each committed growth. |
@@ -722,7 +722,7 @@ before the next:
    after the active stream *A* (`DurableFiles.write`: tmp, force, atomic rename, directory force). This rewrite is
    the **commit point**, and the last step that touches the files.
 4. Then the writer opens the stream (`StreamWriter.addStream`), the CRL's ring and stream table take it, and the
-   `onAdmissionLimitRaised` listeners get the new `admissionLimitBytes`, `(n − 1) · S/2 − S/16`.
+   `onAdmissionLimitRaised` listeners get the new `admissionLimitBytes`, `(n − 1) · S/2 − S/16 − H · n`.
 
 **Why the ring invariant holds after the insert.** The stream after *A* is now `n`, which holds no entry at all.
 *A*'s old successor, now after `n`, holds nothing of the image: the rotation into *A* evacuated it, that rotation is
@@ -771,8 +771,8 @@ completing the write unwritten.
 
 `CrlAdmission` (`S/crl/CrlAdmission.scala`) is one atomic byte counter per device, with limit
 `crl.admissionLimitBytes`, and `crl.maxTransactionBytes` bounds one store's transaction. For a SimpleCRL ring of `n`
-streams of `S` bytes, 6.1 sets the limit SimpleCRL must give at `(n − 2) · S/2 − S/16`: `15S/16` for the minimum of
-4 streams, `9S − S/16` for 20. The per-transaction bound is `T = S/2 − 8192` (`SimpleCRL.EntryOverheadReserve`). 6.1
+streams of `S` bytes, 6.1 sets the limit SimpleCRL must give at `(n − 2) · S/2 − S/16 − H · (n − 1)`
+(`SimpleCRL.admissionLimitFor`, `H = 118`): `15S/16 − 354` for the minimum of 4 streams, `9S − S/16 − 2242` for 20. The per-transaction bound is `T = S/2 − 8192` (`SimpleCRL.EntryOverheadReserve`). 6.1
 proves that, with the rules it lists, these keep every entry writable, and it states the one assumption the proof
 cannot discharge. W1-W6 and S1 are SimpleCRL's, A1-A4 the Frontend's and the store loader's; all are implemented.
 
@@ -1038,20 +1038,20 @@ recovery's count, up to that store's recovered bytes. Without A3, a store moved 
 hold more than this whole CRL. Without A4, a save after a release is uncharged. Without W1a, the counterexample above
 puts late data charged after a release into an entry sealed before it.
 
-**The limit.** With `limit = (n − 2) · S/2 − S/16`, Lemma C gives `F ≤ (n − 1) · S/2 − S/16 − 8192 + 41 · N`, and
-Lemma B needs `F ≤ (n − 1) · S/2 − 118 · (n − 1)`. So every head is written within `n − 1` rotations whenever
+**The limit.** With `limit = (n − 2) · S/2 − S/16 − H · (n − 1)`, Lemma C gives
+`F ≤ (n − 1) · (S/2 − H) − S/16 − 8192 + 41 · N`, and Lemma B needs `F ≤ (n − 1) · (S/2 − H)`. So every head is
+written within `n − 1` rotations whenever
 
-    41 · N ≤ S/16 + 8192 − 118 · (n − 1)
+    41 · N ≤ S/16 + 8192
 
-that is, at most about `S/656` unoffset stubs outstanding: 102491 at 4 streams of 64 MiB and 102445 at 20; 1789 and
-1743 for 1 MiB streams. In the form "live bytes at most `(n − 2) · S/2 + T + unchecked charges`", the unchecked charges
-this leaves are the unoffset stubs, and the room for them is the `S/16` reserve plus what `EntryOverheadReserve` keeps
-beyond the `n − 1` evacuation headers. The limit is `15S/16` at 4 streams, above the `S/2` floor. A ring of 3 streams
-(accepted by `SimpleCRL.apply`, refused by `CrlSizingDefaults.resolve`) is covered by the same proof: limit `7S/16`,
-2 rotations, room for 1792 unoffset stubs at 1 MiB. The room shrinks by 118 bytes per stream: it is negative, even
-with no unoffset stub, once `118 · (n − 1) > S/16 + 8192`, which a ring grown past 625 streams of 1 MiB reaches, and
-which `CrlSizingDefaults.resolve` does not refuse (CRL-W18). The default stream size (at least 64 MiB) keeps it positive
-at every ring size up to `MaxMaxStreams`.
+that is, at most about `S/656` unoffset stubs outstanding, whatever the ring size: 102500 for 64 MiB streams, 1798
+for 1 MiB. The limit charges one `H` for each of the `n − 1` evacuation entries a head may wait behind, so no pairing
+of `crl-max-file-size-mb` and `crl-max-streams` (or growth up to `MaxMaxStreams`) can leave admission itself past
+Lemma B's bound; the limit stays positive for every `n ≥ 3` and `S ≥ 4096`. In the form "live bytes at most
+`limit + T + unchecked charges`", the unchecked charges this leaves are the unoffset stubs, and the room for them is
+the `S/16` reserve plus the 8192 bytes `T` keeps back from half a stream (`SimpleCRL.EntryOverheadReserve`). The limit is `15S/16 − 354` at 4 streams, above the `S/2` floor. A ring of 3
+streams (accepted by `SimpleCRL.apply`, refused by `CrlSizingDefaults.resolve`) is covered by the same proof: limit
+`7S/16 − 236`, 2 rotations.
 
 **What is not proven.** `N` has no structural bound: an unoffset stub cannot be refused (the store must remember that
 it holds the transaction's update), and a device that drops prepares under load is exactly the one that later receives
@@ -1191,8 +1191,7 @@ drive breaks the backends too; it is an operational requirement (AS1).
 stream (6.1, Lemma A) and every other entry is at most half a stream (W1), so `Stream.writeEntry`'s `require` is
 reached only by a bug. A lone record larger than a stream, which admission's Oversized keeps out, fails the CRL at
 once (`writeHead`). With live bytes within 6.1's bound every head is written within `n − 1` rotations (10.18).
-Past the bound, which only unoffset stubs beyond 6.1's margin can reach (or admission itself, for the small-stream
-rings of CRL-W18), the head is still not written after `n − 1`
+Past the bound, which only unoffset stubs beyond 6.1's margin can reach, the head is still not written after `n − 1`
 rotations and the CRL fails (W6, 10.7) rather than rotating on: the unwritten entries were never acknowledged, so the
 files hold a consistent CRL and a restart recovers it. Their deletions are lost with them, so the recovered live set
 may be larger than before the failure; the reloaded stores delete those records again as their transactions
@@ -1308,17 +1307,4 @@ at `writeHead`'s `require`, which only a bug can reach.
 
 ## Open weaknesses
 
-### CRL-W18: The admission limit's proof fails for small streams in a large ring
-Verdict PLAUSIBLE. Priority 4. Effort S.
-Mechanism: `SimpleCRL.limitAt` is `(n − 2) · S/2 − S/16`, so Lemma C gives `F ≤ (n − 1) · S/2 − S/16 − 8192 + 41 · N`,
-while Lemma B needs `F ≤ (n − 1) · S/2 − 118 · (n − 1)` (6.1, "The limit"). With no unoffset stub this holds only while
-`118 · (n − 1) ≤ S/16 + 8192`. `CrlSizingDefaults.resolve` accepts `crl-max-file-size-mb` from 1 and `crl-max-streams`
-up to `MaxMaxStreams` (1024) with no relation between them, and `GrowthPolicy` grows to that cap: 1 MiB streams break
-the inequality past 625 streams, and any `S` below about 1.72 MiB does before 1024. `maxAdmissionLimitBytes`
-(`StoreLoader.neverFits`) admits loaded states against the same formula at 1024 streams.
-Consequence: within the admission limit, a head can fail to be placed in `n − 1` rotations when the image packs the
-streams closely; W6 then fails the CRL and the device is unloaded until restart, where it may fail again. No state is
-lost (W6 is fail-stop), but the "nothing within admission reaches W6" guarantee does not hold for such configs.
-Fix: charge the evacuation headers in the limit, `(n − 2) · S/2 − S/16 − 118 · (n − 1)`, which makes the inequality
-independent of `S` and `n`; or have `resolve` refuse, and `resolveExisting`/`GrowthPolicy` cap, a `crl-max-streams`
-with `118 · (crl-max-streams − 1) > S/16 + 8192`.
+(none)

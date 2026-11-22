@@ -3169,9 +3169,12 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(readState(i.crl, storeId).transactions.map(_.txd.transactionId).toSet == Set(x._1, y._1))
 
     failing.set(false)
-    eventually("no growth after the back-off"):
+    // Requests are ignored during the back-off. Stop at the one that starts an attempt: a further request after
+    // that growth commits would start a second growth and race the count below
+    eventually("no growth attempt started after the back-off"):
       i.crl.requestGrowth()
-      !raised.isEmpty
+      i.crl.growthBusyForTest || i.crl.growthAttemptsEndedForTest >= 2
+    nextRaise(raised)
     assert(i.crl.numStreams == 5)
     i.crl.shutdown()
   }

@@ -328,3 +328,255 @@ All deterministic (LockstepThreading) unless noted.
   still on its own copy.
 - Whether `Parked` merges into Live with an Offline entry, if step 1 shows that `reloadClosedStores` and T5 are the
   same rule.
+
+## Stage 1 audit findings
+
+Audit of HEAD `cde3d375`, code reading only. Paths are relative to `src/main/scala/org/aspen_ddp/aspen/server/`
+unless they start with `src/test` or `cmdline/`. "CT" means the call runs on the control thread. Stage-1 phases
+are read from markers with the precedence RR > TO > TI > RC (Task 2's `CopyPhase`), so "Parked" is
+`Outbound(None)`. Today a TO marker with empty content is written only by `keepRebuiltStoreOffline`: every
+TransferringOut entry carries `Some(transferId)` (`AspenClient.scala:645-648`).
+
+### COUNTEREXAMPLES TO I3 (read first)
+
+I3 does not hold in today's code. Each case below has two Works for one (device, store) in flight at once. The
+invariant is still the right one. Each counterexample comes from a missing guard or a pass-ordering problem, and
+the fix is to add the guard rather than to weaken I3. Stage 1 has to make the change listed in each row, or the
+shadow registry will throw (Task 5 must refuse there, not throw).
+
+| # | Works | How it happens | Guard missing | Spec/plan change |
+|---|-------|----------------|---------------|------------------|
+| C1 | Rebuild (queued or running, episode e1) × TransferIn (receive) on device D | D's entry is Rebuilding(e1) and a rebuild runs (`rebuildingStores`). The entry is re-placed to E (`replaceRebuild`), and the nudge to D is lost (nudges are best effort, and the periodic check is 1 h). E finishes and becomes Active, then is transferred back to D. D's first reconcile after that sees TransferringIn. `startTransfersIn` (`host/DeviceReconciler.scala:191`) runs **before** `startRebuilds`/`abandonUnlisted` (`:192`, `:433`), and `startIn`'s fresh-receive branch (`host/StoreTransfers.scala:433-542`) checks neither `rebuildingStoreIds` nor `silenced`. So the receive starts while the e1 rebuild is still registered, and is cancelled only later in the same task (or never, past finish's latch, `host/StoreRebuilds.scala:94-100`). The queued variant: `silenced` (Rebuild queued) is cleared by `abandonUnlisted:460-462`, which also runs after `startTransfersIn` | `startIn` has a rebuild guard only on the retire-earlier-tenancy branch (`host/StoreTransfers.scala:560`) | Run `abandonUnlisted` before `startTransfersIn`. `startIn` refuses (waits) while the store has any Rebuild work (any stage) on the device, as `retireEarlierTenancy` already does |
+| C2 | Rebuild (discard→running) for a stale episode × TransferIn, or a Rebuild with no Rebuilding entry | `discardLostStore`'s callback (`host/StoreRebuilds.scala:855-858`) calls `startRebuild(local, storeId, episode, acceptLoss)` with the episode captured when the discard began, and without re-reading `reconciledEntries`. A retire held up by a slow CRL (`readStoreState`/`dropStore`) can finish after the entry has moved on, and then starts a rebuild for an entry that is no longer Rebuilding(e1). If the entry is TransferringIn by then, `startIn` waits only while the retire runs (`isRetiring`, `:563`) and then starts the receive (C1) | The handoff does not check the entry | When the discard→running handoff runs, check `local.reconciledEntries` for Rebuilding with the same episode. Otherwise end the Work and re-check the device |
+| C3 | Rebuild (awaiting flip outcome) × TransferOut (close, extract, ship) | A flip attempt commits Active and is reported `TransactionOutcomeUnknown`. Before the retry reads the entry, an operator's `transfer-store` makes it TransferringOut. The receiver's StartStoreTransfer then reaches `startOut` (`host/StoreTransfersOut.scala:119`), which closes or extracts the RC copy and writes TO (`:253`) while `rebuildingStores` still holds the store. The retry then gives `Unconfirmed` (`host/StoreRebuilds.scala:360-368`). This is the designed path ("kept for the transfer"), but the two Works overlap | `startOut` has no rebuild check | Either `startOut` refuses while Rebuild work exists (the receiver retransmits, so the transfer only starts later), or the Rebuild work ends at its first flip attempt and its outcome handler then runs as a stage-less "flip settle". The refusal is the simpler fix |
+| C4 | Create (flip pending) × Rebuild, or × TransferOut | `createNewStore` keeps `creatingStores` until `fflip` completes (`host/StoreRebuilds.scala:189-193`). After the load and before that callback runs, a backend failure marks RR. Once the flip has committed, a reconcile can request a rebuild and start it (`startRebuild` does not check `creatingStores`). The same window allows a TransferringOut request (`startOut`). Only timing orders these: the callback has to lag a whole requestRebuild transaction | None in memory | End Create work when the copy is Served, or when its open fails, not at the flip. Track the flip in its own set: it touches no copy |
+| C5 | TransferOut(tid) twice (two closes of one store) | `startOut` adds to `closingForTransfer` (`host/StoreTransfersOut.scala:200`) without checking it first. Two requests (a retransmit, `retransmitPendingStarts`, or a readdress) that both finish their reads before the first close is handled both call `closeStoreForTransferOut`. The second `ShutdownStore` finds the store gone (`host/StoreLoader.scala:803`) and succeeds at once. So the second `closedForTransfer` writes TO and begins the ship while the first close is still extracting, and its `finally` (`:207`) clears `closingForTransfer` under the first | No single-flight check at `startOut` entry | `startOut` refuses while TransferOut work exists for the store on the device. This is not a two-kind pair, but the registry's `Work` would be set twice |
+
+C1 and C2 can both happen in production. C1 needs one lost nudge, and C2 needs a stalled CRL during a re-placement.
+C3 needs an outcome-Unknown flip plus an operator transfer. C4 and C5 need slow callbacks or retransmits.
+
+### Step 1: disk mutation sites
+
+Phase columns use stage-1 phases. `—` is no copy at a store path: scratch, or gone. "Handler" is the CT handler
+of a site that runs off the control thread.
+
+**Copy creation and promotion into `<device>/<storeDir>`**
+
+| Site | file:line | Before → after | CT? / handler |
+|------|-----------|----------------|---------------|
+| Store create: scratch in `creating/`, then `os.move` | `store/backend/StoreCreation.scala:31-47` (move `:45`), called from `store/backend/BackendOpener.scala:32-37` ← `host/StoreLoader.scala:395` ← `startOpen(create = true)` `:218` ← `host/StoreRebuilds.scala:161` (`createNewStore`) | — → Live (T1) | RocksDB: CT (inline in `startOpen`). FSIF: `FsifOpenEc` → `BackendOpened` → `StoreLoader.handleBackendOpened:258` |
+| Bootstrap create | `cmdline/Main.scala:1907`, `:1920` (`DefaultBackendOpener.createStore`) | — → Live | No host running. Outside the registry |
+| Rebuild finish: RC written in staging, then move | `rebuild/RebuildingStore.scala:801` (RC), `:807` (`DurableFiles.move`) | `rebuilding/<id>` → Rebuilt(ep) (T2) | Rebuild's own Future (client `ec`). Handler `host/StoreRebuilds.scala:312` (`completeFuture.onComplete`) → `markRebuiltStoreActive` → outcome cases `:319-398` |
+| Rebuild start finds its own finished copy | `rebuild/RebuildingStore.scala:315-320` | Rebuilt(ep), unchanged (staging cleaned `:337`) | Same handler |
+| Transfer-in promotion: TO removed and TI written in staging, then move | `host/StoreTransfers.scala:506` (TO `os.remove`), `:509` (TI), `:511` (move) | `transferring-in/<storeDir>` → Arrived(tid) (T8) | CT (`fcomplete.onComplete` `:459`). The bytes are unpacked off CT by `transfer/StoreTransferManager.scala:363-364` (network thread) into staging only |
+
+**Marker writes and removals at the store path**
+
+| Site | file:line | Before → after | CT? |
+|------|-----------|----------------|-----|
+| `StoreTransfersOut.closedForTransfer`: TO written | `host/StoreTransfersOut.scala:253` | Live / Rebuilt (Unconfirmed RC copy) → Outbound(tid) (T6). TI+? at the source gives TI+TO (Step 5) | CT (`fclosed.onComplete` `:205`) |
+| `reinstateAbandonedOut`: TO removed (plain `os.remove`, no directory sync) | `host/StoreTransfersOut.scala:321` ← `host/DeviceReconciler.scala:312` | Outbound → Live (T7). TO+RC → Rebuilt. TI+TO → Arrived | CT |
+| `bringIntoService`: TO removed for each Active entry with no `transferDevice` and not sending (no sync) | `host/DeviceDiscovery.scala:466-469` | Outbound → Live / Rebuilt / Arrived (T5/T7) | CT (adoption or restart callback) |
+| `keepRebuiltStoreOffline` (AdoptOffline): TO "" written, then RC `DurableFiles.remove` | `host/StoreRebuilds.scala:545`, `:547` ← `:336` | Rebuilt → (TO+RC) Outbound(None) → Outbound(None) "Parked" (T4). A crash or failure between the two leaves TO+RC | CT |
+| `clearRebuildCompleteMarker`: RC `os.remove` + `syncMarkerDirectory` | `host/StoreRebuilds.scala:560-571`. Callers: Adopt `:324`, Completed Rebuilds `host/DeviceReconciler.scala:351`, `recordTransferIn` `host/StoreTransfers.scala:302` | Rebuilt → Live (T3). TO+RC → Outbound (phase unchanged). A failure records `pendingMarkerRemovals` | CT |
+| `clearTransferredInMarker`: `arrived-at` written, then TI `os.remove` (no sync) | `host/StoreTransfers.scala:243-252`. Callers: `recordTransferIn` `:294`, Completed Transfers In `host/DeviceReconciler.scala:332` | Arrived → Live (T9). TI+RC → Rebuilt, and then the RC removal `:302` → Live: **two transitions**, not one (see amendments) | CT |
+| RR `writeRebuildRequiredMarker` (all through `markRebuildRequired` `host/StoreRebuilds.scala:667` → `ctx.writeRebuildRequiredMarker`, default `:877-878`; the `Host.Seams.writeRebuildRequiredMarker` seam, `Host.scala:161`, `:335`) | Callers below | X → Lost (T10/T11) | CT, every caller |
+| ↳ an opened, unserved backend that failed | `host/StoreLoader.scala:277` | Live → Lost | CT |
+| ↳ `BackendStateLost` at open | `host/StoreLoader.scala:292` | Live → Lost | CT |
+| ↳ `retireUnserved` (closes the backend, not awaited, then marks) | `host/StoreRebuilds.scala:695`. Callers: `host/StoreLoader.scala:463` (failed before served), `:492` (incarnation lost), `crlSaveFileLost` `host/StoreRebuilds.scala:682` ← `host/StoreLoader.scala:483`, `:501` | Live (with save file) → Lost | CT |
+| ↳ `failedOnClose` | `host/StoreRebuilds.scala:719` ← `host/StoreLoader.scala:846` | Live → Lost (keeps a transfer-out `crl_save.log`) | CT |
+| ↳ `backendFailed`, served: marked **before** the close (`closeUnloaded` `:751`, async) | `host/StoreRebuilds.scala:743`. Callers: `handleBackendFailed:103`, `handleFailStopped:113`, `retireForeignCopy:619`, `retireUnlistedServed:662` | Live (Served→Closing) → Lost | CT |
+| ↳ `backendFailed`, a backend no longer served | `host/StoreRebuilds.scala:765` | Any non-Lost copy at the path (Live closed, Outbound, ...) → Lost | CT |
+| ↳ `retireForeignCopy` | `host/StoreRebuilds.scala:625` | Live (closed) / Outbound / Arrived / Rebuilt(other ep) at a Rebuilding store's path → Lost | CT |
+| ↳ `StoreCopies.retirePresent` step 1 | `host/StoreCopies.scala:75-76` | Any → Lost (T11 step 1) | CT |
+| ↳ lost device CRL: every store dir but those that `holdsOwnState` | `host/DeviceDiscovery.scala:641` (decided `:636`, `holdsOwnState:674-683`) | Live / Outbound / Arrived without a valid own save file → Lost | CT (device load) |
+| ↳ adoption `CrlLost` (inside the transaction's prepare, before commit) | `host/DeviceMetadata.scala:597-601` ← `host/DeviceDiscovery.scala:392-394` | Outbound without a valid save file → Lost (RR copies already Lost) | CT (control context, `host/DeviceMetadata.scala:163-166`) |
+
+**Moves out of the store path, and deletes**
+
+| Site | file:line | Before → after | CT? |
+|------|-----------|----------------|-----|
+| `StoreCopies.moveToPendingDelete` | `host/StoreCopies.scala:108-122` (move `:116`), from retire's `transform` `:94-105` | Lost → Retired (`pending-delete/<storeDir>-<uuid>`) (T11 step 4) | CT |
+| `StoreCopies.retire` callers | Deleted Stores `host/DeviceReconciler.scala:448`; discard `host/StoreRebuilds.scala:855`; earlier tenancy `host/StoreTransfers.scala:566` | — | CT |
+| `StoreCopies.release` → `delete` | `host/StoreCopies.scala:151`, `:168` → `:209-223` (move into `deleting/` `:217`, then remove) | Retired → gone (T12) | CT |
+| `LocalDevices.discardStoreDirectory` → `StoreCopies.delete` | `host/LocalDevices.scala:61-78`. Callers: `RebuildOutcome.Discard` `host/StoreRebuilds.scala:343`; `discardArrivedTransferIn` `host/StoreTransfers.scala:136-139` ← `:325` (SourceRestored/Aborted) | Rebuilt → gone (**not in the table**); Arrived → gone (T13) | CT |
+| `startIn`: unusable or stale arrived copy | `host/StoreTransfers.scala:400` | Arrived (wrong tid, invalid save) or Lost (RR+TI) → gone | CT |
+
+**Scratch only (no copy phase; listed for Task 4 completeness)**
+
+| Area | Sites | CT? |
+|------|-------|-----|
+| `creating/` | `store/backend/StoreCreation.scala:50` (failure cleanup); `host/DeviceDiscovery.scala:713` (load sweep) | Create: as the create above. Sweep: CT |
+| `transferring-in/` | `host/DeviceDiscovery.scala:708`; `host/StoreTransfers.scala:229`, `:466`, `:495`; `transfer/StoreTransferManager.scala:363-364`, `:437` | Manager: network thread, result → `startIn` `:459`. Others: CT |
+| `rebuilding/<id>` | `host/StoreRebuilds.scala:477` (`abandonUnlisted`), `:641-643` (`dropStagingCheckpoint`); `rebuild/RebuildingStore.scala:337` (`cleanupStaging`), `:421` (`createStaging` + `backends.create`) | `RebuildingStore`: rebuild Future, result → `host/StoreRebuilds.scala:312`. Others: CT |
+| `deleting/` | `host/StoreCopies.scala:226-234`, `host/DeviceDiscovery.scala:717` | CT |
+
+Non-phase files written into copies (unchanged by stage 1): `arrived-at` (`host/StoreLoader.scala:866`, via
+`host/StoreTransfers.scala:245` and `host/DeviceDiscovery.scala:458-459`), `crl_save.log` (`host/StoreLoader.scala:826-827`
+on the store executor, `host/StoreTransfersOut.scala:113`, removed at `host/StoreRouter.scala:282` on the executor),
+`lost-crl-*.log` (`host/StoreCopies.scala:85-91`), and the `finish` gates (`rebuild/RebuildingStore.scala:792-799`).
+
+**Amendments implied by Step 1**
+
+- T13 must also cover Rebuilt → gone, for `RebuildOutcome.Discard` (`host/StoreRebuilds.scala:340-346`).
+- T9 for a shipped Rebuilt copy (TI+RC) is two stage-1 transitions, Arrived → Rebuilt → Live, at
+  `host/StoreTransfers.scala:294`/`:302` and at Completed Transfers In followed by Completed Rebuilds in the same
+  reconcile (`host/DeviceReconciler.scala:180-181`). Task 3 needs Arrived → Rebuilt (stage 1 only).
+- T10's "copy closed" precondition is broken on purpose. `backendFailed` (`:742-751`) marks RR while the store is
+  still closing, and `StoreLoader.scala:277` marks before `backend.close()` (`:279`). Stage 1 must allow phase Lost with
+  activity `Closing(FailStop)`. Stage 2's move must wait for the close, so the backend directory is never moved
+  while it is open.
+- T10 also has to cover `retireForeignCopy` taking Arrived and Outbound copies to Lost at a Rebuilding store's
+  path (`host/StoreRebuilds.scala:589-630`).
+- Removing TI or TO does not sync the directory (`host/StoreTransfers.scala:246`, `host/StoreTransfersOut.scala:321`,
+  `host/DeviceDiscovery.scala:469`), and removing RC does (`:563`). Stage 1 keeps this as it is. `Unsynced`
+  belongs to stage 2.
+
+### Step 2: I3 pair table
+
+Work tracking today, by store id **host-wide** unless a device is noted:
+
+| Work | Collections |
+|------|-------------|
+| Create | `creatingStores` (`host/StoreRebuilds.scala:34`), from `createNewStore:139` until `fflip` completes `:193` |
+| Rebuild | queued `silenced` (`:64`, by store → device), discard `droppingCrlState` (`:54`), running `rebuildingStores`/`rebuildDevices`/`rebuildEpisodes` (`:36-40`, through the flip outcome), cancelled `abandonedRebuilds` (`:42`) |
+| TransferIn | earlier-tenancy retire (`StoreCopies.retiring` only, **not** `transferringIn`), receive `transferringIn` + `pendingStartTransfers` (`host/StoreTransfers.scala:58-60`), retry `transferInRetries` (`:63`), record `recordingTransfersIn` (`:55`), abandon `abandoningTransferIns` (`:59`) |
+| TransferOut | close/extract `closingForTransfer` (`host/StoreTransfersOut.scala:32`), ship `storeTransferService` active (`transfer/StoreTransferManager.scala:183-185`), abort-lost `abortingLostTransfers` (`:26`) |
+| Retire (activity) | `StoreCopies.retiring` (`host/StoreCopies.scala:29`, by store id) |
+
+The main guard is the tree. One entry per (device, store) has one status, and each Work starts only from its own
+status (Initializing / Rebuilding / TransferringIn / TransferringOut). Overlaps come from Work that outlives the
+status it started from, or from a pass that runs before the pass that ends the other Work.
+
+| Pair | Overlap? | Guard, or counterexample |
+|------|----------|--------------------------|
+| create × rebuild (any stage) | **Yes (C4)**, timing only | Initializing vs Rebuilding. A rebuild needs Active first (`requestRebuild:803-808`), and Active comes from the create's own flip |
+| create × transfer in | No | TransferringIn needs no entry on the device. The Initializing entry is the device's |
+| create × transfer out | **Yes (C4)**, timing only | TransferringOut needs Active (`AspenClient.scala:641`) |
+| create × retire | Not found | Deleted Stores needs the entry gone. Nothing removes an Initializing entry |
+| rebuild queued × discard × running | No (stages of one Work) | `startRebuild:237-240` (`!rebuildingStores`, slot count includes `droppingCrlState`); `discardLostStore:853`; the handoff `:855-858` |
+| rebuild × transfer in (retire earlier tenancy) | No | `retireEarlierTenancy:560` (`rebuildingStoreIds`) and `:563` (`isRetiring` covers a discard, which is a retire) |
+| rebuild × transfer in (receive, record) | **Yes (C1, C2)** | No rebuild guard on `startIn:433-542`. Reconcile order `DeviceReconciler.scala:191-192` |
+| rebuild × transfer in (abandon) | No | `abandonIn` needs a failed source and TransferringIn. It writes the tree only |
+| rebuild × transfer out (close, extract, ship) | **Yes (C3)** | No rebuild guard in `startOut` |
+| rebuild × retire | **Overlap with Retiring** (not Work×Work) | A rebuild past `finish` (copy at the path, flip pending) whose entry was re-placed away. The Deleted Stores pass (`DeviceReconciler.scala:217-223`, `retireUnowned:439-451`) retires the Rebuilt copy, because the store is in `offlineStores` from its lost copy, and nothing removes it after the discard. The flip then gives `Discard`, which deletes the path (`StoreRebuilds.scala:343`) while the retire may still be running. `retireUnowned` checks `isRetiring`, not `rebuildingStoreIds`. Fix: the Deleted Stores pass skips a store with Rebuild work, and the Discard handler skips a copy that is Lost or Retiring |
+| transfer in: retire earlier tenancy × receive × record × abandon | No (stages) | Retire → re-check → `startIn` (`:571`). Receive and record single-flight on `transferringIn` (`:356`, `:420`, `finished:271-276`). Abandon cancels a receive by design (`dropAbandonedTransferIn:212-234`) |
+| transfer in × transfer out (one device) | Tail only | Exclusive statuses. A ship's registration can outlive the commit that removed the source entry (`StoreTransferManager` `finally` `:250-253`). If the store transfers back to D before the ship ends, `startIn` refuses the old TO copy at the path (see Step 5 site 5). Benign |
+| transfer out × retire | Tail only | Deleted Stores retires the source copy after the commit (`DeviceReconciler.scala:448`) while the ship is still registered. Benign: all bytes have been sent. Theoretical: a request whose tree reads came before the completing commit still closes or extracts (`StoreTransfersOut.scala:73-114`) while the retire reads and drops the same CRL entries. That needs a request still in flight after completion |
+| transfer out close × extract × ship × abort-lost | **Yes (C5)**, one Work twice | Not single-flight at `startOut:200` |
+| retire × retire | No | `StoreCopies.retire:55` (`retiring`, host-wide) |
+
+**Open paths that can race an extraction** (for the controller's shadow-mode ruling). An open of the same store
+that starts during `closingForTransfer` fails the extraction today. `opensStarted` is host-wide, by store
+(`StoreTransfersOut.scala:83-87`, `:236-237`). The paths:
+
+| Open path | file:line | Same device? |
+|-----------|-----------|--------------|
+| `reinstateAbandonedOut` → `tryLoadStore` (a retransmitted request on an Outbound copy whose transfer was aborted meanwhile) | `host/StoreTransfersOut.scala:332` ← `host/DeviceReconciler.scala:312` | yes |
+| `reloadClosedStores` (a cancelled shutdown, entry Active) | `host/DeviceShutdown.scala:360` | yes |
+| Completed Transfers In / Completed Rebuilds | `host/DeviceReconciler.scala:333`, `:352` | other device of the host (same store id) |
+| `handleLoadById` (from `recordTransferIn` `host/StoreTransfers.scala:304`, Adopt `host/StoreRebuilds.scala:325`) | `host/StoreLoader.scala:783-785` | other device |
+| Device load | `host/DeviceDiscovery.scala:749` | other device |
+| `retryFailedLoads` | `host/StoreLoader.scala:379` | guarded (`isClosingForTransfer`) |
+| `createNewStore` → `startOpen(create)` | `host/StoreRebuilds.scala:161` | no (needs Initializing) |
+
+A per-device `Work.TransferOut` refusal covers only the first two. Today's `opensStarted` also fails the
+extraction for an open on **another** device of the host. That open uses its own device's CRL, so it cannot
+corrupt the extraction, but it installs that copy under the store id, which `closedForTransfer`'s
+`router.loaded.contains` (`:236`) then treats as "opened". Task 5/7 should keep this host-wide check until
+stage 2, or state that it has been dropped on purpose.
+
+### Step 3: silence readers
+
+| Mark | Production readers | What the reader needs |
+|------|--------------------|-----------------------|
+| `offline`, `loading`, `awaitingDevice` | `StoreRouter.answersUnknown` (`host/StoreRouter.scala:86-87`; used by `deliverTx:148` and `deliverClient` `Read:156`) | "silent" for any reason, combined with `ready`. No reason needed |
+| `offline` | `StoreRouter.isOffline` (`:309`) → only `DeviceShutdown.storesToClose` (`host/DeviceShutdown.scala:331-333`), which feeds `closeStoresForShutdown:214`, `closeStoresToRelinquish:320`, `closeThenUnload:372` | **Not silence.** It needs "a copy on this device that is Opening or Served": `loadedStores` minus those already closed. A by-id offline mark set for another reason skips a store this device serves. Unguarded `router.markOffline` calls can mark a served store: `host/DeviceReconciler.scala:597` (unloaded-device branch), `host/DeviceDiscovery.scala:260` (Shutdown device), `host/StoreRebuilds.scala:231` (`silenced`). Derive it from activity on the device's copies |
+| `offline` | `router.offlineStores` (`:336`) → `DeviceControl.publishView` (`host/DeviceControl.scala:136`) → `HostStoreView.of` (`host/HostStoreView.scala:29-35`) | `repairable = served -- offline -- rebuilding -- transferringOut`. Read by `Host.repairableStoreIds` (`Host.scala:444`) → `repair/RepairService.scala:131`, and `Host.isRepairable` (`Host.scala:450`) → `repair/StoreRepairer.scala:291`. Since served dominates silence, `served -- silent = served`, so derived silence drops the `-- offline` term. That term today removes only stores the buggy unguarded marks above have marked. No reason needed. `HostStoreView.offline` itself has no production reader (tests: `src/test/.../host/ControlContextSuite.scala:79`, `StoreRouterSuite.scala:471`) |
+| `loading` | `isLoading` (`:311`): tests only (`HostFsifLoadSuite` 509, 514, 530, 642; `StoreRouterSuite` 485) | Activity Opening of some copy |
+| `awaitingDevice` | `isAwaitingDevice` (`:313`): tests only (`HostFsifLoadSuite` 620, 630, 641) | Pending adoption or shutdown-marker decision for the path (`DeviceDiscovery.pendingResolutions`) |
+
+Test readers: `router.isOffline` ×11 and `router.offlineStores` ×52 across `CommittedUnknownRetrySuite`,
+`DeviceShutdownSuite`, `DeviceCrlSuite`, `HostDeviceDiscoverySuite`, `HostFsifLoadSuite`, `StoreRouterSuite` and
+`StoreRebuildTriggerSuite`. `QuicNet.isStoreOffline` (`common/network/implementations/quic/QuicNet.scala:615`) is the
+client's `StoreAvailabilityTracker`, unrelated. The device sets `sds.offlineStores` and `loadedStores` are read by
+the reconcile passes to select stores (`host/DeviceReconciler.scala:217`, `:269`, `:305`, `:324`, `:342`;
+`host/DeviceShutdown.scala:345`; `host/StoreLoader.scala:363`; `host/StoreRouter.scala:398`). They are not silence
+readers. Tasks 7/8 handle them.
+
+**Conclusion.** No production reader needs the reason. The derivation can return `silent: Boolean`, plus
+predicates kept for the test accessors. `storesToClose` has to move off the silence mark (Task 6).
+
+### Step 4: reload paths (`StoreRouter.install` with `replaced != null`)
+
+`install` is reached only from `StoreLoader.handleLoad:611` and from tests (`ControlFixture.scala:533`,
+`installServedElsewhere`, a device that is not loaded). `handleLoad` replaces when `router.entry(storeId)` is
+defined (`:514`).
+
+| Path | file:line | Goes through `startOpen`? | Device in the registry? |
+|------|-----------|---------------------------|-------------------------|
+| `TestNetwork.restartStore` (`ReplayIntegrationSuite:474`, `UnackedCommitsIntegrationSuite:182`, `:383`, `:406`, `StoreRepairerSuite:1743`) | `src/test/.../TestNetwork.scala:637` → `Host.loadStore` (`Host.scala:465-469`) | no, `LoadStore` directly | no: TestNetwork's device is never loaded (`unloadedDeviceCrl`, `TestNetwork.scala:619-626`) |
+| `TestNetwork.moveStore` | `TestNetwork.scala:730` | no | no |
+| `StoreRouterSuite` reload tests (`:531`, `:592`, `:727`, `:893`) | `fx.load` `StoreRouterSuite.scala:170-173` | no | injected `LocalStorageDeviceState` (`:187-193`, and inline) |
+| `LearnOnlyDriverIntegrationSuite:78`, `StoreRebuildTriggerSuite:578`, `:617`, `HostCrlSaveLoadSuite:98` | `Host.loadStore` | no | loads only (no replace) |
+| Production | none intended. `handleBackendOpened` closes an opened backend when the store is served (`StoreLoader.scala:270-280`), and `tryLoadStore` skips one that is served or opening (`:133`) | — | — |
+
+Window found: between `serveOpened`'s post of `LoadStore` (`:210`) and `handleLoad`, `opening` is empty and the
+router has no entry. A second `tryLoadStore` (from a `LoadStoreById` queued meanwhile, `:785`) passes `:133` and
+starts a second open. With RocksDB or FSIF the second open fails on the backend's own lock, and then
+`leaveOffline` (`:264-268`) undoes the first open's `loadedStores`/`loading` (a separate bug). With MapBackend it
+would reload. Every pass that calls `tryLoadStore` selects stores from `offlineStores`, which `serveOpened`
+clears, so in practice only a duplicate `LoadStoreById` reaches the window.
+
+**Decision for Task 3.** `Served → Opening` is **illegal**: no path opens a Served copy. A reload is
+`LoadStore` without `startOpen`, so the registry must also accept `Idle → Served` (the test seam
+`Host.loadStore`) and `Served → Served` (a replace), or skip loads onto devices it does not track. Every test
+reload targets a device with no `DeviceCopies` (TestNetwork) or an injected one (StoreRouterSuite,
+`ControlFixture.injectLoadedDevice`). Task 4 needs a rule for injected devices. `Opening → Opening` (the window
+above) is refused, not thrown, per the R1 ruling.
+
+### Step 5: marker combinations
+
+Writers and removers are as in Step 1. RR is never removed (only moved away with its directory).
+
+| Pair | Reachable? | How (citation) |
+|------|------------|----------------|
+| RR+TO | yes | Retire of a shipped source copy: TO, then RR at `host/StoreCopies.scala:76`, with a crash before the move `:116`. Lost CRL on a TO copy whose save file is invalid (`host/DeviceDiscovery.scala:641`). Adoption `CrlLost` (`host/DeviceMetadata.scala:601`). `backendFailed` on a closed backend (`host/StoreRebuilds.scala:765`) |
+| RR+TI | yes | Lost CRL on an arrived copy whose save file does not validate (`:641`; named at `host/StoreTransfers.scala:364-365`). `retireForeignCopy` on an Arrived copy (`host/StoreRebuilds.scala:625`) |
+| RR+RC | yes | `retireForeignCopy` on an earlier episode's copy (`:625`). A retire of an unpromoted, Superseded or Unconfirmed copy (`host/StoreCopies.scala:76`). `retireEarlierTenancy` (`host/StoreTransfers.scala:427`) |
+| TO+TI | yes, narrow | At a source: the arrived copy's TI removal failed (`host/StoreTransfers.scala:246`, entry Active, store offline `:310`), then `transfer-store` → `startOut` writes TO (`host/StoreTransfersOut.scala:253`) before Completed Transfers In retries. In staging (TO removed `:506`, then TI `:509`), the directory sync of `:509` persists the unlink too, so it never reaches a store path |
+| TO+RC | yes | `keepRebuiltStoreOffline` between `:545` and `:547`, or a failed `:547`. `startOut` on an Unconfirmed rebuilt copy, which today keeps RC (`host/StoreTransfersOut.scala:253`) |
+| TI+RC | yes | A shipped Rebuilt copy arrives with RC (`host/StoreTransfers.scala:296-302`) |
+| triples | TI+TO+RC: only if a TI+RC copy's TI removal fails and it is then shipped. RR+(any) as RR+X | — |
+
+**Precedence RR > TO > TI > RC at the five sites, for every reachable combination**
+
+| Site | Today | With `CopyPhase` | Changes |
+|------|-------|------------------|---------|
+| 1 `tryLoadStore` (`host/StoreLoader.scala:108-132`) | RR, TO, TI, RC. Any → `keepMarkedCopyOffline`. A failed stat → `awaitUnreadRetry` | `read`. Non-Live → keep offline. A throw → `awaitUnreadRetry` | None (only which log line is chosen) |
+| 2 `adoptionClass` (`host/DeviceDiscovery.scala:325-338`) | RR → CrlLost. TI → Clean. TO → Clean iff `loadValidStoreState`. RC ignored → Clean. A stat throws | Lost → CrlLost. Outbound → Clean iff valid save file, else CrlLost. Arrived, Rebuilt, Live → Clean. Throws | **TI+TO**: today Clean whatever its save file; now Outbound, so it needs a valid save file, or it is CrlLost and adopted Rebuilding. In the reachable case (above) the source kept a valid file (extraction ships a valid one unchanged, `host/StoreTransfersOut.scala:98-105`), so this matters only for later damage. TO+RC: same as today (Outbound; the rebuilt copy's empty save file is valid) |
+| 3 `holdsOwnState` (`host/DeviceDiscovery.scala:674-683`) | RC present → true; else a valid own save file | Rebuilt → true. Lost → irrelevant (RR is already written, and marking again is a no-op). Others → valid own save file | TO+RC: today true through RC, now through the save file. Same for reachable states: an RC copy always has `finish`'s empty save file and is never loaded, so nothing removes it. TI+RC (Arrived): the save file was validated at promotion, so same unless damaged |
+| 4 `reloadClosedStores` (`host/DeviceShutdown.scala:352-360`) | Offered to `tryLoadStore` unless RR, TO or TI is known present. RC ignored, then refused by `tryLoadStore`. A failed stat counts as absent → offered | Live → offer. Others → skip. `known` = None → **offer anyway** (today's behaviour: `tryLoadStore` stats again and waits) | RC-only: today offered and then kept offline, now skipped. Unreachable: a copy closed for shutdown was served, and RC appears only through a rebuild's move into an empty path. **Task 2 must offer on None**: the store has already left `closedForShutdown` (`:346-351`), so skipping it would leave it unserved until a restart |
+| 5 `startIn` (`host/StoreTransfers.scala:372-435`) | TI present → stale check (wrong tid, RR, invalid save → **delete** `:400`; unreadable → wait), else resume. Else RC or RR known → `retireEarlierTenancy`. Else path exists or stat fails → refuse ("store path already exists"). Else receive | Arrived(tid) → stale check as today. Lost → `retireEarlierTenancy`. Rebuilt → `retireEarlierTenancy`. Outbound → see below. Live → refuse. `known` = None → wait | **RR+TI**: today deleted (and the transfer restarted); now Lost wins → retired to `pending-delete/` (and restarted). Both are safe: the copy was never the owner's. **TO+RC** (a same-device copy left by an earlier tenancy): today `retireEarlierTenancy`; now Outbound. **TO-only / TI+TO**: today refused forever (TO-only), or deleted as stale (TI+TO). **Decision: Outbound → `retireEarlierTenancy`**. This keeps TO+RC as it is today and fixes the TO-only case, where a store transferred back onto its old source before that device's Deleted Stores pass ran is stuck behind "store path already exists". A TO copy at a TransferringIn path is never the current source (`require(fromDeviceId != toDeviceid)` `:351`) and never the owner's. TI+TO: deleted today, retired now |
+
+Other marker readers outside the five sites. Stage 1 keeps them as single-marker tests, or Task 2 moves them to
+`CopyPhase` with the same decisions:
+
+- `DeviceReconciler.hasMarker` passes: Lost CRL RR (`:269-270`), abandoned out TO (`:305-309`), completed in TI
+  (`:324-327`), completed rebuilds RC (`:342-346`). Their order (`:174-181`) takes TI+RC, TO+RC and TI+TO
+  to Live within one reconcile, one marker per pass.
+- `retireForeignCopy` (`host/StoreRebuilds.scala:595-600`): RC of this episode or RR.
+- `discardLostStore:846`: RR.
+- `StoreCopies.retirePresent:75`: RR.
+- `startOut` (`host/StoreTransfersOut.scala:187`, `:225`): RR.
+- `recordTransferIn:301`: RC.
+- `RebuildingStore.isRebuildCompleteFor` (`rebuild/RebuildingStore.scala:78-80`, and `start:315`): RC.
+
+**Behaviour changes, in full:**
+
+1. An adopted TI+TO copy is Outbound and needs a valid save file (CrlLost otherwise).
+2. At `startIn`, an RR+TI copy is retired, not deleted.
+3. At `startIn`, a TO copy at the path (TO-only or TI+TO) is retired as an earlier tenancy, where today it is
+   refused forever (TO-only) or deleted (TI+TO). TO+RC is unchanged (retired).
+4. `reloadClosedStores` skips an RC-only copy (unreachable), and must offer the copy when its phase cannot be
+   read.

@@ -54,8 +54,10 @@
   device here. A reloaded device keeps its unloaded listing until its first reconcile writes `reconciledEntries`
   (`LocalStorageDeviceState.onReconciled`). `StoreRouter.remove` marks the store silent before it leaves the map;
   `answersUnknown` is `ready`, not installed, not silent. The view's `repairable` is `HostCopies.repairable`
-  (Served, not Closing, no Rebuild work Running and no TransferOut work on any device, not being sent: R20, a queued,
-  discarding or abandoned rebuild reads nothing, and a flip that keeps failing keeps its work queued). A throw of the
+  (Served, not Closing, no Rebuild work Running or Abandoned and no TransferOut work on any device, not being sent:
+  R20, as `rebuildingStoreIds` decided; a queued or discarding rebuild reads nothing, and a flip that keeps failing
+  keeps its work queued). `reloadClosedStores` keeps a closed copy still closing, retiring or held by other work for
+  a later reconcile. A throw of the
   silence path is a bug: in production it is logged at error and the store left silent (clients retransmit); with
   `HostCopies.strict` (`Host.Seams.strictCopyRegistry`, every ControlFixture host; implied by `verifyCopyRegistry`)
   it propagates as `SilenceFailure`, which `shadow` never swallows. Every lockstep drain of a strict host fails on

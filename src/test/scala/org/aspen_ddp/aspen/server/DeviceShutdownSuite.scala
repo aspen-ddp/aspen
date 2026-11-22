@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService}
+import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, RebuildStage, StagedSendService, StagedTransferService, Work}
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState}
@@ -277,6 +277,35 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       paths.forall(noMoveFiles) should be(true)
       recorded(host).storeLoadAttempts.map(_._2).toSet should contain allOf(deviceDir / s0.directoryName,
                                                                   deviceDir / s1.directoryName)
+
+  // A closed copy that other work holds when the cancelled shutdown's reconcile runs is left to that work (I3), and
+  // kept among the closed stores, so a later reconcile loads it once the work has ended rather than dropping it
+  atest("a cancelled shutdown's closed store held by other work is loaded once the work ends"):
+    given ExecutionContext = executionContext
+    val rebuildWork = Some(Work.Rebuild(None, RebuildStage.Queued))
+    for
+      (host, deviceDir) <- setUp(Map(s0 -> active, s1 -> active), loaded = Set(s0, s1))
+      gate = recorded(host).holdShutdownCloses()
+      _ <- client.shutdownStorageDevice(deviceA)
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
+      _ <- client.restartStorageDevice(deviceA)
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.copyRegistry.work("test", deviceA, s1, _.isInstanceOf[Work.Rebuild], rebuildWork)
+      _ = gate.success(())
+      paths = List(s0, s1).map(s => deviceDir / s.directoryName)
+      attempts = () => recorded(host).storeLoadAttempts.map(_._2).toList
+      _ <- awaitLoudly("the cancelled shutdown to reload s0")(recorded(host).shutdownOutcomes.nonEmpty &&
+             host.control.reconciler.activeDeviceChecks.isEmpty && attempts().contains(paths(0)))
+      heldBack = !attempts().contains(paths(1))
+      _ = host.control.copyRegistry.work("test", deviceA, s1, _.isInstanceOf[Work.Rebuild], None)
+      _ = host.control.reconciler.checkAll()
+      _ <- awaitLoudly("the next reconcile to reload s1")(attempts().contains(paths(1)))
+    yield
+      recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Cancelled))
+      heldBack should be(true)
+      attempts() should contain(paths(1))
 
   // A copy whose phase cannot be read is still offered to tryLoadStore, which reads it again and holds it back until it
   // answers: it has left closedForShutdown, so skipping it would leave it unserved until a restart

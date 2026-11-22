@@ -366,15 +366,16 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         (if awaiting.valuesIterator.exists(_.contains(storeId)) then Set(SilenceReason.DeviceUndecided) else Set())
       if reasons.isEmpty then Silence.Unknown else Silence.Silent(reasons)
 
-  /** Whether a repair scan may run against `storeId` here: Served, not Closing, with no Rebuild work Running and no
-   *  TransferOut work on any device, and not being sent out (storeTransferService). A running rebuild reads
-   *  everything; one queued, discarding its lost copy or abandoned reads nothing yet, and a flip that keeps failing
-   *  keeps its work queued, so it must not stop the served copy's repair scans (R20) */
+  /** Whether a repair scan may run against `storeId` here: Served, not Closing, with no Rebuild work Running or
+   *  Abandoned (cancelled, still running past finish's latch until its slot is released) and no TransferOut work on
+   *  any device, and not being sent out (storeTransferService), as `rebuildingStoreIds` decided. A running rebuild
+   *  reads everything; one queued or discarding its lost copy reads nothing yet, and a flip that keeps failing keeps
+   *  its work queued, so it must not stop the served copy's repair scans (R20) */
   def repairable(storeId: StoreId): Boolean =
     silence(storeId) == Silence.Served &&
       !allCopies.exists(_.copies.get(storeId).exists(_.activity.isInstanceOf[Activity.Closing])) &&
       !allCopies.exists(_.work.get(storeId).exists:
-        case Work.Rebuild(_, RebuildStage.Running) | Work.TransferOut(_) => true
+        case Work.Rebuild(_, RebuildStage.Running | RebuildStage.Abandoned) | Work.TransferOut(_) => true
         case _ => false) &&
       !ctx.storeTransferService.transferringOutStores.contains(storeId)
 

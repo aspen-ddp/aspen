@@ -346,9 +346,14 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
     val deviceId = local.storageDeviceId
     closedForShutdown.get(deviceId).foreach: closed =>
       def storePath(storeId: StoreId): os.Path = local.devicePath / storeId.directoryName
-      val (ready, notYet) = closed.filter(ctx.copyRegistry.offlineCopies(local).contains).partition: storeId =>
+      // One loaded by something else since (served or opening), or gone, is dropped. One still closing, retiring or
+      // held by other work on the device is left to it (I3) and kept, for a later reconcile once that has ended
+      val free = ctx.copyRegistry.offlineCopies(local)
+      val held = closed.filter(storeId => !free.contains(storeId) && ctx.copyRegistry.heldOffline(local, storeId))
+      val (ready, notActive) = closed.filter(free.contains).partition: storeId =>
         remote.stores.get(storeId).exists(entry =>
           entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty)
+      val notYet = notActive ++ held
       if notYet.isEmpty then
         closedForShutdown -= deviceId
       else

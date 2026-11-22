@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.store
 
+import org.aspen_ddp.aspen.LogCapture
 import org.aspen_ddp.aspen.server.host.JoinCeiling
 import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
@@ -3784,9 +3785,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       val text = r.logOutput.plainText
       if text.contains(txid.toString) then
         lines.add(r.level -> text)
-    scribe.Logger.root.withHandler(handler).replace()
-    try f
-    finally scribe.Logger.root.withoutHandler(handler).replace()
+    // Every Aspen logger: the assertions are about all the lines naming `txid`, whichever class logs them
+    LogCapture.during(LogCapture.Aspen, handler)(f)
     lines.toArray(Array.empty[(scribe.Level, String)]).toList
 
   test("a recovered commit vote with a UnackedCommits entry applies its update and is forgotten on TxFinalized") {

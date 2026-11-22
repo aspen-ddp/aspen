@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
-import org.aspen_ddp.aspen.FileBasedTests
+import org.aspen_ddp.aspen.{FileBasedTests, LogCapture}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRevision}
@@ -3328,9 +3328,7 @@ class SimpleCRLSuite extends FileBasedTests {
         warnings.add(text)
     def warnedOpening(numStreams: Int, streamSize: Long): Boolean =
       warnings.clear()
-      scribe.Logger.root.withHandler(handler).replace()
-      try SimpleCRL(tdir, numStreams, streamSize).crl.shutdown()
-      finally scribe.Logger.root.withoutHandler(handler).replace()
+      LogCapture.during(CrlDirectory.getClass.getName, handler)(SimpleCRL(tdir, numStreams, streamSize).crl.shutdown())
       !warnings.isEmpty
     // Grown to 5 from the 4 configured: normal
     assert(!warnedOpening(4, growthStreamSize))

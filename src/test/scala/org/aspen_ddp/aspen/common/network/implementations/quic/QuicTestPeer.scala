@@ -187,13 +187,16 @@ object QuicTestPeer:
     * Netty reports a leak only when a later allocation polls the GC'd reference queue, so `leaks()` runs a GC and
     * allocates tracked buffers before returning what was captured. Use with `ResourceLeakDetector.Level.PARANOID`.
     */
+  /** Netty reports leaks through slf4j on the logger named for `ResourceLeakDetector` */
+  private val LeakDetectorLogger = classOf[io.netty.util.ResourceLeakDetector[?]].getName
+
   final class LeakWatch private[QuicTestPeer] ():
     private val reports = new ConcurrentLinkedQueue[String]()
     private val handler = scribe.handler.LogHandler(scribe.Level.Warn): r =>
       val text = r.logOutput.plainText
       if text.contains("LEAK:") then
         reports.add(text)
-    scribe.Logger.root.withHandler(handler).replace()
+    org.aspen_ddp.aspen.LogCapture.add(LeakDetectorLogger, handler)
 
     def leaks(): List[String] =
       var i = 0
@@ -208,7 +211,7 @@ object QuicTestPeer:
         i += 1
       reports.toArray(new Array[String](0)).toList
 
-    def stop(): Unit = scribe.Logger.root.withoutHandler(handler).replace()
+    def stop(): Unit = org.aspen_ddp.aspen.LogCapture.remove(LeakDetectorLogger, handler)
 
   def watchLeaks(): LeakWatch = new LeakWatch()
 

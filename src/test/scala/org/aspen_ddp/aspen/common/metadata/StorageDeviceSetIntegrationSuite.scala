@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.common.metadata
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, LogCapture}
 import org.aspen_ddp.aspen.client.internal.MetadataTree
 import org.aspen_ddp.aspen.client.{AllocationError, AspenClient, GroupObjectAllocatorId, TestTransactions}
 import org.aspen_ddp.aspen.client.tkvl.{KeyValueListPointer, Root, SinglePoolNodeAllocator}
@@ -490,11 +490,11 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
         _ <- net.simulateTransferComplete(bootstrap1, StorageDeviceId.BootstrapStorageDeviceId, net.secondDeviceId)
         _ <- waitForTransactionsToComplete()
         set <- client.getStorageDeviceSetState(bootSetId)
-        _ = scribe.Logger.root.withHandler(handler).replace()
+        _ = LogCapture.add(classOf[StorageDeviceSetState].getName, handler)
         picked <- set.selectDeviceForRebuild(PoolId.BootstrapPoolId, 0.toByte, client)
       yield picked
     picked.transform: result =>
-      scribe.Logger.root.withoutHandler(handler).replace()
+      LogCapture.remove(classOf[StorageDeviceSetState].getName, handler)
       result.map: device =>
         device should be(net.secondDeviceId)
         lines.toArray(Array.empty[(scribe.Level, String)]).toList.map(_._1) should be(List(scribe.Level.Error))

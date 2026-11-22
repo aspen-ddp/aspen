@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.transaction
 
+import org.aspen_ddp.aspen.LogCapture
 import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.common.transaction.{TransactionId, TransactionStatus}
 import org.scalatest.concurrent.Eventually
@@ -172,9 +173,7 @@ class TransactionStatusCacheSuite extends AnyFunSuite with Matchers with Eventua
     val handler = scribe.handler.LogHandler(scribe.Level.Info): r =>
       val text = r.logOutput.plainText
       txids.find(t => text.contains(t.toString)).foreach(t => lines.add((t, r.level, text)))
-    scribe.Logger.root.withHandler(handler).replace()
-    try f
-    finally scribe.Logger.root.withoutHandler(handler).replace()
+    LogCapture.during(classOf[TransactionStatusCache].getName, handler)(f)
     lines.toArray(Array.empty[(TransactionId, scribe.Level, String)]).toList
 
   // Under the overload that fills the cache, about one entry is evicted per insert: one error line each would flood

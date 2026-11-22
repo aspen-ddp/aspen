@@ -272,7 +272,7 @@
     the discard would move the directory the send may still read. Each schedules a device re-check instead, as the
     Abandoned Transfers Out pass does; `startRebuild` asks only when no rebuild of the store is registered, since a
     registered one's end re-checks the device anyway. `startRebuild` also waits while a transfer out is still closing
-    the store (`StoreTransfersOut.holdsRebuild`, i.e. `isClosingForTransfer`): the close's end, whatever its outcome,
+    the store (`StoreTransfersOut.deferRebuildUntilClosed`, i.e. `isClosingForTransfer`): the close's end, whatever its outcome,
     checks the device again, which starts the rebuild.
   - `StoreTransfers.startIn`, for a `rebuild-complete` or `rebuild-required` copy an earlier tenancy left at the
     path of a store transferring onto the device (re-placed away while the host was down, then transferred back;

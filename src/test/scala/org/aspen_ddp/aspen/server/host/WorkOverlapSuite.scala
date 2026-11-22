@@ -561,3 +561,51 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       keptWhileClosing should be(true)
       sends.transfersOut should be(empty)
       factory.created.map(_.storeId).toList should be(List(shipped))
+
+  /** Double open: a ShutdownStore handled between a store's open and its install (posted before the LoadStore its
+   *  open queued) waits for the install, then closes the store it installed. Before, it completed at once with the
+   *  store still to be served. A device shutdown's close and a transfer out's close (which, the store opening, closes
+   *  it rather than extracting from its device CRL) both take this path */
+  for (variant, closeIt) <- List[(String, (Host, LocalStorageDeviceState) => Future[Unit])](
+        "device shutdown" -> ((host, _) => host.control.shutdown.closeForShutdown(moving)),
+        "transfer-out close" -> ((host, local) => host.control.transfersOut.closeForTransferOut(moving, local)))
+  do
+    atest(s"a shutdown arriving mid-load waits for the install and closes the store ($variant)"):
+      given ExecutionContext = executionContext
+      val hostRoot = newHostDir()
+      val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+      val host = newHost(hostRoot)
+      val local = loadedDevices(host)(deviceA)
+      val storePath = deviceDir / moving.directoryName
+      DefaultBackendOpener.createStore(StoreConfig(moving, StoreConfig.RocksDB(None), None, Replication(3, 2)),
+        storePath, deviceDir / StoreCreation.CreatingDirectory)
+      val lockstep = host.threading match
+        case t: LockstepThreading => t
+        case other => fail(s"needs LockstepThreading, not $other")
+      def isLoad(task: Runnable): Boolean = task match
+        case e: Host.EventTask => e.event.isInstanceOf[Host.LoadStore]
+        case _ => false
+
+      // RocksDB opens inline: the LoadStore is queued on return. Taken out, so the close's ShutdownStore is handled
+      // first, inside the window
+      host.control.loader.tryLoadStore(local, storePath)
+      val loads = lockstep.removeQueued(isLoad)
+      val closed = closeIt(host, local)
+      host.testingOnlyHandleEvents()
+      val closedInWindow = closed.isCompleted
+      val openingInWindow = host.control.loader.isOpening(moving)
+      loads.foreach(_.run())
+      val installed = host.control.router.loaded.contains(moving)
+
+      for
+        _ <- pumpUntil(closed.isCompleted, drain = Some(host))
+        outcome = closed.value
+      yield
+        loads.size should be(1)
+        closedInWindow should be(false)
+        openingInWindow should be(true)
+        installed should be(true)
+        outcome.exists(_.isSuccess) should be(true)
+        host.control.router.loaded.contains(moving) should be(false)
+        host.control.loader.isOpening(moving) should be(false)
+        local.offlineStores should contain(moving)

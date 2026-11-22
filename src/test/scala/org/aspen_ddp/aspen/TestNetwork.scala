@@ -204,7 +204,8 @@ object TestNetwork {
 
     /** Makes every later retry of a `retryUntilSuccessful` run as soon as it is scheduled, on the client's
       * ExecutionContext, rather than after its real-time backoff: a test that waits on a retry then waits on events,
-      * not on time */
+      * not on time. With no backoff a retry that keeps failing spins, so it is only for tests whose retry succeeds or
+      * is gated by beforeRetry */
     @volatile var immediateRetries: Boolean = false
 
     private object retryTimers extends BackgroundTaskManager(executionContext):

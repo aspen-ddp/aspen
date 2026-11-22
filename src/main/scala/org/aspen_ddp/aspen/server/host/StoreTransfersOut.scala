@@ -31,7 +31,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   // still deleting from the device CRL
   private var closingForTransfer: Set[StoreId] = Set()
 
-  // Stores whose rebuild start waited for their close for a transfer out (holdsRebuild): the close's end checks the
+  // Stores whose rebuild start waited for their close for a transfer out (deferRebuildUntilClosed): the close's end checks the
   // device again, which starts it
   private var rebuildsAwaitingClose: Set[StoreId] = Set()
 
@@ -40,7 +40,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
 
   /** Whether a rebuild of the store must wait for its close for a transfer out (I3: a discard of its copy would move
    *  the directory the close is extracting from). When it must, the close's end checks the source device again */
-  private[host] def holdsRebuild(storeId: StoreId): Boolean =
+  private[host] def deferRebuildUntilClosed(storeId: StoreId): Boolean =
     val closing = closingForTransfer.contains(storeId)
     if closing then
       rebuildsAwaitingClose += storeId
@@ -207,7 +207,8 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
       // Nor while a rebuild of the store is registered here (I3), its flip's retry after an outcome-unknown attempt
       // included: that attempt may have flipped the entry Active, and a transfer made since is then this request. The
       // rebuild's end keeps the copy (RebuildOutcome.Unconfirmed), and the receiver's retransmit starts the transfer.
-      // A discard of its lost copy (droppingCrlState) is rebuild work too
+      // A discard of its lost copy (droppingCrlState) is rebuild work too. Keyed host-wide by store id, as
+      // rebuildingStores is: a rebuild for a copy on another device of this host delays it too, which only delays
       if ctx.rebuilds.isRebuilding(m.storeId) then
         refuse(s"Not starting the transfer out of store ${m.storeId} yet: a rebuild of it is still registered")
       val markedPath = sourceDs.devicePath / m.storeId.directoryName

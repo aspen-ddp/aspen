@@ -289,10 +289,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       case Success(backend) =>
         if create then
           newStores += storeId
+        val served = serveOpened(sds, storeCfg, storePath, backend)
+        // Marked once its LoadStore is queued, so a serveOpened that throws leaves no store opening for ever
         installing = true
         opening += storeId -> deferred
         awaitingInstall += storeId -> backend
-        val served = serveOpened(sds, storeCfg, storePath, backend)
         created.foreach(_.completeWith(served))
         onServed.foreach(awaitServed(storeId, served, _))
       case Failure(e: BackendStateLost) =>

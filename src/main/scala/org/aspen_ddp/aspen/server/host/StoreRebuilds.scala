@@ -272,8 +272,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     // starts then anyway, and the rebuild's end checks the device again (a send cannot begin meanwhile, since startOut
     // refuses while the rebuild is registered), so a re-check would only repeat at every reconcile
     // Nor while a transfer out is still closing it (and extracting its CRL state from its directory): the close's end
-    // checks the device again (StoreTransfersOut.holdsRebuild)
-    val closing = !rebuildingStores.contains(storeId) && ctx.transfersOut.holdsRebuild(storeId)
+    // checks the device again (StoreTransfersOut.deferRebuildUntilClosed)
+    val closing = !rebuildingStores.contains(storeId) && ctx.transfersOut.deferRebuildUntilClosed(storeId)
     if closing then
       logger.debug(s"Not rebuilding store $storeId on device ${local.storageDeviceId} yet: a transfer out is still " +
                    "closing it")

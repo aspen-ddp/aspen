@@ -185,6 +185,8 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, transferService = transfers, storeRebuildFactory = factory)
     val local = new LocalStorageDeviceState(deviceA, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl)
     injectLoadedDevice(host, local)
+    // Held back offline, as a device load holds a marked copy (tryLoadStore)
+    host.control.markCopyOffline(local, moving)
 
     for
       _ <- check(host, deviceA, Map(moving -> rebuildingIn(UUID.randomUUID())))
@@ -277,7 +279,8 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val sends = new StagedSendService
     val factory = new HeldRebuildFactory
     val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
-    loadedDevices(host)(deviceA).offlineStores += moving
+    // Held back offline, as a device load holds a marked copy (tryLoadStore)
+    host.control.markCopyOffline(loadedDevices(host)(deviceA), moving)
     sends.beginTransferOut(moving, UUID.randomUUID(), storePath, "localhost", 1, org.aspen_ddp.aspen.common.HLCTimestamp.now)
 
     def entry(): Future[Option[StorageDeviceState.StoreStatus]] =
@@ -312,7 +315,8 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val sends = new StagedSendService
     val factory = new HeldRebuildFactory
     val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
-    loadedDevices(host)(deviceA).offlineStores += moving
+    // Held back offline, as a device load holds a marked copy (tryLoadStore)
+    host.control.markCopyOffline(loadedDevices(host)(deviceA), moving)
     sends.beginTransferOut(moving, UUID.randomUUID(), storePath, "localhost", 1, org.aspen_ddp.aspen.common.HLCTimestamp.now)
     val rebuilding = Map(moving -> rebuildingIn(UUID.randomUUID()))
 

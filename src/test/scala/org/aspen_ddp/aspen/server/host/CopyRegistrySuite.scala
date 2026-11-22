@@ -32,6 +32,8 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
     kind(from) match
       case "Unread" => true
       case "Lost" => false
+      // A parked copy (empty TO, AdoptOffline) transferred out: Outbound("") -> Outbound(tid), tid non-empty (R14)
+      case _ if from == Phase.Outbound("") && kind(to) == "Outbound" => to != Phase.Outbound("")
       case f => kind(to) == "Unread" || legal.contains(f -> kind(to))
 
   private val retry = LoadRetry(null.asInstanceOf[LocalStorageDeviceState], os.root / "x", 1, 1)
@@ -92,6 +94,11 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
   test("Outbound to a different Outbound is illegal"):
     Transitions.phaseLegal(Phase.Outbound("a"), Phase.Outbound("b")) should be(false)
     Transitions.phaseLegal(Phase.Outbound("a"), Phase.Outbound("a")) should be(false)
+    Transitions.phaseLegal(Phase.Outbound("a"), Phase.Outbound("")) should be(false)
+    Transitions.phaseLegal(Phase.Outbound(""), Phase.Outbound("")) should be(false)
+
+  test("a parked copy (empty transfer-out marker) may be transferred out (R14)"):
+    Transitions.phaseLegal(Phase.Outbound(""), Phase.Outbound("t")) should be(true)
 
   // Retiring is only ever entered from Idle while Lost, so it is no starting point under another phase
   private def reachable(phase: Phase, from: Activity): Boolean = from != Activity.Retiring || phase == Phase.Lost

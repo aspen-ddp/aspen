@@ -123,7 +123,7 @@ checks that neither RocksDB nor FSIF records its own absolute path.
 | T3 | Rebuilt | Live | flip committed (`Adopt`), or the Completed Rebuilds pass on an Active entry | no Live copy |
 | T4 | Rebuilt | Parked | flip committed `AdoptOffline` (today an empty `transferring-out` written by `keepRebuiltStoreOffline`) | none |
 | T5 | Parked | Live | entry Active with no `transferDevice` (Abandoned Transfers Out pass, adoption) | no Live copy |
-| T6 | Live / Rebuilt | Outbound(tid) | `StoreTransfersOut.closedForTransfer`, after the extraction into `crl_save.log` | copy closed, its work is `TransferOut(tid)` |
+| T6 | Live / Rebuilt / Parked | Outbound(tid) | `StoreTransfersOut.closedForTransfer`, after the extraction into `crl_save.log` (Parked, an empty TO, is also a source: a parked rebuilt copy transferred out; stage 1 `Outbound("") -> Outbound(tid)`) | copy closed, its work is `TransferOut(tid)` |
 | T7 | Outbound | Live | transfer aborted or abandoned: entry Active, no `transferDevice` (`reinstateAbandonedOut`, adoption) | no Live copy |
 | T8 | `transferring-in/<id>` | Arrived(tid) | promotion after validating the save file | no Arrived copy for another transfer (else delete it first) |
 | T9 | Arrived | Live | pool update committed (`recordTransferIn`, `completeTransfersIn`); `arrived-at` written first | no Live copy |
@@ -530,6 +530,14 @@ name in `HostCopies.KnownDefects` until Task 6 removes the marks):
 - Not a defect of the marks: `startRebuild` queued (silenced) a store while a transfer out was closing it, a second
   Work for the (device, store). Fixed in Task 5: the store is not silenced until the close ends and re-checks the
   device.
+- D4 (fix round 1, every ControlFixture suite compared): a store being created has no router mark until its open
+  starts (`createNewStore` reads its pool first), so the router answers UnknownStore meanwhile. The registry is right
+  (silent: Work.Create).
+- D5: the router's offline mark of a retired copy trails its move into pending-delete by one control task
+  (`StoreCopies.retire`, then its caller's `clearOfflineUnlessHeld`). The registry is right (no copy, Unknown).
+- Derivation extension: Work.Create, and an entry a loaded device's latest reconcile read Initializing, are
+  `Opening` reasons, so a failed create (nothing at its path, its Create work ended, its entry still Initializing
+  for the next check to create again) stays silent as the router's offline mark keeps it.
 
 ### Step 4: reload paths (`StoreRouter.install` with `replaced != null`)
 

@@ -181,7 +181,11 @@ object Host:
                           *  on a throw its shadow updates swallowed, a disagreement with the disk
                           *  (HostCopies.verifyAgainstDisk) or with the router's silence marks
                           *  (HostCopies.compareWithRouter) */
-                         verifyCopyRegistry: Boolean = false)
+                         verifyCopyRegistry: Boolean = false,
+                         /** Lockstep only: each testingOnlyHandleEvents compares the copy registry's derived silence
+                          *  and repairability with the router's marks once drained (HostCopies.compareWithRouter),
+                          *  failing on a disagreement. Implied by verifyCopyRegistry */
+                         compareCopyRegistry: Boolean = false)
 
   object Seams:
     val default: Seams = Seams()
@@ -552,6 +556,11 @@ class Host(val client: AspenClient,
           val opens = registry.opensDuringTransferOut.map(o => s"(open during transfer out) $o")
           throw new IllegalStateException(s"Copy registry of host $hostId after a drain:\n  " +
                                           (problems ++ learned ++ opens).mkString("\n  "))
+      else if seams.compareCopyRegistry then
+        val problems = deviceControl.copyRegistry.compareWithRouter()
+        if problems.nonEmpty then
+          throw new IllegalStateException(s"Copy registry of host $hostId after a drain, against the router's " +
+                                          s"marks:\n  " + problems.mkString("\n  "))
     case _ => ()
 
   /** The components, for tests. */

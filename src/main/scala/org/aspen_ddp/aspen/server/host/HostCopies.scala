@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.host
 
-import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{FileStat, StoreConfig}
 import org.aspen_ddp.aspen.server.Host.LoadRetry
@@ -182,6 +182,16 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         untracked += id -> copies
         if !copies.copies.contains(storeId) then
           copies.register(storeId, Phase.Live)
+      // A copy a loaded device holds with no record was put at its path after the device's load and loaded without
+      // tryLoadStore (Host.loadStore, tests): learned here as readAtLoad learns one
+      attached.get(id).foreach: sds =>
+        if !sds.copies.copies.contains(storeId) then
+          val path = sds.devicePath / storeId.directoryName
+          val phase = CopyPhase.known(path).getOrElse(Phase.Live)
+          logger.warn(s"The copy of store $storeId at $path was not known to the copy registry. Learned at its " +
+                      s"install, $phase")
+          learnedCopies :+= s"device $id: $storeId learned at install, $phase"
+          sds.copies.register(storeId, phase)
       // Served -> Served: a reload over the served store (StoreRouter.install replacing an entry)
       device(id).foreach(_.setActivity(storeId, Activity.Served))
 
@@ -262,8 +272,9 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   private def allCopies: Iterable[DeviceCopies] = attached.values.map(_.copies) ++ untracked.values
 
   /** Whether the router should answer for `storeId` (spec, "Router silence is derived"): Served if a copy of it is
-   *  Served on any device; otherwise Silent, with every reason that holds; otherwise Unknown. A create's open in
-   *  flight (Work.Create: its copy is registered only once at its path) is an Opening reason */
+   *  Served on any device; otherwise Silent, with every reason that holds; otherwise Unknown. A create (Work.Create:
+   *  its copy is registered only once at its path), and an entry a loaded device's latest reconcile read
+   *  Initializing (a create to come, a failed one's included), are Opening reasons */
   def silence(storeId: StoreId): Silence =
     if allCopies.exists(_.copies.get(storeId).exists(_.activity == Activity.Served)) then
       Silence.Served
@@ -277,10 +288,23 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
           case _: Work.TransferIn => SilenceReason.TransferringIn
           case Work.Create => SilenceReason.Opening
         ++ (if c.missing.contains(storeId) then List(SilenceReason.Missing) else Nil)
+      // An entry a loaded device's latest reconcile read Initializing: its create is pending, even after one that
+      // failed and left nothing at the path, for the next check creates it again
+      val creating = attached.values.exists(_.reconciledEntries.exists(_.get(storeId).exists(
+        _.status == StorageDeviceState.StoreStatus.Initializing)))
       val reasons = onDevices.toSet ++
+        (if creating then Set(SilenceReason.Opening) else Set()) ++
         (if unloaded.valuesIterator.exists(_.contains(storeId)) then Set(SilenceReason.UnloadedDevice) else Set()) ++
         (if awaiting.valuesIterator.exists(_.contains(storeId)) then Set(SilenceReason.AwaitingDevice) else Set())
       if reasons.isEmpty then Silence.Unknown else Silence.Silent(reasons)
+
+  /** The records and work of `storeId` on every device, for a disagreement's message */
+  private def describe(storeId: StoreId): String =
+    allCopies.flatMap: c =>
+      val r = c.copies.get(storeId).map(r => s"${r.phase}/${r.activity}")
+      val w = c.work.get(storeId).map(_.toString)
+      if r.isEmpty && w.isEmpty then None else Some(s"${c.deviceId}: ${r.getOrElse("no record")} ${w.getOrElse("")}")
+    .mkString("; ")
 
   /** Whether a repair scan may run against `storeId` here: Served, not Closing, with no Rebuild or TransferOut work on
    *  any device, and not being sent out (storeTransferService) */
@@ -320,7 +344,9 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
                 s"$derived")
          else Nil) ++
         (if oldRepairable != newRepairable then
-           List(s"$storeId: repairable by the router's view $oldRepairable, by the registry $newRepairable")
+           List(s"$storeId: repairable by the router's view $oldRepairable (installed ${installed.contains(storeId)}, " +
+                s"offline ${offline.contains(storeId)}, rebuilding ${rebuilding.contains(storeId)}, sending " +
+                s"${sending.contains(storeId)}), by the registry $newRepairable (${describe(storeId)})")
          else Nil)
 
   /** At unload: the device's records go with it, and `listed` is kept as its unloaded entries */
@@ -463,12 +489,23 @@ object HostCopies:
       "a transfer in registers its promoted copy Arrived and its pool update makes it Live (shipped rebuilt copy)" ->
         transferIn,
       "a transfer in deletes an arrived copy of another transfer and unregisters it" -> transferIn,
+      "a retried transfer in asks the host that has since adopted its source" -> transferIn,
+      "a transfer-in retry gives up once the destination no longer records the transfer" -> transferIn,
+      "failed transfer in restarts with a fresh UUID" -> transferIn,
+      "a rebuild requested while a create's flip is pending does not overlap Create (C4)" ->
+        ("D4: a store being created has no router mark until its open starts (createNewStore reads its pool first), " +
+         "so the router answers UnknownStore for it meanwhile"),
+      "a served store its device's entry does not list is taken out of service and retired (RB-W5)" ->
+        ("D5: the router's offline mark of a retired copy trails its move into pending-delete by one control task " +
+         "(StoreCopies.retire, then its caller's clearOfflineUnlessHeld)"),
       "a check of an unloaded device that lists a store served here takes it out of the router's repairable view" ->
         ("D2: a check of a device not loaded here (DeviceReconciler, the unloaded-device branch) marks every store " +
          "its entry lists offline by id, one served from another device of this host included"),
       "an open during a transfer out's close is listed, not refused, and the transfer does not start" ->
         ("D3: the view counts a store repairable while a transfer out is closing it, its CRL state being extracted " +
-         "(an open during the close serves it; R1, refused from Task 7)"))
+         "(an open during the close serves it; R1, refused from Task 7)"),
+      "an open that installs during a served store's transfer-out extraction is Served, with no shadow error" ->
+        ("D3, for a store served when its transfer out began"))
 
   /** `w`, with any id it lacks taken from `current`, of the same kind */
   private def keepIds(current: Work, w: Work): Work = (current, w) match

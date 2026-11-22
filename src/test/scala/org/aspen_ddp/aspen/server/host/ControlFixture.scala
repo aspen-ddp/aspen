@@ -316,9 +316,9 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
     val queued = attached.loadStore(storageDeviceId, backend, maxSliceSize, poolIDA, tier)
     storeLoadGate.get.map(_.future).getOrElse(queued)
 
-  /** Records the close and completes it (or holds it, see holdShutdownCloses) without touching the event queue. The
-   *  real close queues a ShutdownStore event, and the stores the tests name were never opened anyway. Host does its
-   *  own offline bookkeeping once the close completes, so nothing is lost by skipping it. */
+  /** Records the close and completes it (or holds it, see holdShutdownCloses) without touching the event queue, unless
+   *  the store is served: then it is closed for real (a queued ShutdownStore). The stores most tests name were never
+   *  opened. Host does its own offline bookkeeping once the close completes, so nothing is lost by skipping it. */
   private def closeForShutdown(storeId: StoreId): Future[Unit] =
     synchronized:
       shutdownCloses += storeId
@@ -327,7 +327,13 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
         .foreach(dir => os.write.over(dir / RebuildingStore.RebuildRequiredMarkerFile, ""))
       Future.failed(Host.StoreFailedOnClose(storeId))
     else
-      shutdownCloseGate.get.map(_.future).getOrElse(Future.unit)
+      shutdownCloseGate.get match
+        case Some(gate) => gate.future
+        // A store a test did serve is closed for real: left installed, the shutdown would mark a served store offline,
+        // which no production close leaves (HostCopies.compareWithRouter)
+        case None if attached.control.router.loaded.contains(storeId) =>
+          attached.control.shutdown.closeForShutdown(storeId)
+        case None => Future.unit
 
   private def closeForTransferOut(storeId: StoreId, sourceDs: LocalStorageDeviceState): Future[Unit] =
     synchronized:
@@ -344,6 +350,8 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
   def seams(scheduler: ControlScheduler, verifyCopyRegistry: Boolean = false): Host.Seams =
     Host.Seams(
       verifyCopyRegistry = verifyCopyRegistry,
+      // Every ControlFixture host compares the registry's derived silence with the router's marks (Task 5, R16)
+      compareCopyRegistry = true,
       wrapMetadata = Some(base => new RecordingMetadata(base)),
       scheduler = Some(scheduler),
       warn = Some((path, msg) => synchronized(deviceDirWarnings += ((path, msg)))),

@@ -881,6 +881,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
               CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile)))
             store.close().flatMap(_ => Future.fromTry(saved))(using ExecutionContext.parasitic)
           .flatMap: _ =>
+            // The store is closed: its copy's close ends here (shadow), before the extraction's deletion, so an open
+            // that installs during the deletion finds the copy Idle
+            ctx.copyRegistry.closeEnded(store.storageDeviceId, storeId)
             val extracted = extractedTry.get
             // Deleted from the device CRL files only once the save file holding them is durable, so a restart does
             // not recover them on this device too. A crash between the two leaves them in both: harmless, as loading

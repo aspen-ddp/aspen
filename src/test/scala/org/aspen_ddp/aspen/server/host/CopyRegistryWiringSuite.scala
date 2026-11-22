@@ -37,6 +37,17 @@ private class PlacingRebuildFactory(writeConfig: (os.Path, StoreId) => os.Path)(
       def complete: Future[Unit] = placed
       def cancel(): Unit = ()
 
+/** A device CRL whose deleteTransactions waits for the test once `hold` is set (an extraction's final deletion held
+ *  up by a slow CRL) */
+private class HeldDeleteCrl extends org.aspen_ddp.aspen.TestNetwork.TestCRL:
+  @volatile var hold: Option[scala.concurrent.Promise[Unit]] = None
+
+  override def deleteTransactions(storeId: StoreId,
+                                  txids: List[org.aspen_ddp.aspen.common.transaction.TransactionId]): Future[Unit] =
+    hold match
+      case Some(p) => p.future.flatMap(_ => super.deleteTransactions(storeId, txids))(using ExecutionContext.parasitic)
+      case None => super.deleteTransactions(storeId, txids)
+
 /** The copy registry in shadow mode (store copy state machine, stage 1): a device load registers each store directory
  *  with its phase, every disk mutation keeps it, and the drain check (Host.Seams.verifyCopyRegistry) finds no
  *  disagreement with the disk */
@@ -729,3 +740,74 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       sends.transfersOut should be(empty)
       after should be(None)
       consistent(host)
+
+  // A create that fails leaves nothing at its path and ends its Create work, but its entry stays Initializing and the
+  // next check creates it again: the store stays silent, by its entry, as the router's offline mark keeps it
+  atest("a failed create leaves its store silent while its entry is Initializing"):
+    given ExecutionContext = executionContext
+    val created = StoreId(PoolId.BootstrapPoolId, 2)
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, source)
+    val host = newHost(hostRoot, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(source)
+    // The create's scratch area cannot be made: the create fails, leaving nothing at the store's path
+    os.write.over(dev / StoreCreation.CreatingDirectory, "not a directory")
+    // As the reconcile that starts the create reads it
+    local.reconciledEntries = Some(Map(created ->
+      StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Initializing, None)))
+    host.control.rebuilds.createNewStore(local, created)
+    for
+      // Not drained before its open: the router has no mark for a create's pool read (D4)
+      _ <- pumpUntil(host, !host.control.rebuilds.isCreating(created), drain = false)
+      _ = host.testingOnlyHandleEvents()
+    yield
+      host.control.router.isOffline(created) should be(true)
+      os.exists(dev / created.directoryName) should be(false)
+      host.control.copyRegistry.silence(created) should be(Silence.Silent(Set(SilenceReason.Opening)))
+      consistent(host)
+
+  // R12 for a store served when its transfer out began: its close (Closing(TransferOut)) ends before the extraction's
+  // deletion, so an open that installs during the extraction moves the copy Idle -> Served, never Closing -> Served
+  atest("an open that installs during a served store's transfer-out extraction is Served, with no shadow error"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = hostRoot / os.up / "injected-device"
+    os.makeDir.all(deviceDir)
+    val storePath = realStore(deviceDir, shipped)
+    val crl = new HeldDeleteCrl
+    val sends = new StagedSendService
+    val host = newHost(hostRoot, transferService = sends, verifyCopyRegistry = true)
+    val local = new LocalStorageDeviceState(source, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl)
+    injectLoadedDevice(host, local)
+    host.control.loader.tryLoadStore(local, storePath)
+    val seen = watch(host, shipped)
+    for
+      _ <- pumpUntil(host, host.control.router.loaded.contains(shipped))
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(shipped, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      held = scala.concurrent.Promise[Unit]()
+      _ = crl.hold = Some(held)
+      request = ask(host)
+      _ <- pumpUntil(host, !host.control.router.loaded.contains(shipped) &&
+                           !seen.lastOption.exists(_.activity.exists(_.isInstanceOf[Activity.Closing])))
+      closedBeforeDeletion = record(host, source, shipped).map(_.activity)
+      // An open during the extraction's deletion: the store's backend is closed, so it opens and installs
+      _ = host.control.loader.tryLoadStore(local, storePath)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(shipped))
+      served = record(host, source, shipped).map(_.activity)
+      _ = crl.hold = None
+      _ = held.success(())
+      refused <- request
+      _ = host.testingOnlyHandleEvents()
+      errors = host.control.copyRegistry.takeShadowErrors()
+      _ <- close(host, shipped)
+    yield
+      closedBeforeDeletion should be(Some(Activity.Idle))
+      served should be(Some(Activity.Served))
+      errors should be(Vector())
+      refused should be(Success(()))
+      sends.transfersOut should be(empty)
+      host.control.copyRegistry.opensDuringTransferOut.size should be(1)

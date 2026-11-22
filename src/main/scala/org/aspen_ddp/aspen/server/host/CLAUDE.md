@@ -37,18 +37,23 @@
   out is closing. `declaredMissing` is mirrored as `missing`. An open during TransferOut work is not refused yet (R1,
   Task 7): its Opening is skipped and listed (`opensDuringTransferOut`). `silence` derives the router's answer
   (Served if any copy is Served; else Silent with its reasons: a record, Opening, Rebuild / TransferIn / Create work,
-  missing, an unloaded device's entries, awaiting device; else Unknown) and `repairable` (Served, not Closing, no
-  Rebuild or TransferOut work, not being sent). With
-  `Host.Seams.verifyCopyRegistry` (TestNetwork; ControlFixture's `newHost(verifyCopyRegistry = ...)`, default off)
-  each lockstep drain throws on a recorded throw, on any `verifyAgainstDisk` mismatch (phase, unrecorded config'd
-  directory, record without directory) or on any `compareWithRouter` disagreement (silence or repairability against
-  the router's marks), except for the tests `HostCopies.KnownDefects` lists, whose disagreement is a defect of the old
-  marks (spec, Step 3 addenda D1-D3). A ControlFixture host so checked holds each load its recording seam skips
-  offline (`RecordingSeams.holdLoadsOffline`), as a production load holding a copy back does. `attach` never throws: a child whose stat fails is registered `Unread`, and
-  so is one whose markers cannot be read. `tryLoadStore` reports each phase it reads (`readAtLoad`): an `Unread`
-  record takes it, a copy with no record (put at its path after the device's load, by hand or by a test) is
-  registered and listed in `learned` (reported by the drain check, not failed on), and any other disagreement is a
-  shadow error. Stores loaded onto a device this host has not loaded, through `Host.Seams.unloadedDeviceCrl`
+  missing, an unloaded device's entries, awaiting device, an entry the latest reconcile read Initializing; else
+  Unknown) and `repairable` (Served, not Closing, no Rebuild or TransferOut work, not being sent). A transfer-out
+  close ends its copy's Closing once the store is closed, before the extraction's deletion, so an open installing
+  during it goes Idle -> Served. An install on a loaded device with no record learns the copy (`learned`), as
+  `readAtLoad` does. With `Host.Seams.verifyCopyRegistry` (TestNetwork; ControlFixture's
+  `newHost(verifyCopyRegistry = ...)`, default off) each lockstep drain throws on a recorded throw, on any
+  `verifyAgainstDisk` mismatch (phase, unrecorded config'd directory, record without directory) or on any
+  `compareWithRouter` disagreement (silence or repairability against the router's marks); with
+  `Host.Seams.compareCopyRegistry` (every ControlFixture host) on a `compareWithRouter` disagreement alone. The tests
+  `HostCopies.KnownDefects` lists are exempt: their disagreement is a defect of the old marks (spec, Step 3 addenda
+  D1-D5). A ControlFixture host with `verifyCopyRegistry` holds each load its recording seam skips offline
+  (`RecordingSeams.holdLoadsOffline`), as a production load holding a copy back does; every ControlFixture host's
+  shutdown close seam closes a store a test did serve for real. `attach` never throws: a child whose stat fails is
+  registered `Unread`, and so is one whose markers cannot be read. `tryLoadStore` reports each phase it reads
+  (`readAtLoad`): an `Unread` record takes it, a copy with no record (put at its path after the device's load, by
+  hand or by a test) is registered and listed in `learned` (reported by the drain check, not failed on), and any
+  other disagreement is a shadow error. Stores loaded onto a device this host has not loaded, through `Host.Seams.unloadedDeviceCrl`
   (TestNetwork), get an untracked record (Live) at install, Served there and Closing then Idle once the router
   removes the store, kept as a closed copy's record is kept on a loaded device, so the store stays silent;
   `HostCopies.device` returns them like any other, and the disk check skips them. The drain check can land between

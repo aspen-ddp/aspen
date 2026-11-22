@@ -46,6 +46,8 @@ object Transitions:
     // Outbound -> Rebuilt | Arrived: the transfer-out marker removed from a copy that also carries rebuild-complete
     // (an Unconfirmed rebuilt copy shipped, then reinstated) or transferred-in (a failed TI removal at the source)
     case (Phase.Outbound(_), Phase.Live | Phase.Lost | Phase.Rebuilt(_) | Phase.Arrived(_)) => true
+    // Outbound("") -> Outbound(tid): a parked copy (an AdoptOffline rebuild's empty transfer-out marker) transferred out
+    case (Phase.Outbound(""), Phase.Outbound(tid)) => tid.nonEmpty
     // Arrived -> Outbound: a transfer out of a copy whose transferred-in marker could not be removed
     case (Phase.Arrived(_), Phase.Rebuilt(_) | Phase.Live | Phase.Lost | Phase.Outbound(_)) => true
     case (Phase.Rebuilt(_), Phase.Live | Phase.Outbound(_) | Phase.Lost) => true

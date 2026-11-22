@@ -58,7 +58,7 @@
   Shutdown / Relinquish; `handleClose` with `extractCrl`: TransferOut; else FailStop), until
   `handleClose`/`closeUnloaded` end it (Idle, or AwaitingRetry when a retry was parked while it closed; a
   transfer-out close ends once the store is closed, before the extraction's deletion);
-  `StoreCopies.retire` Retiring (`isRetiring`, host-wide: a second retire of the store does nothing). Work is the
+  `StoreCopies.retire` Retiring (`isRetiring`, over loaded devices: a second retire of the store does nothing). Work is the
   only record of each owner's work, set where it starts and ends: Create (`createNewStore`, until the copy is served,
   its open fails or the create is skipped; the flip that follows touches no copy and is kept apart,
   `pendingCreateFlips`), Rebuild (`server/rebuild/CLAUDE.md`: Queued, DiscardingLost, Running, Abandoned; the running
@@ -376,7 +376,11 @@
   - The Rebuilding pass, for a `rebuild-required` copy at the path of a store rebuilt here
     (`StoreRebuilds.discardLostStore`). It holds a rebuild slot from its start (`maxConcurrentRebuilds` counts its
     Rebuild work's DiscardingLost stage), and the slot passes straight to the rebuild in the same callback
-    (DiscardingLost -> Running), so one reconcile cannot retire every marked store at once. The handoff re-reads `reconciledEntries`: the rebuild starts only if the entry
+    (DiscardingLost -> Running), so one reconcile cannot retire every marked store at once. Discards count only on
+    loaded devices (`HostCopies.discards`), as does `isRetiring`: a device unloaded mid-retire (`crlFailed`, a
+    relinquish) drops its discard work and frees the slot while the orphaned retire's CRL calls finish. That is safe:
+    the orphan's only remaining destructive step, the move to `pending-delete/`, is skipped once its device is not
+    loaded, and its CRL is being shut down; running rebuilds, by contrast, count by handle (`runningRebuilds`). The handoff re-reads `reconciledEntries`: the rebuild starts only if the entry
     is still Rebuilding under the episode the discard began for; otherwise the slot is released and the device checked
     again (a retire held up by a slow CRL can outlast a re-placement). A failed retire is a failed pass: it re-checks
     the other devices and schedules this device's backoff re-check (`scheduleRebuildRetry`), which also starts a

@@ -29,7 +29,12 @@ disk". Read the spec's Phases and transitions, Registry and Router-silence secti
 - Every existence test uses `server.FileStat` (`FileStatUsageSuite` enforces it). A failed stat is never an absence.
 - Registry state is control-thread only (`server/CLAUDE.md` threading rules). The router's silent set stays a
   concurrent set written only by the control thread.
-- An illegal transition throws `IllegalStateException`. Production code must not catch it in order to continue.
+- ~~An illegal transition throws `IllegalStateException`. Production code must not catch it in order to
+  continue.~~ Superseded by R19 and R22. Registry updates are facts or claims. A fact is applied even when the
+  table refuses it, and a refused phase is set to what the directory reads. A refused claim is refused, and its
+  caller backs off. Tests fail on any recorded violation (a strict host's drain), and production logs it at error,
+  with its throwable, keeping nothing. A throw in the silence path leaves the store silent. See the spec's "Facts
+  and claims" under Registry.
 - Scala 3 quiet syntax, indented if/then/else.
 - Tests are deterministic (`LockstepThreading`), and none may be flaky. Run full suites with `sbt test` under a
   70 s timeout (CLAUDE.local.md).

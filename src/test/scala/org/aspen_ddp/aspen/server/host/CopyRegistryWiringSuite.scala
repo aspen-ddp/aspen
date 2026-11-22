@@ -484,6 +484,32 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       phases(host, net.secondDeviceId) should be(Map())
       consistent(host)
 
+  // Task 8 M2: crlFailed cancels no transfer in, and the unload's detach forgets the receive attempt. Bytes that land
+  // after that find the attempt not current; the device's StartStoreTransfer must stop retransmitting, since no
+  // abandon will find the attempt to stop it
+  atest("a receive whose attempt its device's unload forgot stops retransmitting when its bytes land"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    device(hostRoot, net.secondDeviceId)
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(shipped, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(host, transfers.startedTransfersIn.contains(shipped))
+      retransmitting = host.control.transfers.pendingStartTransfers.contains(shipped)
+      _ = host.control.shutdown.crlFailed(loadedDevices(host)(net.secondDeviceId), new Exception("injected CRL failure"))
+      _ <- pumpUntil(host, !loadedDevices(host).contains(net.secondDeviceId))
+      _ = transfers.finishTransferIn(shipped)
+      _ = host.testingOnlyHandleEvents()
+    yield
+      retransmitting should be(true)
+      host.control.transfers.pendingStartTransfers.contains(shipped) should be(false)
+
   // ---- Task 5: activity and work (shadow), and derived silence ----
 
   /** What the registry holds for one store on one device after a change: its record's phase and activity, if any,
@@ -894,29 +920,57 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       consistent(host)
 
   // R22: a fact (here a router removal of a copy the registry holds Idle, and a phase the registry holds against what
-  // the disk reads) is applied whatever the table says, and recorded; a phase is set to what the disk reads
-  test("an illegal fact is applied in production mode and recorded"):
+  // the disk reads) is applied whatever the table says; a phase is set to what the disk reads. A strict (test) host
+  // records the violation for its drain; production only logs it, keeping nothing
+  for strictMode <- List(true, false) do
+    test(s"an illegal fact is applied, and recorded only when strict (strict = $strictMode)"):
+      val hostRoot = newHostDir()
+      val dev = device(hostRoot, deviceA)
+      writeStoreConfig(dev, sid(0))
+      writeStoreConfig(dev, sid(1))
+      val host = newHost(hostRoot)
+      host.testingOnlyHandleEvents()
+      val registry = host.control.copyRegistry
+      registry.strict = strictMode
+      val local = loadedDevices(host)(deviceA)
+      val copies = registry.copiesOf(local).get
+      // Idle -> Closing is not in the table: applied anyway
+      registry.removedFromRouter(deviceA, sid(0))
+      // Lost -> Live is not in the table: the disk reads Live, so Live is recorded
+      copies.setPhase(sid(1), Phase.Lost)
+      registry.placed("test", local, sid(1), Phase.Live)
+      val errors = registry.takeRegistryErrors()
+      copies.copies(sid(0)).activity should be(Activity.Closing(ClosePurpose.FailStop))
+      copies.copies(sid(1)).phase should be(Phase.Live)
+      if strictMode then
+        errors.size should be(2)
+        errors.exists(_.contains("router remove")) should be(true)
+        errors.exists(_.contains("test")) should be(true)
+      else
+        errors should be(Vector())
+
+  // I-2: production retries a refused claim at every check and may learn copies; a non-strict registry only logs
+  // them, so nothing grows without bound
+  test("in production mode, repeated refused claims and learned copies keep nothing"):
     val hostRoot = newHostDir()
     val dev = device(hostRoot, deviceA)
     writeStoreConfig(dev, sid(0))
-    writeStoreConfig(dev, sid(1))
     val host = newHost(hostRoot)
     host.testingOnlyHandleEvents()
     val registry = host.control.copyRegistry
     registry.strict = false
     val local = loadedDevices(host)(deviceA)
-    val copies = registry.copiesOf(local).get
-    // Idle -> Closing is not in the table: applied anyway
-    registry.removedFromRouter(deviceA, sid(0))
-    // Lost -> Live is not in the table: the disk reads Live, so Live is recorded
-    copies.setPhase(sid(1), Phase.Lost)
-    registry.placed("test", local, sid(1), Phase.Live)
-    val errors = registry.takeRegistryErrors()
-    copies.copies(sid(0)).activity should be(Activity.Closing(ClosePurpose.FailStop))
-    copies.copies(sid(1)).phase should be(Phase.Live)
-    errors.size should be(2)
-    errors.exists(_.contains("router remove")) should be(true)
-    errors.exists(_.contains("test")) should be(true)
+    registry.opening(local, sid(0), 1L, create = false) should be(true)
+    (1 to 100).foreach: i =>
+      registry.opening(local, sid(0), 1L + i, create = false) should be(false)
+      registry.registered("test", local, sid(0), Phase.Live) should be(false)
+    // A copy put at its path after the load, learned by its load
+    val dir = writeStoreConfig(dev, sid(1))
+    registry.readAtLoad(local, dir, sid(1), Phase.Live)
+    registry.copiesOf(local).get.copies.contains(sid(1)) should be(true)
+    registry.takeRegistryErrors() should be(Vector())
+    registry.takeLearned() should be(Vector())
+    registry.takeSilenceErrors() should be(Vector())
 
   // ---- The states of D1, D4, D5 and D6 of the old marks (spec, Stage 1 audit findings, Step 3 addenda), derived ----
 

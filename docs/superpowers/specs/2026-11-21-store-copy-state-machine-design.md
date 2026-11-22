@@ -40,8 +40,10 @@ a loadable phase is not in the directory the loader reads, so it cannot be loade
 ## Goals
 
 - One persisted phase per copy. No combination of markers exists, so no precedence rule exists.
-- Legal transitions are listed in one table (below) and enforced by one function. An illegal transition is a
-  programming error (thrown), not a state to recover from.
+- Legal transitions are listed in one table (below) and checked by one function. An illegal transition is a
+  programming error, but production never stops on one (R19, R22; "Facts and claims" under Registry): a fact the
+  table refuses is applied anyway, and a claim it refuses is refused while its caller backs off. Each violation is
+  logged at error in production, and fails the test that made it.
 - Every phase change is one `DurableFiles.move`. Every move has the same durability policy, including the handling
   of a rename whose directory sync failed (`Unsynced`, below), which replaces `pendingMarkerRemovals` and the three
   current marker-removal policies (`os.remove` with a directory sync, plain `os.remove`, `DurableFiles.remove`).
@@ -199,12 +201,33 @@ with no Live copy and no work).
 
 - It is built at device load by listing the phase directories. A listing that fails leaves the device unloaded for
   the next scan, as a failed CRL open does.
-- Every phase or activity change goes through `DeviceCopies.transition(copyId, ...)`. That function checks the
-  table and the per-phase invariants, and it publishes the view.
-- Opens are started only by `transition(_, Activity.Opening)` from an Idle Live copy whose store has no
-  `TransferOut` work. That one check replaces the `opensStarted` counter and `isClosingForTransfer`.
+- Every phase or activity change goes through the registry's moves (stage 1: `DeviceCopies.setPhase` /
+  `setActivity` / `startWork` for claims, `applyPhase` / `applyActivity` for facts). They check the table and the
+  per-phase invariants, and the change republishes the view.
+- Opens are started only by an Opening claim (stage 1: `HostCopies.opening`) on an Idle Live copy whose store has
+  no `TransferOut` work. That one check replaces the `opensStarted` counter and `isClosingForTransfer`.
 
-Invariants checked by `transition`. Violating one throws, and tests assert it never happens:
+**Facts and claims (R19, R22).** Every registry update is one of two kinds, and an illegal one is handled by kind:
+
+- A **fact** records something that already happened: an install, a router removal, the end of a close, open,
+  retire or retry, a retire's start, a phase a disk mutation reached, a copy leaving its path, a copy a load found.
+  The registry mirrors what is true, so a fact is applied even when the table refuses it. A refused phase is not
+  taken on trust: the record is set to what the copy's directory reads (`CopyPhase.known`, Unread where it cannot be
+  read).
+- A **claim** takes ownership of something about to start that another actor may hold: Opening, AwaitingRetry, a
+  Work's start or update, a new record. A claim the table refuses is refused (`false`), and the caller backs off: it
+  opens nothing and starts no work, and a later check asks again. Forcing a claim through could hide a served store
+  from a shutdown, or open a copy that is being retired, so a claim is never applied over a refusal.
+- Each violation, of either kind, is a bug. Tests fail on any recorded violation: a strict host
+  (`Host.Seams.strictCopyRegistry`, implied by `verifyCopyRegistry`) fails its next lockstep drain. Production logs
+  it at error, with its throwable, and keeps nothing: a refused claim is retried at every check, so a kept record
+  would grow without bound.
+- The silence path is neither. A throw while deriving a store's silence (below) leaves the store silent, the
+  conservative answer, since clients retransmit; it is logged at error in production, and a strict host's
+  propagates (`SilenceFailure`, which neither a fact nor a claim swallows).
+
+Invariants checked by the registry's moves. A violation is handled as above (applied for a fact, refused for a
+claim), and tests assert it never happens:
 
 - I1. At most one Live copy of a store per device. A device load that finds two retires both (T10) and logs an
   error. The entry is then rebuilt through the normal path.
@@ -225,7 +248,12 @@ transition, for the affected store only. A store is:
 
 - served if a copy of it is Served on any device of this host;
 - otherwise silent if any of these holds:
-  - some loaded device has a non-Retired copy of it, or Rebuild or TransferIn work for it;
+  - some loaded device has a non-Retired copy of it, or Rebuild, TransferIn or Create work for it (a create's copy
+    is silent from its claim until it is served);
+  - a loaded device's latest reconcile read its entry Initializing (its create not started, or the device shutting
+    down before it starts);
+  - a loaded device has declared it missing (an Active entry with no `config.yaml` at its path, being rebuilt by
+    the Missing Stores pass: the device's `missing` mark);
   - some unloaded device's last tree entry lists it;
   - its device's adoption or shutdown-marker decision is pending (`awaitingDevice`);
 - otherwise unknown.
@@ -277,8 +305,12 @@ RR > TO > TI > RC), so the items tied to the on-disk format wait for stage 2.
   `transferringIn`, `rebuildingStores`, `abandonedRebuilds`, and `opensStarted`). Silence is derived; opens, retries,
   closes and retires are a copy's Activity; Create, Rebuild, TransferIn and TransferOut are its Work.
 - Kept until stage 2: `StoreDirMarkers` and the marker constants (the reconcile passes' single-marker tests),
-  `keepRebuiltStoreOffline` and its empty `transferring-out` marker (Parked), and `startIn`'s path-collision
-  branches.
+  `keepRebuiltStoreOffline` and its empty `transferring-out` marker (Parked), `startIn`'s path-collision
+  branches, and `retireForeignCopy`'s staging-checkpoint dance (`StoreRebuilds`: a foreign or rebuild-required copy
+  at a rebuilding store's path may have served since the first pass began, so the checkpoint is dropped durably
+  before the copy is retired). Stage 2's unique copy directories remove the path collision; the checkpoint rule
+  stays for a foreign copy that may have served.
+- Error handling: stage 1 ends with the fact/claim split above (R19, R22), not with throws on production paths.
 - Kept, because Work and Activity cannot hold what they carry:
   - `pendingCreateFlips` (`StoreRebuilds`): `Work.Create` ends when the copy is served, on purpose, so a rebuild or
     transfer out of the served store never overlaps the create (I3). The flip out of Initializing that follows
@@ -327,7 +359,8 @@ Each stage leaves the full suite green and is reviewable on its own.
 
 All deterministic (LockstepThreading) unless noted.
 
-- **Table:** every illegal (from, to) pair throws, and every legal one moves the directory and updates the record.
+- **Table:** every illegal (from, to) pair is refused by the claim moves (they throw, and `claim` turns that into a
+  refusal) and recorded by the fact moves, and every legal one moves the directory and updates the record.
 - **Crash at each step of each transition** (a fresh `DeviceCopies` built from the disk after the step): the copy
   is in exactly one phase, and the next check finishes or retries the transition. This covers T6 after the
   extraction and before the move, T11 at each step, and T3/T9 after the rename and before the sync.

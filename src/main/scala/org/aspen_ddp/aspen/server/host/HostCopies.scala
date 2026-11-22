@@ -32,8 +32,9 @@ import scala.util.control.NonFatal
  *   - a claim (`claim`): something about to start that another actor may hold (Opening, AwaitingRetry, a work's
  *     start or update, a new record). An illegal one is refused, recorded, and returned as `false`, and the caller
  *     backs off: no open, no work start.
- *  Production logs each recorded violation at error. `Host.testingOnlyHandleEvents` fails a strict host's drain on
- *  any of them, and on any mismatch `verifyAgainstDisk` finds, when `Host.Seams.verifyCopyRegistry` is set. */
+ *  Each violation is logged at error with its throwable. Only a strict (test) registry also records it, and the
+ *  copies loads learned, and the silence path's throws: production retries a refused claim at every check, so a kept
+ *  record would grow without bound. `Host.testingOnlyHandleEvents` fails a strict host's drain on any of them, and on any mismatch `verifyAgainstDisk` finds, when `Host.Seams.verifyCopyRegistry` is set. */
 final class HostCopies(ctx: DeviceControl) extends Logging:
   private var attached: Map[StorageDeviceId, LocalStorageDeviceState] = Map()
   // Unloaded devices, by id, with the stores their last tree entry listed
@@ -108,7 +109,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     try f
     catch
       case e: SilenceFailure => throw e
-      case NonFatal(t) => violation(site, t.toString)
+      case NonFatal(t) => violation(site, t.toString, Some(t))
 
   /** Runs `f`, a claim at the production site `site`, with the moves that throw on what the table does not allow.
    *  Returns whether it was made; a refused one is recorded, and its caller backs off. A strict silence path's throw
@@ -120,13 +121,22 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     catch
       case e: SilenceFailure => throw e
       case NonFatal(t) =>
-        violation(site, s"refused: $t")
+        violation(site, s"refused: $t", Some(t))
         false
 
-  /** Logs and records a registry violation at `site` */
-  private def violation(site: String, message: String): Unit =
-    logger.error(s"Copy registry ($site): $message")
-    errors :+= s"$site: $message"
+  /** Logs a registry violation at `site`, with its throwable if any, and records it for the drain check only when
+   *  `strict` (tests): production retries a refused claim at every check, so a kept record would grow without bound */
+  private def violation(site: String, message: String, cause: Option[Throwable] = None): Unit =
+    cause match
+      case Some(t) => logger.error(s"Copy registry ($site): $message", t)
+      case None => logger.error(s"Copy registry ($site): $message")
+    if strict then
+      errors :+= s"$site: $message"
+
+  /** Records a learned copy for the drain check, only when `strict` (tests); production has logged it */
+  private def learnedCopy(message: String): Unit =
+    if strict then
+      learnedCopies :+= message
 
   /** Records an activity fact on `copies`, applied whatever the table says */
   private def activityFact(site: String, copies: DeviceCopies, storeId: StoreId, to: Activity): Unit =
@@ -144,8 +154,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     e
 
   /** Something `silence(storeId)` reads changed: recomputes it, sets the router's mark, and republishes the view. A
-   *  throw is a bug: logged at error, the store left silent (clients retransmit), and recorded for the drain check;
-   *  with `strict` it then propagates */
+   *  throw is a bug: logged at error, the store left silent (clients retransmit), and, when `strict`, recorded for the
+   *  drain check and then propagated */
   def onChange(storeId: StoreId): Unit = onChange(List(storeId))
 
   /** `onChange` of each of `storeIds`, publishing the view once */
@@ -155,7 +165,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         ctx.router.setSilent(storeId, silence(storeId).isInstanceOf[Silence.Silent])
         None
       catch case NonFatal(t) =>
-        logger.error(s"Copy registry: the silence of store $storeId could not be derived. Leaving it silent: $t")
+        logger.error(s"Copy registry: the silence of store $storeId could not be derived. Leaving it silent: $t", t)
         ctx.router.setSilent(storeId, true)
         Some(s"silence of $storeId: $t" -> t)
     val published =
@@ -163,11 +173,11 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         ctx.publishView()
         None
       catch case NonFatal(t) =>
-        logger.error(s"Copy registry: the host's store view could not be published: $t")
+        logger.error(s"Copy registry: the host's store view could not be published: $t", t)
         Some(s"publishView: $t" -> t)
     val all = failed.toList ++ published
-    silenceErrors ++= all.map(_._1)
     if strict then
+      silenceErrors ++= all.map(_._1)
       all.headOption.foreach((msg, t) => throw SilenceFailure(msg, t))
 
   /** The violations facts and claims recorded since the last call, which clears them */
@@ -237,7 +247,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
             case None =>
               logger.warn(s"The copy of store $storeId at $storePath was not known to the copy registry. Learned " +
                           s"at its load, $phase")
-              learnedCopies :+= s"device ${sds.storageDeviceId}: $storeId learned at load, $phase"
+              learnedCopy(s"device ${sds.storageDeviceId}: $storeId learned at load, $phase")
               copies.register(storeId, phase)
             case Some(Phase.Unread) => copies.setPhase(storeId, phase)
             case Some(p) if p == phase => ()
@@ -301,7 +311,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
             // Put at its path after the device's load (by hand or by a test): learned, as readAtLoad learns one
             logger.warn(s"The copy of store $storeId at ${retry.storePath} was not known to the copy registry. " +
                         "Learned awaiting a load retry, Unread")
-            learnedCopies :+= s"device ${retry.sds.storageDeviceId}: $storeId learned awaiting a retry, Unread"
+            learnedCopy(s"device ${retry.sds.storageDeviceId}: $storeId learned awaiting a retry, Unread")
             copies.register(storeId, Phase.Unread)
             copies.setActivity(storeId, Activity.AwaitingRetry(retry))
           case Some(r) => r.activity match
@@ -374,7 +384,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         val phase = CopyPhase.known(path).getOrElse(Phase.Live)
         logger.warn(s"The copy of store $storeId at $path was not known to the copy registry. Learned at its " +
                     s"$site, $phase")
-        learnedCopies :+= s"device $id: $storeId learned at $site, $phase"
+        learnedCopy(s"device $id: $storeId learned at $site, $phase")
         sds.copies.register(storeId, phase)
 
   /** The close of `storeId` about to be asked for is for `purpose` (DeviceShutdown, StoreLoader.handleClose): taken
@@ -570,7 +580,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     silence(storeId) == Silence.Served &&
       !allCopies.exists(_.copies.get(storeId).exists(_.activity.isInstanceOf[Activity.Closing])) &&
       !allCopies.exists(_.work.get(storeId).exists:
-        case Work.Rebuild(_, RebuildStage.Running | RebuildStage.Abandoned) | Work.TransferOut(_, _) => true
+        case Work.Rebuild(_, stage) => HostCopies.RebuildReads.contains(stage)
+        case Work.TransferOut(_, _) => true
         case _ => false) &&
       !ctx.storeTransferService.transferringOutStores.contains(storeId)
 
@@ -661,7 +672,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
             // Put back at its path after the device's load (a restore finishing late): learned, as readAtLoad learns
             logger.warn(s"The copy of store $storeId at $storePath was not known to the copy registry. Learned at " +
                         s"$site, Lost")
-            learnedCopies :+= s"device ${copies.deviceId}: $storeId learned at $site, Lost"
+            learnedCopy(s"device ${copies.deviceId}: $storeId learned at $site, Lost")
             copies.register(storeId, Phase.Lost)
           case Some(r) if r.phase != Phase.Lost => phaseFact(site, copies, storeId, Phase.Lost)
           case Some(_) => ()

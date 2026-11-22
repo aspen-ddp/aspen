@@ -518,9 +518,11 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
 
             fcomplete.onComplete:
               case Success(_) if ! isCurrent =>
-                // The bytes landed as the transfer was abandoned. Nobody owns the staged copy now,
-                // and nothing can be receiving this store, since a new attempt needs the store to
+                // The bytes landed as the transfer was abandoned, or as its device's unload forgot the attempt
+                // (crlFailed cancels no transfer in, so no abandon will stop its retransmission). Nobody owns the
+                // staged copy now, and nothing can be receiving this store, since a new attempt needs the store to
                 // have no attempt, as dropping this one left it.
+                stopRetransmitting()
                 if attemptOf(storeId).isEmpty then
                   val stagedPath = devicePath / StoreTransfer.StagingDirectory / storeId.directoryName
                   try os.remove.all(stagedPath)

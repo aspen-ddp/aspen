@@ -105,15 +105,17 @@
   error, applies the fact, and backs off the claim. With `verifyCopyRegistry` (every lockstep test host:
   TestNetwork, every ControlFixture host, `ControlFixture.compared` seams, FsifIntegrationSuite)
   each drain also throws on any `verifyAgainstDisk` mismatch (phase, unrecorded config'd directory, record without
-  directory). It skips only: an Unread or unsynced record's phase, and stats that fail; a create's record before its copy is placed (`Work.Create`); the store of a rebuild
-  whose completion's handler has not yet recorded the copy its finish placed off the control thread
-  (`StoreRebuilds.finishUnrecorded`, from the rebuild's start until that handler, so a drain may land in between);
-  untracked records; and a loaded device whose directory is known absent (a drive pulled from its running host).
-  A copy put back at its path after its device's load (a restore finishing late) is learned where it is
-  marked rebuild-required (`markedLost`). A test that places a copy by hand after its device's load registers it
-  with `host.testingOnlyRescan(deviceId)` (`HostCopies.rescan`: each unrecorded store directory with its phase, as
-  the load registers them) or `ControlFixture.placedCopies`; a fake rebuild places its copy as finish does (a config
-  and the `rebuild-complete` marker of its episode) before completing
+  directory) and on any copy a load, retry, LoadStore or `markedLost` learned since the last drain
+  (`HostCopies.takeLearned`): a learn is a site that placed a copy without recording it. The disk check skips only:
+  an Unread or unsynced record's phase, and stats that fail; a create's record before its copy is placed
+  (`Work.Create`); the copy a running rebuild's finish placed off the control thread before its completion's
+  handler records it, recognised by its directory reading that rebuild's `Rebuilt(episode)` phase
+  (`StoreRebuilds.finishPlacing`; any other copy at the rebuilding store's path is checked); untracked records; and
+  a device a test pulled from under its running host (`host.testingOnlySkipDiskCheck(deviceId)`; a device directory
+  that is merely missing is reported). A test that places a copy by hand after its device's load registers it
+  before the next drain with `host.testingOnlyRescan(deviceId)` (`HostCopies.rescan`: each unrecorded store
+  directory with its phase, as the load registers them) or `ControlFixture.placedCopies`; a fake rebuild places its
+  copy as finish does (a config and the `rebuild-complete` marker of its episode) before completing
 - The reconcile passes select from the device's offline copies (`HostCopies.offlineCopies`: records Idle or awaiting
   a load retry, with no work on the device): the Deleted Stores, Lost CRL, Abandoned Transfers Out, Completed
   Transfers In and Completed Rebuilds passes and `reloadClosedStores`. A copy that a transfer in, rebuild, create or

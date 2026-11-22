@@ -192,8 +192,10 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     os.write.over(storeDir / StoreConfig.configFilename, fsifStoreCfg.yamlConfig)
     storeDir
 
-  /** Loads the store as tryLoadStore does after a restart, and runs the events that load queues */
+  /** Loads the store as tryLoadStore does after a restart, and runs the events that load queues. The copy the test
+   *  placed after the device's load is registered first, as a restart's device load would find it */
   private def load(host: Host): Unit =
+    host.testingOnlyRescan(deviceA)
     host.loadStoreById(deviceA, storeId)
     host.testingOnlyHandleEvents()
 

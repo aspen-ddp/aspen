@@ -548,13 +548,13 @@ class Host(val client: AspenClient,
       t.drain()
       if seams.verifyCopyRegistry then
         val registry = deviceControl.copyRegistry
+        // A copy a load learned of fails too: a test that places a copy after its device's load registers it
+        // (testingOnlyRescan), so any other learn is a site that placed a copy without recording it
         val problems = registry.takeRegistryErrors().toList ++ registry.takeSilenceErrors() ++
-          registry.verifyAgainstDisk()
-        // A copy a load learned of is reported, not failed on: a test may place a copy after its device's load
+          registry.verifyAgainstDisk() ++ registry.takeLearned().map(l => s"(learned) $l")
         if problems.nonEmpty then
-          val learned = registry.learned.map(l => s"(learned) $l")
           throw new IllegalStateException(s"Copy registry of host $hostId after a drain:\n  " +
-                                          (problems ++ learned).mkString("\n  "))
+                                          problems.mkString("\n  "))
       else if seams.strictCopyRegistry then
         val registry = deviceControl.copyRegistry
         val problems = registry.takeRegistryErrors().toList ++ registry.takeSilenceErrors()
@@ -568,6 +568,11 @@ class Host(val client: AspenClient,
    *  directories it finds (HostCopies.rescan). Returns the stores registered */
   private[aspen] def testingOnlyRescan(deviceId: StorageDeviceId): List[StoreId] =
     deviceControl.devices.devices.get(deviceId).toList.flatMap(deviceControl.copyRegistry.rescan)
+
+  /** Test-only, on the control thread: the drain's disk check skips loaded device `deviceId`, whose directory the
+   *  test removed while the host has it loaded (a drive pulled from its running host) */
+  private[aspen] def testingOnlySkipDiskCheck(deviceId: StorageDeviceId): Unit =
+    deviceControl.copyRegistry.skipDiskCheck(deviceId)
 
   /** The components, for tests. */
   private[aspen] def control: DeviceControl = deviceControl

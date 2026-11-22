@@ -611,6 +611,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val storeDir = deviceDir / back.directoryName
     os.makeDir.all(storeDir)
     StoreIncarnationFile.writeFresh(storeDir)
+    host.testingOnlyRescan(deviceA)
     val backend = new MapBackend(back):
       override def path: os.Path = storeDir
     val load = host.loadStore(deviceA, backend, None)
@@ -652,7 +653,9 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       StoreIncarnationFile.writeFresh(dir)
       new MapBackend(s):
         override def path: os.Path = dir
-    val loads = List(unlisted, listed).map(s => host.loadStore(deviceA, backendAt(s), None))
+    val backends = List(unlisted, listed).map(backendAt)
+    host.testingOnlyRescan(deviceA)
+    val loads = backends.map(b => host.loadStore(deviceA, b, None))
 
     def served(s: StoreId): Boolean = host.control.router.loaded.contains(s)
     def pending: List[os.Path] =

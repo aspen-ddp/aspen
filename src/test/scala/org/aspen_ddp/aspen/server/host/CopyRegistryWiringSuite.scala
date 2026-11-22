@@ -249,7 +249,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     host.control.copyRegistry.verifyAgainstDisk().size should be(1)
     host.control.loader.tryLoadStore(local, dir)
     phases(host, deviceA) should be(Map(sid(0) -> Phase.Outbound("t")))
-    host.control.copyRegistry.learned.size should be(1)
+    host.control.copyRegistry.takeLearned().size should be(1)
     host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
     host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
@@ -1119,8 +1119,10 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
   // ---- Task 9: the disk check runs in every host test ----
 
   // A rebuild's finish places its copy off the control thread, ahead of its completion's handler: a drain in between
-  // finds a directory with no record. Its store is exempt from the check until the handler records the copy, and
-  // only its store: a copy placed by hand meanwhile is still reported, until a rescan registers it
+  // finds a directory with no record. Only that copy is exempt, recognised by its disk signature (the Rebuilt phase
+  // of the running rebuild's episode), and only until the handler records it. Any other copy at the rebuilding
+  // store's path meanwhile is reported, as is a copy placed by hand at another store's path, until a rescan
+  // registers it
   atest("a rebuild's copy placed ahead of its completion's handler is exempt from the disk check until recorded"):
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
@@ -1130,35 +1132,50 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     host.testingOnlyHandleEvents()
     val local = loadedDevices(host)(deviceA)
     val episode = UUID.randomUUID()
+    def mismatches(): List[String] = host.control.copyRegistry.verifyAgainstDisk()
     for
       _ <- net.createDevice(deviceA)
       _ <- setDeviceState(deviceA)(_.setRebuilding(sid(0), episode))
       _ <- waitForTransactionsToComplete()
       _ = host.control.rebuilds.startRebuild(local, sid(0), Some(episode), acceptLoss = false)
       _ <- pumpUntil(host, factory.created.nonEmpty)
+      // Near misses, at the rebuilding store's path before finish: an unregistered Live copy, then one finished for
+      // another episode. Neither is the rebuild's own, so both are reported (checked without draining)
+      wrong = writeStoreConfig(dev, sid(0))
+      liveCopy = mismatches()
+      _ = os.write.over(wrong / RebuildingStore.RebuildCompleteMarkerFile,
+                        RebuildingStore.rebuildCompleteContent(Some(UUID.randomUUID())))
+      otherEpisode = mismatches()
+      _ = os.remove.all(wrong)
       // Where finish places the copy, before its future completes
       placed = writeStoreConfig(dev, sid(0))
       _ = os.write.over(placed / RebuildingStore.RebuildCompleteMarkerFile,
                         RebuildingStore.rebuildCompleteContent(Some(episode)))
-      unrecordedWhilePlacing = host.control.rebuilds.finishUnrecorded(deviceA, sid(0))
-      // The draining check passes: the store is exempt
+      placingPhase = host.control.rebuilds.finishPlacing(deviceA, sid(0))
+      // The draining check passes: the copy is exempt
       _ = host.testingOnlyHandleEvents()
-      exempt = host.control.copyRegistry.verifyAgainstDisk()
+      exempt = mismatches()
       // A copy put at another store's path meanwhile is not exempt
       _ = writeStoreConfig(dev, sid(1))
-      handPlaced = host.control.copyRegistry.verifyAgainstDisk()
+      handPlaced = mismatches()
       rescanned = host.testingOnlyRescan(deviceA)
       _ = factory.created.head.promise.success(())
       _ <- awaitRebuild(host, deviceA, sid(0))
-      recordedAfterFinish = host.control.rebuilds.finishUnrecorded(deviceA, sid(0))
+      recordedAfterFinish = host.control.rebuilds.finishPlacing(deviceA, sid(0))
     yield
-      unrecordedWhilePlacing should be(true)
+      liveCopy.size should be(1)
+      liveCopy.head should include(sid(0).directoryName)
+      liveCopy.head should include("has no record")
+      otherEpisode.size should be(1)
+      otherEpisode.head should include(sid(0).directoryName)
+      otherEpisode.head should include("has no record")
+      placingPhase should be(Some(Phase.Rebuilt(episode.toString)))
       exempt should be(Nil)
       handPlaced.size should be(1)
       handPlaced.head should include(sid(1).directoryName)
       handPlaced.head should include("has no record")
       rescanned should be(List(sid(1)))
-      recordedAfterFinish should be(false)
+      recordedAfterFinish should be(None)
       recorded(host).rebuildOutcomes((deviceA, sid(0))) should be(RebuildOutcome.Adopt)
       phases(host, deviceA) should be(Map(sid(0) -> Phase.Live, sid(1) -> Phase.Live))
       consistent(host)

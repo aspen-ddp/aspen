@@ -495,6 +495,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val storePath = deviceDir / moving.directoryName
     DefaultBackendOpener.createStore(StoreConfig(moving, StoreConfig.RocksDB(None), None, Replication(3, 2)),
       storePath, deviceDir / StoreCreation.CreatingDirectory)
+    host.testingOnlyRescan(deviceA)
 
     for
       _ <- net.createDevice(deviceA)
@@ -588,6 +589,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       val storePath = deviceDir / moving.directoryName
       DefaultBackendOpener.createStore(StoreConfig(moving, StoreConfig.RocksDB(None), None, Replication(3, 2)),
         storePath, deviceDir / StoreCreation.CreatingDirectory)
+      host.testingOnlyRescan(deviceA)
       val lockstep = host.threading match
         case t: LockstepThreading => t
         case other => fail(s"needs LockstepThreading, not $other")

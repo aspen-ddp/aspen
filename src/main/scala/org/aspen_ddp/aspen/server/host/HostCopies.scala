@@ -72,8 +72,28 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   /** The records of device `id`: a loaded one's, or those of the stores served from it untracked */
   def device(id: StorageDeviceId): Option[DeviceCopies] = attached.get(id).map(_.copies).orElse(untracked.get(id))
 
-  /** Every copy a load learned of (readAtLoad), each as a message */
+  /** Every copy a load learned of (readAtLoad), each as a message, since the last takeLearned */
   def learned: Vector[String] = learnedCopies
+
+  /** The copies learned since the last call, which clears them (the drain check fails on any) */
+  def takeLearned(): Vector[String] =
+    val l = learnedCopies
+    learnedCopies = Vector()
+    l
+
+  // Devices a test pulled from under the host (testingOnlySkipDiskCheck): the disk check skips them
+  private var diskCheckSkipped: Set[StorageDeviceId] = Set()
+
+  /** Test-only: the disk check skips device `id`, whose directory the test removed while the host has it loaded (a
+   *  drive pulled from its running host) */
+  def skipDiskCheck(id: StorageDeviceId): Unit =
+    diskCheckSkipped += id
+
+  /** Test-only: whether the copy at `storeId`'s path on device `id` is the one a running rebuild's finish placed
+   *  there, its completion's handler not yet run: the handler records it (StoreRebuilds.finishPlacing). Its
+   *  directory reads that rebuild's Rebuilt phase */
+  private def finishInFlight(id: StorageDeviceId, devicePath: os.Path, storeId: StoreId): Boolean =
+    ctx.rebuilds.finishPlacing(id, storeId).exists(p => CopyPhase.known(devicePath / storeId.directoryName).contains(p))
 
   /** The unloaded devices' stores, by device */
   def unloadedEntries: Map[StorageDeviceId, Set[StoreId]] = unloaded
@@ -186,13 +206,13 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
 
   /** Test-only (Host.testingOnlyRescan): registers each store directory on `sds` that has no record, with its phase,
    *  as `attach` registers the directories a device load finds: copies a test placed by hand after the load. Records
-   *  already there are left as they are, and so is the path of a rebuild whose finish is still to be recorded
-   *  (StoreRebuilds.finishUnrecorded): its completion's handler records it. Returns the stores registered */
+   *  already there are left as they are, and so is a copy a rebuild's finish placed whose completion's handler has
+   *  not yet run (finishInFlight): the handler records it. Returns the stores registered */
   def rescan(sds: LocalStorageDeviceState): List[StoreId] =
     copiesOf(sds).toList.flatMap: copies =>
       storeDirectories(sds.devicePath).collect:
         case (storeId, path) if !copies.copies.contains(storeId) &&
-                                !ctx.rebuilds.finishUnrecorded(sds.storageDeviceId, storeId) =>
+                                !finishInFlight(sds.storageDeviceId, sds.devicePath, storeId) =>
           copies.register(storeId, CopyPhase.known(path).getOrElse(Phase.Unread))
           storeId
 
@@ -714,19 +734,19 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
    *   - a record's phase is not the phase its directory's markers read, for records neither Unread nor unsynced;
    *   - a store directory with a config has no record;
    *   - a record has no directory, but one whose create is still placing it (Work.Create).
-   *  Stats and reads that fail are skipped: they say nothing. A store a rebuild runs for on the device whose
-   *  completion's handler has not yet recorded its copy (StoreRebuilds.finishUnrecorded) is skipped whole: its finish
-   *  places the copy off the control thread, ahead of the handler. A device whose directory is known absent (pulled
-   *  from its running host) is skipped. Empty when consistent. */
+   *  Stats and reads that fail are skipped: they say nothing. A store path holding the copy a running rebuild's
+   *  finish placed, its directory reading that rebuild's Rebuilt phase while its completion's handler has not yet run
+   *  (finishInFlight), is skipped: finish places the copy off the control thread, ahead of the handler. A device a test
+   *  pulled from under the host (skipDiskCheck) is skipped. Empty when consistent. */
   def verifyAgainstDisk(): List[String] =
     ctx.devices.devices.toList.sortBy(_._1.uuid).flatMap: (id, sds) =>
       if !attached.get(id).exists(_ eq sds) then
         List(s"device $id is loaded but not attached to the copy registry")
-      else if Try(FileStat.isDir(sds.devicePath)).toOption.contains(false) then
-        // The device itself is gone (a drive pulled from its running host): its disk says nothing of its copies
+      else if diskCheckSkipped.contains(id) then
+        // A test pulled the device from under its running host (skipDiskCheck)
         Nil
       else
-        val placing = (storeId: StoreId) => ctx.rebuilds.finishUnrecorded(id, storeId)
+        val placing = (storeId: StoreId) => finishInFlight(id, sds.devicePath, storeId)
         val records = sds.copies.copies.filterNot((storeId, _) => placing(storeId))
         val onDisk =
           try storeDirectories(sds.devicePath).filter((storeId, path) =>

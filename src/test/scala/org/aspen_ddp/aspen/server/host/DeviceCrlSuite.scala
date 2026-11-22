@@ -399,6 +399,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       newRoot = newHostDir()
       newDir = StorageDeviceManager.deviceDirectory(newRoot, "dev0")
       _ = os.move(oldDir, newDir)
+      // The old host keeps the device loaded until it relinquishes it: its disk says nothing of its copies now
+      _ = oldHost.testingOnlySkipDiskCheck(deviceA)
       _ = net.takeCapturedHostMessages()
       host = newCrlHost(newRoot, second)
       _ <- pumpWithTx(host, recovered(host, sid, txid))
@@ -2580,6 +2582,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
              stores = Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
       _ <- writeRocksStore(deviceDir, storeId)
       _ = CrashRecoveryLog.saveStoreState(storeId, landedState, Backend.crlSaveFile(storeDir))
+      _ = restarted.testingOnlyRescan(deviceA)
       _ = crl.loadGate = Some(loadGate.future)
       _ = restarted.control.loader.tryLoadStore(sds, storeDir)
       _ <- pumpUntil(restarted, crl.dropCalls.get == 2)

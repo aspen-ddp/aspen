@@ -2154,6 +2154,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val host = newRealHost(hostRoot)
     val storeDir = writeStoreDir(deviceDir)
     os.write.over(Backend.crlSaveFile(storeDir), "")
+    host.testingOnlyRescan(deviceA)
 
     val backend = new RocksDBBackend(storeDir, storeId, executionContext)
     val loaded = host.loadStore(deviceA, backend, None)

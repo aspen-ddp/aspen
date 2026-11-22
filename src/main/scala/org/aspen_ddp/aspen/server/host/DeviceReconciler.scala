@@ -269,11 +269,18 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // reads Active is flipped to Rebuilding; startRebuilds then discards its
     // directory and rebuilds it. Before the abandoned-transfers-out pass, which would
     // otherwise take a marked store left behind a transfer-out marker for one to reinstate.
+    //
+    // A store still being shipped (its transfer aborted while the send runs: the abandoned-out pass below makes the
+    // same check) waits, re-checked shortly: its rebuild's discard would move the directory the send may still be
+    // reading (I3, one piece of work per (device, store)).
     val lostCrl = local.offlineStores.filter(storeId =>
       hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildRequired))
     lostCrl.foreach: storeId =>
       if remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) then
-        ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
+        if ctx.storeTransferService.isTransferringOut(storeId) then
+          scheduleDeviceRecheck(local.storageDeviceId)
+        else
+          ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
     lostCrl
 
   /** Reinstates stores left offline behind a transfer-out marker whose transfer was abandoned. */

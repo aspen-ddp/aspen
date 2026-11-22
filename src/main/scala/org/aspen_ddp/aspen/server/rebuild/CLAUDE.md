@@ -90,6 +90,8 @@
   latest reconcile (`discardLostStore`); an entry moved on meanwhile gets a fresh device check instead
   A new store's create work ends once its copy is served, before its flip commits, so a rebuild of a store whose
   backend failed right after its create never overlaps the create (`StoreRebuilds.createNewStore`)
+  A rebuild is neither requested (Lost CRL pass) nor started (`startRebuild`) while a send of the store is still
+  registered (`isTransferringOut`): its discard would move the directory being shipped. A device re-check follows
 - A rebuild's staging store opens through the same `BackendOpener` as a normal load (passed by
   `StoreRebuildFactory.createRebuild`). A first pass (no checkpoint) discards whatever staging holds and creates a
   fresh staging store atomically (`BackendOpener.create`); a resume only opens it, and one whose backend is lost

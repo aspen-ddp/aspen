@@ -265,7 +265,15 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     // checks the device: otherwise stores whose passes keep failing, sorting first, would retake the slots at every
     // check of the device and starve the stores queued behind them. An operator's remedy since the failure (a
     // re-placement to another device or episode, an accept-rebuild-loss) is not held back (rebuild-process 5.7)
-    if !rebuildingStores.contains(storeId) && !scheduledRebuildRetries.get(storeId).contains(held) &&
+    // A store still being shipped waits, re-checked shortly: a discard of its lost copy would move the directory the
+    // send may still be reading (I3, one piece of work per (device, store)). DeviceReconciler.flipLostCrlStores and the
+    // abandoned-transfers-out pass make the same check
+    val shipping = ctx.storeTransferService.isTransferringOut(storeId)
+    if shipping then
+      logger.debug(s"Not rebuilding store $storeId on device ${local.storageDeviceId} yet: a transfer out of it is " +
+                   "still sending")
+      ctx.reconciler.scheduleDeviceRecheck(local.storageDeviceId)
+    if !shipping && !rebuildingStores.contains(storeId) && !scheduledRebuildRetries.get(storeId).contains(held) &&
        rebuildingStores.size + droppingCrlState.size < ctx.maxConcurrentRebuilds &&
        ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId, episode) &&
        discardLostStore(local, storeId, episode) then

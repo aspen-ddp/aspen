@@ -201,3 +201,70 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       createWorkWhileQueued should be(false)
       host.control.rebuilds.createFlipsPending should not contain creating
       recorded(host).loadStoreRequests.toList should be(List((deviceA, creating)))
+
+  /** Ship x discard (audit review Minor 1): a lost copy (rebuild-required, offline, its entry Active again after its
+   *  transfer was aborted) whose ship is still registered is neither flipped to Rebuilding nor retired until the ship
+   *  ends: the retire would move the directory the archiver may still be reading. */
+  atest("a lost copy still being shipped is not retired until the ship ends"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val storePath = writeStoreConfig(deviceDir, moving)
+    os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+    val sends = new StagedSendService
+    val factory = new HeldRebuildFactory
+    val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
+    loadedDevices(host)(deviceA).offlineStores += moving
+    sends.beginTransferOut(moving, UUID.randomUUID(), storePath, "localhost", 1, org.aspen_ddp.aspen.common.HLCTimestamp.now)
+
+    def entry(): Future[Option[StorageDeviceState.StoreStatus]] =
+      client.getStorageDeviceState(deviceA).map(_.stores.get(moving).map(_.status))
+
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.setStoreEntry(moving, StorageDeviceState.StoreStatus.Active, None))
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.reconciler.checkStorageDevice(deviceA)
+      _ <- pumpUntil(false, rounds = 3)
+      whileShipping <- entry()
+      keptWhileShipping = os.exists(storePath)
+      _ = sends.endTransferOut(moving)
+      _ = runDeviceRechecks(host)
+      _ <- pumpUntil(factory.created.nonEmpty)
+      afterShip <- entry()
+    yield
+      whileShipping should be(Some(StorageDeviceState.StoreStatus.Active))
+      keptWhileShipping should be(true)
+      afterShip should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      os.exists(storePath) should be(false)
+      factory.created.map(_.storeId).toList should be(List(moving))
+
+  /** Ship x discard, the entry already Rebuilding: its rebuild does not discard the copy while the ship runs */
+  atest("a lost copy still being shipped is not discarded by its rebuild until the ship ends"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val storePath = writeStoreConfig(deviceDir, moving)
+    os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+    val sends = new StagedSendService
+    val factory = new HeldRebuildFactory
+    val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
+    loadedDevices(host)(deviceA).offlineStores += moving
+    sends.beginTransferOut(moving, UUID.randomUUID(), storePath, "localhost", 1, org.aspen_ddp.aspen.common.HLCTimestamp.now)
+    val rebuilding = Map(moving -> rebuildingIn(UUID.randomUUID()))
+
+    for
+      _ <- check(host, deviceA, rebuilding)
+      // Long enough for a discard to have moved the copy
+      _ <- yieldUntil(!os.exists(storePath))
+      keptWhileShipping = os.exists(storePath)
+      discardingWhileShipping = host.control.rebuilds.isRebuilding(moving)
+      _ = sends.endTransferOut(moving)
+      _ = recorded(host).armLookup(deviceA).success(deviceState(deviceA, rebuilding))
+      _ = runDeviceRechecks(host)
+      _ <- yieldUntil(factory.created.nonEmpty)
+    yield
+      keptWhileShipping should be(true)
+      discardingWhileShipping should be(false)
+      os.exists(storePath) should be(false)
+      factory.created.map(_.storeId).toList should be(List(moving))

@@ -18,9 +18,9 @@ enum MoveResult:
 
 /** Runs only on the control thread. See HostThreading.scala.
  *
- *  Every phase change of a copy between phase directories (spec "Uniform move and Unsynced"): the target phase's
- *  `phase-param` written durably first, when it carries one, then the rename through DurableFiles.move, which forces
- *  the directories that name the copy before and after. A rename that landed but was not forced leaves the copy
+ *  Every phase change of a copy between phase directories (spec "Uniform move and Unsynced"): the target phase's own
+ *  parameter file (CopyLayout.paramFile) written durably first, when it carries one, then the rename through
+ *  DurableFiles.move, which forces the directories that name the copy before and after. A rename that landed but was not forced leaves the copy
  *  unsynced (CopyRecord.unsynced, the one unsynced mechanism, which CopyMarkers' marker changes share): it is never
  *  loaded, shipped or released until a device check forces both directories again (`resync`, at the top of
  *  DeviceReconciler.reconcileDeviceState). A rename that failed changes nothing.
@@ -100,7 +100,7 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
       // Between two flat phases the markers move it (CopyMarkers), never a rename
       MoveResult.NotMoved(IllegalArgumentException(s"$to is the flat path $from, where the copy already is"))
     else
-      val result = relocate(from, target, fromFlat, toFlat, CopyLayout.param(to))
+      val result = relocate(from, target, fromFlat, toFlat, to)
       result match
         case MoveResult.Durable => logger.info(s"Moved the copy at $from to $target ($site)")
         case MoveResult.Unsynced(t) =>
@@ -110,11 +110,13 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
           logger.error(s"Failed to move the copy at $from to $target ($site). It stays where it is. Error: $t")
       result
 
-  /** The steps of a move from `from` to `target`: the target's directory made if absent, the markers stripped when
-   *  leaving a phase directory for the flat path, `param` placed durably, the rename forced, then the markers
-   *  stripped when the copy left the flat path for a phase directory and the move is durable */
+  /** The steps of a move from `from` to `target`, into phase `to`: the target's directory made if absent, the
+   *  markers stripped when leaving a phase directory for the flat path, `to`'s own parameter file placed durably (the
+   *  source phase's file is never touched, so a failed move leaves the source reading what it read), the rename
+   *  forced, then the markers stripped when the copy left the flat path for a phase directory and the move is
+   *  durable */
   private[host] def relocate(from: os.Path, target: os.Path, fromFlat: Boolean, toFlat: Boolean,
-                             param: Option[String]): MoveResult =
+                             to: Phase): MoveResult =
     val prepared =
       try
         val dir = target / os.up
@@ -123,7 +125,10 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
           syncDirectory(dir / os.up)
         if !fromFlat && toFlat && stripMarkers(from) then
           syncDirectory(from)
-        param.foreach(p => DurableFiles.write(from / CopyLayout.PhaseParamFile, p))
+        for
+          file <- CopyLayout.paramFile(to)
+          p <- CopyLayout.param(to)
+        do DurableFiles.write(from / file, p)
         None
       catch case NonFatal(t) => Some(MoveResult.NotMoved(t))
     prepared.getOrElse:

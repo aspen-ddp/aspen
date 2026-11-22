@@ -31,9 +31,11 @@
   move that places the copy, which `DurableFiles.move` forces
 - Copy layout (store copy state machine, stage 2; spec "Device layout"): `CopyLayout` says where each copy lives.
   A converted phase is a directory under the device root holding copies named `<storeId.directoryName>.<copyId>`
-  (`copyName`/`parseName`; the store id comes from the name only), its parameter in the copy's `phase-param`
-  (`param`, `readParam`: "" when known absent, a failed stat throws). So far only Retired (`pending-delete/`) is a
-  directory (`dirOf`); every other phase is the flat path `<device>/<storeId.directoryName>`, whose markers say it.
+  (`copyName`/`parseName`; the store id comes from the name only), its parameter in the copy's own file for that
+  phase, `phase-param.<phase directory>` (`paramFile`, `param`, `readParam(copy, phase)`: "" when known absent, a
+  failed stat throws). Each location reads only its own phase's file and a move writes only its target's, so a
+  failed move or a crash before the rename leaves the source's parameter as it was; an earlier phase's file is
+  inert. So far only Retired (`pending-delete/`) is a directory (`dirOf`); every other phase is the flat path `<device>/<storeId.directoryName>`, whose markers say it.
   `CopyLayout.list` is the one listing of a device's copies (device load and its CRL-lost decision, `storesIn`,
   `HostCopies.attach`/`rescan`/`verifyAgainstDisk`): flat store-named directories (config or not; a failed stat
   counts) and each converted directory's children; a child that is no copy name is a stray, logged at warn at the
@@ -41,9 +43,9 @@
   `CopyLayout.path` over its `copyId` and phase), `pathOrLive` where the copy may have no record, or
   `CopyLayout.path(..., None, Phase.Live)` for a copy not recorded yet (a create's target, a rebuild's final path, a
   transfer's promotion). `CopyRecord.copyId` is None for a flat copy. Every phase change into or out of a phase
-  directory is one `CopyMoves.move` (`DeviceControl.moves`; `moveUnattached` for a device being loaded): the target's
-  `phase-param` written durably, then `DurableFiles.move` through the `rename` and `syncDirectory` seams, recorded as
-  a fact (`HostCopies.moved`, a fresh `copyId` on a copy's first move). `DurableFiles.move` throws
+  directory is one `CopyMoves.move` (`DeviceControl.moves`; `moveUnattached` for a device being loaded): the target
+  phase's parameter file written durably, then `DurableFiles.move` through the `rename` and `syncDirectory` seams,
+  recorded as a fact (`HostCopies.moved`, a fresh `copyId` on a copy's first move). `DurableFiles.move` throws
   `DurableFiles.MoveNotForced` for a rename that landed but was not forced: `MoveResult.Unsynced`, the record takes
   the phase with `unsynced` (the same flag a marker change sets) and `resync` forces both directories again; any
   other failure is `NotMoved`, nothing changed. A durable move to Retired unregisters the record (P3); an unsynced one

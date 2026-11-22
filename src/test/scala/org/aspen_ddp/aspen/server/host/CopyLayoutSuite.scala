@@ -41,17 +41,26 @@ class CopyLayoutSuite extends FileBasedTests:
     CopyLayout.param(Phase.Live) should be(None)
     CopyLayout.param(Phase.Lost) should be(None)
 
+  test("each phase's parameter has its own file"):
+    CopyLayout.paramFile(Phase.Arrived("t")) should be(Some("phase-param.arrived"))
+    CopyLayout.paramFile(Phase.Outbound("t")) should be(Some("phase-param.outbound"))
+    CopyLayout.paramFile(Phase.Rebuilt("e")) should be(Some("phase-param.rebuilt"))
+    List(Phase.Live, Phase.Lost, Phase.Retired).map(CopyLayout.paramFile) should be(List(None, None, None))
+
   test("readParam reads an absent file as empty and throws a failed stat"):
     val copy = tdir / "copy"
     os.makeDir.all(copy)
-    CopyLayout.readParam(copy) should be("")
-    os.write(copy / CopyLayout.PhaseParamFile, "t-1")
-    CopyLayout.readParam(copy) should be("t-1")
+    CopyLayout.readParam(copy, Phase.Rebuilt("")) should be("")
+    os.write(copy / CopyLayout.paramFile(Phase.Rebuilt("")).get, "e-1")
+    // Each phase reads only its own file
+    CopyLayout.readParam(copy, Phase.Rebuilt("")) should be("e-1")
+    CopyLayout.readParam(copy, Phase.Outbound("")) should be("")
+    CopyLayout.readParam(copy, Phase.Live) should be("")
     // A parent without search permission: the stat fails (EACCES), which is no absence
     val locked = tdir / "locked"
     os.makeDir.all(locked / "copy")
     os.perms.set(locked, "rw-------")
-    try an[java.io.IOException] should be thrownBy CopyLayout.readParam(locked / "copy")
+    try an[java.io.IOException] should be thrownBy CopyLayout.readParam(locked / "copy", Phase.Rebuilt(""))
     finally os.perms.set(locked, "rwx------")
 
   test("a child whose name is not a copy name is reported, not listed"):

@@ -11,8 +11,8 @@ import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import java.util.UUID
 import scala.concurrent.Future
 
-/** CopyMoves: every phase change of a copy is one move, phase-param first, then a rename forced in both directories
- *  (spec "Uniform move and Unsynced"). Until a phase is converted these drive the one phase directory there is,
+/** CopyMoves: every phase change of a copy is one move, the target phase's parameter file first, then a rename forced
+ *  in both directories (spec "Uniform move and Unsynced"). Until a phase is converted these drive the one phase directory there is,
  *  Retired, from a flat Lost copy */
 class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
 
@@ -37,14 +37,14 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
 
   private def injected(): java.io.IOException = new java.io.IOException("injected failure")
 
-  test("a move writes phase-param before the rename and records the phase"):
+  test("a move writes the target phase's parameter before the rename and records the phase"):
     val (host, local, dev) = withDevice()
     val from = CopyFixtures.copyPath(dev, s).get
     var renames = List.empty[(os.Path, os.Path)]
     val rename = host.control.moves.rename
     host.control.moves.rename = (a, b) =>
       renames ::= (a, b)
-      CopyLayout.param(Phase.Retired).foreach(p => CopyLayout.readParam(a) should be(p))
+      CopyLayout.param(Phase.Retired).foreach(p => CopyLayout.readParam(a, Phase.Retired) should be(p))
       rename(a, b)
     host.control.moves.move("test", local, s, Phase.Retired) should be(MoveResult.Durable)
     host.testingOnlyHandleEvents()
@@ -63,12 +63,12 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(b)
     var seen = Option.empty[String]
     host.control.moves.rename = (x, y) =>
-      seen = Some(CopyLayout.readParam(x))
+      seen = Some(CopyLayout.readParam(x, Phase.Outbound("")))
       rename(x, y)
-    host.control.moves.relocate(a / "copy", b / "copy", fromFlat = false, toFlat = false, Some("t-7")) should be(
-      MoveResult.Durable)
+    host.control.moves.relocate(a / "copy", b / "copy", fromFlat = false, toFlat = false,
+      Phase.Outbound("t-7")) should be(MoveResult.Durable)
     seen should be(Some("t-7"))
-    CopyLayout.readParam(b / "copy") should be("t-7")
+    CopyLayout.readParam(b / "copy", Phase.Outbound("")) should be("t-7")
 
   test("a copy leaving a phase directory for the flat path is stripped of markers first, or not moved"):
     val (host, _, _) = withDevice()
@@ -77,10 +77,12 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(copy)
     os.write(copy / RebuildingStore.RebuildRequiredMarkerFile, "")
     host.control.moves.syncDirectory = d => if d == copy then throw injected()
-    host.control.moves.relocate(copy, tdir / "flat", fromFlat = false, toFlat = true, None) shouldBe a[MoveResult.NotMoved]
+    host.control.moves.relocate(copy, tdir / "flat", fromFlat = false, toFlat = true, Phase.Live) shouldBe
+      a[MoveResult.NotMoved]
     os.isDir(copy) should be(true)
     host.control.moves.syncDirectory = DurableFiles.syncDirectory
-    host.control.moves.relocate(copy, tdir / "flat", fromFlat = false, toFlat = true, None) should be(MoveResult.Durable)
+    host.control.moves.relocate(copy, tdir / "flat", fromFlat = false, toFlat = true, Phase.Live) should be(
+      MoveResult.Durable)
     os.list(tdir / "flat") should be(Nil)
 
   test("a sync that fails after the rename leaves the record unsynced and the next resync clears it"):
@@ -101,6 +103,28 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     // Synced, the retired copy leaves the registry as a durable move's does
     record(host, s) should be(None)
     host.control.moves.resync(local) should be(Nil)
+
+  // Review finding (fix round 1): a move writes only its target phase's parameter file, so a failed rename (or a crash
+  // before it) leaves the source reading its own parameter. No param-carrying phase is converted yet: driven through
+  // relocate, from a copy in a phase directory whose own Rebuilt file names its episode, to Outbound
+  test("a failed move to a phase with a parameter leaves the source's own parameter as it was"):
+    val (host, _, _) = withDevice()
+    val before = record(host, s)
+    val tdir = scratch()
+    val copy = tdir / "rebuilt" / "copy"
+    os.makeDir.all(copy)
+    os.makeDir.all(tdir / "outbound")
+    os.write(copy / CopyLayout.paramFile(Phase.Rebuilt("")).get, "episode-e")
+    host.control.moves.rename = (_, _) => throw injected()
+    host.control.moves.relocate(copy, tdir / "outbound" / "copy", fromFlat = false, toFlat = false,
+      Phase.Outbound("transfer-t")) shouldBe a[MoveResult.NotMoved]
+    host.testingOnlyHandleEvents()
+    os.isDir(copy) should be(true)
+    CopyLayout.readParam(copy, Phase.Rebuilt("")) should be("episode-e")
+    // The target's file written ahead of the rename is inert where the copy still is
+    CopyLayout.readParam(copy, Phase.Outbound("")) should be("transfer-t")
+    record(host, s) should be(before)
+    host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
   test("a rename that fails changes nothing"):
     val (host, local, dev) = withDevice()

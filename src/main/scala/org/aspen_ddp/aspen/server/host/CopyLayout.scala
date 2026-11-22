@@ -9,17 +9,18 @@ import scala.util.Try
 
 /** Where each copy of a store lives on its device (spec "Device layout"): the location of a copy is its phase. A
  *  converted phase is a directory under the device root, holding each copy as `<storeId.directoryName>.<copyId>`,
- *  with the phase's parameter in the copy's `phase-param`. A phase not converted yet is the flat path,
- *  `<device>/<storeId.directoryName>`, whose marker files say the phase (CopyPhase). Code never builds a copy's path
+ *  with the phase's parameter in the copy's own file for that phase, `phase-param.<phase directory>` (paramFile): a
+ *  move writes only its target phase's file, and a location reads only its own, so a move that fails or a crash
+ *  before its rename leaves the source's parameter as it was, and a stale file of an earlier phase is inert. A phase
+ *  not converted yet is the flat path, `<device>/<storeId.directoryName>`, whose marker files say the phase
+ *  (CopyPhase). Code never builds a copy's path
  *  itself: it asks here, or the registry (HostCopies.pathOf).
  *
  *  Stage 2 converts the phases one task at a time; so far only Retired (`pending-delete/`) is a directory. */
 object CopyLayout:
-  val PhaseParamFile = "phase-param"
-
-  /** The converted phase directories, by name, each with the phase its children are in given their `phase-param`
-   *  (read only by a phase that carries one). Each task that converts a phase adds its row */
-  private val phaseDirectories: List[(String, (=> String) => Phase)] = List(
+  /** The converted phase directories, by name, each with the phase of a child copy there (reading that phase's own
+   *  parameter file, readParam, for a phase that carries one). Each task that converts a phase adds its row */
+  private val phaseDirectories: List[(String, os.Path => Phase)] = List(
     RebuildingStore.PendingDeleteDirectory -> (_ => Phase.Retired))
 
   /** The directory of `phase` under the device root, None while the phase is still a flat marker copy */
@@ -54,10 +55,22 @@ object CopyLayout:
     case Phase.Rebuilt(e) => Some(e)
     case _ => None
 
-  /** Reads `phase-param` of the copy at `copyPath`: "" when known absent; throws a failed stat or read */
-  def readParam(copyPath: os.Path): String =
-    val file = copyPath / PhaseParamFile
-    if FileStat.exists(file) then os.read(file).trim else ""
+  /** The file in a copy holding `phase`'s parameter, `phase-param.<the phase's directory>`; None for a phase that
+   *  carries none. Named for the spec's directory whether or not the phase is converted yet */
+  def paramFile(phase: Phase): Option[String] = phase match
+    case Phase.Arrived(_) => Some("phase-param.arrived")
+    case Phase.Outbound(_) => Some("phase-param.outbound")
+    case Phase.Rebuilt(_) => Some("phase-param.rebuilt")
+    case _ => None
+
+  /** Reads `phase`'s parameter file in the copy at `copyPath`: "" when known absent, or for a phase that carries
+   *  none; throws a failed stat or read */
+  def readParam(copyPath: os.Path, phase: Phase): String =
+    paramFile(phase) match
+      case None => ""
+      case Some(name) =>
+        val file = copyPath / name
+        if FileStat.exists(file) then os.read(file).trim else ""
 
   final case class Found(storeId: StoreId, copyId: Option[UUID], phase: Phase, path: os.Path)
 
@@ -88,6 +101,6 @@ object CopyLayout:
         else
           os.list(dir).toList.partitionMap: child =>
             parseName(child.last) match
-              case Some((storeId, copyId)) => Left(Found(storeId, Some(copyId), phaseOf(readParam(child)), child))
+              case Some((storeId, copyId)) => Left(Found(storeId, Some(copyId), phaseOf(child), child))
               case None => Right(child)
       Listing(flat ++ inPhases.flatMap(_._1), inPhases.flatMap(_._2))

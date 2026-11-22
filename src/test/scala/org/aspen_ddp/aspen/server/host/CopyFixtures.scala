@@ -15,7 +15,7 @@ object CopyFixtures:
   /** Places a configured copy of `storeId` in `phase` on the device at `deviceDir`, returning its path. Writes the
    *  store config (as ControlFixture.writeStoreConfig), unless not `configured` (a copy holding nothing: a test's
    *  stand-in for a landed rebuild, or a copy that lost its config), and the phase's representation (marker or
-   *  directory and phase-param) */
+   *  directory and the phase's parameter file) */
   def placeCopy(deviceDir: os.Path, storeId: StoreId, phase: Phase = Phase.Live, configured: Boolean = true): os.Path =
     val dir = CopyLayout.dirOf(phase) match
       case None => deviceDir / storeId.directoryName
@@ -25,7 +25,10 @@ object CopyFixtures:
       os.write.over(dir / StoreConfig.configFilename,
         StoreConfig(storeId, StoreConfig.RocksDB(None), None, Replication(3, 2)).yamlConfig)
     if CopyLayout.dirOf(phase).isDefined then
-      CopyLayout.param(phase).foreach(p => os.write.over(dir / CopyLayout.PhaseParamFile, p))
+      for
+        file <- CopyLayout.paramFile(phase)
+        p <- CopyLayout.param(phase)
+      do os.write.over(dir / file, p)
     else
       marker(phase).foreach((file, content) => os.write.over(dir / file, content))
     dir

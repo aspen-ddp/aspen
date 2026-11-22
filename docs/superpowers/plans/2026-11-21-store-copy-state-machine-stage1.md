@@ -101,6 +101,50 @@ use the tables it fixes.
   - List each behaviour change. Known: an adopted TI+TO copy becomes Outbound and so needs a valid save file.
 - [ ] **Step 6: Commit** `Stage 1 audit: disk mutation sites, I3, silence readers, reload paths, marker combinations`.
 
+### Task 1b: Close the I3 overlaps on the rebuild side
+
+Added after Task 1's audit (spec, "Stage 1 audit findings", COUNTEREXAMPLES TO I3). Each fix is a missing guard.
+Use TDD: write the regression test, watch it fail, then add the guard.
+
+**Files:**
+- Modify: `host/DeviceReconciler.scala`, `host/StoreTransfers.scala`, `host/StoreRebuilds.scala`
+- Test: create `src/test/scala/org/aspen_ddp/aspen/server/host/WorkOverlapSuite.scala` (ControlFixture or TestNetwork,
+  whichever reaches the scenario deterministically)
+
+- [ ] **C1.** `reconcileDeviceState` runs `abandonUnlisted` before `startTransfersIn`. `startIn` waits (no receive, logged
+  at debug, the next check retries) while the store has any rebuild registered on the device: queued (`silenced`),
+  discarding (`droppingCrlState`), running (`rebuildingStores`) or abandoned past finish's latch. Test: "a transfer in
+  waits while a rebuild of the store is registered on the device", plus a cancelled-past-latch variant.
+- [ ] **C2.** `discardLostStore`'s handoff to `startRebuild` first re-reads `local.reconciledEntries`. It starts the
+  rebuild only if the entry is still Rebuilding with the same episode. Otherwise it releases the slot, ends the
+  work and re-checks the device. Test: "a discard finishing after the entry moved on starts no rebuild".
+- [ ] **C4.** Create work ends when the new copy is served or its open fails, not when the flip completes. A
+  separate `pendingCreateFlips` set keeps `createNewStore` from creating again while the entry is still
+  Initializing. Test: "a rebuild requested while a create's flip is pending does not overlap Create".
+- [ ] **Ship × discard (audit review Minor 1).** `flipLostCrlStores` and `startRebuild` skip a store while
+  `storeTransferService.isTransferringOut` holds it, as the abandoned-out pass already does. Test: "a lost copy
+  still being shipped is not retired until the ship ends".
+- [ ] Run the new suite, then the full suite. Update `server/host/CLAUDE.md` and `server/rebuild/CLAUDE.md` for each
+  new guard. Commit once per counterexample, with the counterexample id in the subject.
+
+### Task 1c: Close the I3 overlaps on the transfer-out side, and the double open
+
+**Files:**
+- Modify: `host/StoreTransfersOut.scala`, `host/StoreLoader.scala`
+- Test: `WorkOverlapSuite` (from Task 1b)
+
+- [ ] **C5.** `startOut` is single-flight per store. A request that arrives while `closingForTransfer` holds the
+  store, or while an `extractUnloaded` of it runs, does nothing; the receiver retransmits. Test: "two
+  StartStoreTransfer requests close and extract once", one case loaded and one unloaded.
+- [ ] **C3.** `startOut` refuses while a rebuild of the store is registered (`rebuildingStores`), including the
+  wait for an outcome-unknown flip's retry. The receiver's retransmit starts the transfer once the flip settles.
+  Test: "a transfer out waits for an outcome-unknown flip's retry". Use `TestNetwork.TClient.beforeRetry`.
+- [ ] **Double open (audit Step 4 finding, review Minor 3).** A store stays marked opening from `startOpen` until
+  `handleLoad` installs it or fails, closing the window between `serveOpened` posting `LoadStore` and
+  `handleLoad`. A second offer in that window starts no open. Test: "a second load offer between open and install
+  starts no second open, and the device's shutdown closes the served store".
+- [ ] Run the suite, then the full suite. Update `server/host/CLAUDE.md`. Commit per fix, with the id in the subject.
+
 ### Task 2: One phase reader
 
 **Files:**
@@ -188,7 +232,7 @@ use the tables it fixes.
   ```
   Every mutator calls `onChange(storeId)` after it succeeds.
 
-The stage-1 phase table (`phaseLegal`) comes from Task 1 Step 1.
+The stage-1 phase table (`phaseLegal`) comes from Task 1 Step 1 and its "Amendments implied by Step 1": add `Arrived -> Rebuilt` (a shipped Rebuilt copy), Rebuilt -> gone (`unregister`, `RebuildOutcome.Discard`), and `Arrived | Outbound -> Lost` via `retireForeignCopy`. Phase `Lost` is legal with activity `Closing(FailStop)`: RR is written before the close. `Idle -> Served` and `Served -> Served` are legal for loads that install without `startOpen` (`Host.loadStore` and test reloads), on any device.
 - Expected legal moves:
   - `Live -> Lost | Outbound`
   - `Outbound -> Live | Lost`

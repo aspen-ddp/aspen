@@ -1,7 +1,5 @@
 package org.aspen_ddp.aspen.server.host
 
-import java.util.UUID
-import scala.util.Try
 import scala.util.control.NonFatal
 
 /** The phase of one copy of a store, read from the marker files of its directory. */
@@ -10,10 +8,10 @@ enum Phase:
   case Live
   /** Arrived from another host (transferred-in) and awaiting its pool update; carries the transfer's id, trimmed */
   case Arrived(transferId: String)
-  /** Transferring out; carries the transfer's id, None for an empty marker */
-  case Outbound(transferId: Option[UUID])
-  /** A finished rebuild (rebuild-complete); carries its episode, None for an empty marker */
-  case Rebuilt(episode: Option[UUID])
+  /** Transferring out; carries the marker's trimmed content verbatim, "" when empty */
+  case Outbound(transferId: String)
+  /** A finished rebuild (rebuild-complete); carries the marker's trimmed content verbatim, "" when empty (compare as RebuildingStore.isRebuildCompleteFor does) */
+  case Rebuilt(episode: String)
   /** Rebuild-required: its CRL state is gone */
   case Lost
   /** Stage 1 only: never returned by `CopyPhase.read`. The registry's record of a copy whose read threw */
@@ -27,16 +25,14 @@ object CopyPhase:
    *  the content of only that marker is read. Throws a failed stat or read: a stat that fails is no absence. */
   def read(storePath: os.Path): Phase =
     def content(marker: StoreDirMarkers.Marker): String = os.read(storePath / marker.fileName).trim
-    def uuid(marker: StoreDirMarkers.Marker): Option[UUID] =
-      Some(content(marker)).filter(_.nonEmpty).flatMap(c => Try(UUID.fromString(c)).toOption)
     if StoreDirMarkers.has(storePath, RebuildRequired) then
       Phase.Lost
     else if StoreDirMarkers.has(storePath, TransferOut) then
-      Phase.Outbound(uuid(TransferOut))
+      Phase.Outbound(content(TransferOut))
     else if StoreDirMarkers.has(storePath, TransferredIn) then
       Phase.Arrived(content(TransferredIn))
     else if StoreDirMarkers.has(storePath, RebuildComplete) then
-      Phase.Rebuilt(uuid(RebuildComplete))
+      Phase.Rebuilt(content(RebuildComplete))
     else
       Phase.Live
 

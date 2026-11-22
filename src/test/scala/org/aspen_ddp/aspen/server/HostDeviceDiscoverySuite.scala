@@ -1914,6 +1914,31 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         os.list(t.deviceDir / RebuildingStore.PendingDeleteDirectory).map(_.last.startsWith(t.movingStore.directoryName))
           .toList should be(List(true))
 
+  // A promoted copy whose transfer-in marker is replaced by transfer-out (a store transferred back onto its old
+  // source before that device's Deleted Stores pass ran): its entry is still TransferringIn, so nothing else clears
+  // it. It was refused forever as "store path already exists"; now it is retired and the store shipped again
+  atest("a transferring-out copy at a transfer in's path is retired on resume and the store shipped again"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      _ = recorded(t.host).holdTransferOutcomes()
+      promoted = t.deviceDir / t.movingStore.directoryName
+      _ = t.transfers.finishTransferIn(t.movingStore)
+      _ <- pumpUntil(os.exists(promoted))
+      _ = os.remove(promoted / StoreTransfer.TransferredInMarkerFile)
+      _ = os.write.over(promoted / StoreTransfer.TransferOutMarkerFile, "")
+
+      transfers2 = new StagedTransferService
+      host2 = newHost(t.hostRoot, transferService = transfers2)
+      _ = host2.control.reconciler.checkAll()
+      _ <- pumpUntil(transfers2.transfersIn.nonEmpty)
+    yield
+      transfers2.transfersIn.size should be(1)
+      os.exists(promoted) should be(false)
+      os.list(t.deviceDir / RebuildingStore.PendingDeleteDirectory).map(_.last.startsWith(t.movingStore.directoryName))
+        .toList should be(List(true))
+
   // rebuild-process FS17: a copy an earlier tenancy left at the store's path (a finished rebuild awaiting its flip, a
   // lost copy), the store having since been re-placed away and transferred back
   // A copy marked for transfer out (a store transferred back onto its old source before that device's Deleted Stores

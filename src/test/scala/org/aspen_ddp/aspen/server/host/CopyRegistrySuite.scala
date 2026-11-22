@@ -2,12 +2,17 @@ package org.aspen_ddp.aspen.server.host
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.Host.LoadRetry
+import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
+
+import scala.concurrent.ExecutionContext
+import scala.concurrent.duration.{Duration, SECONDS}
 
 class CopyRegistrySuite extends AnyFunSuite with Matchers:
 
@@ -194,3 +199,119 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
     d.unregister(storeId)
     changes.size should be(10)
     changes.toSet should be(Set(storeId))
+
+  // ---- The spec's transition table (Tests: "Table"), over the copy registry's claims and facts ----
+
+  // Every phase, each that carries a parameter drawn from "" and one id
+  private val tablePhases: List[Phase] = List(Phase.Live, Phase.Arrived(""), Phase.Arrived("t-1"), Phase.Outbound(""),
+    Phase.Outbound("t-1"), Phase.Rebuilt(""), Phase.Rebuilt("t-1"), Phase.Parked, Phase.Lost, Phase.Retired)
+
+  /** The legal phase moves, written out from the spec's table (T1-T13) and the rulings since, never from
+   *  Transitions.phaseLegal. T1 (a create), T2 (a rebuild's finish) and T8 (a promotion) place a new copy, and T12
+   *  (a release), T13 (an arrival's or a Discarded rebuild's delete) remove one: none is a move between phases. A move
+   *  into Outbound is legal whatever the parameters; Outbound to Outbound never is (P10: a copy Outbound for the
+   *  transfer is shipped where it is, one Outbound for another goes back to Live first) */
+  private def tableLegal(from: Phase, to: Phase): Boolean = (from, to) match
+    // T3: an Adopt flip, or the Completed Rebuilds pass
+    case (Phase.Rebuilt(_), Phase.Live) => true
+    // T4: an AdoptOffline flip
+    case (Phase.Rebuilt(_), Phase.Parked) => true
+    // T5: a parked copy whose entry is Active with no transfer device
+    case (Phase.Parked, Phase.Live) => true
+    // T6: from Live, Rebuilt or Parked (P10)
+    case (Phase.Live | Phase.Rebuilt(_) | Phase.Parked, Phase.Outbound(_)) => true
+    // T7: an aborted or abandoned transfer out; P10's move back before a new transfer's T6
+    case (Phase.Outbound(_), Phase.Live) => true
+    // T9: a committed pool update
+    case (Phase.Arrived(_), Phase.Live) => true
+    // T10
+    case (Phase.Live | Phase.Outbound(_) | Phase.Arrived(_) | Phase.Rebuilt(_) | Phase.Parked, Phase.Lost) => true
+    // T11: every retire goes through Lost
+    case (Phase.Lost, Phase.Retired) => true
+    case _ => false
+
+  /** A DeviceControl with only what the copy registry and the moves read: the router, the loaded devices and the
+   *  transfer service. Everything else is never touched */
+  private def control(): DeviceControl =
+    new DeviceControl(
+      metadata = null, scheduler = null, backends = null, devices = new LocalDevices(), client = null,
+      hostId = HostId.BootstrapHostId, aspenSystemId = new UUID(0, 0), rootDir = os.root, net = null,
+      backgroundTasks = BackgroundTaskManager.NoBackgroundTaskManager,
+      threading = new LockstepThreading(ExecutionContext.parasitic), post = _ => (), crlFactory = null,
+      unloadedDeviceCrl = None, txStatusCache = null, wrapCompletionHandler = identity, objectCacheFactory = null,
+      finalizerFactory = null, txDriverFactory = null, heartbeatPeriod = Duration(5, SECONDS),
+      deviceScanPeriod = Duration(10, SECONDS), storeRebuildFactory = null, maxConcurrentRebuilds = 2,
+      loadStore = null, tryLoadStore = null, loadStoreById = null, warn = null,
+      storeTransferService = StoreTransferService.Disabled, shutdownWorkTimeout = Duration(60, SECONDS),
+      gossipStoreOnline = null, closeStoreForTransferOut = null, closeStoreForShutdown = null,
+      scheduleShutdownWorkTimeout = null, scheduleEndpointRetry = null, ec = ExecutionContext.parasitic)
+
+  /** A strict registry with a device attached at a fresh directory, holding a copy of `storeId` placed in `from` and
+   *  recorded there: the registry, the device and the copy's path */
+  private def attachedCopy(root: os.Path, from: Phase): (DeviceControl, LocalStorageDeviceState, os.Path) =
+    val ctx = control()
+    ctx.copyRegistry.strict = true
+    val dev = os.temp.dir(dir = root, prefix = "dev", deleteOnExit = false)
+    val sds = new LocalStorageDeviceState(StorageDeviceId(UUID.randomUUID()), dev, dev / "config", null)
+    val path = CopyFixtures.placeCopy(dev, storeId, from)
+    ctx.copyRegistry.attach(sds, CopyLayout.list(dev))
+    if from == Phase.Retired then
+      // Not recorded once durable (P3): recorded only as an unsynced move to Retired leaves it
+      sds.copies.register(storeId, from, CopyFixtures.copyIdOf(path), unsynced = true)
+    ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(storeId)).map(_.phase) should be(Some(from))
+    (ctx, sds, path)
+
+  test("every (from, to) pair is legal exactly as the spec's table says"):
+    val root = os.temp.dir(prefix = "aspen-copy-table", deleteOnExit = false)
+    try table(root)
+    finally os.remove.all(root)
+
+  private def table(root: os.Path): Unit =
+    for from <- tablePhases; to <- tablePhases do
+      val legal = tableLegal(from, to)
+      withClue(s"$from -> $to: "):
+        // The table itself
+        Transitions.phaseLegal(from, to) should be(legal)
+
+        // A claim (HostCopies.claim over DeviceCopies.setPhase): an illegal move is refused, recorded and changes
+        // nothing; a legal one is made
+        val (claimCtx, claimSds, _) = attachedCopy(root, from)
+        val claimRegistry = claimCtx.copyRegistry
+        claimRegistry.claim("table")(claimSds.copies.setPhase(storeId, to)) should be(legal)
+        claimSds.copies.copies(storeId).phase should be(if legal then to else from)
+        claimRegistry.takeRegistryErrors().size should be(if legal then 0 else 1)
+
+        // A fact (HostCopies.moved, what every CopyMoves move records): applied whatever the table says, and a
+        // violation recorded for each illegal one. A durable move to Retired takes the copy out of the registry (P3)
+        val (factCtx, factSds, _) = attachedCopy(root, from)
+        val factId = factSds.copies.copies(storeId).copyId
+        factCtx.copyRegistry.moved("table", factSds, storeId, to, factId, unsynced = false)
+        val factRecord = factSds.copies.copies.get(storeId)
+        if to == Phase.Retired && !factRecord.exists(_.unsynced) then
+          factRecord should be(None)
+        else
+          factRecord.map(_.phase) should be(Some(to))
+        factCtx.copyRegistry.takeRegistryErrors().size should be(if legal then 0 else 1)
+
+        // The move itself (CopyMoves.move): between two phase directories it moves the directory, with the target's
+        // parameter, and records the fact, legal or not; within one directory it is no move (NotMoved) and changes
+        // nothing
+        val (moveCtx, moveSds, at) = attachedCopy(root, from)
+        val result = moveCtx.moves.move("table", moveSds, storeId, to)
+        val target = CopyLayout.path(moveSds.devicePath, storeId, CopyFixtures.copyIdOf(at), to)
+        if CopyLayout.dirOf(from) == CopyLayout.dirOf(to) then
+          result shouldBe a[MoveResult.NotMoved]
+          os.isDir(at) should be(true)
+          moveSds.copies.copies.get(storeId).map(_.phase) should be(Some(from))
+          moveCtx.copyRegistry.takeRegistryErrors() should be(Vector())
+        else
+          result should be(MoveResult.Durable)
+          os.exists(at) should be(false)
+          os.isDir(target) should be(true)
+          CopyLayout.phaseAt(target) should be(Some(to))
+          val moved = moveSds.copies.copies.get(storeId)
+          if to == Phase.Retired && from != Phase.Retired then
+            moved should be(None)
+          else
+            moved.map(_.phase) should be(Some(to))
+          moveCtx.copyRegistry.takeRegistryErrors().size should be(if legal then 0 else 1)

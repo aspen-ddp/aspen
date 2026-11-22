@@ -128,7 +128,9 @@
   scan), and adoption's `CrlLost` stores move through the `DeviceMetadata.adoptDevice` callback `moveToLost:
   StoreId => Unit` (a failed move fails the adoption's transaction). The device load offers no phase directory, and
   no copy in `lost/` or `pending-delete/`, to `tryLoadStore`. Tests fail renames with `Host.Seams.copyRename`
-  (installed as `CopyMoves.rename` before the first device load)
+  (installed as `CopyMoves.rename` before the first device load). The phase suites share `CopyHostFixture` (real-loading hosts, device setup,
+  drains); `CopyCrashSuite` crashes a host (dropped, a fresh one over the same directory) after each step of T1, T3,
+  T4, T6, T8, T9 and T11, and `CopyRegistrySuite`'s table test checks every (from, to) pair's claim, fact and move
 - Arrived is `arrived/<copy>` (T8, T9, T13; stage 2, Task 5). Each receive attempt stages in its own directory,
   `<device>/transferring-in/<transferUUID>` (`StoreTransfers.stagingOf`, P7), which `beginTransferIn` is given; the
   service extracts into `<that>/<storeDir>` (`StoreTransferManager.storeDirectory`, unchanged: no two attempts share

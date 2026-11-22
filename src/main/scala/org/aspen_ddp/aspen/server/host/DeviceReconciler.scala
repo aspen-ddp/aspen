@@ -247,6 +247,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         !ctx.loader.isOpening(storeId) && !ctx.copies.isRetiring(storeId)
     local.declaredMissing = local.declaredMissing.filter(storeId =>
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) && unserved(storeId))
+    ctx.copyRegistry.missingIs(local)
     val missing = remote.stores.collect {
       case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Active &&
           !local.declaredMissing.contains(storeId) &&
@@ -260,6 +261,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                    s"${local.devicePath / storeId.directoryName} holds no store. Rebuilding it")
       ctx.markStoreOffline(local, storeId)
       local.declaredMissing += storeId
+      ctx.copyRegistry.missingIs(local)
     local.declaredMissing.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
       ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
 

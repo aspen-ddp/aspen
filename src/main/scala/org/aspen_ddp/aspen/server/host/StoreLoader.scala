@@ -82,6 +82,19 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     else
       1
 
+  /** Records `retry` for `storeId` in storesAwaitingRetry, and in its copy's record (shadow) */
+  private def awaitRetry(site: String, storeId: StoreId, retry: LoadRetry): Unit =
+    storesAwaitingRetry += storeId -> retry
+    ctx.copyRegistry.awaitingRetry(site, storeId, retry)
+
+  /** Drops the retry of `storeId`, and its copy's AwaitingRetry (shadow) */
+  private def dropRetry(storeId: StoreId, wait: LoadRetry): Unit =
+    storesAwaitingRetry -= storeId
+    ctx.copyRegistry.retryDropped("retryFailedLoads", wait.sds, storeId)
+
+  /** The retry the loader holds for `storeId`, if any */
+  private[host] def retryOf(storeId: StoreId): Option[LoadRetry] = storesAwaitingRetry.get(storeId)
+
   /** Whether a store awaiting a load retry holds a real onServed callback; None if it awaits none */
   private[server] def awaitingRetryHasCallback(storeId: StoreId): Option[Boolean] =
     storesAwaitingRetry.get(storeId).map(_.onServed.isDefined)
@@ -183,8 +196,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           logger.warn(s"Store $storeId cannot be loaded: its directory could not be read. Leaving it offline and " +
                       s"retrying, with backoff. $storePath. Error: $err")
         ctx.markStoreOffline(sds, storeId)
-        storesAwaitingRetry += storeId -> LoadRetry(sds, storePath, waitScans, waitScans,
-          composeServed(previous.flatMap(_.onServed), onServed))
+        awaitRetry("awaitUnreadRetry", storeId, LoadRetry(sds, storePath, waitScans, waitScans,
+          composeServed(previous.flatMap(_.onServed), onServed)))
 
   /** The store a directory's name identifies, if it is a store directory name */
   private def storeIdOf(storePath: os.Path): Try[StoreId] =
@@ -232,6 +245,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val servedCallback = composeServed(previous.flatMap(_.onServed), onServed)
     opening += storeId -> Nil
     openCounts += storeId -> (opensStarted(storeId) + 1)
+    ctx.copyRegistry.opening(sds, storeId, opensStarted(storeId), create)
     sds.loadedStores += storeId
     router.markLoading(storeId)
     val fopen =
@@ -278,6 +292,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       router.clearLoading(storeId)
       sds.offlineStores += storeId
       sds.loadedStores -= storeId
+    // The open's copy, unless served below: Opening -> Idle, or AwaitingRetry (shadow)
+    def openEnded(): Unit = ctx.copyRegistry.openEnded("open ended", sds, storeId)
     result match
       case Success(backend) if (!inline && !registered) || router.get(storeId).isDefined =>
         logger.warn(s"Not serving store $storeId opened at $storePath: its device was unloaded or another " +
@@ -290,9 +306,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           catch case t: Throwable => logger.error(s"Failed to mark store $storeId for rebuild at $storePath: $t")
         backend.close()
         created.foreach(_.tryFailure(new IllegalStateException(s"store $storeId was opened but not served")))
+        openEnded()
       case Success(backend) =>
         if create then
           newStores += storeId
+          ctx.copyRegistry.createOpened(sds, storeId, opensStarted(storeId))
         val served = serveOpened(sds, storeCfg, storePath, backend)
         // Marked once its LoadStore is queued, so a serveOpened that throws leaves no store opening for ever
         installing = true
@@ -304,6 +322,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         logger.error(s"Store $storeId cannot be loaded: its backend found its acknowledged state lost. " +
                      s"Rebuilding it. $storePath. Error: ${e.getMessage}")
         leaveOffline()
+        openEnded()
         try
           ctx.rebuilds.markRebuildRequired(storePath)
         catch
@@ -323,6 +342,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         logger.warn(s"Store $storeId cannot be created on device ${sds.storageDeviceId}. Leaving it offline; the " +
                     s"next device check creates it again. Error: $e")
         leaveOffline()
+        openEnded()
         created.foreach(_.tryFailure(e))
       case Failure(e) =>
         val outOfSpace = Backend.isOutOfSpace(e)
@@ -335,7 +355,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           logger.warn(s"Store $storeId cannot be loaded: $why. Leaving it offline and retrying, with backoff" +
                       s"${if outOfSpace then ", until space returns" else ""}. $storePath. Error: $e")
         leaveOffline()
-        storesAwaitingRetry += storeId -> LoadRetry(sds, storePath, waitScans, waitScans, onServed)
+        awaitRetry("failed open", storeId, LoadRetry(sds, storePath, waitScans, waitScans, onServed))
         created.foreach(_.tryFailure(e))
     if !installing then
       deferred.reverse.foreach(ctx.post)
@@ -355,7 +375,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       case Failure(_) =>
         ctx.threading.controlEvents.execute: () =>
           storesAwaitingRetry.get(storeId).foreach: wait =>
-            storesAwaitingRetry += storeId -> wait.copy(onServed = composeServed(wait.onServed, Some(callback)))
+            awaitRetry("awaitServed", storeId, wait.copy(onServed = composeServed(wait.onServed, Some(callback))))
 
   /** Called once per device scan. Retries the load of every store in storesAwaitingRetry whose backoff has run
    *  out, whose device is still loaded here and not shutting down, and which is still offline and unloaded. Others
@@ -378,19 +398,19 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       val entry = wait.sds.reconciledEntries.map(_.get(storeId))
       if ! ctx.devices.isLoaded(wait.sds) || router.get(storeId).isDefined ||
          ! wait.sds.offlineStores.contains(storeId) || opening.contains(storeId) then
-        storesAwaitingRetry -= storeId
+        dropRetry(storeId, wait)
       else if entry.contains(None) then
         logger.info(s"Store $storeId awaiting a load retry has no entry on device $deviceId any more. Dropping the " +
                     s"retry")
-        storesAwaitingRetry -= storeId
+        dropRetry(storeId, wait)
       else if FileStat.existence(wait.storePath / StoreConfig.configFilename).contains(false) then
         // Nothing left to load. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass. A failed
         // stat is retried as below: tryLoadStore takes it for an unreadable config
         logger.error(s"Store $storeId awaiting a load retry no longer has a ${StoreConfig.configFilename} at " +
                      s"${wait.storePath}. Dropping the retry")
-        storesAwaitingRetry -= storeId
+        dropRetry(storeId, wait)
       else if wait.scansLeft > 1 then
-        storesAwaitingRetry += storeId -> wait.copy(scansLeft = wait.scansLeft - 1)
+        awaitRetry("retryFailedLoads", storeId, wait.copy(scansLeft = wait.scansLeft - 1))
       else if ! entry.forall(_.exists(e => e.status == StorageDeviceState.StoreStatus.Active ||
                                            e.status == StorageDeviceState.StoreStatus.Offline)) ||
               wait.sds.declaredMissing.contains(storeId) || ctx.transfersOut.isClosingForTransfer(storeId) ||
@@ -430,7 +450,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     // The open that queued this LoadStore ends here: this task installs the store or gives up. Its deferred
     // ShutdownStores run after it, so a store installed is closed like any served one. A LoadStore queued by no
     // startOpen (Host.loadStore, a test's reload) leaves an open in progress alone
-    if awaitingInstall.get(backend.storeId).exists(_ eq backend) then
+    val fromOpen = awaitingInstall.get(backend.storeId).exists(_ eq backend)
+    if fromOpen then
       awaitingInstall -= backend.storeId
       opening.get(backend.storeId).foreach(_.reverse.foreach(ctx.post))
       opening -= backend.storeId
@@ -547,7 +568,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             logger.error(s"Store $storeId cannot be loaded: no executor could be assigned to it. Leaving it offline " +
                          s"and retrying at the device scans. Error: $err")
             ctx.devices.devices.get(storageDeviceId).foreach: sds =>
-              storesAwaitingRetry += storeId -> LoadRetry(sds, backend.path, 1, 1)
+              awaitRetry("no executor", storeId, LoadRetry(sds, backend.path, 1, 1))
             abandonLoad(storageDeviceId, backend, replaced = false, err, p)
           case Success(executor) =>
             // Everything up to install may throw (the Store constructor, the backend's setCompletionHandler). The
@@ -628,15 +649,15 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                   ctx.threading.release(storeId)
                   // Retried as a store awaiting space is, once a scan, until it fits
                   ctx.devices.devices.get(storageDeviceId).foreach: sds =>
-                    storesAwaitingRetry += storeId -> LoadRetry(sds, backend.path, 1, 1)
+                    awaitRetry("no CRL room", storeId, LoadRetry(sds, backend.path, 1, 1))
                 abandonLoad(storageDeviceId, backend, replacing.isDefined, err, p)
               case Success(entry) =>
                 buildRetryWaits -= storeId
                 router.install(entry)
-                // A store served from a device not loaded here, on the test seam's CRL: recorded apart (HostCopies)
-                if ctx.devices.devices.get(storageDeviceId).isEmpty && ctx.unloadedDeviceCrl.isDefined then
-                  ctx.copyRegistry.installedUntracked(storageDeviceId, storeId)
                 awaitCrlLoad(entry.store, trs, p)
+    // The open that queued this LoadStore ended unserved: its copy is Opening no more (shadow). Installed, it is Served
+    if fromOpen && router.entry(backend.storeId).forall(_.store.backend ne backend) then
+      ctx.devices.devices.get(storageDeviceId).foreach(ctx.copyRegistry.openEnded("load ended", _, backend.storeId))
 
   /** Records a store whose Store failed to build in storesAwaitingRetry: retried next scan, then 2, 4 ... scans
    *  later per build failure in a row, capped at LoadRetryCap, and logged at error once per cap interval. A waiting
@@ -652,7 +673,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     else
       logger.debug(s"Store $storeId still fails to build. Retrying in $waitScans device scans. Error: $err")
     val onServed = storesAwaitingRetry.get(storeId).flatMap(_.onServed)
-    storesAwaitingRetry += storeId -> LoadRetry(sds, storePath, waitScans, waitScans, onServed)
+    awaitRetry("failed build", storeId, LoadRetry(sds, storePath, waitScans, waitScans, onServed))
 
   /** The admission of a device's CRL, Unlimited for a device not loaded here (the test seam's CRL) */
   private def admissionOf(storageDeviceId: StorageDeviceId): CrlAdmission =
@@ -757,7 +778,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
         sds.loadedStores -= storeId
         sds.offlineStores += storeId
-        storesAwaitingRetry += storeId -> LoadRetry(sds, store.backend.path, 1, 1)
+        awaitRetry("save file removal failed", storeId, LoadRetry(sds, store.backend.path, 1, 1))
       closeUnloaded(entry, dropDurably = false)
 
   /** Closes the store of `entry`, already removed from the router, without saving its CRL state: clears its object
@@ -779,6 +800,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         if dropped == Success(true) then
           store.frontend.admission.releaseRetained(store.storeId)
         ctx.threading.release(store.storeId)
+        ctx.copyRegistry.closeEnded(store.storageDeviceId, store.storeId)
 
   /** The first step of a close, on the executor of `entry`, whose store the router no longer holds. Every task
    *  queued ahead of it has run against the open store. It then sets `closing`, so I/O completions posted from now on
@@ -837,6 +859,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           // acknowledged commits are durable in the store's journal. It completes without waiting for space.
           logger.warn(s"Closing store $storeId while its device is out of space: its held writes are " +
                       s"abandoned, as in a crash, and redone from the CRL when it next loads")
+        // A close for a transfer out extracts; one asked for no other purpose (Host.closeStore, tests) is a shutdown's
+        if extractCrl then
+          ctx.copyRegistry.closingFor(storeId, ClosePurpose.TransferOut)
+        else if !ctx.copyRegistry.closePurposeOf(storeId).isDefined then
+          ctx.copyRegistry.closingFor(storeId, ClosePurpose.Shutdown)
         router.remove(storeId)
         ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
           sds.offlineStores += storeId
@@ -865,6 +892,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         .onComplete: result =>
           // The close has ended: the backend and directory belong to the control side again
           ctx.threading.release(storeId)
+          ctx.copyRegistry.closeEnded(store.storageDeviceId, storeId)
           result match
             case Success(_) =>
               // An FSIF close completes even after a fail-stop during it, and this store is no

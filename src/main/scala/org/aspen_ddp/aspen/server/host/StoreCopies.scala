@@ -75,6 +75,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
         if !StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildRequired) then
           ctx.writeRebuildRequiredMarker(storePath)
           ctx.copyRegistry.markedLost("retire", storePath)
+        ctx.copyRegistry.retiring(local, storeId)
         val lostState = storePath / RebuildingStore.LostCrlStateFile
         val saveFile = Backend.crlSaveFile(storePath)
         val saved =
@@ -94,6 +95,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
       catch case NonFatal(t) => Future.failed(t)
     dropped.transform: result =>
       retiring -= storeId
+      ctx.copyRegistry.retireEnded(local, storeId)
       result match
         case Failure(t) =>
           logger.error(s"Failed to save and drop the CRL state of store $storeId before retiring its copy at " +

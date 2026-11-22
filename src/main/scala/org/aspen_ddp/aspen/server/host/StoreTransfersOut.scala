@@ -11,6 +11,7 @@ import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
+import java.util.UUID
 import scala.concurrent.Future
 import scala.util.{Failure, Success, Try}
 
@@ -34,6 +35,16 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   // Stores whose rebuild start waited for their close for a transfer out (deferRebuildUntilClosed): the close's end checks the
   // device again, which starts it
   private var rebuildsAwaitingClose: Set[StoreId] = Set()
+
+  /** The store's TransferOut work on `sds` (shadow): from startOut's close until its marker task has run, and while
+   *  returnLostTransferToRebuild aborts its transfer */
+  private def syncWork(storeId: StoreId, sds: LocalStorageDeviceState, transferId: Option[UUID]): Unit =
+    val desired =
+      if closingForTransfer.contains(storeId) || abortingLostTransfers.contains(storeId) then
+        Some(Work.TransferOut(transferId))
+      else
+        None
+    ctx.copyRegistry.work("transfer out", sds.storageDeviceId, storeId, _.isInstanceOf[Work.TransferOut], desired)
 
   /** Whether startOut is closing the store for a transfer out, its marker not yet written */
   private[host] def isClosingForTransfer(storeId: StoreId): Boolean = closingForTransfer.contains(storeId)
@@ -228,6 +239,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
         // serves it, so it is not marked or shipped
         val opens = ctx.loader.opensStarted(m.storeId)
         closingForTransfer += m.storeId
+        syncWork(m.storeId, sourceDs, devEntry.transferId)
         val fclosed =
           try ctx.closeStoreForTransferOut(m.storeId, sourceDs)
           catch case t: Throwable => Future.failed(t)
@@ -236,6 +248,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
           try closedForTransfer(m, devEntry, sourceDs, toHostState, wasLoaded, opens, result)
           finally
             closingForTransfer -= m.storeId
+            syncWork(m.storeId, sourceDs, None)
             if rebuildsAwaitingClose.contains(m.storeId) then
               rebuildsAwaitingClose -= m.storeId
               if ctx.devices.isLoaded(sourceDs) then
@@ -312,12 +325,14 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   private def returnLostTransferToRebuild(storeId: StoreId, sds: LocalStorageDeviceState): Unit =
     if ! abortingLostTransfers.contains(storeId) then
       abortingLostTransfers += storeId
+      syncWork(storeId, sds, None)
       logger.warn(s"Aborting the transfer out of store $storeId, which is marked rebuild-required, so it is rebuilt")
       val fabort =
         try ctx.metadata.abortLostTransfer(storeId)
         catch case t: Throwable => Future.failed(t)
       fabort.onComplete: result =>
         abortingLostTransfers -= storeId
+        syncWork(storeId, sds, None)
         result.failed.foreach: t =>
           logger.warn(s"Failed to abort the transfer out of store $storeId for its rebuild. A retransmitted " +
                       s"request tries again. Error: $t")

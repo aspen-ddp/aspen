@@ -335,6 +335,12 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   /** A snapshot of the stores marked offline */
   private[server] def offlineStores: Set[StoreId] = offline.asScala.toSet
 
+  /** A snapshot of the stores marked loading (HostCopies.compareWithRouter) */
+  private[host] def loadingStores: Set[StoreId] = loading.asScala.toSet
+
+  /** A snapshot of the stores marked awaiting their device (HostCopies.compareWithRouter) */
+  private[host] def awaitingDeviceStores: Set[StoreId] = awaitingDevice.asScala.toSet
+
   /** `install` of a new entry, for a store whose backend needs no completion handler bound to it (tests). */
   private[host] def install(store: Store, executor: StoreExecutor): Unit = install(new Entry(store, executor))
 
@@ -370,14 +376,16 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
             using scala.concurrent.ExecutionContext.parasitic)
     offline.remove(store.storeId)
     loading.remove(store.storeId)
+    // Its copy's record is Served (shadow)
+    ctx.copyRegistry.installed(store.storageDeviceId, store.storeId)
     ctx.publishView()
 
   /** Marks the store offline, then unloads it, returning the entry it had. */
   private[host] def remove(storeId: StoreId): Option[Entry] =
     offline.add(storeId)
     val removed = Option(stores.remove(storeId))
-    if removed.isDefined then
-      ctx.copyRegistry.removedFromRouter(storeId)
+    // Its copy's record is Closing until the close ends (shadow)
+    removed.foreach(e => ctx.copyRegistry.removedFromRouter(e.store.storageDeviceId, storeId))
     ctx.publishView()
     removed
 

@@ -61,6 +61,28 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
   // The restart of each failed transfer in that is waiting out TransferInRetryDelay. Its store
   // stays in transferringIn meanwhile, so device checks do not start a parallel attempt.
   private[server] var transferInRetries: Map[StoreId, TransferInRetry] = Map()
+  // Shadow bookkeeping (copy registry, Work.TransferIn): the device each store in transferringIn and
+  // abandoningTransferIns is received on or abandoned from, and the stores whose earlier tenancy's copy
+  // retireEarlierTenancy is retiring, by device
+  private var transferInDevices: Map[StoreId, StorageDeviceId] = Map()
+  private var abandonDevices: Map[StoreId, StorageDeviceId] = Map()
+  private var retiringEarlier: Map[StoreId, StorageDeviceId] = Map()
+
+  /** The store's TransferIn work on `deviceId` (shadow), staged as the sets above and recordingTransfersIn say */
+  private def syncWork(storeId: StoreId, deviceId: StorageDeviceId, transferId: Option[UUID] = None): Unit =
+    val stage =
+      if recordingTransfersIn.get(storeId).exists(_._1 == deviceId) then
+        Some(TransferInStage.Recording)
+      else if abandoningTransferIns.contains(storeId) && abandonDevices.get(storeId).contains(deviceId) then
+        Some(TransferInStage.Abandoning)
+      else if transferringIn.contains(storeId) && transferInDevices.get(storeId).contains(deviceId) then
+        Some(TransferInStage.Receiving)
+      else if retiringEarlier.get(storeId).contains(deviceId) then
+        Some(TransferInStage.RetiringEarlierTenancy)
+      else
+        None
+    ctx.copyRegistry.work("transfer in", deviceId, storeId, _.isInstanceOf[Work.TransferIn],
+      stage.map(Work.TransferIn(transferId, _)))
 
   /** The transfer-in work on `deviceId` that a shutdown of it must stop or wait for. `ingStores` are the stores
    *  the device's tree entry records as TransferringIn.
@@ -88,6 +110,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         transferInRetries -= storeId
       val uuid = transferringIn.get(storeId)
       transferringIn -= storeId
+      syncWork(storeId, deviceId)
       uuid.map(storeId -> _)
 
     (ins, recording)
@@ -164,6 +187,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
       if current then
         transferInRetries -= storeId
         transferringIn -= storeId
+        syncWork(storeId, toDeviceid)
         val stillWanted = entryState match
           case Success(state) =>
             state.stores.get(storeId).exists: entry =>
@@ -222,6 +246,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           pendingStartTransfers -= storeId
           transferInRetries -= storeId
           transferringIn -= storeId
+          syncWork(storeId, toDeviceId)
           // A retry waiting on a failed promotion still has the extracted copy in staging, which
           // the service no longer owns. Nothing else can be receiving this store now.
           if retry.nonEmpty then
@@ -269,12 +294,14 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     // from here on finds it and waits for it.
     val settled = Promise[Unit]()
     recordingTransfersIn += storeId -> (toDeviceid, settled)
+    syncWork(storeId, toDeviceid)
 
     def finished(): Unit =
       if transferringIn.get(storeId).contains(transferUUID) then
         transferringIn -= storeId
       if recordingTransfersIn.get(storeId).exists(_._2 eq settled) then
         recordingTransfersIn -= storeId
+      syncWork(storeId, toDeviceid)
       settled.trySuccess(())
 
     // Loading is downstream of the metadata decision, not ahead of it. An unconditional load
@@ -424,6 +451,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                         s"pool update")
             val transferUUID = UUID.randomUUID()
             transferringIn += storeId -> transferUUID
+            transferInDevices += storeId -> toDeviceid
+            syncWork(storeId, toDeviceid, transferId)
             recordTransferIn(storeId, transferUUID, fromDeviceId, toDeviceid)
 
           // A finished rebuild awaiting its flip, a lost copy, or a copy marked for transfer out, left by an earlier
@@ -451,6 +480,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
               storeId, transferUUID, devicePath / StoreTransfer.StagingDirectory)
 
             transferringIn += storeId -> transferUUID
+            transferInDevices += storeId -> toDeviceid
+            syncWork(storeId, toDeviceid, transferId)
 
             // Retransmission stops on completion, success or failure, not on first data: the
             // sender needs the request until it has finished, and a failure restarts with a new
@@ -572,7 +603,11 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     else if !ctx.copies.isRetiring(storeId) then
       logger.warn(s"Retiring the copy of an earlier tenancy of store $storeId at its path on device " +
                   s"${local.storageDeviceId} before transferring the store onto it")
+      retiringEarlier += storeId -> local.storageDeviceId
+      syncWork(storeId, local.storageDeviceId)
       ctx.copies.retire(local, storeId).foreach: clear =>
+        retiringEarlier -= storeId
+        syncWork(storeId, local.storageDeviceId)
         if clear then
           local.loadedStores -= storeId
           local.offlineStores -= storeId
@@ -600,6 +635,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     // createNewStore's creatingStores and startIn's transferringIn.
     if ! abandoningTransferIns.contains(storeId) then
       abandoningTransferIns += storeId
+      abandonDevices += storeId -> toDeviceId
+      syncWork(storeId, toDeviceId)
 
       logger.warn(s"Abandoning transfer of store $storeId onto device $toDeviceId: source " +
                   s"device $fromDeviceId has been declared failed")
@@ -633,6 +670,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
       // repaired -- should be free to try again rather than find the flag stuck forever.
       fabandon.onComplete: result =>
         abandoningTransferIns -= storeId
+        syncWork(storeId, toDeviceId)
         // Whether or not this transaction was the one to remove the entry, it is gone (or has
         // moved on to Rebuilding), so nothing will complete this host's attempt. Its registration
         // has no timeout of its own and its retransmits go to a host that does not exist.

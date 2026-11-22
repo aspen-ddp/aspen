@@ -178,8 +178,9 @@ object Host:
                          /** How far past the start lead each renewal sets the join ceiling (JoinCeiling.Step) */
                          joinCeilingStep: FiniteDuration = JoinCeiling.Step,
                          /** Lockstep only: each testingOnlyHandleEvents checks the copy registry once drained, failing
-                          *  on a throw its shadow updates swallowed or a disagreement with the disk
-                          *  (HostCopies.verifyAgainstDisk) */
+                          *  on a throw its shadow updates swallowed, a disagreement with the disk
+                          *  (HostCopies.verifyAgainstDisk) or with the router's silence marks
+                          *  (HostCopies.compareWithRouter) */
                          verifyCopyRegistry: Boolean = false)
 
   object Seams:
@@ -541,13 +542,16 @@ class Host(val client: AspenClient,
     case t: LockstepThreading =>
       t.drain()
       if seams.verifyCopyRegistry then
-        val problems = deviceControl.copyRegistry.takeShadowErrors().toList ++
-          deviceControl.copyRegistry.verifyAgainstDisk()
-        // A copy a load learned of is reported, not failed on: a test may place one after its device's load
+        val registry = deviceControl.copyRegistry
+        val problems = registry.takeShadowErrors().toList ++ registry.verifyAgainstDisk() ++
+          registry.compareWithRouter()
+        // A copy a load learned of, and an open during a transfer out (refused from stage 1 Task 7), are reported,
+        // not failed on: a test may place a copy after its device's load
         if problems.nonEmpty then
-          val learned = deviceControl.copyRegistry.learned.map(l => s"(learned) $l")
+          val learned = registry.learned.map(l => s"(learned) $l")
+          val opens = registry.opensDuringTransferOut.map(o => s"(open during transfer out) $o")
           throw new IllegalStateException(s"Copy registry of host $hostId after a drain:\n  " +
-                                          (problems ++ learned).mkString("\n  "))
+                                          (problems ++ learned ++ opens).mkString("\n  "))
     case _ => ()
 
   /** The components, for tests. */

@@ -7,14 +7,16 @@ import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.StartStoreTransfer
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.{Host, StorageDeviceConfig}
+import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.server.{Host, StorageDeviceConfig, StoreConfig}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{RebuildOutcome, TransferOutcome}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
-import org.aspen_ddp.aspen.server.store.backend.BackendOpener
+import org.aspen_ddp.aspen.server.store.backend.{BackendOpener, DefaultBackendOpener, StoreCreation}
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 
 import java.util.UUID
+import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Success, Try}
 
@@ -240,19 +242,21 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
     host.control.copyRegistry.takeShadowErrors() should be(Vector())
 
-  atest("a store served from an unloaded device has an untracked record until the router removes it"):
+  atest("a store served from an unloaded device has an untracked record, Idle once the router removes it"):
     given ExecutionContext = executionContext
     val smgr = net.smgr
     val storeId = net.stores.head.storeId
-    def record: Option[CopyRecord] =
+    def current: Option[CopyRecord] =
       smgr.control.copyRegistry.device(net.storageDeviceId).flatMap(_.copies.get(storeId))
-    val loaded = record
+    val loaded = current
     for
       _ <- smgr.closeStore(storeId).transform(Success(_))
       _ = handleEvents()
     yield
-      loaded.map(r => (r.phase, r.activity)) should be(Some((Phase.Live, Activity.Idle)))
-      record should be(None)
+      loaded.map(r => (r.phase, r.activity)) should be(Some((Phase.Live, Activity.Served)))
+      // Kept, as a closed copy's record is kept on a loaded device: the store stays silent, as the router's mark says
+      current.map(r => (r.phase, r.activity)) should be(Some((Phase.Live, Activity.Idle)))
+      smgr.control.copyRegistry.silence(storeId) should be(Silence.Silent(Set(SilenceReason.CopyHere)))
       smgr.control.copyRegistry.verifyAgainstDisk() should be(Nil)
 
   atest("a create registers its copy Live"):
@@ -367,6 +371,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val lost = phases(host, deviceA)
     for
       retired <- host.control.copies.retire(local, sid(1))
+      // As each pass that retires a copy then does (the Deleted Stores pass, retireEarlierTenancy)
+      _ = local.offlineStores -= sid(1)
+      _ = host.control.router.clearOfflineUnlessHeld(sid(1))
     yield
       lost should be(Map(sid(0) -> Phase.Lost, sid(1) -> Phase.Live))
       retired should be(true)
@@ -467,4 +474,258 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       before should be(Map(shipped -> Phase.Arrived("another-transfer")))
       transfers.startedTransfersIn should contain(shipped)
       phases(host, net.secondDeviceId) should be(Map())
+      consistent(host)
+
+  // ---- Task 5: activity and work (shadow), and derived silence ----
+
+  /** What the registry holds for one store on one device after a change: its record's phase and activity, if any,
+   *  and its work */
+  private final case class Sample(phase: Option[Phase], activity: Option[Activity], work: Option[Work])
+
+  /** Records a Sample of `storeId` on each change the registry of `host` makes to it */
+  private def watch(host: Host, storeId: StoreId): mutable.ArrayBuffer[Sample] =
+    val seen = mutable.ArrayBuffer[Sample]()
+    host.control.copyRegistry.observer = (copies, s) =>
+      if s == storeId then
+        val r = copies.copies.get(s)
+        seen += Sample(r.map(_.phase), r.map(_.activity), copies.work.get(s))
+    seen
+
+  /** `xs` with each run of equal neighbours taken once */
+  private def runs[T](xs: Iterable[T]): List[T] =
+    xs.foldLeft(List[T]())((acc, x) => if acc.headOption.contains(x) then acc else x :: acc).reverse
+
+  private def record(host: Host, deviceId: StorageDeviceId, storeId: StoreId): Option[CopyRecord] =
+    host.control.copyRegistry.device(deviceId).flatMap(_.copies.get(storeId))
+
+  /** A complete RocksDB store at its path on `dev`, as a create leaves it */
+  private def realStore(dev: os.Path, storeId: StoreId): os.Path =
+    val storePath = dev / storeId.directoryName
+    DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, Replication(3, 2)),
+      storePath, dev / StoreCreation.CreatingDirectory)
+    storePath
+
+  /** Closes `storeId` as Host.closeStore does, draining until it is closed */
+  private def close(host: Host, storeId: StoreId): Future[Unit] =
+    given ExecutionContext = executionContext
+    val closed = host.closeStore(storeId)
+    pumpUntil(host, closed.isCompleted).flatMap(_ => closed)
+
+  atest("a load moves Idle -> Opening -> Served"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, deviceA)
+    val storePath = realStore(dev, sid(0))
+    val host = newHost(hostRoot, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    val before = record(host, deviceA, sid(0)).map(_.activity)
+    val seen = watch(host, sid(0))
+    // RocksDB opens inline: its LoadStore is queued on return
+    host.control.loader.tryLoadStore(local, storePath)
+    val opening = record(host, deviceA, sid(0)).map(_.activity)
+    val silentWhileOpening = host.control.copyRegistry.silence(sid(0))
+    for
+      _ <- pumpUntil(host, host.control.router.loaded.contains(sid(0)))
+      served = record(host, deviceA, sid(0)).map(_.activity)
+      repairable = host.control.copyRegistry.repairable(sid(0))
+      _ = consistent(host)
+      _ <- close(host, sid(0))
+    yield
+      before should be(Some(Activity.Idle))
+      opening should be(Some(Activity.Opening(1)))
+      silentWhileOpening should be(Silence.Silent(Set(SilenceReason.Opening)))
+      served should be(Some(Activity.Served))
+      repairable should be(true)
+      runs(seen.map(_.activity)) should be(List(Some(Activity.Opening(1)), Some(Activity.Served),
+        Some(Activity.Closing(ClosePurpose.Shutdown)), Some(Activity.Idle)))
+      host.control.copyRegistry.silence(sid(0)) should be(Silence.Silent(Set(SilenceReason.CopyHere)))
+      consistent(host)
+
+  atest("a failed open leaves AwaitingRetry"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, deviceA)
+    val storePath = realStore(dev, sid(0))
+    val host = newHost(hostRoot, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    // Opened elsewhere first: the load's own open fails on the backend's lock, its data intact
+    val held = new DefaultBackendOpener(executionContext).open(
+      StoreConfig.loadStoreConfig(storePath / StoreConfig.configFilename), storePath, _ => ()).value.get.get
+    val seen = watch(host, sid(0))
+    host.control.loader.tryLoadStore(local, storePath)
+    host.testingOnlyHandleEvents()
+    val waiting = record(host, deviceA, sid(0)).map(_.activity)
+    val waitScans = host.control.loader.awaitingRetryWaitScans(sid(0))
+    for
+      _ <- held.close()
+      // The retry's load (retryFailedLoads offers it to the fixture's recording tryLoadStore), which now serves the
+      // store
+      _ = host.control.loader.tryLoadStore(local, storePath)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(sid(0)))
+      served = record(host, deviceA, sid(0)).map(_.activity)
+      _ <- close(host, sid(0))
+    yield
+      waitScans should be(Some(1))
+      waiting.get should be(a[Activity.AwaitingRetry])
+      runs(seen.map(_.activity.map(_.toString.takeWhile(_ != '(')))) should be(List(
+        Some("Opening"), Some("AwaitingRetry"), Some("Opening"), Some("Served"), Some("Closing"), Some("Idle")))
+      served should be(Some(Activity.Served))
+      consistent(host)
+
+  atest("a transfer out runs Closing(TransferOut) under Work.TransferOut and ends Outbound + Idle"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, source)
+    val storePath = realStore(dev, shipped)
+    val sends = new StagedSendService
+    val host = newHost(hostRoot, transferService = sends, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(source)
+    host.control.loader.tryLoadStore(local, storePath)
+    for
+      _ <- pumpUntil(host, host.control.router.loaded.contains(shipped))
+      served = record(host, source, shipped).map(_.activity)
+      seen = watch(host, shipped)
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(shipped, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      started <- ask(host)
+      _ <- pumpUntil(host, sends.isTransferringOut(shipped))
+      after = record(host, source, shipped)
+      work = host.control.copyRegistry.device(source).get.work.get(shipped)
+    yield
+      started should be(Success(()))
+      served should be(Some(Activity.Served))
+      seen.exists(s => s.activity.contains(Activity.Closing(ClosePurpose.TransferOut)) &&
+                       s.work.exists(_.isInstanceOf[Work.TransferOut])) should be(true)
+      // The work starts before the close and ends after the marker
+      runs(seen.map(_.work.map(_.toString.takeWhile(_ != '(')))) should be(List(Some("TransferOut"), None))
+      runs(seen.map(_.activity)) should be(List(Some(Activity.Served), Some(Activity.Closing(ClosePurpose.TransferOut)),
+        Some(Activity.Idle)))
+      after.map(r => (r.phase, r.activity)).get._1 should be(a[Phase.Outbound])
+      after.map(_.activity) should be(Some(Activity.Idle))
+      work should be(None)
+      consistent(host)
+
+  atest("a rebuild holds Work.Rebuild from its first reconcile to its flip"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    device(hostRoot, deviceA)
+    val host = newHost(hostRoot, storeRebuildFactory = new PlacingRebuildFactory(writeStoreConfig)(using executionContext),
+                       verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    val episode = UUID.randomUUID()
+    val seen = watch(host, sid(0))
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.setRebuilding(sid(0), episode))
+      _ <- waitForTransactionsToComplete()
+      // What the reconcile's Rebuilding pass calls
+      _ = host.control.rebuilds.startRebuild(local, sid(0), Some(episode), acceptLoss = false)
+      queued = host.control.copyRegistry.silence(sid(0))
+      _ <- awaitRebuild(host, deviceA, sid(0))
+      _ <- pumpUntil(host, !host.control.rebuilds.rebuildingStoreIds.contains(sid(0)), drain = false)
+    yield
+      recorded(host).rebuildOutcomes((deviceA, sid(0))) should be(RebuildOutcome.Adopt)
+      queued should be(Silence.Silent(Set(SilenceReason.Rebuilding)))
+      runs(seen.map(_.work)) should be(List(Some(Work.Rebuild(Some(episode), RebuildStage.Queued)),
+        Some(Work.Rebuild(Some(episode), RebuildStage.Running)), None))
+      // Held through the finish and the flip's marker removal, and ended by the flip's settling
+      seen.filter(_.work.isDefined).last.phase should be(Some(Phase.Live))
+      seen.last should be(Sample(Some(Phase.Live), Some(Activity.Idle), None))
+      consistent(host)
+
+  atest("a reload over a served store stays Served"):
+    given ExecutionContext = executionContext
+    val smgr = net.smgr
+    val backend = net.stores.head
+    val storeId = backend.storeId
+    val before = record(smgr, net.storageDeviceId, storeId).map(r => (r.phase, r.activity))
+    val seen = watch(smgr, storeId)
+    val reloaded = net.restartStore(backend)
+    for
+      _ <- pumpUntil(smgr, reloaded.isCompleted)
+      _ <- reloaded
+    yield
+      before should be(Some((Phase.Live, Activity.Served)))
+      seen.map(_.activity).toSet should be(Set(Some(Activity.Served)))
+      seen should not be empty
+      record(smgr, net.storageDeviceId, storeId).map(r => (r.phase, r.activity)) should be(
+        Some((Phase.Live, Activity.Served)))
+      smgr.control.copyRegistry.repairable(storeId) should be(true)
+      smgr.control.copyRegistry.compareWithRouter() should be(Nil)
+
+  // Known defect D2 of the router's marks (spec, Stage 1 audit findings, Step 3 addenda; HostCopies.KnownDefects): a
+  // check of a device not loaded here marks every store its entry lists offline, by store id, one served from another
+  // device of this host included. Served dominates the derived silence, so the registry keeps it repairable
+  atest("a check of an unloaded device that lists a store served here takes it out of the router's repairable view"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, deviceA)
+    val storePath = realStore(dev, sid(0))
+    val host = newHost(hostRoot, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    host.control.loader.tryLoadStore(loadedDevices(host)(deviceA), storePath)
+    for
+      _ <- pumpUntil(host, host.control.router.loaded.contains(sid(0)))
+      armed = recorded(host).armLookup(deviceB)
+      _ = host.control.reconciler.checkStorageDevice(deviceB)
+      _ = armed.success(deviceState(deviceB,
+            Map(sid(0) -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+      _ <- pumpUntil(host, host.control.router.isOffline(sid(0)))
+      // A drain while the store is served and marked: its check would report the disagreement but for the whitelist
+      _ = host.testingOnlyHandleEvents()
+      served = host.control.router.loaded.contains(sid(0))
+      offline = host.control.router.isOffline(sid(0))
+      viewRepairable = host.control.currentView.repairable.contains(sid(0))
+      derived = host.control.copyRegistry.silence(sid(0))
+      registryRepairable = host.control.copyRegistry.repairable(sid(0))
+      _ <- close(host, sid(0))
+    yield
+      served should be(true)
+      offline should be(true)
+      viewRepairable should be(false)
+      derived should be(Silence.Served)
+      registryRepairable should be(true)
+
+  // R1 (shadow): an open that starts while the store has TransferOut work on its device is not refused yet (stage 1
+  // Task 7 refuses it); its Opening is skipped and listed, and the extraction's end finds the store opened
+  atest("an open during a transfer out's close is listed, not refused, and the transfer does not start"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, source)
+    val storePath = realStore(dev, shipped)
+    val sends = new StagedSendService
+    val host = newHost(hostRoot, transferService = sends, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(source)
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(shipped, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      gate = recorded(host).holdTransferOutCloses()
+      request = ask(host)
+      _ <- pumpUntil(host, host.control.transfersOut.isClosingForTransfer(shipped))
+      work = host.control.copyRegistry.device(source).get.work.get(shipped)
+      _ = host.control.loader.tryLoadStore(local, storePath)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(shipped))
+      opens = host.control.copyRegistry.opensDuringTransferOut
+      served = record(host, source, shipped).map(_.activity)
+      _ = gate.success(())
+      refused <- request
+      _ = host.testingOnlyHandleEvents()
+      after = host.control.copyRegistry.device(source).get.work.get(shipped)
+      _ <- close(host, shipped)
+    yield
+      work.get should be(a[Work.TransferOut])
+      opens.size should be(1)
+      served should be(Some(Activity.Served))
+      refused should be(Success(()))
+      sends.transfersOut should be(empty)
+      after should be(None)
       consistent(host)

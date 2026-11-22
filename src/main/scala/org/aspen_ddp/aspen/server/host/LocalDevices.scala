@@ -16,7 +16,9 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
                               val crl: CrashRecoveryLog,
                               val admission: CrlAdmission = CrlAdmission.Unlimited):
   /** The device's copy registry (HostCopies), attached at load. Updated on the control thread only */
-  val copies: DeviceCopies = new DeviceCopies(storageDeviceId, devicePath, _ => ())
+  val copies: DeviceCopies = new DeviceCopies(storageDeviceId, devicePath, s => onCopyChange(s))
+  /** Called after every change to `copies` (HostCopies.observer, for tests) */
+  var onCopyChange: StoreId => Unit = _ => ()
   var loadedStores: Set[StoreId] = Set()
   var offlineStores: Set[StoreId] = Set()
   /** Stores the reconcile's Missing Stores pass declared lost on this device, while their entry stays Active here.

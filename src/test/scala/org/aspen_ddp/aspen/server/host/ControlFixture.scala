@@ -29,11 +29,21 @@ import scala.concurrent.duration.{Duration, SECONDS}
  *  Replaces the recordings of the former RecordingHost, which overrode Host's protected methods. Nothing here loads
  *  a store: `tryLoadStore` records the candidate path and does nothing else, so it never touches the router, the
  *  loaded devices or the offline set. A test asserting that it put something there would pass vacuously; assert on
- *  `storeLoadAttempts` instead. */
+ *  `storeLoadAttempts` instead. The exception is a host whose copy registry is checked (`holdLoadsOffline`). */
 final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = false):
   @volatile private var host: Host = null
 
-  def attach(h: Host): Unit = host = h
+  def attach(h: Host): Unit =
+    host = h
+    heldBack.foreach((sds, storeId) => h.control.markCopyOffline(sds, storeId))
+    heldBack = Nil
+
+  /** Set for a host whose copy registry is checked (HostCopies.compareWithRouter): each load the seam skips leaves its
+   *  copy offline on its device, as a production load holding it back does, rather than neither served, opening nor
+   *  offline, which no production load leaves */
+  @volatile var holdLoadsOffline: Boolean = false
+  // Loads held back before attach, the device scan in the Host constructor
+  private var heldBack: List[(LocalStorageDeviceState, StoreId)] = Nil
 
   private def attached: Host =
     if host == null then throw new IllegalStateException("RecordingSeams used before attach")
@@ -283,6 +293,10 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
       if storeLoadFailureOwed.getAndSet(false) then
         throw new RuntimeException(s"Simulated store load failure for $potentialStoreFile")
       storeLoadAttempts += ((sds.storageDeviceId, potentialStoreFile))
+      if holdLoadsOffline then
+        HostCopies.storeIdOf(potentialStoreFile).foreach: storeId =>
+          if host == null then heldBack ::= (sds, storeId)
+          else host.control.markCopyOffline(sds, storeId)
 
   private def loadStoreById(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
     synchronized:
@@ -484,6 +498,7 @@ trait ControlFixture:
     val threading = new LockstepThreading(ec)
     val scheduler = new ManualControlScheduler(threading.controlEvents)
     val recording = new RecordingSeams(ec, failFirstStoreLoad)
+    recording.holdLoadsOffline = verifyCopyRegistry
     val host = new Host(client, hostId, systemId, hostRoot, ec, threading,
                         net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
                         TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory,
@@ -496,6 +511,8 @@ trait ControlFixture:
           (!keepInitializeTaskExecutor && t.event.isInstanceOf[Host.InitializeTaskExecutor])
       case _ => false
     rigs.put(host, new Rig(recording, scheduler))
+    // For HostCopies.KnownDefects
+    host.control.copyRegistry.testName = testName
     host
 
   /** What `host` did, and the knobs that make it do something else. */

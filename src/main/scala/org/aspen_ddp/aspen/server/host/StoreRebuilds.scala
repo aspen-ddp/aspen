@@ -72,6 +72,23 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   // failed leaves no marker to select the store by.
   private var pendingMarkerRemovals: Set[StoreId] = Set()
 
+  /** The store's Rebuild work on `deviceId` (shadow), staged as `silenced`, `droppingCrlState`, `rebuildDevices` and
+   *  `abandonedRebuilds` say. An episode the sets do not hold (a queued or discarding rebuild) is `episode`, or else
+   *  the work's own */
+  private def syncRebuildWork(storeId: StoreId, deviceId: StorageDeviceId, episode: Option[UUID] = None): Unit =
+    val running = rebuildDevices.get(storeId).contains(deviceId)
+    val stage =
+      if running then
+        Some(if abandonedRebuilds.contains(storeId) then RebuildStage.Abandoned else RebuildStage.Running)
+      else if droppingCrlState.get(storeId).contains(deviceId) then
+        Some(RebuildStage.DiscardingLost)
+      else if silenced.get(storeId).contains(deviceId) then
+        Some(RebuildStage.Queued)
+      else
+        None
+    val ep = (if running then rebuildEpisodes.get(storeId).flatten else None).orElse(episode)
+    ctx.copyRegistry.work("rebuild", deviceId, storeId, _.isInstanceOf[Work.Rebuild], stage.map(Work.Rebuild(ep, _)))
+
   /** Whether a rebuild of the store runs here, or its lost copy is being discarded for one (discardLostStore) */
   private[host] def isRebuilding(storeId: StoreId): Boolean =
     rebuildingStores.contains(storeId) || droppingCrlState.contains(storeId)
@@ -163,6 +180,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
        ! ctx.shutdown.isShuttingDown(deviceId) then
       creatingStores += storeId
       pendingCreateFlips += storeId
+      ctx.copyRegistry.work("create", deviceId, storeId, _ == Work.Create, Some(Work.Create))
 
       // True when the store exists on disk (created here, or by an attempt that crashed before
       // its flip), false when the create was skipped for a shutdown. A stat that fails (FileStat) fails the flip, which
@@ -189,7 +207,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
       // The create's work ends here: served, failed, or skipped. Registered before the flip's callback, which runs
       // only once fcreate has completed
-      fcreate.onComplete(_ => creatingStores -= storeId)
+      fcreate.onComplete: _ =>
+        creatingStores -= storeId
+        ctx.copyRegistry.work("create", deviceId, storeId, _ == Work.Create, None)
 
       // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
       // the control-context onComplete; the prepare closure's combinators run on the control thread
@@ -258,10 +278,18 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   def startRebuild(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
                    acceptLoss: Boolean): Unit =
     val held = StoreRebuilds.HeldRebuild(local.storageDeviceId, episode, acceptLoss)
+    // Nor queued while a transfer out is still closing it (and extracting its CRL state from its directory): that
+    // close is the (device, store)'s one piece of work (I3), and its end checks the device again
+    // (StoreTransfersOut.deferRebuildUntilClosed). The close took the store out of service already
+    val closing = !rebuildingStores.contains(storeId) && ctx.transfersOut.deferRebuildUntilClosed(storeId)
+    if closing then
+      logger.debug(s"Not rebuilding store $storeId on device ${local.storageDeviceId} yet: a transfer out is still " +
+                   "closing it")
     // Silent from the first reconcile that sees the entry, a store queued for a slot included (rebuild-process 6.2)
-    if !silenced.contains(storeId) then
+    if !closing && !silenced.contains(storeId) then
       ctx.router.markOffline(storeId)
       silenced += storeId -> local.storageDeviceId
+    syncRebuildWork(storeId, local.storageDeviceId, episode)
     // A store inside its backoff (scheduleRebuildRetry) waits for that re-check, which clears the mark before it
     // checks the device: otherwise stores whose passes keep failing, sorting first, would retake the slots at every
     // check of the device and starve the stores queued behind them. An operator's remedy since the failure (a
@@ -271,12 +299,6 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     // abandoned-transfers-out pass make the same check. Not asked while a rebuild of the store is registered: nothing
     // starts then anyway, and the rebuild's end checks the device again (a send cannot begin meanwhile, since startOut
     // refuses while the rebuild is registered), so a re-check would only repeat at every reconcile
-    // Nor while a transfer out is still closing it (and extracting its CRL state from its directory): the close's end
-    // checks the device again (StoreTransfersOut.deferRebuildUntilClosed)
-    val closing = !rebuildingStores.contains(storeId) && ctx.transfersOut.deferRebuildUntilClosed(storeId)
-    if closing then
-      logger.debug(s"Not rebuilding store $storeId on device ${local.storageDeviceId} yet: a transfer out is still " +
-                   "closing it")
     val shipping = !closing && !rebuildingStores.contains(storeId) &&
       ctx.storeTransferService.isTransferringOut(storeId)
     if shipping then
@@ -300,6 +322,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         rebuildDevices -= storeId
         rebuildEpisodes -= storeId
         abandonedRebuilds -= storeId
+        syncRebuildWork(storeId, local.storageDeviceId)
         ctx.publishView()
         if rebuildsSettled.get(storeId).exists(_ eq settled) then
           rebuildsSettled -= storeId
@@ -352,6 +375,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       rebuildDevices += storeId -> local.storageDeviceId
       rebuildEpisodes += storeId -> episode
       rebuildsSettled += storeId -> settled
+      syncRebuildWork(storeId, local.storageDeviceId, episode)
       ctx.publishView()
 
       // The pool already names this device, so peers would otherwise pick a store that cannot
@@ -507,6 +531,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           logger.info(s"Cancelling the rebuild of store $storeId on device $deviceId: its entry there is no " +
                       "longer Rebuilding for this rebuild's episode")
           abandonedRebuilds += storeId
+          syncRebuildWork(storeId, deviceId)
           sr.cancel()
 
     // A store queued for a slot whose entry left before its rebuild started (rebuild-process 6.2)
@@ -534,8 +559,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  here, the router mark is removed too, so the host answers UnknownStore for it again, unless a device's
    *  offlineStores holds the store: that mark belongs to another path (a shutdown, transfer or lost CRL). */
   private def unsilence(storeId: StoreId, clear: Boolean): Unit =
-    if silenced.contains(storeId) then
+    silenced.get(storeId).foreach: deviceId =>
       silenced -= storeId
+      syncRebuildWork(storeId, deviceId)
       if clear then
         ctx.router.clearOfflineUnlessHeld(storeId)
 
@@ -910,8 +936,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     else
       if !droppingCrlState.contains(storeId) then
         droppingCrlState += storeId -> local.storageDeviceId
+        syncRebuildWork(storeId, local.storageDeviceId, episode)
         ctx.copies.retire(local, storeId).foreach: clear =>
           droppingCrlState -= storeId
+          syncRebuildWork(storeId, local.storageDeviceId)
           if clear then
             // The retire may outlast the entry it began for (a slow CRL read or drop during a re-placement): the
             // rebuild starts only for an entry the device's latest reconcile still read as Rebuilding under this

@@ -516,6 +516,21 @@ readers. Tasks 7/8 handle them.
 **Conclusion.** No production reader needs the reason. The derivation can return `silent: Boolean`, plus
 predicates kept for the test accessors. `storesToClose` has to move off the silence mark (Task 6).
 
+Task 5 addenda (derived silence compared with the router's marks after each test drain; each is whitelisted by test
+name in `HostCopies.KnownDefects` until Task 6 removes the marks):
+
+- D1: a transfer in's store has no router mark on its destination while it is received, promoted (Arrived) and its
+  pool update runs, so once the pool names the destination the router answers UnknownStore until the load. The
+  registry is right (silent: TransferIn work, the Arrived copy).
+- D2: the device check of an unloaded device (`DeviceReconciler`, the `None` branch) marks every store its entry lists
+  offline by id, one served from another device of this host included, which drops it from `repairable`. The registry
+  is right (Served dominates).
+- D3: the view counts a store repairable while a transfer out is closing it, when an open during the close (R1) serves
+  it. The registry is right (TransferOut work); Task 7's refusal of that open removes the case.
+- Not a defect of the marks: `startRebuild` queued (silenced) a store while a transfer out was closing it, a second
+  Work for the (device, store). Fixed in Task 5: the store is not silenced until the close ends and re-checks the
+  device.
+
 ### Step 4: reload paths (`StoreRouter.install` with `replaced != null`)
 
 `install` is reached only from `StoreLoader.handleLoad:611` and from tests (`ControlFixture.scala:533`,

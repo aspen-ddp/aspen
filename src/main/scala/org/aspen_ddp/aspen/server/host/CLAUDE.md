@@ -23,15 +23,34 @@
   with its `CopyPhase` (`Unread` where it cannot be read); `detach` at unload. Every disk mutation site of a store
   path (create, rebuild finish's handler, transfer-in promotion, the four markers' writes and removals, retire into
   pending-delete, discards) updates it right after its durable step, through `HostCopies.shadow`, which logs and
-  records a throw instead of failing production. Nothing reads it yet; activity and work stay Idle/empty. With
+  records a throw instead of failing production. Nothing reads it yet. Activity and work are mirrored from the old
+  sets (spec mapping table), also through `shadow`: `startOpen` sets Opening (a create's record, registered at its
+  open's outcome, too), an open's unserved end Idle, each `storesAwaitingRetry` write AwaitingRetry and a dropped
+  retry Idle; `StoreRouter.install` Served (Served -> Served for a reload) and `remove` Closing, its purpose from
+  `closingFor` (DeviceShutdown: Shutdown / Relinquish; `handleClose` with `extractCrl`: TransferOut; else FailStop),
+  until `handleClose`/`closeUnloaded` end it (Idle, or AwaitingRetry when the loader holds a retry); `StoreCopies.retire`
+  Retiring. Work is synced from each owner's sets at every write: Create (`creatingStores`), Rebuild
+  (`silenced` Queued, `droppingCrlState` DiscardingLost, `rebuildDevices` Running / Abandoned), TransferIn
+  (`transferringIn` Receiving, `recordingTransfersIn` Recording, `abandoningTransferIns` Abandoning,
+  `retireEarlierTenancy` RetiringEarlierTenancy), TransferOut (`closingForTransfer`, `abortingLostTransfers`); a second
+  Work for a (device, store) is a shadow error (I3), so `startRebuild` does not even queue (silence) a store a transfer
+  out is closing. `declaredMissing` is mirrored as `missing`. An open during TransferOut work is not refused yet (R1,
+  Task 7): its Opening is skipped and listed (`opensDuringTransferOut`). `silence` derives the router's answer
+  (Served if any copy is Served; else Silent with its reasons: a record, Opening, Rebuild / TransferIn / Create work,
+  missing, an unloaded device's entries, awaiting device; else Unknown) and `repairable` (Served, not Closing, no
+  Rebuild or TransferOut work, not being sent). With
   `Host.Seams.verifyCopyRegistry` (TestNetwork; ControlFixture's `newHost(verifyCopyRegistry = ...)`, default off)
-  each lockstep drain throws on a recorded throw or on any `verifyAgainstDisk` mismatch (phase, unrecorded config'd
-  directory, record without directory). `attach` never throws: a child whose stat fails is registered `Unread`, and
+  each lockstep drain throws on a recorded throw, on any `verifyAgainstDisk` mismatch (phase, unrecorded config'd
+  directory, record without directory) or on any `compareWithRouter` disagreement (silence or repairability against
+  the router's marks), except for the tests `HostCopies.KnownDefects` lists, whose disagreement is a defect of the old
+  marks (spec, Step 3 addenda D1-D3). A ControlFixture host so checked holds each load its recording seam skips
+  offline (`RecordingSeams.holdLoadsOffline`), as a production load holding a copy back does. `attach` never throws: a child whose stat fails is registered `Unread`, and
   so is one whose markers cannot be read. `tryLoadStore` reports each phase it reads (`readAtLoad`): an `Unread`
   record takes it, a copy with no record (put at its path after the device's load, by hand or by a test) is
   registered and listed in `learned` (reported by the drain check, not failed on), and any other disagreement is a
   shadow error. Stores loaded onto a device this host has not loaded, through `Host.Seams.unloadedDeviceCrl`
-  (TestNetwork), get an untracked record (Live, Idle) at install, removed when the router removes the store;
+  (TestNetwork), get an untracked record (Live) at install, Served there and Closing then Idle once the router
+  removes the store, kept as a closed copy's record is kept on a loaded device, so the store stays silent;
   `HostCopies.device` returns them like any other, and the disk check skips them. The drain check can land between
   an off-thread step and its control-thread handler (a rebuild's copy placed before its completion callback runs),
   so a test does not drain while such a step is in flight

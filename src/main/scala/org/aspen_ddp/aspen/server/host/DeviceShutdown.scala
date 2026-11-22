@@ -216,10 +216,12 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
     runSequentially(storesToClose(local)): storeId =>
       // A store whose backend failed while closing is marked rebuild-required instead of closed
       // cleanly (see StoreRebuilds.failedOnClose), and an adopter takes it as Rebuilding.
+      ctx.copyRegistry.closingFor(storeId, ClosePurpose.Shutdown)
       ctx.closeStoreForShutdown(storeId).transform:
         case Failure(_: StoreFailedOnClose) => Success(false)
         case other => other.map(_ => true)
       .map: clean =>
+        ctx.copyRegistry.closeAskEnded(storeId)
         // ShutdownStore records this too. Done here as well so the bookkeeping that later
         // steps read does not depend on how the store was closed.
         ctx.markStoreOffline(local, storeId)
@@ -321,7 +323,9 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
       Future.unit
     else
       runSequentially(open): storeId =>
+        ctx.copyRegistry.closingFor(storeId, ClosePurpose.Relinquish)
         ctx.closeStoreForShutdown(storeId).transform(_ => Success(())).map: _ =>
+          ctx.copyRegistry.closeAskEnded(storeId)
           ctx.markStoreOffline(local, storeId)
           onClosed(storeId)
       .flatMap(_ => closeStoresToRelinquish(local, onClosed))

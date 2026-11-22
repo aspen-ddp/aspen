@@ -548,6 +548,8 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
       _ <- check(host, source, rebuilding)
       startedWhileClosing = factory.created.nonEmpty || host.control.rebuilds.isRebuilding(shipped)
+      // Not even queued (silenced): the close's TransferOut work holds the (device, store) (I3)
+      queuedWhileClosing = host.control.rebuilds.hasRebuildWork(shipped, source)
       keptWhileClosing = FileStat.exists(storePath)
       // The close fails (an extraction I/O error): nothing else then checks the device, so it is the close's end that
       // re-checks it, reading the entry still Rebuilding
@@ -558,6 +560,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     yield
       closingAtCheck should be(true)
       startedWhileClosing should be(false)
+      queuedWhileClosing should be(false)
       keptWhileClosing should be(true)
       sends.transfersOut should be(empty)
       factory.created.map(_.storeId).toList should be(List(shipped))

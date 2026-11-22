@@ -543,9 +543,11 @@ class Host(val client: AspenClient,
       if seams.verifyCopyRegistry then
         val problems = deviceControl.copyRegistry.takeShadowErrors().toList ++
           deviceControl.copyRegistry.verifyAgainstDisk()
+        // A copy a load learned of is reported, not failed on: a test may place one after its device's load
         if problems.nonEmpty then
+          val learned = deviceControl.copyRegistry.learned.map(l => s"(learned) $l")
           throw new IllegalStateException(s"Copy registry of host $hostId after a drain:\n  " +
-                                          problems.mkString("\n  "))
+                                          (problems ++ learned).mkString("\n  "))
     case _ => ()
 
   /** The components, for tests. */

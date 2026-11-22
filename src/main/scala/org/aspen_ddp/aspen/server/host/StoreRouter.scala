@@ -376,6 +376,8 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   private[host] def remove(storeId: StoreId): Option[Entry] =
     offline.add(storeId)
     val removed = Option(stores.remove(storeId))
+    if removed.isDefined then
+      ctx.copyRegistry.removedFromRouter(storeId)
     ctx.publishView()
     removed
 

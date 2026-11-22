@@ -112,6 +112,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath)
           val storeId = storeCfg.storeId
           val phase = CopyPhase.read(potentialStoreFile)
+          ctx.copyRegistry.readAtLoad(sds, potentialStoreFile, storeId, phase)
           if phase != Phase.Live then
             phase match
               case Phase.Lost =>
@@ -632,6 +633,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
               case Success(entry) =>
                 buildRetryWaits -= storeId
                 router.install(entry)
+                // A store served from a device not loaded here, on the test seam's CRL: recorded apart (HostCopies)
+                if ctx.devices.devices.get(storageDeviceId).isEmpty && ctx.unloadedDeviceCrl.isDefined then
+                  ctx.copyRegistry.installedUntracked(storageDeviceId, storeId)
                 awaitCrlLoad(entry.store, trs, p)
 
   /** Records a store whose Store failed to build in storesAwaitingRetry: retried next scan, then 2, 4 ... scans

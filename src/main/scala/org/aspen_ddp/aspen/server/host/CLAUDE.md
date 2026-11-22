@@ -26,8 +26,15 @@
   records a throw instead of failing production. Nothing reads it yet; activity and work stay Idle/empty. With
   `Host.Seams.verifyCopyRegistry` (TestNetwork; ControlFixture's `newHost(verifyCopyRegistry = ...)`, default off)
   each lockstep drain throws on a recorded throw or on any `verifyAgainstDisk` mismatch (phase, unrecorded config'd
-  directory, record without directory). A copy put at a store path after the device's load (by hand, or by a test)
-  has no record
+  directory, record without directory). `attach` never throws: a child whose stat fails is registered `Unread`, and
+  so is one whose markers cannot be read. `tryLoadStore` reports each phase it reads (`readAtLoad`): an `Unread`
+  record takes it, a copy with no record (put at its path after the device's load, by hand or by a test) is
+  registered and listed in `learned` (reported by the drain check, not failed on), and any other disagreement is a
+  shadow error. Stores loaded onto a device this host has not loaded, through `Host.Seams.unloadedDeviceCrl`
+  (TestNetwork), get an untracked record (Live, Idle) at install, removed when the router removes the store;
+  `HostCopies.device` returns them like any other, and the disk check skips them. The drain check can land between
+  an off-thread step and its control-thread handler (a rebuild's copy placed before its completion callback runs),
+  so a test does not drain while such a step is in flight
 - `DeviceControl.markStoreOffline` keeps the router's offline mark and the device's
   `offlineStores` together; `LocalDevices.isLoaded(sds)` says whether a device state is still the loaded one
 

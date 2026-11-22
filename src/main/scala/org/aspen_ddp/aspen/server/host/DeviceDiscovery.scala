@@ -750,7 +750,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
             try
               // Its copies registered before any store is offered (HostCopies)
-              ctx.copyRegistry.attach(sds)
+              ctx.copyRegistry.attach(sds, storeFiles)
               storeFiles.foreach: potentialStoreFile =>
                 ctx.tryLoadStore(sds, potentialStoreFile, None)
             catch

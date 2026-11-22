@@ -26,8 +26,8 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
   private def expectedPhase(from: Phase, to: Phase): Boolean =
     val legal = Set(
       "Live" -> "Lost", "Live" -> "Outbound",
-      "Outbound" -> "Live", "Outbound" -> "Lost",
-      "Arrived" -> "Rebuilt", "Arrived" -> "Live", "Arrived" -> "Lost",
+      "Outbound" -> "Live", "Outbound" -> "Lost", "Outbound" -> "Rebuilt", "Outbound" -> "Arrived",
+      "Arrived" -> "Rebuilt", "Arrived" -> "Live", "Arrived" -> "Lost", "Arrived" -> "Outbound",
       "Rebuilt" -> "Live", "Rebuilt" -> "Outbound", "Rebuilt" -> "Lost")
     kind(from) match
       case "Unread" => true

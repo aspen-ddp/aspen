@@ -26,8 +26,18 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   // Device directories whose ownership is being decided, with the stores found in them
   private var awaiting: Map[os.Path, Set[StoreId]] = Map()
   private var errors: Vector[String] = Vector()
+  // Copies a load found with no record (readAtLoad), for the drain check to report
+  private var learnedCopies: Vector[String] = Vector()
+  // The records of stores this host serves from a device it has not loaded: only a load through the unloaded-device
+  // CRL seam (Host.Seams.unloadedDeviceCrl, tests) makes them, never production. No marker site reaches them, and the
+  // disk check skips them: their backends have no directory
+  private var untracked: Map[StorageDeviceId, DeviceCopies] = Map()
 
-  def device(id: StorageDeviceId): Option[DeviceCopies] = attached.get(id).map(_.copies)
+  /** The records of device `id`: a loaded one's, or those of the stores served from it untracked */
+  def device(id: StorageDeviceId): Option[DeviceCopies] = attached.get(id).map(_.copies).orElse(untracked.get(id))
+
+  /** Every copy a load learned of (readAtLoad), each as a message */
+  def learned: Vector[String] = learnedCopies
 
   /** The unloaded devices' stores, by device */
   def unloadedEntries: Map[StorageDeviceId, Set[StoreId]] = unloaded
@@ -48,15 +58,65 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     errors = Vector()
     e
 
-  /** At load, before any store is offered: registers every store directory of the device with its phase, Unread
-   *  where it cannot be read. A listing that fails throws, leaving the device unloaded for the next scan */
-  def attach(sds: LocalStorageDeviceState): Unit =
-    val dirs = storeDirectories(sds.devicePath)
+  /** At load, before any store is offered: registers each of the device's `children` (its listing) whose name is a
+   *  store's and that is a directory with its phase, Unread where its stat or phase cannot be read. Never throws: the
+   *  device is attached whatever the registration meets, and a copy it cannot read waits for its load to read it
+   *  (readAtLoad) */
+  def attach(sds: LocalStorageDeviceState, children: Seq[os.Path]): Unit =
     attached += sds.storageDeviceId -> sds
     unloaded -= sds.storageDeviceId
     shadow("attach"):
-      dirs.foreach: (storeId, path) =>
-        sds.copies.register(storeId, CopyPhase.known(path).getOrElse(Phase.Unread))
+      children.foreach: path =>
+        HostCopies.storeIdOf(path).foreach: storeId =>
+          Try(FileStat.isDir(path)) match
+            case scala.util.Success(false) => ()
+            case scala.util.Success(true) =>
+              sds.copies.register(storeId, CopyPhase.known(path).getOrElse(Phase.Unread))
+            case scala.util.Failure(_) => sds.copies.register(storeId, Phase.Unread)
+
+  /** As attach, listing the device itself (ControlFixture.injectLoadedDevice). A listing that fails registers none */
+  def attach(sds: LocalStorageDeviceState): Unit =
+    val children =
+      try
+        if FileStat.isDir(sds.devicePath) then os.list(sds.devicePath).toList else Nil
+      catch case NonFatal(t) =>
+        shadow("attach")(throw t)
+        Nil
+    attach(sds, children)
+
+  /** A load (StoreLoader.tryLoadStore) read the copy at `storePath`, whose config names `storeId`, in `phase`. A copy
+   *  with no record is registered and reported as learned; an Unread record takes the phase; a record in another
+   *  phase is a miswired site, recorded as a shadow error and left as it is */
+  def readAtLoad(sds: LocalStorageDeviceState, storePath: os.Path, storeId: StoreId, phase: Phase): Unit =
+    shadow("readAtLoad"):
+      if HostCopies.storeIdOf(storePath).contains(storeId) && storePath / os.up == sds.devicePath then
+        copiesOf(sds).foreach: copies =>
+          copies.copies.get(storeId).map(_.phase) match
+            case None =>
+              logger.warn(s"The copy of store $storeId at $storePath was not known to the copy registry. Learned " +
+                          s"at its load, $phase")
+              learnedCopies :+= s"device ${sds.storageDeviceId}: $storeId learned at load, $phase"
+              copies.register(storeId, phase)
+            case Some(Phase.Unread) => copies.setPhase(storeId, phase)
+            case Some(p) if p == phase => ()
+            case Some(p) =>
+              throw IllegalStateException(s"record of $storeId is $p, its load read $phase at $storePath")
+
+  /** A store loaded onto device `id`, which this host has not loaded, through the unloaded-device CRL seam, was
+   *  installed: it has a record (Live, Idle) until the router removes it */
+  def installedUntracked(id: StorageDeviceId, storeId: StoreId): Unit =
+    shadow("installedUntracked"):
+      val copies = untracked.getOrElse(id, new DeviceCopies(id, os.root, _ => ()))
+      untracked += id -> copies
+      if !copies.copies.contains(storeId) then
+        copies.register(storeId, Phase.Live)
+
+  /** The router removed `storeId`: an untracked record of it goes */
+  def removedFromRouter(storeId: StoreId): Unit =
+    shadow("removedFromRouter"):
+      untracked.foreach: (id, copies) =>
+        if copies.copies.contains(storeId) then
+          copies.unregister(storeId)
 
   /** At unload: the device's records go with it, and `listed` is kept as its unloaded entries */
   def detach(id: StorageDeviceId, listed: Set[StoreId]): Unit =

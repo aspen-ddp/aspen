@@ -188,6 +188,9 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         ctx.rebuilds.createNewStore(local, storeId)
 
       dropAbortedTransfersIn(local, remote)
+      // Rebuild work for stores no longer Rebuilding here (re-placed elsewhere, rebuild-process 4.2) is cancelled
+      // first: a transfer in of such a store waits while that work is registered on the device (StoreTransfers.startIn)
+      ctx.rebuilds.abandonUnlisted(local, remote)
       startTransfersIn(local, remote)
       startRebuilds(local, remote)
       // Pending deletes
@@ -423,14 +426,12 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                 ctx.client.sendHostMessage(pt.msg)
             ctx.transfers.startIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId, transferId)
 
-  /** Starts the rebuild of each Rebuilding entry and cancels rebuild work for stores no longer Rebuilding here. */
+  /** Starts the rebuild of each Rebuilding entry. */
   private def startRebuilds(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     remote.stores.filter((_, entry) =>
       entry.status == StorageDeviceState.StoreStatus.Rebuilding
     ).toList.sortBy(_._1.poolIndex).foreach: (storeId, entry) =>
       ctx.rebuilds.startRebuild(local, storeId, entry.rebuildEpisode, entry.acceptLoss)
-    // Rebuild work for stores no longer Rebuilding here (re-placed elsewhere, rebuild-process 4.2)
-    ctx.rebuilds.abandonUnlisted(local, remote)
 
   /** The Deleted Stores pass's retire of `storeId`'s copy on `local`, whose entry no longer names it. The store
    *  leaves offlineStores, and its router offline mark goes (unless another device here holds the store offline), only

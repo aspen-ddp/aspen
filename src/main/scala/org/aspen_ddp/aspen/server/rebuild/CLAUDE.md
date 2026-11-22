@@ -83,6 +83,9 @@
   keeps it, e.g. for another device's Deleted Stores pass after a same-host re-placement). An adopted store's load
   clears it; `Discard`, a cancel for an entry that left the device, and `abandonUnlisted` for a queued one clear it
   unless a device's `offlineStores` holds it; other outcomes keep it
+- One piece of host work per (device, store) at a time (I3): while a rebuild of a store is registered on a device
+  (queued, discarding its lost copy, running, or cancelled and not yet released), a transfer in of that store onto
+  the device waits (`StoreRebuilds.hasRebuildWork`, checked by `StoreTransfers.startIn`; `server/host/CLAUDE.md`)
 - A rebuild's staging store opens through the same `BackendOpener` as a normal load (passed by
   `StoreRebuildFactory.createRebuild`). A first pass (no checkpoint) discards whatever staging holds and creates a
   fresh staging store atomically (`BackendOpener.create`); a resume only opens it, and one whose backend is lost

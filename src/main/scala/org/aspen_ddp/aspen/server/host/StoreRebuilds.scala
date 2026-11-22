@@ -51,7 +51,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   // (discardLostStore). Each one's rebuild waits for the drop to be durable. Each holds a rebuild slot, as a
   // running rebuild does: the discard is the first destructive step, so maxConcurrentRebuilds bounds discards too
   // (systemic-loss-protection.md).
-  private var droppingCrlState: Set[StoreId] = Set()
+  private var droppingCrlState: Map[StoreId, StorageDeviceId] = Map()
 
   // rebuild-process 5.7, retry backoff: by store, how many passes or flips have failed in a row, and the stores
   // with a retry scheduled, each with what the failure that scheduled it (the latest) ran for
@@ -71,6 +71,15 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   /** Whether a rebuild of the store runs here, or its lost copy is being discarded for one (discardLostStore) */
   private[host] def isRebuilding(storeId: StoreId): Boolean =
     rebuildingStores.contains(storeId) || droppingCrlState.contains(storeId)
+
+  /** Whether rebuild work for `storeId` is registered on `deviceId`: queued for a slot (`silenced`), discarding its
+   *  lost copy (`droppingCrlState`), or running, one cancelled (abandonUnlisted) included until its slot is released,
+   *  since a rebuild past finish's latch re-check ignores the cancel and can still move a copy into the store's path.
+   *  A transfer in of the store onto the device waits while it holds (StoreTransfers.startIn): one piece of work per
+   *  (device, store) at a time. */
+  private[host] def hasRebuildWork(storeId: StoreId, deviceId: StorageDeviceId): Boolean =
+    silenced.get(storeId).contains(deviceId) || droppingCrlState.get(storeId).contains(deviceId) ||
+      rebuildDevices.get(storeId).contains(deviceId)
 
   /** Rebuilt stores whose rebuild-complete marker removal awaits a retry by the Completed Rebuilds pass */
   private[server] def markerRemovalsPending: Set[StoreId] = pendingMarkerRemovals
@@ -851,7 +860,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       false
     else
       if !droppingCrlState.contains(storeId) then
-        droppingCrlState += storeId
+        droppingCrlState += storeId -> local.storageDeviceId
         ctx.copies.retire(local, storeId).foreach: clear =>
           droppingCrlState -= storeId
           if clear then

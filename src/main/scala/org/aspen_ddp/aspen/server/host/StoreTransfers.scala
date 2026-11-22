@@ -350,10 +350,18 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                                    transferId: Option[UUID]): Unit =
     require(fromDeviceId != toDeviceid)
 
+    // One piece of work per (device, store) at a time: while rebuild work of the store is registered on the device
+    // (queued, discarding its lost copy, running, or cancelled and not yet ended: one past finish's latch can still
+    // move a copy into the path), nothing is received. The re-placement that moved the entry away cancels it
+    // (StoreRebuilds.abandonUnlisted, which the reconcile runs before this pass), and its end checks the device again.
+    if ctx.rebuilds.hasRebuildWork(storeId, toDeviceid) then
+      logger.debug(s"Not transferring store $storeId onto device $toDeviceid yet: rebuild work of the store is " +
+                   "still registered there. Retrying at a later check")
+
     // The shutdown guard covers a source read issued before this device's shutdown began, and a
     // retry whose delay ran out during it: the shutdown has already cancelled this device's
     // transfers in and would not see a new one.
-    if ! transferringIn.contains(storeId) && ! ctx.shutdown.isShuttingDown(toDeviceid) then
+    else if ! transferringIn.contains(storeId) && ! ctx.shutdown.isShuttingDown(toDeviceid) then
       ctx.devices.devices.get(toDeviceid).foreach: toDevice =>
         val devicePath = toDevice.devicePath
         val finalPath = devicePath / storeId.directoryName

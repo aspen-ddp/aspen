@@ -396,6 +396,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
 
   /** Clears a store's offline mark without touching the loaded stores */
   private[host] def clearOffline(storeId: StoreId): Unit =
+    ctx.copyRegistry.offlineClearAsked(storeId)
     offline.remove(storeId)
     ctx.publishView()
 
@@ -405,6 +406,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
    *  them): a copy that leaves one device's offlineStores does not unsilence the other's, nor a rebuild's destination,
    *  which never held the store and so lists it in no offlineStores. Callers remove it from their own record first. */
   private[host] def clearOfflineUnlessHeld(storeId: StoreId): Unit =
+    ctx.copyRegistry.offlineClearAsked(storeId)
     if !ctx.devices.devices.values.exists(_.offlineStores.contains(storeId)) &&
        !ctx.rebuilds.silencedStores.contains(storeId) then
       clearOffline(storeId)

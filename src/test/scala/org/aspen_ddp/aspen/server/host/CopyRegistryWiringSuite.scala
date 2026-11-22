@@ -811,3 +811,72 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       refused should be(Success(()))
       sends.transfersOut should be(empty)
       host.control.copyRegistry.opensDuringTransferOut.size should be(1)
+
+  // ---- Fix round 3: each state-recognised defect (HostCopies.knownDefect) is exempt only inside its window. One
+  //      state just outside each window, which the drain must report ----
+
+  /** A second loaded device directory, dev1 */
+  private def secondDevice(hostRoot: os.Path, deviceId: StorageDeviceId): os.Path =
+    val dev = writeDevice(hostRoot, "dev1", deviceId)
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(dev))
+    dev
+
+  /** The drain's report on `storeId`, which it must make */
+  private def reported(host: Host, storeId: StoreId): String =
+    val thrown = intercept[IllegalStateException](host.testingOnlyHandleEvents())
+    thrown.getMessage should include(s"$storeId: the router's marks say")
+    thrown.getMessage
+
+  test("D4's exemption needs Create work: an Initializing entry alone is reported"):
+    val hostRoot = newHostDir()
+    device(hostRoot, deviceA)
+    val host = newHost(hostRoot, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    // Read Initializing by a reconcile, its create not started (the reconcile's read before createNewStore, or a
+    // device shutting down): no Create work, no copy, no router mark
+    loadedDevices(host)(deviceA).reconciledEntries = Some(Map(sid(5) ->
+      StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Initializing, None)))
+    reported(host, sid(5)) should include("Silent(Set(Opening))")
+
+  atest("D5's exemption ends with the retire's lagging clear: an offline mark left after it is reported"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, deviceA)
+    writeStoreConfig(dev, sid(1))
+    val host = newHost(hostRoot, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    for
+      retired <- host.control.copies.retire(local, sid(1))
+      // The caller's clear (the Deleted Stores pass's forget), then a mark leaked by another path
+      _ = local.offlineStores -= sid(1)
+      _ = host.control.router.clearOfflineUnlessHeld(sid(1))
+      _ = host.control.router.markOffline(sid(1))
+    yield
+      retired should be(true)
+      reported(host, sid(1)) should include("the registry Unknown")
+
+  test("D1's exemption is the transfer's own device: an unmarked copy on another device is reported"):
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, deviceA)
+    secondDevice(hostRoot, deviceB)
+    writeStoreConfig(dev, sid(2))
+    val host = newHost(hostRoot, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    // Device A's copy is left unmarked, and a transfer in of the store runs onto device B
+    host.control.router.clearOffline(sid(2))
+    host.control.copyRegistry.work("test", deviceB, sid(2), _.isInstanceOf[Work.TransferIn],
+      Some(Work.TransferIn(None, TransferInStage.Receiving)))
+    reported(host, sid(2)) should include("CopyHere")
+
+  test("D6's exemption needs every copy without its config: an unmarked configured copy is reported"):
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, deviceA)
+    val other = secondDevice(hostRoot, deviceB)
+    // Its config lost on device A; a whole copy on device B
+    os.makeDir.all(dev / sid(3).directoryName)
+    writeStoreConfig(other, sid(3))
+    val host = newHost(hostRoot, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    host.control.router.clearOffline(sid(3))
+    reported(host, sid(3)) should include("Silent(Set(CopyHere))")

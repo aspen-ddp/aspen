@@ -539,6 +539,9 @@ name in `HostCopies.KnownDefects` until Task 6 removes the marks):
   only logs it); only the reconcile's Missing Stores pass silences it. The registry is right (silent: its copy).
 - D1, D4, D5 and D6 arise in windows whose timing varies from run to run, so `compareWithRouter` recognises them by
   their state (`HostCopies.knownDefect`) rather than by test name; D2 and D3 stay whitelisted by test name.
+  Each state is bounded to its window: D1 to copies on the receiving device (or Arrived), D4 to Create work before
+  its copy exists, D5 to before the retiring caller's clear (a device still lists the store offline), D6 to stores
+  every copy of which lacks its config.
 - Derivation extension: Work.Create, and an entry a loaded device's latest reconcile read Initializing, are
   `Opening` reasons, so a failed create (nothing at its path, its Create work ended, its entry still Initializing
   for the next check to create again) stays silent as the router's offline mark keeps it.

@@ -347,7 +347,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
       val rebuilding = ctx.rebuilds.rebuildingStoreIds
       val sending = ctx.storeTransferService.transferringOutStores
       val known = allCopies.flatMap(c => c.copies.keySet ++ c.work.keySet ++ c.missing) ++
-        unloaded.values.flatten ++ awaiting.values.flatten
+        unloaded.values.flatten ++ awaiting.values.flatten ++
+        attached.values.flatMap(_.reconciledEntries.map(_.keySet).getOrElse(Set()))
       (installed ++ marked ++ known).toList.sortBy(_.directoryName).flatMap: storeId =>
         val oldSilent = !installed.contains(storeId) && marked.contains(storeId)
         val derived = silence(storeId)
@@ -369,32 +370,50 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   /** The defect of the router's marks (spec, Step 3 addenda) that explains a silence disagreement over `storeId`, if
    *  one does. These four arise in windows whose timing varies from run to run, so they are recognised by their
    *  state, not whitelisted by test name:
-   *   - D1: not marked, silent only for a transfer in (TransferIn work, an Arrived copy);
-   *   - D4: not marked, silent only for a create that has no copy yet (Work.Create, an Initializing entry);
-   *   - D5: offline, Unknown, its copy retired into pending-delete here (the mark's clearing is one task behind);
-   *   - D6: not marked, silent only for a Live copy whose directory has no config (silenced by the Missing Stores
-   *     pass only) */
+   *   - D1: not marked, silent only for a transfer in: every copy on the receiving device, or Arrived;
+   *   - D4: not marked, silent only by its Create work, before the create's copy exists;
+   *   - D5: offline, Unknown, its copy retired into pending-delete here and the retiring caller's clear of the mark
+   *     not yet run (a device still lists it offline);
+   *   - D6: not marked, silent only for Live, Idle copies whose directories all lack their config (silenced by the
+   *     Missing Stores pass only) */
   private def knownDefect(storeId: StoreId, oldSilent: Boolean, derived: Silence): Option[String] =
-    val records = allCopies.flatMap(_.copies.get(storeId)).toList
+    val withRecord = allCopies.filter(_.copies.contains(storeId)).toList
+    val records = withRecord.map(_.copies(storeId))
     val works = allCopies.flatMap(_.work.get(storeId)).toList
+    val receiving = allCopies.filter(_.work.get(storeId).exists(_.isInstanceOf[Work.TransferIn])).map(_.deviceId).toSet
     derived match
       case Silence.Silent(reasons) if !oldSilent =>
+        // D1: each copy is the transfer's own (on the device receiving it) or Arrived
         if reasons.subsetOf(Set(SilenceReason.TransferringIn, SilenceReason.CopyHere)) &&
-           works.exists(_.isInstanceOf[Work.TransferIn]) || reasons == Set(SilenceReason.CopyHere) &&
-           records.nonEmpty && records.forall(_.phase.isInstanceOf[Phase.Arrived]) then
+           (receiving.nonEmpty || records.nonEmpty) &&
+           withRecord.forall(c => receiving.contains(c.deviceId) || c.copies(storeId).phase.isInstanceOf[Phase.Arrived])
+        then
           Some("D1")
-        else if reasons == Set(SilenceReason.Opening) && records.isEmpty then
+        // D4: the create's pool read, before its open: its Create work, and no copy yet
+        else if reasons == Set(SilenceReason.Opening) && records.isEmpty && works.contains(Work.Create) then
           Some("D4")
-        else if reasons == Set(SilenceReason.CopyHere) && records.forall(r => r.phase == Phase.Live &&
-                  r.activity == Activity.Idle) &&
-                attached.values.exists(sds => sds.copies.copies.contains(storeId) &&
-                  FileStat.existence(sds.devicePath / storeId.directoryName / StoreConfig.configFilename)
-                    .contains(false)) then
+        // D6: every copy is a Live, Idle directory on a loaded device whose config is known absent
+        else if reasons == Set(SilenceReason.CopyHere) && withRecord.nonEmpty &&
+                withRecord.forall: c =>
+                  val r = c.copies(storeId)
+                  r.phase == Phase.Live && r.activity == Activity.Idle &&
+                    attached.get(c.deviceId).exists(sds => (sds.copies eq c) &&
+                      FileStat.existence(sds.devicePath / storeId.directoryName / StoreConfig.configFilename)
+                        .contains(false))
+        then
           Some("D6")
         else
           None
-      case Silence.Unknown if oldSilent && retiredStores.contains(storeId) => Some("D5")
+      // D5: its copy retired here, and the retiring device's lagging clear not yet run (it still lists the store)
+      case Silence.Unknown if oldSilent && retiredStores.contains(storeId) &&
+                              attached.values.exists(_.offlineStores.contains(storeId)) =>
+        Some("D5")
       case _ => None
+
+  /** A caller cleared, or asked to clear, the router's offline mark of `storeId` (StoreRouter.clearOffline,
+   *  clearOfflineUnlessHeld): a retire's lagging clear has run, ending D5's window */
+  def offlineClearAsked(storeId: StoreId): Unit =
+    retiredStores -= storeId
 
   /** At unload: the device's records go with it, and `listed` is kept as its unloaded entries */
   def detach(id: StorageDeviceId, listed: Set[StoreId]): Unit =

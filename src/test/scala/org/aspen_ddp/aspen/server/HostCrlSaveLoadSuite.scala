@@ -82,12 +82,12 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
   private def newCrlHost(crl: CrashRecoveryLog = new TestNetwork.RecordingCRL): Host =
     val hostRoot = os.temp.dir()
     tempRoots += hostRoot
-    new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+    named(new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net,
       BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
       net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
       // The store is loaded directly, onto a device this host never loads
-      seams = Host.Seams(unloadedDeviceCrl = Some(crl)))
+      seams = compared(Host.Seams(unloadedDeviceCrl = Some(crl)))))
 
   private def storeOf(host: Host): Option[Store] = host.control.router.loaded.get(crlStoreId)
 

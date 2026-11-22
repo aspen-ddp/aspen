@@ -391,7 +391,9 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
     closedForShutdown -= storageDeviceId
     ctx.devices.devices.get(storageDeviceId).foreach: sds =>
       shutDownCrl(sds.devicePath, sds.crl)
-      ctx.copyRegistry.detach(storageDeviceId, sds.reconciledEntries.map(_.keySet).getOrElse(Set()))
+      // Its last tree entry's stores, and the copies it holds: an unload before its first reconcile lists those
+      ctx.copyRegistry.detach(storageDeviceId,
+        sds.reconciledEntries.map(_.keySet).getOrElse(Set()) ++ sds.copies.copies.keySet)
     ctx.devices.devices -= storageDeviceId
     ctx.discovery.forgetDevice(storageDeviceId)
     ctx.publishView()

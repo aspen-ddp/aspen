@@ -450,6 +450,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     // The open that queued this LoadStore ends here: this task installs the store or gives up. Its deferred
     // ShutdownStores run after it, so a store installed is closed like any served one. A LoadStore queued by no
     // startOpen (Host.loadStore, a test's reload) leaves an open in progress alone
+    ctx.copyRegistry.loadHandled(storageDeviceId, backend.storeId)
     val fromOpen = awaitingInstall.get(backend.storeId).exists(_ eq backend)
     if fromOpen then
       awaitingInstall -= backend.storeId

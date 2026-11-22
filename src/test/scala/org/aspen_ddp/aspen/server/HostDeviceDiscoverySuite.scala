@@ -777,12 +777,12 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
           new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
             net.objectCacheFactory, net, tasks, TestNetwork.TestCRL,
             net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
-            Duration(60, SECONDS))
+            Duration(60, SECONDS), seams = compared())
         case Some(p) =>
           new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
             net.objectCacheFactory, net, tasks, TestNetwork.TestCRL,
             net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
-            Duration(60, SECONDS), deviceScanPeriod = p)
+            Duration(60, SECONDS), deviceScanPeriod = p, seams = compared())
       tasks.periods
 
     // 7 s is used by nothing else Host schedules, so its presence pins the new parameter.
@@ -2029,10 +2029,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     os.write.over(storeDir / StoreTransfer.TransferredInMarkerFile, Array.emptyByteArray)
     val filesBefore = os.list(storeDir).toSet
 
-    val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
-      net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
-      net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
-      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2)
+    val host = named(new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+      new LockstepThreading(executionContext), net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
+      TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
+      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared()))
 
     Future.successful:
       host.control.router.offlineStores should contain(storeId)
@@ -2052,10 +2052,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, Array.emptyByteArray)
     val filesBefore = os.list(storeDir).toSet
 
-    val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
-      net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
-      net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
-      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2)
+    val host = named(new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+      new LockstepThreading(executionContext), net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
+      TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
+      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared()))
 
     Future.successful:
       host.control.router.offlineStores should contain(storeId)
@@ -2141,10 +2141,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
   /** A real Host, which opens RocksDB backends and honours the markers, over `hostRoot`. */
   private def newRealHost(hostRoot: os.Path): Host =
-    new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
-      net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
-      net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
-      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2)
+    named(new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+      new LockstepThreading(executionContext), net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
+      TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
+      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared()))
 
   private def writeStoreDir(deviceDir: os.Path, storeId: StoreId = storeId): os.Path =
     val storeDir = deviceDir / storeId.directoryName

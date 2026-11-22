@@ -35,6 +35,9 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   private var untracked: Map[StorageDeviceId, DeviceCopies] = Map()
   // The purpose each close asked for (closingFor) is for, until the router removes its store
   private var closePurposes: Map[StoreId, ClosePurpose] = Map()
+  // Stores a copy of which was retired into pending-delete, for compareWithRouter's D5 (the router's offline mark
+  // trails the move by one control task)
+  private var retiredStores: Set[StoreId] = Set()
   // Opens that began while their store had TransferOut work on the device (R1: refused from Task 7)
   private var transferOutOpens: Vector[String] = Vector()
 
@@ -159,7 +162,13 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     shadow(site):
       copiesOf(retry.sds).foreach: copies =>
         copies.copies.get(storeId) match
-          case None => throw IllegalStateException(s"No copy record for $storeId, awaiting a load retry")
+          case None =>
+            // Put at its path after the device's load (by hand or by a test): learned, as readAtLoad learns one
+            logger.warn(s"The copy of store $storeId at ${retry.storePath} was not known to the copy registry. " +
+                        "Learned awaiting a load retry, Unread")
+            learnedCopies :+= s"device ${retry.sds.storageDeviceId}: $storeId learned awaiting a retry, Unread"
+            copies.register(storeId, Phase.Unread)
+            copies.setActivity(storeId, Activity.AwaitingRetry(retry))
           case Some(r) => r.activity match
             case Activity.Closing(_) => ()
             case _ => copies.setActivity(storeId, Activity.AwaitingRetry(retry))
@@ -171,29 +180,37 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         if copies.copies.get(storeId).exists(_.activity.isInstanceOf[Activity.AwaitingRetry]) then
           copies.setActivity(storeId, Activity.Idle)
 
-  /** The router installed `storeId`, loaded from device `id` (StoreRouter.install): its record is Served. A store
-   *  loaded onto a device this host has not loaded, through the unloaded-device CRL seam (tests), gets an untracked
-   *  record (Live) first, kept until the host goes, as a copy's record is kept on a loaded device. A device neither
-   *  loaded nor seamed (a test's stand-in) has no records */
+  /** The router installed `storeId`, loaded from device `id` (StoreRouter.install): its record (`known`) is Served */
   def installed(id: StorageDeviceId, storeId: StoreId): Unit =
     shadow("install"):
-      if !attached.contains(id) && !ctx.devices.devices.contains(id) && ctx.unloadedDeviceCrl.isDefined then
-        val copies = untracked.getOrElse(id, new DeviceCopies(id, os.root, s => observer(untracked(id), s)))
-        untracked += id -> copies
-        if !copies.copies.contains(storeId) then
-          copies.register(storeId, Phase.Live)
-      // A copy a loaded device holds with no record was put at its path after the device's load and loaded without
-      // tryLoadStore (Host.loadStore, tests): learned here as readAtLoad learns one
-      attached.get(id).foreach: sds =>
-        if !sds.copies.copies.contains(storeId) then
-          val path = sds.devicePath / storeId.directoryName
-          val phase = CopyPhase.known(path).getOrElse(Phase.Live)
-          logger.warn(s"The copy of store $storeId at $path was not known to the copy registry. Learned at its " +
-                      s"install, $phase")
-          learnedCopies :+= s"device $id: $storeId learned at install, $phase"
-          sds.copies.register(storeId, phase)
+      known("install", id, storeId)
       // Served -> Served: a reload over the served store (StoreRouter.install replacing an entry)
       device(id).foreach(_.setActivity(storeId, Activity.Served))
+
+  /** A LoadStore of `storeId` onto device `id` is handled (StoreLoader.handleLoad): its copy has a record before the
+   *  load's outcome, whatever it is (see `known`) */
+  def loadHandled(id: StorageDeviceId, storeId: StoreId): Unit =
+    shadow("LoadStore")(known("LoadStore", id, storeId))
+
+  /** Gives the copy of `storeId` loaded onto device `id` a record if it has none. A store loaded onto a device this
+   *  host has not loaded, through the unloaded-device CRL seam (tests), gets an untracked record (Live), kept until
+   *  the host goes, as a copy's record is kept on a loaded device. A copy a loaded device holds with no record was put
+   *  at its path after the device's load and loaded without tryLoadStore (Host.loadStore, tests): learned, as
+   *  readAtLoad learns one. A device neither loaded nor seamed (a test's stand-in) has no records */
+  private def known(site: String, id: StorageDeviceId, storeId: StoreId): Unit =
+    if !attached.contains(id) && !ctx.devices.devices.contains(id) && ctx.unloadedDeviceCrl.isDefined then
+      val copies = untracked.getOrElse(id, new DeviceCopies(id, os.root, s => observer(untracked(id), s)))
+      untracked += id -> copies
+      if !copies.copies.contains(storeId) then
+        copies.register(storeId, Phase.Live)
+    attached.get(id).foreach: sds =>
+      if !sds.copies.copies.contains(storeId) then
+        val path = sds.devicePath / storeId.directoryName
+        val phase = CopyPhase.known(path).getOrElse(Phase.Live)
+        logger.warn(s"The copy of store $storeId at $path was not known to the copy registry. Learned at its " +
+                    s"$site, $phase")
+        learnedCopies :+= s"device $id: $storeId learned at $site, $phase"
+        sds.copies.register(storeId, phase)
 
   /** The close of `storeId` about to be asked for is for `purpose` (DeviceShutdown, StoreLoader.handleClose): taken
    *  by the router's removal of the store */
@@ -337,17 +354,47 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         val oldRepairable = installed.contains(storeId) && !offline.contains(storeId) &&
           !rebuilding.contains(storeId) && !sending.contains(storeId)
         val newRepairable = repairable(storeId)
-        (if oldSilent != derived.isInstanceOf[Silence.Silent] then
+        (if oldSilent != derived.isInstanceOf[Silence.Silent] && knownDefect(storeId, oldSilent, derived).isEmpty then
            List(s"$storeId: the router's marks say ${if oldSilent then "silent" else "not silent"} (installed " +
                 s"${installed.contains(storeId)}, offline ${offline.contains(storeId)}, loading " +
                 s"${router.isLoading(storeId)}, awaiting device ${router.isAwaitingDevice(storeId)}), the registry " +
-                s"$derived")
+                s"$derived (${describe(storeId)})")
          else Nil) ++
         (if oldRepairable != newRepairable then
            List(s"$storeId: repairable by the router's view $oldRepairable (installed ${installed.contains(storeId)}, " +
                 s"offline ${offline.contains(storeId)}, rebuilding ${rebuilding.contains(storeId)}, sending " +
                 s"${sending.contains(storeId)}), by the registry $newRepairable (${describe(storeId)})")
          else Nil)
+
+  /** The defect of the router's marks (spec, Step 3 addenda) that explains a silence disagreement over `storeId`, if
+   *  one does. These four arise in windows whose timing varies from run to run, so they are recognised by their
+   *  state, not whitelisted by test name:
+   *   - D1: not marked, silent only for a transfer in (TransferIn work, an Arrived copy);
+   *   - D4: not marked, silent only for a create that has no copy yet (Work.Create, an Initializing entry);
+   *   - D5: offline, Unknown, its copy retired into pending-delete here (the mark's clearing is one task behind);
+   *   - D6: not marked, silent only for a Live copy whose directory has no config (silenced by the Missing Stores
+   *     pass only) */
+  private def knownDefect(storeId: StoreId, oldSilent: Boolean, derived: Silence): Option[String] =
+    val records = allCopies.flatMap(_.copies.get(storeId)).toList
+    val works = allCopies.flatMap(_.work.get(storeId)).toList
+    derived match
+      case Silence.Silent(reasons) if !oldSilent =>
+        if reasons.subsetOf(Set(SilenceReason.TransferringIn, SilenceReason.CopyHere)) &&
+           works.exists(_.isInstanceOf[Work.TransferIn]) || reasons == Set(SilenceReason.CopyHere) &&
+           records.nonEmpty && records.forall(_.phase.isInstanceOf[Phase.Arrived]) then
+          Some("D1")
+        else if reasons == Set(SilenceReason.Opening) && records.isEmpty then
+          Some("D4")
+        else if reasons == Set(SilenceReason.CopyHere) && records.forall(r => r.phase == Phase.Live &&
+                  r.activity == Activity.Idle) &&
+                attached.values.exists(sds => sds.copies.copies.contains(storeId) &&
+                  FileStat.existence(sds.devicePath / storeId.directoryName / StoreConfig.configFilename)
+                    .contains(false)) then
+          Some("D6")
+        else
+          None
+      case Silence.Unknown if oldSilent && retiredStores.contains(storeId) => Some("D5")
+      case _ => None
 
   /** At unload: the device's records go with it, and `listed` is kept as its unloaded entries */
   def detach(id: StorageDeviceId, listed: Set[StoreId]): Unit =
@@ -423,6 +470,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def removed(site: String, sds: LocalStorageDeviceState, storeId: StoreId): Unit =
     shadow(site):
       copiesOf(sds).foreach(_.unregister(storeId))
+      if site == "moveToPendingDelete" then
+        retiredStores += storeId
 
   /** Test-only. For every loaded device, where its records and its disk disagree:
    *   - a record's phase is not the phase its directory's markers read, for records neither Unread nor unsynced;
@@ -480,24 +529,9 @@ enum Silence:
 object HostCopies:
   /** Tests whose drain disagrees with the router's marks through a defect of those marks (spec, Stage 1 audit
    *  findings, Step 3 addenda), by test name: compareWithRouter reports nothing for them until Task 6 removes the
-   *  marks */
+   *  marks. The defects of timing windows (D1, D4, D5, D6) are recognised by their state instead (knownDefect) */
   val KnownDefects: Map[String, String] =
-    val transferIn = "D1: a transfer in's store has no router mark on its destination while it is received and its " +
-      "pool update runs, so the router answers UnknownStore once the pool names the destination and before the load"
     Map(
-      "a transfer in registers its promoted copy Arrived and its pool update makes it Live (arrived copy)" -> transferIn,
-      "a transfer in registers its promoted copy Arrived and its pool update makes it Live (shipped rebuilt copy)" ->
-        transferIn,
-      "a transfer in deletes an arrived copy of another transfer and unregisters it" -> transferIn,
-      "a retried transfer in asks the host that has since adopted its source" -> transferIn,
-      "a transfer-in retry gives up once the destination no longer records the transfer" -> transferIn,
-      "failed transfer in restarts with a fresh UUID" -> transferIn,
-      "a rebuild requested while a create's flip is pending does not overlap Create (C4)" ->
-        ("D4: a store being created has no router mark until its open starts (createNewStore reads its pool first), " +
-         "so the router answers UnknownStore for it meanwhile"),
-      "a served store its device's entry does not list is taken out of service and retired (RB-W5)" ->
-        ("D5: the router's offline mark of a retired copy trails its move into pending-delete by one control task " +
-         "(StoreCopies.retire, then its caller's clearOfflineUnlessHeld)"),
       "a check of an unloaded device that lists a store served here takes it out of the router's repairable view" ->
         ("D2: a check of a device not loaded here (DeviceReconciler, the unloaded-device branch) marks every store " +
          "its entry lists offline by id, one served from another device of this host included"),

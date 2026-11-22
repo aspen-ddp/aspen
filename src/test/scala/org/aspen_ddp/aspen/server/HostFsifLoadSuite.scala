@@ -159,8 +159,9 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL, net.FinalizerFactory,
       TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
       StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2,
-      seams = Host.Seams(backends = Some(seams), wrapMetadata = Some(seams.withDeviceStates),
-                         gossipStoreOnline = Some(seams.gossipStoreOnline)))
+      seams = compared(Host.Seams(backends = Some(seams), wrapMetadata = Some(seams.withDeviceStates),
+                         gossipStoreOnline = Some(seams.gossipStoreOnline))))
+    named(host)
     fsifSeams.put(host, seams)
     host
 

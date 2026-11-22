@@ -41,13 +41,15 @@
   Unknown) and `repairable` (Served, not Closing, no Rebuild or TransferOut work, not being sent). A transfer-out
   close ends its copy's Closing once the store is closed, before the extraction's deletion, so an open installing
   during it goes Idle -> Served. An install on a loaded device with no record learns the copy (`learned`), as
-  `readAtLoad` does. With `Host.Seams.verifyCopyRegistry` (TestNetwork; ControlFixture's
+  `readAtLoad` does, and so do a LoadStore and a load retry that find none (copies put at a path after the device's load);
+  an unload lists the device's records among its unloaded entries, and a Shutdown device's decision lists its stores. With `Host.Seams.verifyCopyRegistry` (TestNetwork; ControlFixture's
   `newHost(verifyCopyRegistry = ...)`, default off) each lockstep drain throws on a recorded throw, on any
   `verifyAgainstDisk` mismatch (phase, unrecorded config'd directory, record without directory) or on any
   `compareWithRouter` disagreement (silence or repairability against the router's marks); with
-  `Host.Seams.compareCopyRegistry` (every ControlFixture host) on a `compareWithRouter` disagreement alone. The tests
-  `HostCopies.KnownDefects` lists are exempt: their disagreement is a defect of the old marks (spec, Step 3 addenda
-  D1-D5). A ControlFixture host with `verifyCopyRegistry` holds each load its recording seam skips offline
+  `Host.Seams.compareCopyRegistry` (every ControlFixture host: `newHost`, and `ControlFixture.compared`/`named` for
+  a host a suite builds itself) on a `compareWithRouter` disagreement alone. Defects of the old marks (spec, Step 3
+  addenda D1-D6) are exempt: D2 and D3 by test name (`HostCopies.KnownDefects`), the timing windows D1, D4, D5 and D6
+  by their state (`HostCopies.knownDefect`). A ControlFixture host with `verifyCopyRegistry` holds each load its recording seam skips offline
   (`RecordingSeams.holdLoadsOffline`), as a production load holding a copy back does; every ControlFixture host's
   shutdown close seam closes a store a test did serve for real. `attach` never throws: a child whose stat fails is
   registered `Unread`, and so is one whose markers cannot be read. `tryLoadStore` reports each phase it reads

@@ -523,6 +523,15 @@ trait ControlFixture:
     host.control.copyRegistry.testName = testName
     host
 
+  /** `seams` for a host a suite builds itself, outside newHost: its drains compare the copy registry with the
+   *  router's marks, as every ControlFixture host's do (Task 5, R16). Pass the host to `named` once built */
+  protected def compared(seams: Host.Seams = Host.Seams.default): Host.Seams = seams.copy(compareCopyRegistry = true)
+
+  /** `host`, its copy registry told the running test's name (HostCopies.KnownDefects) */
+  protected def named(host: Host): Host =
+    host.control.copyRegistry.testName = testName
+    host
+
   /** What `host` did, and the knobs that make it do something else. */
   protected def recorded(host: Host): RecordingSeams = rigs.get(host).seams
 

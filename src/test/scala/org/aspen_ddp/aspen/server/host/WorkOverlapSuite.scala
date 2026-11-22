@@ -515,7 +515,6 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(!loadedDevices(host).contains(deviceA), drain = Some(host))
-      _ <- served.map(_.backend.close()).getOrElse(Future.unit)
     yield
       queued should be(List((deviceA, moving)))
       opens should be(1)

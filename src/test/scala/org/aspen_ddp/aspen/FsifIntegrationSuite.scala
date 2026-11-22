@@ -39,7 +39,7 @@ private object FsifTestHost:
             systemId: UUID,
             hostRoot: os.Path,
             ec: ExecutionContext): Host =
-    val seams = Host.Seams(wrapIoHandler = Some: queue =>
+    val seams = Host.Seams(compareCopyRegistry = true, wrapIoHandler = Some: queue =>
       new CompletionHandler:
         override def complete(op: Completion): Unit =
           queue.complete(op)
@@ -157,7 +157,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
   // ---- Setup ------------------------------------------------------------------------------------------------
 
   private def newFsifHost(): Host =
-    FsifTestHost(net, client, fsifHostId, systemId, hostRoot, executionContext)
+    named(FsifTestHost(net, client, fsifHostId, systemId, hostRoot, executionContext))
 
   /** The FSIF host, its device and the pool, with every store created and served */
   private def setUp(): Future[Unit] =

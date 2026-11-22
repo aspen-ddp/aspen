@@ -258,6 +258,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                   // Awaiting a restart or a move: silent, as unloadDevice leaves the stores of a
                   // device shut down while this host ran
                   marked.foreach(ctx.router.markOffline)
+                  // Its stores are an unloaded device's, silent in the copy registry too (shadow)
+                  ctx.copyRegistry.recordUnloadedEntries(deviceId, state.stores.keySet ++ marked)
                 case DeviceStatus.ShuttingDown if ownedHere =>
                   logger.info(s"Storage device $deviceId at $path was being shut down when this host " +
                               s"stopped. Loading it to finish the shutdown")

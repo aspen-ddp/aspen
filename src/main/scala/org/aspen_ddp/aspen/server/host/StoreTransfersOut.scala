@@ -192,6 +192,12 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
       // receiver's next retransmit tries again
       if closingForTransfer.contains(m.storeId) then
         refuse(s"Not starting the transfer out of store ${m.storeId} again: an earlier request is still closing it")
+      // Nor while a rebuild of the store is registered here (I3), its flip's retry after an outcome-unknown attempt
+      // included: that attempt may have flipped the entry Active, and a transfer made since is then this request. The
+      // rebuild's end keeps the copy (RebuildOutcome.Unconfirmed), and the receiver's retransmit starts the transfer.
+      // A discard of its lost copy (droppingCrlState) is rebuild work too
+      if ctx.rebuilds.isRebuilding(m.storeId) then
+        refuse(s"Not starting the transfer out of store ${m.storeId} yet: a rebuild of it is still registered")
       val markedPath = sourceDs.devicePath / m.storeId.directoryName
       // A stat that fails throws (FileStat), failing the request: a marked copy never ships
       if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut &&

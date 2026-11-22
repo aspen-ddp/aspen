@@ -267,7 +267,8 @@
     (`DeviceReconciler.flipLostCrlStores`) nor `startRebuild` acts on a store while
     `storeTransferService.isTransferringOut` (host-wide, by store id) holds it (a transfer aborted while its send runs, its copy then marked):
     the discard would move the directory the send may still read. Each schedules a device re-check instead, as the
-    Abandoned Transfers Out pass does.
+    Abandoned Transfers Out pass does; `startRebuild` asks only when no rebuild of the store is registered, since a
+    registered one's end re-checks the device anyway.
   - `StoreTransfers.startIn`, for a `rebuild-complete` or `rebuild-required` copy an earlier tenancy left at the
     path of a store transferring onto the device (re-placed away while the host was down, then transferred back;
     rebuild-process). It retires before asking for bytes, waits while a rebuild of the store runs here, the
@@ -355,7 +356,10 @@
   or Deleted Stores pass (rebuild-process 5.7). A transfer ships it with its `rebuild-complete`, which the destination
   removes (`clearRebuildCompleteMarker`) when its pool update commits, before `loadStoreById`
   (`StoreTransfers.recordTransferIn`); a failed removal keeps it offline for the destination's Completed Rebuilds pass.
-  Tests run a write between an Unknown attempt and its retry with
+  `StoreTransfersOut.startOut` refuses (logged at debug) while a rebuild of the store is registered
+  (`StoreRebuilds.isRebuilding`, the flip's retry after an Unknown attempt included), so a transfer made meanwhile
+  never closes or ships the copy under it (I3); the receiver's retransmit (`StoreTransfers.retransmitPendingStarts`,
+  every 30 s) starts it once the flip settles. Tests run a write between an Unknown attempt and its retry with
   `TestNetwork.TClient.beforeRetry`
 - Nothing of a store's previous copy is destroyed before the store is Active on its owner device (the store copies
   rule above). A fail-stopped backend's CRL entries likewise stay live until the retire saves them

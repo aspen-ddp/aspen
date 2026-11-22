@@ -268,8 +268,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     // re-placement to another device or episode, an accept-rebuild-loss) is not held back (rebuild-process 5.7)
     // A store still being shipped waits, re-checked shortly: a discard of its lost copy would move the directory the
     // send may still be reading (I3, one piece of work per (device, store)). DeviceReconciler.flipLostCrlStores and the
-    // abandoned-transfers-out pass make the same check
-    val shipping = ctx.storeTransferService.isTransferringOut(storeId)
+    // abandoned-transfers-out pass make the same check. Not asked while a rebuild of the store is registered: nothing
+    // starts then anyway, and the rebuild's end checks the device again (a send cannot begin meanwhile, since startOut
+    // refuses while the rebuild is registered), so a re-check would only repeat at every reconcile
+    val shipping = !rebuildingStores.contains(storeId) && ctx.storeTransferService.isTransferringOut(storeId)
     if shipping then
       logger.debug(s"Not rebuilding store $storeId on device ${local.storageDeviceId} yet: a transfer out of it is " +
                    "still sending")

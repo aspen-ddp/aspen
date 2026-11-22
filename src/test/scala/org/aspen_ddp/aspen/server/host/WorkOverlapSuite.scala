@@ -12,6 +12,7 @@ import org.aspen_ddp.aspen.common.network.StartStoreTransfer
 import org.aspen_ddp.aspen.server.{FileStat, Host, StorageDeviceConfig}
 import org.aspen_ddp.aspen.server.crl.StoreRecoveryState
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
+import org.aspen_ddp.aspen.server.host.DeviceMetadata.RebuildOutcome
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 
@@ -407,3 +408,68 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
         sends.transfersOut.map(_._1) should be(Vector(shipped))
         FileStat.exists(storePath / StoreTransfer.TransferOutMarkerFile) should be(true)
         host.control.transfersOut.isClosingForTransfer(shipped) should be(false)
+
+  /** C3: a rebuild's flip commits Active but is reported Unknown. Before its retry reads the entry, an operator's
+   *  transfer makes it TransferringOut and the receiver's StartStoreTransfer arrives. The request is refused while
+   *  the rebuild is registered (its retry still pending); the retry then finds the entry moved on (Unconfirmed) and
+   *  keeps the copy offline, and the receiver's retransmit starts the transfer */
+  atest("a transfer out waits for an outcome-unknown flip's retry (C3)"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", source)
+    val factory = new HeldRebuildFactory
+    val sends = new StagedSendService
+    val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
+    val tclient = client.asInstanceOf[TestNetwork.TClient]
+    val episode = UUID.randomUUID()
+    val rebuilding = Map(shipped -> rebuildingIn(episode))
+    @volatile var hooked = false
+    @volatile var registeredAtRequest = false
+    @volatile var requestWhileRegistered: Option[Try[Unit]] = None
+    @volatile var closesWhileRegistered: List[StoreId] = Nil
+
+    def touches(ptr: KeyValueObjectPointer)(txd: TransactionDescription): Boolean =
+      txd.allReferencedObjectsSet.exists(_.id == ptr.id)
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- setDeviceState(source)(_.setRebuilding(shipped, episode))
+      _ <- waitForTransactionsToComplete()
+      _ <- check(host, source, rebuilding)
+      _ <- yieldUntil(factory.created.nonEmpty)
+      // Where the rebuild placed its copy
+      storePath = writeStoreConfig(deviceDir, shipped)
+      devPtr <- client.getStorageDevicePointer(source)
+      _ = net.reportCommitAsUnknown(touches(devPtr))
+      _ = tclient.beforeRetry =
+        case _: TransactionOutcomeUnknown if !hooked =>
+          hooked = true
+          for
+            _ <- client.transferStore(shipped, net.secondDeviceId)
+            _ = registeredAtRequest = host.control.rebuilds.rebuildingStoreIds.contains(shipped)
+            r <- ask(host)
+          yield
+            requestWhileRegistered = Some(r)
+            closesWhileRegistered = recorded(host).transferOutCloses.toList
+        case _ => Future.unit
+      // The checks the flip's outcome asks for read the entry the transfer wrote
+      _ = List(1, 2).foreach(_ => recorded(host).armLookup(source).success(deviceState(source,
+            Map(shipped -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut,
+              Some(net.secondDeviceId), Some(UUID.randomUUID()))))))
+      _ = factory.created.head.promise.success(())
+      _ <- pumpUntil(hooked && !host.control.rebuilds.rebuildingStoreIds.contains(shipped), drain = Some(host))
+      _ = tclient.beforeRetry = _ => Future.unit
+      outcome = recorded(host).rebuildOutcomes.get((source, shipped))
+      // The receiver's retransmit
+      retransmit <- ask(host)
+      _ <- pumpUntil(sends.isTransferringOut(shipped), drain = Some(host))
+    yield
+      hooked should be(true)
+      registeredAtRequest should be(true)
+      closesWhileRegistered should be(Nil)
+      requestWhileRegistered.exists(_.isFailure) should be(true)
+      outcome should be(Some(RebuildOutcome.Unconfirmed))
+      retransmit.isSuccess should be(true)
+      recorded(host).transferOutCloses.toList should be(List(shipped))
+      sends.transfersOut.map(_._1) should be(Vector(shipped))
+      FileStat.exists(storePath / StoreTransfer.TransferOutMarkerFile) should be(true)

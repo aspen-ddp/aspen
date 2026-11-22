@@ -137,6 +137,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                                        toDeviceId: StorageDeviceId): Unit =
     ctx.devices.discardStoreDirectory(storeId, toDeviceId,
       "The pool does not name this device, so this copy belongs to nobody")
+      .foreach(sds => ctx.copyRegistry.removed("discardArrivedTransferIn", sds, storeId))
 
   /** Restarts a failed transfer in after TransferInRetryDelay rather than at once. A deterministic
    *  failure (the sender's archiver exiting non-zero, a full disk here) would otherwise loop hot,
@@ -244,6 +245,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     try
       StoreLoader.writeArrivedAt(storePath)
       os.remove(storePath / StoreTransfer.TransferredInMarkerFile)
+      ctx.copyRegistry.markerRemoved("clearTransferredInMarker", storePath)
       true
     catch
       case t: Throwable =>
@@ -401,6 +403,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                 logger.warn(s"Discarding the arrived copy of store $storeId on device $toDeviceid: $why")
                 // Rename-first: a failure leaves the copy whole behind its marker. The source still owns the store
                 if StoreCopies.delete(devicePath, finalPath, s"an unusable arrived copy of store $storeId") then
+                  ctx.copyRegistry.removed("startIn unusable arrived copy", toDevice, storeId)
                   toDevice.offlineStores -= storeId
                   ctx.router.clearOfflineUnlessHeld(storeId)
                   Some(Phase.Live)
@@ -513,6 +516,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                       DurableFiles.write(stagedPath / StoreTransfer.TransferredInMarkerFile,
                                          transferId.map(_.toString).getOrElse(""))
                       DurableFiles.move(stagedPath, finalPath)
+                      ctx.copyRegistry.registered("transfer-in promotion", toDevice, storeId,
+                        Phase.Arrived(transferId.map(_.toString).getOrElse("")))
                       true
                     catch
                       case t: Throwable =>

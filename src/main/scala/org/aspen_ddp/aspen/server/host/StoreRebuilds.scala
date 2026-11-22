@@ -360,6 +360,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
       completeFuture.onComplete:
         case Success(_) =>
+          // The rebuild placed its finished copy at the store's path (RebuildingStore.finish, off the control thread)
+          ctx.copyRegistry.rebuilt("rebuild finish", local, storeId,
+            Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)))
           // Loading is downstream of the metadata decision, not ahead of it. An unconditional
           // load hands a live copy to a device that markRebuiltStoreActive may be about to
           // decide must not own it (because the device was tombstoned mid-rebuild), and nothing
@@ -391,6 +394,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 unsilence(storeId, clear = true)
                 ctx.devices.discardStoreDirectory(storeId, local.storageDeviceId,
                   "The tree does not say this device owns a rebuilt store")
+                  .foreach(sds => ctx.copyRegistry.removed("RebuildOutcome.Discard", sds, storeId))
               finally
                 finishSettled(recheckAll())
 
@@ -592,6 +596,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     val storePath = local.devicePath / storeId.directoryName
     try
       DurableFiles.write(storePath / StoreTransfer.TransferOutMarkerFile, "")
+      ctx.copyRegistry.moved("keepRebuiltStoreOffline", local, storeId, Phase.Outbound(""))
       // After the pair: the transfer-out marker now keeps it offline, and its reinstatement loads it
       DurableFiles.remove(storePath / RebuildingStore.RebuildCompleteMarkerFile)
     catch
@@ -610,6 +615,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     try
       os.remove(storePath / RebuildingStore.RebuildCompleteMarkerFile, checkExists = false)
       syncMarkerDirectory(storePath)
+      ctx.copyRegistry.markerRemoved("clearRebuildCompleteMarker", storePath)
       pendingMarkerRemovals -= storeId
       true
     catch
@@ -713,7 +719,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
   /** Writes the marker that keeps the store at `storePath` from ever being loaded again: its CRL
    *  save file is unusable and was the only copy of its transaction state. */
-  def markRebuildRequired(storePath: os.Path): Unit = ctx.writeRebuildRequiredMarker(storePath)
+  def markRebuildRequired(storePath: os.Path): Unit =
+    ctx.writeRebuildRequiredMarker(storePath)
+    ctx.copyRegistry.markedLost("markRebuildRequired", storePath)
 
   /** The LoadStore handler found `backend`'s CRL save file unusable. The file sits in the store's
    *  own directory, so it is the only copy of that state: the store is permanently failed. It

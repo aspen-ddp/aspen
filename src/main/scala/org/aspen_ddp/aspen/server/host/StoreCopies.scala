@@ -74,6 +74,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
       try
         if !StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildRequired) then
           ctx.writeRebuildRequiredMarker(storePath)
+          ctx.copyRegistry.markedLost("retire", storePath)
         val lostState = storePath / RebuildingStore.LostCrlStateFile
         val saveFile = Backend.crlSaveFile(storePath)
         val saved =
@@ -114,6 +115,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
         logger.warn(s"Retiring the copy of store $storeId at $storePath to $target. It is deleted once the store " +
                     s"is Active on the device its pool names")
         DurableFiles.move(storePath, target)
+        ctx.copyRegistry.removed("moveToPendingDelete", local, storeId)
       true
     catch
       case t: Throwable =>

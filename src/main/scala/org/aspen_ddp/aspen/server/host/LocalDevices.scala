@@ -15,6 +15,8 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
                               val configFile: os.Path,
                               val crl: CrashRecoveryLog,
                               val admission: CrlAdmission = CrlAdmission.Unlimited):
+  /** The device's copy registry (HostCopies), attached at load. Updated on the control thread only */
+  val copies: DeviceCopies = new DeviceCopies(storageDeviceId, devicePath, _ => ())
   var loadedStores: Set[StoreId] = Set()
   var offlineStores: Set[StoreId] = Set()
   /** Stores the reconcile's Missing Stores pass declared lost on this device, while their entry stays Active here.
@@ -56,16 +58,18 @@ class LocalDevices extends Logging:
    *  reconcileDeviceState ignores a failed device outright. Were it loaded, and the source happened to live on this
    *  same host, the load would replace the source's entry in `stores`, which is keyed by StoreId alone.
    *
-   *  Nothing is unloaded because nothing was loaded: the load is downstream of the decision.
+   *  Nothing is unloaded because nothing was loaded: the load is downstream of the decision. Returns the device whose
+   *  copy was deleted, for the copy registry.
    */
   def discardStoreDirectory(storeId: StoreId,
                             deviceId: StorageDeviceId,
-                            reason: String): Unit =
+                            reason: String): Option[LocalStorageDeviceState] =
     devices.get(deviceId) match
       case None =>
         // The operation completed on a device this process never loaded, or one a shutdown has
         // since unloaded. Log rather than assume.
         logger.warn(s"Cannot discard the copy of store $storeId on unloaded device $deviceId")
+        None
 
       case Some(sds) =>
         val storePath = sds.devicePath / storeId.directoryName
@@ -75,4 +79,6 @@ class LocalDevices extends Logging:
                       s"$reason: $storePath")
           // Rename-first: a failure leaves the copy whole, its marker included, so a restart never loads it.
           // The store is not loaded, so nothing serves it now
-          StoreCopies.delete(sds.devicePath, storePath, reason)
+          if StoreCopies.delete(sds.devicePath, storePath, reason) then Some(sds) else None
+        else
+          None

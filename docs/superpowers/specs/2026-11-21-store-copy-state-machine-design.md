@@ -419,6 +419,11 @@ Non-phase files written into copies (unchanged by stage 1): `arrived-at` (`host/
 on the store executor, `host/StoreTransfersOut.scala:113`, removed at `host/StoreRouter.scala:282` on the executor),
 `lost-crl-*.log` (`host/StoreCopies.scala:85-91`), the `finish` gates (`rebuild/RebuildingStore.scala:792-799`), and the `inherited-votes` unlink from a live copy (`RebuildingStore.removeInheritedVotes`, `rebuild/RebuildingStore.scala:153-155`, called from `store/Frontend.scala:467` on the store executor).
 
+Task 4 addendum: the drain check (run with ControlFixture verification forced on, exploratory) found no missing
+production site; its 13 mismatches were all copies a test put at a store path after the device's load, or fake rebuilds
+that complete without placing a copy. A copy put at a store path by hand after its device's load is not known to the
+registry.
+
 **Amendments implied by Step 1**
 
 - T13 must also cover Rebuilt → gone, for `RebuildOutcome.Discard` (`host/StoreRebuilds.scala:340-346`).

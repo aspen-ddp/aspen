@@ -268,6 +268,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     // Set when the store is served: it stays opening until its LoadStore is handled, which puts `deferred` again
     var installing = false
     val registered = ctx.devices.isLoaded(sds)
+    // A create renames its finished copy into the store's path before the open (StoreCreation): one that succeeded left
+    // it there, whether or not the open did. A stat that fails says nothing, and the disk check skips it
+    if create && (result.isSuccess || FileStat.existence(storePath).contains(true)) then
+      ctx.copyRegistry.registered("store create", sds, storeId, Phase.Live)
     def leaveOffline(): Unit =
       router.markOffline(storeId)
       router.clearLoading(storeId)

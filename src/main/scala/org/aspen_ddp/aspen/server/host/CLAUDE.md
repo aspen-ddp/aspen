@@ -17,6 +17,17 @@
   CrlLost), `holdsOwnState` (Rebuilt), `reloadClosedStores` (offers Live, and a copy whose phase cannot be read) and
   `startIn` (Arrived: stale check; Lost, Rebuilt and Outbound: `retireEarlierTenancy`; Live: refuse or receive; None:
   wait) match on it. The single-marker tests of the reconciler passes, `retire` and the rebuilds stay `StoreDirMarkers`
+- Copy registry (store copy state machine, stage 1, shadow mode): `HostCopies` (`DeviceControl.copyRegistry`) holds
+  one `DeviceCopies` per loaded device, the device state's `LocalStorageDeviceState.copies`. `attach` at device load
+  (before any store is offered; `ControlFixture.injectLoadedDevice` too) registers every store directory, by name,
+  with its `CopyPhase` (`Unread` where it cannot be read); `detach` at unload. Every disk mutation site of a store
+  path (create, rebuild finish's handler, transfer-in promotion, the four markers' writes and removals, retire into
+  pending-delete, discards) updates it right after its durable step, through `HostCopies.shadow`, which logs and
+  records a throw instead of failing production. Nothing reads it yet; activity and work stay Idle/empty. With
+  `Host.Seams.verifyCopyRegistry` (TestNetwork; ControlFixture's `newHost(verifyCopyRegistry = ...)`, default off)
+  each lockstep drain throws on a recorded throw or on any `verifyAgainstDisk` mismatch (phase, unrecorded config'd
+  directory, record without directory). A copy put at a store path after the device's load (by hand, or by a test)
+  has no record
 - `DeviceControl.markStoreOffline` keeps the router's offline mark and the device's
   `offlineStores` together; `LocalDevices.isLoaded(sds)` says whether a device state is still the loaded one
 

@@ -385,7 +385,9 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    */
   def unloadDevice(storageDeviceId: StorageDeviceId): Unit =
     closedForShutdown -= storageDeviceId
-    ctx.devices.devices.get(storageDeviceId).foreach(sds => shutDownCrl(sds.devicePath, sds.crl))
+    ctx.devices.devices.get(storageDeviceId).foreach: sds =>
+      shutDownCrl(sds.devicePath, sds.crl)
+      ctx.copyRegistry.detach(storageDeviceId, sds.reconciledEntries.map(_.keySet).getOrElse(Set()))
     ctx.devices.devices -= storageDeviceId
     ctx.discovery.forgetDevice(storageDeviceId)
     ctx.publishView()

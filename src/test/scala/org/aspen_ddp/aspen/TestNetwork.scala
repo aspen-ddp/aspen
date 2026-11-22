@@ -633,7 +633,7 @@ class TestNetwork(executionContext: ExecutionContext,
     // Its stores are loaded directly (below), onto a device it never loads
     seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapUnackedLookup = hostOptions.wrapUnackedLookup,
       missingDataWait = hostOptions.missingDataWait, parkedReadWait = hostOptions.parkedReadWait, storeLoadedAt = storeLoadedAt, joinCeiling = Some(smgrCeiling),
-      joinCeilingStep = CeilingStep),
+      joinCeilingStep = CeilingStep, verifyCopyRegistry = true),
     transactionHorizon = hostOptions.transactionHorizon)
 
   // Stand in for each store's StoreConfig.effectiveMaxSliceSize and ida, which Host reads from the store config file
@@ -695,7 +695,7 @@ class TestNetwork(executionContext: ExecutionContext,
       TestCRL, FinalizerFactory, txDriverFactory, hostOptions.heartbeatPeriod, Duration(60, SECONDS),
       seams = Host.Seams(unloadedDeviceCrl = Some(crl), wrapUnackedLookup = hostOptions.wrapUnackedLookup,
         missingDataWait = hostOptions.missingDataWait, parkedReadWait = hostOptions.parkedReadWait, storeLoadedAt = storeLoadedAt, joinCeiling = Some(ceiling),
-        joinCeilingStep = CeilingStep),
+        joinCeilingStep = CeilingStep, verifyCopyRegistry = true),
       transactionHorizon = hostOptions.transactionHorizon)
     synchronized:
       ceilings = (host, ceiling) :: ceilings

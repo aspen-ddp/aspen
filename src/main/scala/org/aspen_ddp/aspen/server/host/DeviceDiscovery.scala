@@ -179,7 +179,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                                fromShutdownMarker: Boolean): Unit =
     if ! pendingResolutions.contains(storageDevicePath) then
       val stores = storesIn(storageDevicePath)
-      stores.foreach(ctx.router.markAwaitingDevice)
+      ctx.copyRegistry.awaitDevice(storageDevicePath, stores)
       pendingResolutions += storageDevicePath -> stores
       // A throw before the Future exists would register no callback, and the path would stay
       // pending -- and the device unresolved -- for the life of the process.
@@ -297,7 +297,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   /** Clears the awaiting-device marks of `stores`, unless an adoption of `path` has taken them over */
   private def releaseMarks(path: os.Path, stores: Set[StoreId]): Unit =
     if ! pendingResolutions.contains(path) then
-      stores.foreach(ctx.router.clearAwaitingDevice)
+      ctx.copyRegistry.deviceDecided(path)
 
   /** How the store at `storePath`, whose entry is Offline or Active, can be put back into service by
    *  an adoption. The host that served it is not here, so its state must be on the device: in
@@ -465,7 +465,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       val markerFile = path / storeId.directoryName / StoreTransfer.TransferOutMarkerFile
       if entry.transferDevice.isEmpty && !ctx.storeTransferService.isTransferringOut(storeId) then
         // A marker that cannot be removed, or whose stat fails, keeps the store offline as a present one does
-        try os.remove(markerFile, checkExists = false)
+        try
+          os.remove(markerFile, checkExists = false)
+          ctx.copyRegistry.markerRemoved("bringIntoService", path / storeId.directoryName)
         catch case t: Throwable =>
           logger.error(s"Failed to remove the transfer-out marker for store $storeId at $markerFile. " +
                        s"The store stays offline until a later check of its device. Error: $t")
@@ -747,11 +749,14 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             crl.failed.foreach(t => ctx.shutdown.crlFailed(sds, t))
             logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
             try
+              // Its copies registered before any store is offered (HostCopies)
+              ctx.copyRegistry.attach(sds)
               storeFiles.foreach: potentialStoreFile =>
                 ctx.tryLoadStore(sds, potentialStoreFile, None)
             catch
               case t: Throwable =>
                 // Shut down as an unload does, so the retry does not open the files a second time
+                ctx.copyRegistry.detach(sds.storageDeviceId, Set())
                 ctx.shutdown.shutDownCrl(storageDevicePath, crl)
                 throw t
             // Registered only after every child has been offered to tryLoadStore. If

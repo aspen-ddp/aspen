@@ -287,6 +287,8 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
         // offline across restarts until the transfer is resolved one way or the other.
         DurableFiles.write(storePath / StoreTransfer.TransferOutMarkerFile,
                            devEntry.transferId.map(_.toString).getOrElse(""))
+        ctx.copyRegistry.moved("closedForTransfer", sourceDs, m.storeId,
+          Phase.Outbound(devEntry.transferId.map(_.toString).getOrElse("")))
         ctx.storeTransferService.beginTransferOut(m.storeId, m.transferUUID, storePath,
           toHostState.address, toHostState.storeTransferPort, m.timestamp)
         ctx.publishView()
@@ -354,6 +356,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
     val markerRemoved =
       try
         os.remove(storePath / StoreTransfer.TransferOutMarkerFile)
+        ctx.copyRegistry.markerRemoved("reinstateAbandonedOut", storePath)
         true
       catch
         case t: Throwable =>

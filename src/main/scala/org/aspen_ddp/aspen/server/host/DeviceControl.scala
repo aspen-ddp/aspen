@@ -108,6 +108,7 @@ final class DeviceControl(val metadata: DeviceMetadata,
   lazy val shutdown: DeviceShutdown = new DeviceShutdown(this)
   lazy val reconciler: DeviceReconciler = new DeviceReconciler(this)
   lazy val services: HostServices = new HostServices(this)
+  lazy val copyRegistry: HostCopies = new HostCopies(this)
 
   @volatile private var view: HostStoreView = HostStoreView.Empty
 

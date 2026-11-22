@@ -603,6 +603,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                     // Silence its stores rather than sending "UnknownStore".
                     remote.stores.keysIterator.foreach: storeId =>
                       ctx.router.markOffline(storeId)
+                    ctx.copyRegistry.recordUnloadedEntries(storageDeviceId, remote.stores.keySet)
 
               // The lookup fails whenever the device has no entry in the storage-devices tree:
               // a config written out-of-band naming an id that was never registered -- the

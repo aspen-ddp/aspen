@@ -327,8 +327,9 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
 
   /** The seams that make a Host record and, where a test asks, hold or fail what the old RecordingHost did. `None`
    *  fields keep the production behaviour; the schedule of retries and timeouts goes through `scheduler`. */
-  def seams(scheduler: ControlScheduler): Host.Seams =
+  def seams(scheduler: ControlScheduler, verifyCopyRegistry: Boolean = false): Host.Seams =
     Host.Seams(
+      verifyCopyRegistry = verifyCopyRegistry,
       wrapMetadata = Some(base => new RecordingMetadata(base)),
       scheduler = Some(scheduler),
       warn = Some((path, msg) => synchronized(deviceDirWarnings += ((path, msg)))),
@@ -478,7 +479,8 @@ trait ControlFixture:
                         maxConcurrentRebuilds: Int = 2,
                         hostId: HostId = HostId.BootstrapHostId,
                         keepCheckAllDevices: Boolean = false,
-                        keepInitializeTaskExecutor: Boolean = false): Host =
+                        keepInitializeTaskExecutor: Boolean = false,
+                        verifyCopyRegistry: Boolean = false): Host =
     val threading = new LockstepThreading(ec)
     val scheduler = new ManualControlScheduler(threading.controlEvents)
     val recording = new RecordingSeams(ec, failFirstStoreLoad)
@@ -486,7 +488,7 @@ trait ControlFixture:
                         net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
                         TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory,
                         Duration(5, SECONDS), Duration(60, SECONDS), transferService, storeRebuildFactory,
-                        maxConcurrentRebuilds, seams = recording.seams(scheduler))
+                        maxConcurrentRebuilds, seams = recording.seams(scheduler, verifyCopyRegistry))
     recording.attach(host)
     threading.removeQueued:
       case t: Host.EventTask =>
@@ -515,6 +517,8 @@ trait ControlFixture:
     val devices = host.control.devices
     require(!devices.devices.contains(sds.storageDeviceId),
             s"${sds.storageDeviceId} is already loaded; injectLoadedDevice does not replace")
+    // Its copies registered as a device load registers them
+    host.control.copyRegistry.attach(sds)
     devices.devices += (sds.storageDeviceId -> sds)
     host.control.publishView()
 

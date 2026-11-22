@@ -176,7 +176,11 @@ object Host:
                          /** Where the host keeps its join ceiling (JoinCeiling). None: a file in its root directory */
                          joinCeiling: Option[JoinCeiling.Persistence] = None,
                          /** How far past the start lead each renewal sets the join ceiling (JoinCeiling.Step) */
-                         joinCeilingStep: FiniteDuration = JoinCeiling.Step)
+                         joinCeilingStep: FiniteDuration = JoinCeiling.Step,
+                         /** Lockstep only: each testingOnlyHandleEvents checks the copy registry once drained, failing
+                          *  on a throw its shadow updates swallowed or a disagreement with the disk
+                          *  (HostCopies.verifyAgainstDisk) */
+                         verifyCopyRegistry: Boolean = false)
 
   object Seams:
     val default: Seams = Seams()
@@ -534,7 +538,14 @@ class Host(val client: AspenClient,
   /** Lockstep threading: runs all posted work, returning when none is left. Any other threading runs its own work,
    *  so this returns at once, doing nothing. */
   def testingOnlyHandleEvents(): Unit = threading match
-    case t: LockstepThreading => t.drain()
+    case t: LockstepThreading =>
+      t.drain()
+      if seams.verifyCopyRegistry then
+        val problems = deviceControl.copyRegistry.takeShadowErrors().toList ++
+          deviceControl.copyRegistry.verifyAgainstDisk()
+        if problems.nonEmpty then
+          throw new IllegalStateException(s"Copy registry of host $hostId after a drain:\n  " +
+                                          problems.mkString("\n  "))
     case _ => ()
 
   /** The components, for tests. */

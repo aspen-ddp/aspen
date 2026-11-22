@@ -271,7 +271,9 @@
     `storeTransferService.isTransferringOut` (host-wide, by store id) holds it (a transfer aborted while its send runs, its copy then marked):
     the discard would move the directory the send may still read. Each schedules a device re-check instead, as the
     Abandoned Transfers Out pass does; `startRebuild` asks only when no rebuild of the store is registered, since a
-    registered one's end re-checks the device anyway.
+    registered one's end re-checks the device anyway. `startRebuild` also waits while a transfer out is still closing
+    the store (`StoreTransfersOut.holdsRebuild`, i.e. `isClosingForTransfer`): the close's end, whatever its outcome,
+    checks the device again, which starts the rebuild.
   - `StoreTransfers.startIn`, for a `rebuild-complete` or `rebuild-required` copy an earlier tenancy left at the
     path of a store transferring onto the device (re-placed away while the host was down, then transferred back;
     rebuild-process). It retires before asking for bytes, waits while a rebuild of the store runs here, the
@@ -363,7 +365,7 @@
   (`StoreRebuilds.isRebuilding`, the flip's retry after an Unknown attempt included), so a transfer made meanwhile
   never closes or ships the copy under it (I3); the receiver's retransmit (`StoreTransfers.retransmitPendingStarts`,
   every 30 s) starts it once the flip settles. Tests run a write between an Unknown attempt and its retry with
-  `TestNetwork.TClient.beforeRetry`
+  `TestNetwork.TClient.beforeRetry`, and `TClient.immediateRetries` fires the retry without its real-time backoff
 - Nothing of a store's previous copy is destroyed before the store is Active on its owner device (the store copies
   rule above). A fail-stopped backend's CRL entries likewise stay live until the retire saves them
 - A device the tree records Failed is retired by its host's reconcile (`DeviceShutdown.retireFailedDevice`): a

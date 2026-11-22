@@ -31,8 +31,20 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   // still deleting from the device CRL
   private var closingForTransfer: Set[StoreId] = Set()
 
+  // Stores whose rebuild start waited for their close for a transfer out (holdsRebuild): the close's end checks the
+  // device again, which starts it
+  private var rebuildsAwaitingClose: Set[StoreId] = Set()
+
   /** Whether startOut is closing the store for a transfer out, its marker not yet written */
   private[host] def isClosingForTransfer(storeId: StoreId): Boolean = closingForTransfer.contains(storeId)
+
+  /** Whether a rebuild of the store must wait for its close for a transfer out (I3: a discard of its copy would move
+   *  the directory the close is extracting from). When it must, the close's end checks the source device again */
+  private[host] def holdsRebuild(storeId: StoreId): Boolean =
+    val closing = closingForTransfer.contains(storeId)
+    if closing then
+      rebuildsAwaitingClose += storeId
+    closing
 
   /** Takes a store out of service for a transfer out, extracting its CRL state into its crl_save.log to travel with
    *  it: closes it (extractCrl) if it is open or opening, else extracts the state of the closed store from the
@@ -221,7 +233,12 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
 
         fclosed.onComplete: result =>
           try closedForTransfer(m, devEntry, sourceDs, toHostState, wasLoaded, opens, result)
-          finally closingForTransfer -= m.storeId
+          finally
+            closingForTransfer -= m.storeId
+            if rebuildsAwaitingClose.contains(m.storeId) then
+              rebuildsAwaitingClose -= m.storeId
+              if ctx.devices.isLoaded(sourceDs) then
+                ctx.reconciler.checkStorageDevice(sourceDs.storageDeviceId)
 
   /** The rest of startOut once the store's close for its transfer out has completed, in that completion's control
    *  task: either the transferring-out marker is written and the send begun, or the request is refused */

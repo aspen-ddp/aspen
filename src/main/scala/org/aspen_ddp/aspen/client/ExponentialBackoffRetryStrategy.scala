@@ -6,10 +6,18 @@ import scala.concurrent.duration.Duration
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
+
 /** `UnpinnedTransaction`, `BlindKeyValueWrite` and `RefcountSerialNotAdvanced` are programming errors that fail identically on every attempt, so
   * they are never retried
+  *
+  * @param timers where the retries are scheduled; None is the client's backgroundTaskManager. A test passes its own to
+  *               fire retries without waiting out their real-time delay
   */
-class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 60 * 1000, initialRetryDelay: Int = 16) extends RetryStrategy {
+class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 60 * 1000, initialRetryDelay: Int = 16,
+                                      timers: Option[BackgroundTaskManager] = None) extends RetryStrategy {
+
+  private def scheduler: BackgroundTaskManager = timers.getOrElse(client.backgroundTaskManager)
 
   private  var exit = false
 
@@ -33,7 +41,7 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
 
       val delay = ThreadLocalRandom.current().nextInt(window)
 
-      client.backgroundTaskManager.schedule(Duration(delay, TimeUnit.MILLISECONDS)) {
+      scheduler.schedule(Duration(delay, TimeUnit.MILLISECONDS)) {
         retry(retryCount + 1)
       }
 
@@ -82,7 +90,7 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
 
       val delay = ThreadLocalRandom.current().nextInt(window)
 
-      client.backgroundTaskManager.schedule(Duration(delay, TimeUnit.MILLISECONDS)) {
+      scheduler.schedule(Duration(delay, TimeUnit.MILLISECONDS)) {
         retry(retryCount + 1)
       }
 

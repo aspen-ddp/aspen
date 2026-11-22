@@ -202,8 +202,21 @@ object TestNetwork {
       * before the retry is scheduled: a test's write between an attempt reported Unknown and its retry's reads */
     @volatile var beforeRetry: Throwable => Future[Unit] = _ => Future.unit
 
+    /** Makes every later retry of a `retryUntilSuccessful` run as soon as it is scheduled, on the client's
+      * ExecutionContext, rather than after its real-time backoff: a test that waits on a retry then waits on events,
+      * not on time */
+    @volatile var immediateRetries: Boolean = false
+
+    private object retryTimers extends BackgroundTaskManager(executionContext):
+      override def schedule(delay: Duration)(fn: => Unit): BackgroundTaskManager.ScheduledTask =
+        if immediateRetries then
+          TClient.this.clientContext.execute(() => fn)
+          BackgroundTaskManager.ShutdownTask
+        else
+          backgroundTaskManager.schedule(delay)(fn)
+
     override val retryStrategy: RetryStrategy = new RetryStrategy:
-      private val base = new ExponentialBackoffRetryStrategy(TClient.this)
+      private val base = new ExponentialBackoffRetryStrategy(TClient.this, timers = Some(retryTimers))
       def retryUntilSuccessful[T](attempt: => Future[T]): Future[T] = base.retryUntilSuccessful(attempt)
       def retryUntilSuccessful[T](onAttemptFailure: Throwable => Future[Unit])(attempt: => Future[T]): Future[T] =
         given ExecutionContext = executionContext

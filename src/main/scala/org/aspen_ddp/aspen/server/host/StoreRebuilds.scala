@@ -271,12 +271,19 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     // abandoned-transfers-out pass make the same check. Not asked while a rebuild of the store is registered: nothing
     // starts then anyway, and the rebuild's end checks the device again (a send cannot begin meanwhile, since startOut
     // refuses while the rebuild is registered), so a re-check would only repeat at every reconcile
-    val shipping = !rebuildingStores.contains(storeId) && ctx.storeTransferService.isTransferringOut(storeId)
+    // Nor while a transfer out is still closing it (and extracting its CRL state from its directory): the close's end
+    // checks the device again (StoreTransfersOut.holdsRebuild)
+    val closing = !rebuildingStores.contains(storeId) && ctx.transfersOut.holdsRebuild(storeId)
+    if closing then
+      logger.debug(s"Not rebuilding store $storeId on device ${local.storageDeviceId} yet: a transfer out is still " +
+                   "closing it")
+    val shipping = !closing && !rebuildingStores.contains(storeId) &&
+      ctx.storeTransferService.isTransferringOut(storeId)
     if shipping then
       logger.debug(s"Not rebuilding store $storeId on device ${local.storageDeviceId} yet: a transfer out of it is " +
                    "still sending")
       ctx.reconciler.scheduleDeviceRecheck(local.storageDeviceId)
-    if !shipping && !rebuildingStores.contains(storeId) && !scheduledRebuildRetries.get(storeId).contains(held) &&
+    if !closing && !shipping && !rebuildingStores.contains(storeId) && !scheduledRebuildRetries.get(storeId).contains(held) &&
        rebuildingStores.size + droppingCrlState.size < ctx.maxConcurrentRebuilds &&
        ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId, episode) &&
        discardLostStore(local, storeId, episode, held) then

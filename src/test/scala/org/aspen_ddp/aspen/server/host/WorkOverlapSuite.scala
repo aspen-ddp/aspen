@@ -99,26 +99,6 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
         _ <- pumpUntil(condition, rounds - 1, drain)
       yield ()
 
-  /** As pumpUntil, bounded by time rather than rounds, for waits on the client's real-time retry backoff: pumps until
-   *  `condition` or 10 s, sleeping a millisecond a round past the first 50 so a long wait does not spin a core.
-   *  Silent on the deadline; the caller asserts */
-  private def pumpFor(condition: => Boolean, drain: Option[Host] = None): Future[Unit] =
-    given ExecutionContext = executionContext
-    val deadline = System.nanoTime() + 10_000_000_000L
-    def loop(round: Int): Future[Unit] =
-      drain.foreach(_.testingOnlyHandleEvents())
-      if condition || System.nanoTime() - deadline > 0 then
-        Future.unit
-      else
-        if round >= 50 then
-          Thread.sleep(1)
-        for
-          _ <- yieldUntil(condition, 20)
-          _ <- waitForTransactionsToComplete()
-          _ <- loop(round + 1)
-        yield ()
-    loop(0)
-
   /** C1: deviceA's entry was Rebuilding (e1) with its rebuild running here. The store was re-placed away, the nudge to
    *  this host was lost, and the store was transferred back: deviceA's next check reads TransferringIn. The rebuild is
    *  cancelled by that check, but it is still registered (winding down, or past finish's latch), so the receive waits
@@ -237,6 +217,8 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     // No slot: the rebuild stays queued, its only work the silence
     val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 0)
     val tclient = client.asInstanceOf[TestNetwork.TClient]
+    // The flip's retry runs once its attempt is handled, not after a real-time backoff
+    tclient.immediateRetries = true
     // A real pool, so the create gets as far as serving the store
     val creating = StoreId(PoolId.BootstrapPoolId, 0)
     @volatile var hooked = false
@@ -272,7 +254,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
             createWorkWhileQueued = host.control.rebuilds.isCreating(creating)
         case _ => Future.unit
       _ = host.control.reconciler.checkStorageDevice(deviceA)
-      _ <- pumpFor(hooked && !host.control.rebuilds.createFlipsPending.contains(creating), drain = Some(host))
+      _ <- pumpUntil(hooked && !host.control.rebuilds.createFlipsPending.contains(creating), drain = Some(host))
       _ = tclient.beforeRetry = _ => Future.unit
     yield
       hooked should be(true)
@@ -412,13 +394,13 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
         _ <- client.transferStore(shipped, net.secondDeviceId)
         _ <- waitForTransactionsToComplete()
         first = ask(host)
-        _ <- pumpFor(firstCloseRunning)
+        _ <- pumpUntil(firstCloseRunning)
         second <- ask(host)
         closesWhileFirstRuns = recorded(host).transferOutCloses.toList
         queuedWhileFirstRuns = queuedCloses(host).size
         readsWhileFirstRuns = crl.synchronized(crl.readCount.getOrElse(shipped, 0))
         _ = finishFirstClose()
-        _ <- pumpFor(sends.isTransferringOut(shipped))
+        _ <- pumpUntil(sends.isTransferringOut(shipped))
         _ <- first
       yield
         closesWhileFirstRuns should be(List(shipped))
@@ -443,6 +425,8 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val sends = new StagedSendService
     val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
     val tclient = client.asInstanceOf[TestNetwork.TClient]
+    // The flip's retry runs once its attempt is handled, not after a real-time backoff
+    tclient.immediateRetries = true
     val episode = UUID.randomUUID()
     val rebuilding = Map(shipped -> rebuildingIn(episode))
     @volatile var hooked = false
@@ -479,12 +463,12 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
             Map(shipped -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut,
               Some(net.secondDeviceId), Some(UUID.randomUUID()))))))
       _ = factory.created.head.promise.success(())
-      _ <- pumpFor(hooked && !host.control.rebuilds.rebuildingStoreIds.contains(shipped), drain = Some(host))
+      _ <- pumpUntil(hooked && !host.control.rebuilds.rebuildingStoreIds.contains(shipped), drain = Some(host))
       _ = tclient.beforeRetry = _ => Future.unit
       outcome = recorded(host).rebuildOutcomes.get((source, shipped))
       // The receiver's retransmit
       retransmit <- ask(host)
-      _ <- pumpFor(sends.isTransferringOut(shipped), drain = Some(host))
+      _ <- pumpUntil(sends.isTransferringOut(shipped), drain = Some(host))
     yield
       hooked should be(true)
       registeredAtRequest should be(true)
@@ -526,7 +510,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       _ = host.control.reconciler.checkAll()
-      _ <- pumpFor(!loadedDevices(host).contains(deviceA), drain = Some(host))
+      _ <- pumpUntil(!loadedDevices(host).contains(deviceA), drain = Some(host))
       _ <- served.map(_.backend.close()).getOrElse(Future.unit)
     yield
       queued should be(List((deviceA, moving)))
@@ -534,3 +518,46 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       served should be(defined)
       listed should be(true)
       recorded(host).shutdownCloses.toList should be(List(moving))
+
+  /** TransferOut (close) x Rebuild: the store's transfer-out close is still running when its backend fails and the
+   *  store is requested for rebuild (the transfer aborted, the entry Rebuilding). A reconcile reaching startRebuild
+   *  meanwhile starts nothing: the discard would move the directory the close is extracting from. The close's end,
+   *  here a failure, checks the device again, which starts the rebuild */
+  atest("a rebuild waits while a transfer out is closing the store"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", source)
+    val factory = new HeldRebuildFactory
+    val sends = new StagedSendService
+    val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
+    // After the host's device load, which marks a store directory it finds beside no CRL state rebuild-required
+    val storePath = writeStoreConfig(deviceDir, shipped)
+    loadedDevices(host)(source).offlineStores += shipped
+    val rebuilding = Map(shipped -> rebuildingIn(UUID.randomUUID()))
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(shipped, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      close = recorded(host).holdTransferOutCloses()
+      request = ask(host)
+      _ <- pumpUntil(host.control.transfersOut.isClosingForTransfer(shipped))
+      closingAtCheck = host.control.transfersOut.isClosingForTransfer(shipped)
+      // Its backend failed while it closed (StoreRebuilds.failedOnClose), and the store is requested for rebuild
+      _ = os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+      _ <- check(host, source, rebuilding)
+      startedWhileClosing = factory.created.nonEmpty || host.control.rebuilds.isRebuilding(shipped)
+      keptWhileClosing = FileStat.exists(storePath)
+      // The close fails (an extraction I/O error): nothing else then checks the device, so it is the close's end that
+      // re-checks it, reading the entry still Rebuilding
+      _ = recorded(host).armLookup(source).success(deviceState(source, rebuilding))
+      _ = close.failure(new java.io.IOException("Simulated extraction failure"))
+      _ <- request
+      _ <- pumpUntil(factory.created.nonEmpty, drain = Some(host))
+    yield
+      closingAtCheck should be(true)
+      startedWhileClosing should be(false)
+      keptWhileClosing should be(true)
+      sends.transfersOut should be(empty)
+      factory.created.map(_.storeId).toList should be(List(shipped))

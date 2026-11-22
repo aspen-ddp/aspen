@@ -720,20 +720,20 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     claim(site):
       copiesOf(sds).foreach(_.register(storeId, phase, copyId))
 
-  /** A copy a rebuild produced in rebuilt/ on `sds` as `copyId` (T2), in `phase`: registered, unless the rebuild found
-   *  its own finished copy there, which is already registered so. A fact: the copy is there whatever the registry
-   *  held, so a record of another copy or phase (a bug: P2 keeps one copy of a store per device) is recorded as a
-   *  violation and takes this copy */
+  /** A copy a rebuild produced in rebuilt/ on `sds` as `copyId` (T2), in `phase`, unsynced when its rename landed but
+   *  was not forced (StoreRebuild.placedUnforced): registered, unless the rebuild found its own finished copy there,
+   *  which is already registered so. A fact: the copy is there whatever the registry held, so a record of another copy
+   *  or phase (a bug: P2 keeps one copy of a store per device) is recorded as a violation and takes this copy */
   def rebuilt(site: String, sds: LocalStorageDeviceState, storeId: StoreId, phase: Phase,
-              copyId: java.util.UUID): Unit =
+              copyId: java.util.UUID, unsynced: Boolean = false): Unit =
     fact(site):
       copiesOf(sds).foreach: copies =>
         copies.copies.get(storeId) match
-          case None => copies.register(storeId, phase, copyId)
+          case None => copies.register(storeId, phase, copyId, unsynced)
           case Some(r) if r.phase == phase && r.copyId == copyId => ()
           case Some(r) =>
             violation(site, s"record of $storeId is ${r.phase} as ${r.copyId}, its rebuild placed $phase as $copyId")
-            copies.applyMove(storeId, phase, copyId, unsynced = false): Unit
+            copies.applyMove(storeId, phase, copyId, unsynced): Unit
 
   /** A move of the copy now at `storePath` landed but its sync failed (CopyMoves): its copy is unsynced, never
    *  loaded, shipped or retired until a device check forces the directories again. A copy of a device not attached

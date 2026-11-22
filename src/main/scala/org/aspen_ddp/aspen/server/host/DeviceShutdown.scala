@@ -45,6 +45,11 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
   /** True while the shutdown sequence of `id` is running. */
   def isShuttingDown(id: StorageDeviceId): Boolean = shuttingDownDevices.contains(id)
 
+  /** True while `id` is being taken out of service by a relinquish, a Failed retirement or a CRL failure
+   *  (stopServing, crlFailed): no store opens on it (StoreLoader.startOpen), so the unload, which unloads whatever is
+   *  open once the closes it waits for have ended, never leaves a store opened meanwhile served */
+  def isStoppingServing(id: StorageDeviceId): Boolean = relinquishingDevices.contains(id)
+
   /** Takes one store out of service for a device shutdown. This is the default of Host.closeStoreForShutdown, the
    *  seam a test replaces. */
   def closeForShutdown(storeId: StoreId): Future[Unit] = ctx.loader.closeStore(storeId, extractCrl = false)
@@ -383,7 +388,8 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  made on the attached device: unloaded first, the copy would stay where it was, and a load or an adoption would
    *  take it for a clean one. The check and the unload run in one control task. False if it was not loaded, or, when
    *  `untilOpen` (a shutdown), a store is open on it again (the caller's next round closes it); a relinquish or a CRL
-   *  failure unloads whatever is open, as it always has */
+   *  failure unloads whatever is open, which is only what its closes have not reached: no store opens on a device
+   *  being taken out of service (isStoppingServing) */
   private def unloadOnceClosed(local: LocalStorageDeviceState, untilOpen: Boolean = false): Future[Boolean] =
     val deviceId = local.storageDeviceId
     if !ctx.devices.isLoaded(local) || (untilOpen && storesToClose(local).nonEmpty) then

@@ -213,7 +213,9 @@ class RebuildingStore(client: AspenClient,
                       /** How long one object read may take before the object counts as failed (ObjectReadTimeout) */
                       objectReadTimeout: FiniteDuration = RebuildingStore.ObjectReadTimeout,
                       /** How long the peer query waits for its quorum before the pass fails (PeerQueryTimeout) */
-                      peerQueryTimeout: FiniteDuration = RebuildingStore.PeerQueryTimeout)
+                      peerQueryTimeout: FiniteDuration = RebuildingStore.PeerQueryTimeout,
+                      /** How finish's rename into rebuilt/ forces its directories. Replaced only by tests */
+                      syncDirectory: os.Path => Unit = DurableFiles.syncDirectory)
   extends StoreRebuild with Logging:
 
   import RebuildingStore.*
@@ -230,6 +232,10 @@ class RebuildingStore(client: AspenClient,
   // the completion's handler records the copy with it
   private val completionPromise: Promise[UUID] = Promise()
   def complete: Future[UUID] = completionPromise.future
+
+  // Set by completeStaging, before the completion, for a rename into rebuilt/ that landed unforced
+  @volatile private var unforcedPlacement: Option[DurableFiles.MoveNotForced] = None
+  override def placedUnforced: Option[DurableFiles.MoveNotForced] = unforcedPlacement
 
   /** Keys handed to rebuildWrite, in walk order. Test hook, and off unless a test asks for it:
    *  a real store holds millions of objects, and accumulating a Key per object for the life of
@@ -804,7 +810,13 @@ class RebuildingStore(client: AspenClient,
       os.makeDir.all(dir)
       DurableFiles.syncDirectory(devicePath)
     // Durable before the store is reported in place: a device shut down and moved after this must come back with the
-    // store in rebuilt/, or an adopting host refuses it. A failed rename leaves staging whole for the next pass
-    DurableFiles.move(stagingPath, finalPath)
-    logger.info(s"Rebuild of $storeId: store in place at $finalPath")
+    // store in rebuilt/, or an adopting host refuses it. A failed rename leaves staging whole for the next pass. One
+    // that landed but was not forced is in place all the same: reported (placedUnforced), so the host records it
+    // unsynced and flips it once a device check has forced it, rather than rebuild the store over it
+    try
+      DurableFiles.move(stagingPath, finalPath, syncDirectory)
+      logger.info(s"Rebuild of $storeId: store in place at $finalPath")
+    catch case t: DurableFiles.MoveNotForced =>
+      logger.error(s"Rebuild of $storeId: store in place at $finalPath, but its move could not be forced: $t")
+      unforcedPlacement = Some(t)
     copyId

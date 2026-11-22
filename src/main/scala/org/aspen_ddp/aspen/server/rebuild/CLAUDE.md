@@ -30,6 +30,9 @@
 - Completion identity (rebuild-process 2.2, 5.6): `finish` writes the episode (empty for None) durably as
   `phase-param.rebuilt` in staging, the last write, then renames staging into `<device>/rebuilt/` under a fresh copy id
   (T2), and `complete` reports that id (`StoreRebuild.complete: Future[UUID]`), with which the host records the copy. A
+  rename that landed but was not forced (`DurableFiles.MoveNotForced`; the sync is the `syncDirectory` constructor
+  seam) completes all the same, reported by `placedUnforced`: the host records the copy unsynced and flips it only once
+  a device check has forced it, by restarting the rebuild, which takes the copy for done (never a second rebuild). A
   copy in `rebuilt/` is a finished rebuild awaiting its flip: `start()`, run by the constructor on the control thread,
   reads its `existingCopy: Option[(Phase, os.Path)]` (`StoreRebuildFactory.createRebuild`'s, built by
   `StoreRebuilds.startRebuild` from the store's copy record on the device; nothing lists the device) and takes a copy

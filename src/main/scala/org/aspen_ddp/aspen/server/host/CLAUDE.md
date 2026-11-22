@@ -85,7 +85,11 @@
   `finish` writes its episode as `phase-param.rebuilt` in staging, last, then renames staging into `rebuilt/` under a
   fresh copy id (T2, off the control thread; a failed rename leaves staging for the next pass), and its completion
   (`StoreRebuild.complete: Future[UUID]`) reports that id: the control-thread handler records the copy with it
-  (`HostCopies.rebuilt`). `RebuildingStore.start`, run by its constructor on the control thread, reads the
+  (`HostCopies.rebuilt`). A rename that landed but was not forced (`MoveNotForced`) completes all the same, reported by
+  `StoreRebuild.placedUnforced`: the copy is recorded unsynced (`CopyMoves.placedUnforced` holds both directories for
+  the resync) and not flipped; its work is queued again and a device recheck scheduled, whose resync forces it and
+  whose Rebuilding pass restarts the rebuild, which takes the copy for done and flips it (no second rebuild).
+  `RebuildingStore.start`, run by its constructor on the control thread, reads the
   `existingCopy` it is given, `(phase, path)` of the store's record on the device (`StoreRebuilds.startRebuild` builds
   it from the registry; nothing lists the device): a Rebuilt copy of its own episode (`isRebuiltFor`) completes at once
   with its copy id; any other copy fails it. The flip then moves the copy: `Adopt` Rebuilt -> Live
@@ -114,17 +118,25 @@
   on it whose end may move a copy to lost/ (`StoreRebuilds.closeStarted`/`closeDone`: `handleClose`, `closeUnloaded`,
   `retireUnserved`, a failed unserved backend's close in `handleBackendOpened`) through
   `DeviceShutdown.unloadOnceClosed`, so every such move is made on the attached device and an adopter never reads a
-  fail-stopped copy as clean. A close that ends after its device's unload is a bug: logged at error, and its copy moved
+  fail-stopped copy as clean. A relinquish, a Failed retirement and a CRL failure then unload whatever is open, so no
+  store opens on such a device meanwhile (`DeviceShutdown.isStoppingServing`: `StoreLoader.startOpen` refuses, and
+  `retryFailedLoads` skips it). Each close takes `closeStarted` last, and its end runs `closeDone` (and completes a
+  `handleClose` caller) whatever its callback meets, so a throw there never wedges the device's unloads.
+  A close that ends after its device's unload is a bug: logged at error, and its copy moved
   with `moveUnattached` all the same. `ClosePurpose.Reload` (a failed CRL load, `handleUnloadFailed`; a failed save-file
   removal, `handleSaveFileRemovalFailed`) leaves the copy where it is, to load again. A move that fails is logged at
-  error and the copy held offline in `CopyMoves.pendingLost(local)` (in memory, per device, dropped at detach): never
+  error and the copy held offline in `CopyMoves.pendingLost(local)` (not a copy Opening, Served or Closing again since
+  the move was asked for, e.g. a failed unserved backend's close ending after a new open: logged at warn, left to its
+  own open or close, never held) (in memory, per device, dropped at detach): never
   loaded (`tryLoadStore`), shipped (`startOut`, `closedForTransfer`: treated as Lost), retired (`StoreCopies.retire`
   answers false) or acted on by a pass (`offlineCopies` excludes it; `heldOffline` includes it); each device check
   retries the move first, beside `resync` (`StoreRebuilds.retryPendingLost`). A crash forgets the hold. Every reader of
   "is it lost" reads the record's phase: the Lost CRL pass (`flipLostCrlStores`), `discardLostStore`,
   `retireForeignCopy`, `startOut`/`closedForTransfer`. A device being loaded moves copies with
-  `CopyMoves.moveUnattached`: a lost device CRL moves every copy that does not hold its own state (a failed move throws,
-  leaving the device unloaded for the next scan), and adoption's `CrlLost` stores move through the
+  `CopyMoves.moveUnattached`: a lost device CRL moves every copy that does not hold its own state (a move that fails or
+  lands unforced throws, leaving the device unloaded and its CRL untouched for the next scan, and every `lost/` copy and
+  phase directory is forced, `CopyMoves.forceUnattached`, before the CRL is replaced: a crash undoing an unforced move
+  would put the copy back in `live/` over the empty CRL), and adoption's `CrlLost` stores move through the
   `DeviceMetadata.adoptDevice` callback `moveToLost: StoreId => Unit` (a failed move fails the adoption's transaction).
   The device load offers no phase directory, and no copy in `lost/` or `pending-delete/`, to `tryLoadStore`. Tests fail
   renames with `Host.Seams.copyRename` (installed as `CopyMoves.rename` before the first device load). The phase suites
@@ -314,7 +326,8 @@
   and must not overlap the create (I3). The pending flip is tracked apart (`pendingCreateFlips`), so a check meanwhile
   does not create the store again. A failed create, out of space included, leaves nothing at the path and awaits no
   retry: its record goes, its entry stays Initializing and the next device check creates it again. Any other failed open
-  but a lost state (out of space, an I/O, lock or resource error) leaves the store offline, its copy left in `live/`, and its copy
+  but a lost state (out of space, an I/O, lock or resource error) leaves the store offline, its copy left in `live/`,
+  and its copy
   AwaitingRetry (the retry lives only there): each device scan retries it with backoff (`StoreLoader.retryFailedLoads`,
   over `HostCopies.retries`, 1, 2, 4 ... scans, capped at `Host.LoadRetryCap` 5 min), so an Active store is never left
   unserved and untracked until a restart. The next wait doubles the retry the copy awaited before (an open takes it, and
@@ -466,7 +479,8 @@
   never served. A read that fails without saying anything of the content (`CrashRecoveryLog.isUnreadable`: EIO, EMFILE,
   out of memory; `loadValidStoreState` throws it rather than return `Left`) is never taken for that: `handleLoad`
   retries through `awaitUnreadRetry`, `holdsOwnState` (which reads the store config the same way) throws before any
-  copy is moved to `lost/`, `adoptionClass` fails the adoption for the next scan, and `StoreTransfers` neither resumes nor
+  copy is moved to `lost/`, `adoptionClass` fails the adoption for the next scan, and `StoreTransfers` neither resumes
+  nor
   discards a promoted copy it cannot read. It is moved to `lost/`, its entry is flipped to Rebuilding by the reconcile,
   and the copy is retired (below) before the rebuild. Adoption of a device does the same for an `outbound/` copy without
   a valid save file instead of refusing the device, and adopts any copy in `lost/` as Rebuilding whatever files it

@@ -95,10 +95,11 @@ trait CopyHostFixture extends ControlFixture:
   protected def realHost(hostRoot: os.Path, opener: TestOpener,
                        rename: Option[(os.Path, os.Path) => Unit] = None,
                        rebuilds: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
-                       transfers: StoreTransferService = StoreTransferService.Disabled): Host =
+                       transfers: StoreTransferService = StoreTransferService.Disabled,
+                       threadingOf: ExecutionContext => LockstepThreading = new LockstepThreading(_)): Host =
     newHost(hostRoot, storeRebuildFactory = rebuilds, transferService = transfers,
       adjustSeams = _.copy(tryLoadStore = None, loadStore = None, loadStoreById = None, backends = Some(opener),
-        copyRename = rename))
+        copyRename = rename), threadingOf = threadingOf)
 
   /** Drains `host` and yields until `condition`, `rounds` drains (when not negative) or 10 s. The caller asserts */
   protected def pump(host: Host, condition: => Boolean, rounds: Int = -1): Future[Unit] =

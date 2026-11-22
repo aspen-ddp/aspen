@@ -144,6 +144,80 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       loadedDevices(host).contains(deviceA) should be(false)
       inLost(dev, s, flat)
 
+  // Final review M2.12: a throw in a close's end, before its closeDone, left the close counted running for good, and
+  // every later unload of the device waited for it forever. Both close ends: closeUnloaded's (a fail-stop's) and
+  // handleClose's (the relinquish's own close)
+  for failStopFirst <- List(true, false) do
+    val which = if failStopFirst then "a fail-stop close" else "a relinquish's close"
+    atest(s"a throw in the end of $which does not wedge the device's unload"):
+      given ExecutionContext = executionContext
+      val (hostRoot, dev) = device()
+      val other = org.aspen_ddp.aspen.common.metadata.HostId(new java.util.UUID(9, 9))
+      rocksCopy(dev, s)
+      val opener = new TestOpener
+      @volatile var throws = 0
+      val host = realHost(hostRoot, opener, threadingOf = ec => new LockstepThreading(ec):
+        override def release(storeId: StoreId): Unit =
+          if storeId == s && throws == 0 then
+            throws += 1
+            throw new IllegalStateException("injected release failure"))
+      for
+        _ <- pump(host, host.control.router.loaded.contains(s))
+        _ <-
+          if failStopFirst then
+            opener.onFatals.head(new java.io.IOException("injected"))
+            pump(host, !host.control.router.loaded.contains(s) && !host.control.rebuilds.closesRunning(deviceA))
+          else Future.unit
+        armed = recorded(host).armLookup(deviceA)
+        _ = host.control.reconciler.checkStorageDevice(deviceA)
+        _ = armed.success(deviceState(deviceA).copy(hostId = other))
+        _ <- pump(host, !loadedDevices(host).contains(deviceA), rounds = 200)
+      yield
+        throws should be(1)
+        host.control.router.loaded.contains(s) should be(false)
+        loadedDevices(host).contains(deviceA) should be(false)
+
+  // Final review I3: a relinquish or a CRL failure waits for a fail-stop close before its unload, which then unloads
+  // whatever is open. A load retry firing during that wait must open nothing: after a relinquish, the adopter would
+  // serve the same store
+  for how <- List("relinquish", "CRL failure") do
+    atest(s"a load retry during a $how's wait for a fail-stop close opens nothing before the unload"):
+      given ExecutionContext = executionContext
+      val (hostRoot, dev) = device()
+      val other = org.aspen_ddp.aspen.common.metadata.HostId(new java.util.UUID(9, 9))
+      val s1 = StoreId(s.poolId, 1)
+      val active = StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
+      for
+        (host, _, gate) <- heldFailStop(hostRoot, dev)
+        local = loadedDevices(host)(deviceA)
+        // A copy of s1 awaiting a load retry, due at the next scan
+        retryPath = rocksCopy(dev, s1)
+        _ = host.testingOnlyRescan(deviceA)
+        _ = host.control.copyRegistry.awaitingRetry("test", s1, Host.LoadRetry(local, retryPath, 1, 1))
+        _ = how match
+          case "relinquish" =>
+            // The tree names another owner: the device is relinquished
+            val armed = recorded(host).armLookup(deviceA)
+            host.control.reconciler.checkStorageDevice(deviceA)
+            armed.success(deviceState(deviceA, Map(s -> active, s1 -> active)).copy(hostId = other))
+          case _ =>
+            local.reconciledEntries = Some(Map(s -> active, s1 -> active))
+            host.control.shutdown.crlFailed(local, new Exception("injected CRL failure"))
+        _ <- pump(host, false, rounds = 20)
+        closingWhileHeld = closingFailStop(host)
+        _ = host.control.loader.retryFailedLoads()
+        _ <- pump(host, false, rounds = 20)
+        s1WhileHeld = (host.control.router.loaded.contains(s1), recordOf(host, local, s1).map(_.activity))
+        _ = gate.success(())
+        _ <- pump(host, !loadedDevices(host).contains(deviceA))
+      yield
+        closingWhileHeld should be(true)
+        s1WhileHeld._1 should be(false)
+        s1WhileHeld._2 should not be(Some(Activity.Served))
+        s1WhileHeld._2.exists(_.isInstanceOf[Activity.Opening]) should be(false)
+        loadedDevices(host).contains(deviceA) should be(false)
+        host.control.router.loaded.contains(s1) should be(false)
+
   atest("a crash after a fail-stop close and before its move reloads the copy from live"):
     given ExecutionContext = executionContext
     val (hostRoot, dev) = device()
@@ -217,6 +291,42 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       heldPhase should be(Some(Phase.Live))
       inLost(dev, s, flat)
 
+  // Final review M2.1: the copy's move to lost/ refused for its activity (a new open began before the failed backend's
+  // close ended) is not held for a retry at every check: the copy's own open or close path handles it
+  atest("a move to lost refused because a new open of the copy began is not held for retry"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val opener = new TestOpener
+    val host = realHost(hostRoot, opener)
+    host.testingOnlyHandleEvents()
+    installServedElsewhere(host, s)
+    val flat = rocksCopy(dev, s)
+    host.testingOnlyRescan(deviceA)
+    val sds = loadedDevices(host)(deviceA)
+    val cfg = StoreConfig.loadStoreConfig(flat / StoreConfig.configFilename)
+    val closing = Promise[Unit]()
+    val opening = Promise[Unit]()
+    opener.failing = true
+    opener.closeGate = Some(closing.future)
+    host.control.loader.startOpen(sds, cfg, flat, create = false, None)
+    for
+      _ <- pump(host, false, rounds = 20)
+      // A second open of the copy begins while the failed backend closes, and stays opening
+      _ = opener.failing = false
+      _ = opener.closeGate = None
+      _ = opener.openGate = Some(opening.future)
+      _ = host.control.loader.startOpen(sds, cfg, flat, create = false, None)
+      _ = closing.success(())
+      _ <- pump(host, false, rounds = 20)
+      heldWhileOpening = host.control.moves.isPendingLost(sds, s)
+      phaseWhileOpening = CopyFixtures.phaseOf(dev, s)
+      _ = opening.success(())
+      _ <- pump(host, false, rounds = 20)
+    yield
+      heldWhileOpening should be(false)
+      phaseWhileOpening should be(Some(Phase.Live))
+      host.control.moves.isPendingLost(sds, s) should be(false)
+
   atest("a BackendStateLost open moves the copy to lost"):
     given ExecutionContext = executionContext
     val (hostRoot, dev) = device()
@@ -256,6 +366,46 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
     attempts should contain(flat1)
     attempts.filter(p => p == lostDir(dev) || p / os.up == lostDir(dev)) should be(Nil)
     Future.successful(succeed)
+
+  // Final review I1: a crash undoing an unforced move to lost/ would put the copy back in live/ over the empty
+  // replacement CRL. The device stays unloaded, its CRL untouched, and the next scan forces the move before replacing it
+  atest("a lost device CRL whose move to lost is not forced leaves the CRL and the device for the next scan"):
+    val hostRoot = newHostDir()
+    val host = newHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val dev = writeDevice(hostRoot, "dev0", deviceA)
+    writeStoreConfig(dev, s)
+    val crlDir = CrashRecoveryLog.deviceCrlDir(dev)
+    @volatile var failSyncs = 1
+    // Each directory forced, and whether the device's CRL directory existed then
+    @volatile var syncs = Vector.empty[(os.Path, Boolean)]
+    host.control.moves.syncDirectory = d =>
+      syncs :+= (d, os.exists(crlDir))
+      if d == lostDir(dev) && failSyncs > 0 then
+        failSyncs -= 1
+        throw new java.io.IOException("injected sync")
+      DurableFiles.syncDirectory(d)
+    host.control.discovery.checkForNewDevices()
+    host.testingOnlyHandleEvents()
+    val loadedFirst = loadedDevices(host).contains(deviceA)
+    val rootAfterFirst = os.list(dev).map(_.last).toSet
+    val phaseAfterFirst = CopyFixtures.phaseOf(dev, s)
+    syncs = Vector.empty
+    host.control.discovery.checkForNewDevices()
+    host.testingOnlyHandleEvents()
+    Future.successful:
+      failSyncs should be(0)
+      loadedFirst should be(false)
+      phaseAfterFirst should be(Some(Phase.Lost))
+      rootAfterFirst.filter(_.startsWith("crl")) should be(Set())
+      loadedDevices(host).contains(deviceA) should be(true)
+      // The second scan forced lost/ and live/ before any CRL directory was there
+      syncs.filter(_._1 == lostDir(dev)).map(_._2).headOption should be(Some(false))
+      syncs.filter(_._1 == dev / CopyLayout.LiveDirectory).map(_._2).headOption should be(Some(false))
+      os.exists(crlDir) should be(true)
+      recordOf(host, loadedDevices(host)(deviceA), s).map(r => (r.phase, r.unsynced)) should be(
+        Some((Phase.Lost, false)))
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
   atest("retire moves lost to pending-delete under the copy's name"):
     given ExecutionContext = executionContext
@@ -656,6 +806,70 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       CopyFixtures.copyPath(dev, s) should be(Some(flat))
       inDir(dev, CopyLayout.RebuiltDirectory) should be(Nil)
       host.control.router.loaded.contains(s) should be(true)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  /** As PlacingRebuilds(real = true), but its first placement's rename is reported landed and not forced (as
+   *  RebuildingStore.finish reports a MoveNotForced); a rebuild started over its own episode's Rebuilt copy completes
+   *  with that copy at once, as RebuildingStore.start does. Counts its placements */
+  private class UnforcedRebuilds extends StoreRebuildFactory:
+    val placements = new AtomicInteger(0)
+    def createRebuild(client: org.aspen_ddp.aspen.client.AspenClient, storeId: StoreId, deviceId: StorageDeviceId,
+                      devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener,
+                      episode: Option[UUID], existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
+      val id = storeId
+      val rebuilt = Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode))
+      val (copy, unforced) = existingCopy match
+        case Some((phase, path)) if phase == rebuilt => (path, None)
+        case _ =>
+          val n = placements.incrementAndGet()
+          val flat = rocksCopy(devicePath, id)
+          RebuildingStore.writeEmptyCrlState(flat, id)
+          val placed = CopyFixtures.markCopy(devicePath, id, rebuilt)
+          // The staging area it was renamed from, which the resync forces
+          os.makeDir.all(devicePath / RebuildingStore.RebuildDirectory)
+          (placed, Option.when(n == 1)(new DurableFiles.MoveNotForced(
+            devicePath / RebuildingStore.RebuildDirectory / id.directoryName, placed,
+            new java.io.IOException("injected sync"))))
+      new StoreRebuild:
+        val storeId: StoreId = id
+        def complete: Future[UUID] = Future.successful(CopyFixtures.copyIdOf(copy))
+        override def placedUnforced: Option[DurableFiles.MoveNotForced] = unforced
+        def cancel(): Unit = ()
+
+  // Final review I2: a finish whose rename into rebuilt/ landed unforced is recorded unsynced, flipped only once a device
+  // check has forced it, and never rebuilt a second time
+  atest("a rebuilt copy placed unforced is recorded unsynced, forced, then flipped and served: one rebuild"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val opener = new TestOpener
+    val rebuilds = new UnforcedRebuilds
+    val host = realHost(hostRoot, opener, rebuilds = rebuilds)
+    host.testingOnlyHandleEvents()
+    val episode = UUID.randomUUID()
+    val entry = StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None, Some(episode))
+    @volatile var syncs = Vector.empty[os.Path]
+    host.control.moves.syncDirectory = d =>
+      syncs :+= d
+      DurableFiles.syncDirectory(d)
+    def record = recordOf(host, loadedDevices(host)(deviceA), s)
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.setRebuilding(s, episode))
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.rebuilds.startRebuild(loadedDevices(host)(deviceA), s, Some(episode), acceptLoss = false)
+      _ <- pumpTx(host, !host.control.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(s), rounds = 50)
+      afterFinish = (record.map(r => (r.phase, r.unsynced)), recorded(host).rebuildOutcomes.get((deviceA, s)))
+      _ <- check(host, Map(s -> entry))
+      _ <- pumpTx(host, host.control.router.loaded.contains(s))
+    yield
+      afterFinish should be((Some((Phase.Rebuilt(episode.toString), true)), None))
+      syncs should contain(dev / CopyLayout.RebuiltDirectory)
+      syncs should contain(dev / RebuildingStore.RebuildDirectory)
+      recorded(host).rebuildOutcomes.get((deviceA, s)) should be(Some(RebuildOutcome.Adopt))
+      rebuilds.placements.get should be(1)
+      record.map(r => (r.phase, r.unsynced)) should be(Some((Phase.Live, false)))
+      host.control.router.loaded.contains(s) should be(true)
+      copyDirs(dev, s).size should be(1)
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
   atest("an AdoptOffline flip moves the rebuilt copy to parked in one move"):

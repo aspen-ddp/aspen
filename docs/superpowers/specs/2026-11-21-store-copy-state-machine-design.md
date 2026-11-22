@@ -535,6 +535,14 @@ P8 and P9 close the open questions above. Where this block and the text above di
   listing.
 - **Deletions.** Per-attempt staging (P7) and the deletion of `StoreDirMarkers` and `CopyMarkers` were done in Task 5;
   `CopyPhase.read`, `CopyPhase.known` and `Phase.Unread` were deleted in Task 6.
+- **Final review fixes.** A lost device CRL's move to `lost/` that lands unforced leaves the device unloaded and its
+  CRL untouched, as a failed one does, and every `lost/` copy and phase directory is forced before the CRL is replaced
+  (`CopyMoves.forceUnattached`). A rebuild's finish whose rename into `rebuilt/` lands unforced completes with its copy
+  id (`StoreRebuild.placedUnforced`): the copy is recorded unsynced, and the flip waits for a device check to force it
+  (its restarted rebuild takes the copy for done; there is never a second rebuild). No store opens on a device being
+  relinquished, retired as Failed or unloaded for a CRL failure (`DeviceShutdown.isStoppingServing`), since those
+  unload whatever is open once their closes have ended. A move to Lost refused because the copy is Opening, Served or
+  Closing again is not held in `pendingLost`.
 
 ## Stage 1 audit findings
 

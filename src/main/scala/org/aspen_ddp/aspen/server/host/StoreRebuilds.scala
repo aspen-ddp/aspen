@@ -397,91 +397,109 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           // thread, T2), or found it there
           runningRebuilds.get(storeId).filter(_.settled eq settled).foreach: r =>
             runningRebuilds += storeId -> r.copy(finishRecorded = true)
+          // A rename into rebuilt/ that landed unforced: the copy is recorded unsynced, its directories held for the
+          // resync. Read only after the completion, which publishes it
+          val unforced = sr.placedUnforced
+          unforced.foreach(ctx.moves.placedUnforced)
           ctx.copyRegistry.rebuilt("rebuild finish", local, storeId,
-            Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)), copyId)
-          // Loading is downstream of the metadata decision, not ahead of it. An unconditional
-          // load hands a live copy to a device that markRebuiltStoreActive may be about to
-          // decide must not own it (because the device was tombstoned mid-rebuild), and nothing
-          // would ever take it back.
-          ctx.metadata.markRebuiltStoreActive(local.storageDeviceId, storeId, episode, ctx.gossipStoreOnline).onComplete:
-            case Success(RebuildOutcome.Adopt) =>
-              try
-                // Loaded only once it is Live, or tryLoadStore leaves it offline. Its copy keeps it silent until the
-                // load's install serves it
-                workEnds = true
-                // Otherwise its copy is offline on its device: a failed move leaves it Rebuilt for the Completed
-                // Rebuilds pass, and one not forced leaves it Live and unsynced, which the next check of the device
-                // forces and loads (CopyMoves, rebuild-process 5.7)
-                if bringRebuiltLive(local, storeId) == MoveResult.Durable then
-                  ctx.loadStoreById(local.storageDeviceId, storeId)
-              finally
-                finishSettled(recheckAll())
+            Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)), copyId, unsynced = unforced.isDefined)
+          if registry.isUnsynced(local, storeId) then
+            // Not flipped over a copy a crash could still undo: the store would be Active with no copy, or its copy
+            // back in staging. Its work is queued again, and the device check scheduled here forces it first
+            // (CopyMoves.resync) and then restarts the rebuild, which takes this copy for done (RebuildingStore.start)
+            // and flips it. No second rebuild runs over it
+            try
+              logger.warn(s"Rebuild of store $storeId on device ${local.storageDeviceId}: its copy in rebuilt/ is " +
+                          "not forced yet. Flipping it once a device check has forced it")
+            finally
+              release()
+              ctx.reconciler.scheduleDeviceRecheck(deviceId)
+          else
+            // Loading is downstream of the metadata decision, not ahead of it. An unconditional
+            // load hands a live copy to a device that markRebuiltStoreActive may be about to
+            // decide must not own it (because the device was tombstoned mid-rebuild), and nothing
+            // would ever take it back.
+            ctx.metadata.markRebuiltStoreActive(local.storageDeviceId, storeId, episode, ctx.gossipStoreOnline)
+              .onComplete:
+              case Success(RebuildOutcome.Adopt) =>
+                try
+                  // Loaded only once it is Live, or tryLoadStore leaves it offline. Its copy keeps it silent until the
+                  // load's install serves it
+                  workEnds = true
+                  // Otherwise its copy is offline on its device: a failed move leaves it Rebuilt for the Completed
+                  // Rebuilds pass, and one not forced leaves it Live and unsynced, which the next check of the device
+                  // forces and loads (CopyMoves, rebuild-process 5.7)
+                  if bringRebuiltLive(local, storeId) == MoveResult.Durable then
+                    ctx.loadStoreById(local.storageDeviceId, storeId)
+                finally
+                  finishSettled(recheckAll())
 
-            case Success(RebuildOutcome.AdoptOffline) =>
-              try
-                workEnds = true
-                keepRebuiltStoreOffline(local, storeId, copyId)
-              finally
-                finishSettled(recheckAll())
+              case Success(RebuildOutcome.AdoptOffline) =>
+                try
+                  workEnds = true
+                  keepRebuiltStoreOffline(local, storeId, copyId)
+                finally
+                  finishSettled(recheckAll())
 
-            case Success(RebuildOutcome.Discard) =>
-              try
-                workEnds = true
-                ctx.devices.discardStoreDirectory(storeId, local.storageDeviceId,
-                  "The tree does not say this device owns a rebuilt store")
-                  .foreach(sds => ctx.copyRegistry.removed("RebuildOutcome.Discard", sds, storeId))
-              finally
-                finishSettled(recheckAll())
+              case Success(RebuildOutcome.Discard) =>
+                try
+                  workEnds = true
+                  ctx.devices.discardStoreDirectory(storeId, local.storageDeviceId,
+                    "The tree does not say this device owns a rebuilt store")
+                    .foreach(sds => ctx.copyRegistry.removed("RebuildOutcome.Discard", sds, storeId))
+                finally
+                  finishSettled(recheckAll())
 
-            case Success(RebuildOutcome.Superseded) =>
-              // The entry is Rebuilding here under a later episode: the store was re-placed away and back while this
-              // rebuild ran. Its copy stays in rebuilt/, offline, Rebuilt for this episode, so the next rebuild retires
-              // it (retireForeignCopy) and starts over, or the Deleted Stores pass does if the entry leaves the device
-              // first
-              try
-                logger.info(s"Rebuild of store $storeId on device ${local.storageDeviceId} finished for an earlier " +
-                            "Rebuilding episode. Not promoting it; the store is rebuilt again")
-              finally
-                finishSettled(recheckAll())
+              case Success(RebuildOutcome.Superseded) =>
+                // The entry is Rebuilding here under a later episode: the store was re-placed away and back while this
+                // rebuild ran. Its copy stays in rebuilt/, offline, Rebuilt for this episode, so the next rebuild
+                // retires it (retireForeignCopy) and starts over, or the Deleted Stores pass does if the entry leaves
+                // the device first
+                try
+                  logger.info(s"Rebuild of store $storeId on device ${local.storageDeviceId} finished for an earlier " +
+                              "Rebuilding episode. Not promoting it; the store is rebuilt again")
+                finally
+                  finishSettled(recheckAll())
 
-            case Success(RebuildOutcome.Unconfirmed) =>
-              // An attempt reported Unknown may have made the copy the owner's before its entry moved on (a transfer
-              // out, say). Kept in place, offline and unpromoted, for the pass that owns the entry's state: the
-              // transfer ships it, an aborted one reinstates it, the Deleted Stores pass retires it
-              try
-                workEnds = true
-              finally
-                finishSettled(recheckAll())
+              case Success(RebuildOutcome.Unconfirmed) =>
+                // An attempt reported Unknown may have made the copy the owner's before its entry moved on (a transfer
+                // out, say). Kept in place, offline and unpromoted, for the pass that owns the entry's state: the
+                // transfer ships it, an aborted one reinstates it, the Deleted Stores pass retires it
+                try
+                  workEnds = true
+                finally
+                  finishSettled(recheckAll())
 
-            case Success(RebuildOutcome.NotOwned) =>
-              // The device is another host's now; the copy is left for it. Only the other
-              // devices are worth re-checking: this one is not ours to reconcile.
-              try
-                // Its copy keeps it silent, and once the device is unloaded its tree entry does
-                workEnds = true
-                logger.info(s"Rebuild of store $storeId finished after device " +
-                            s"${local.storageDeviceId} moved to another host. Leaving it to that host")
-              finally
-                finishSettled(recheckOtherDevices())
+              case Success(RebuildOutcome.NotOwned) =>
+                // The device is another host's now; the copy is left for it. Only the other
+                // devices are worth re-checking: this one is not ours to reconcile.
+                try
+                  // Its copy keeps it silent, and once the device is unloaded its tree entry does
+                  workEnds = true
+                  logger.info(s"Rebuild of store $storeId finished after device " +
+                              s"${local.storageDeviceId} moved to another host. Leaving it to that host")
+                finally
+                  finishSettled(recheckOtherDevices())
 
-            case Failure(t) =>
-              // The only observer this Future has. Its onFail routes the permanent errors to
-              // StopRetrying, which fails the promise -- and an unobserved failed Promise is
-              // not reported by the ExecutionContext, so without this line a permanent give-up
-              // is exactly as silent as the infinite retry loop it replaced. What is left
-              // behind matters: the store is on disk, the tree still says Rebuilding.
-              try
-                // Its copy is offline on its device, so the Deleted Stores pass retires it if the entry leaves the
-                // device before the retry
-                logger.error(s"Failed to record the completed rebuild of store $storeId on " +
-                             s"device ${local.storageDeviceId}. The store is on disk in " +
-                             s"${ctx.copyRegistry.pathOf(local, storeId).getOrElse("rebuilt/")} but is not " +
-                             s"loaded, and the device entry still says Rebuilding. Retrying with a backoff", t)
-              finally
-                release()
-                // Not this device at once: its reconcile restarts the rebuild, which flips again (rebuild-process 5.7)
-                recheckOtherDevices()
-                scheduleRebuildRetry(storeId, held)
+              case Failure(t) =>
+                // The only observer this Future has. Its onFail routes the permanent errors to
+                // StopRetrying, which fails the promise -- and an unobserved failed Promise is
+                // not reported by the ExecutionContext, so without this line a permanent give-up
+                // is exactly as silent as the infinite retry loop it replaced. What is left
+                // behind matters: the store is on disk, the tree still says Rebuilding.
+                try
+                  // Its copy is offline on its device, so the Deleted Stores pass retires it if the entry leaves the
+                  // device before the retry
+                  logger.error(s"Failed to record the completed rebuild of store $storeId on " +
+                               s"device ${local.storageDeviceId}. The store is on disk in " +
+                               s"${ctx.copyRegistry.pathOf(local, storeId).getOrElse("rebuilt/")} but is not " +
+                               s"loaded, and the device entry still says Rebuilding. Retrying with a backoff", t)
+                finally
+                  release()
+                  // Not this device at once: its reconcile restarts the rebuild, which flips again
+                  // (rebuild-process 5.7)
+                  recheckOtherDevices()
+                  scheduleRebuildRetry(storeId, held)
 
         case Failure(RebuildingStore.RebuildCancelled(_))
             if registry.rebuildWorkOn(deviceId, storeId).exists(_.stage == RebuildStage.Abandoned) =>
@@ -732,12 +750,24 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  fails is logged at error and its copy held offline (CopyMoves.pendingLost: never loaded, shipped or retired) and
    *  retried at each device check before the passes; a crash forgets the hold, and the copy then reloads from where it
    *  is, as after any crash (P5). An unsynced move leaves the copy Lost and unsynced until a device check forces it.
-   *  Only ever called once the copy is closed: CopyMoves.move refuses one opening, served or closing */
+   *  Called once the copy is closed. One opened, opening or closing again since (a failed unserved backend's close
+   *  ending after a new open began) is not moved, held or retried: logged at warn, NotMoved, left to its own open or
+   *  close (CopyMoves.move would refuse it) */
   def moveToLost(site: String, sds: LocalStorageDeviceState, storeId: StoreId): MoveResult =
     registry.copiesOf(sds).flatMap(_.copies.get(storeId)) match
       case Some(r) if r.phase == Phase.Lost =>
         ctx.moves.holdLost(sds, storeId, held = false)
         MoveResult.Durable
+      case Some(r) if r.activity.isInstanceOf[Activity.Opening] || r.activity == Activity.Served ||
+                      r.activity.isInstanceOf[Activity.Closing] =>
+        // Opened, opening or closing since this move was asked for (a failed unserved backend's close ending after
+        // a new open began): never moved while installed or opening, and not held for a retry, which would refuse at
+        // every check for as long as it is served. Its own open or close path ends it: a backend that fails again
+        // moves it then. Logged once, here
+        ctx.moves.holdLost(sds, storeId, held = false)
+        logger.warn(s"Not moving the copy of store $storeId on device ${sds.storageDeviceId} to lost/ ($site): it " +
+                    s"is ${r.activity} now. Left to its own open or close")
+        MoveResult.NotMoved(IllegalStateException(s"the copy of $storeId is ${r.activity}"))
       case record =>
         // No record: no copy to move, NotMoved
         val result = ctx.moves.move(site, sds, storeId, Phase.Lost)

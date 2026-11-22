@@ -220,7 +220,15 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         val waitScans = nextWait(previous)
         awaitRetry("refused open", storeId, LoadRetry(sds, storePath, waitScans, waitScans, servedCallback))
     val transferOut = ctx.copyRegistry.transferOutWork(sds, storeId)
-    if transferOut.isDefined then
+    if ctx.shutdown.isStoppingServing(sds.storageDeviceId) then
+      // A relinquish, Failed retirement or CRL failure is taking the device out of service, and unloads it whatever
+      // is open once the closes it waits for have ended: a store opened now would stay served (after a relinquish,
+      // beside the adopter's copy). Nothing is opened, and no retry recorded: the device is going
+      logger.info(s"Not opening store $storeId on device ${sds.storageDeviceId}: the device is being taken out of " +
+                  "service")
+      created.foreach(_.tryFailure(new IllegalStateException(
+        s"the open of store $storeId was refused: its device is being taken out of service")))
+    else if transferOut.isDefined then
       logger.debug(s"Not opening store $storeId on device ${sds.storageDeviceId}: it has ${transferOut.get} there, " +
                    "which keeps it closed until its copy is moved to outbound/. Retrying at the device scans")
       refused(s"it has ${transferOut.get}")
@@ -416,7 +424,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
               ctx.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(storeId) then
         logger.debug(s"Store $storeId awaiting a load retry is not loaded yet: its entry on device $deviceId is " +
                      s"${entry.flatten.map(_.status)}, or the host is rebuilding or has declared it")
-      else if ! ctx.shutdown.isShuttingDown(deviceId) then
+      else if ! ctx.shutdown.isShuttingDown(deviceId) && ! ctx.shutdown.isStoppingServing(deviceId) then
         ctx.tryLoadStore(wait.sds, wait.storePath, None)
 
   /** Opens the backend `storeCfg` names at `storePath`, wherever the BackendOpener runs it; with `create`, first
@@ -784,16 +792,19 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  ends (StoreRebuilds.failStopClosed, P5); any other leaves it where it is */
   private[host] def closeUnloaded(entry: StoreRouter.Entry, dropDurably: Boolean, purpose: ClosePurpose): Unit =
     val store = entry.store
-    // Its device's unload waits for the close's end (StoreRebuilds.closeStarted)
-    val tracked = ctx.rebuilds.closeStarted(store.storageDeviceId)
-    startClose(entry):
+    val closed = startClose(entry):
       store.objectCache.clear()
       if dropDurably then
         store.crl.dropStore(store.storeId).map(_ => true)(using ExecutionContext.parasitic)
       else
         Future.successful(false)
-    .onComplete: dropped =>
-      onExecutor(entry)(store.close()).onComplete: _ =>
+    .transformWith: dropped =>
+      onExecutor(entry)(store.close()).transform(_ => Success(dropped == Success(true)))
+    // Its device's unload waits for the close's end (StoreRebuilds.closeStarted). Taken last, once nothing before the
+    // callback can throw, and done whatever the callback meets, so no close is left counted running for good
+    val tracked = ctx.rebuilds.closeStarted(store.storageDeviceId)
+    closed.onComplete: dropped =>
+      try
         // Released once the close has retained them: dropped entries are no longer in the CRL
         if dropped == Success(true) then
           store.frontend.admission.releaseRetained(store.storeId)
@@ -801,12 +812,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         ctx.copyRegistry.closeEnded(store.storageDeviceId, store.storeId)
         // The reconcile's passes leave a closing copy to its close (HostCopies.offlineCopies): its end checks the
         // device again, so a fail-stopped or unloaded copy is retired or rebuilt without waiting for the periodic check
-        try
-          if purpose == ClosePurpose.FailStop then
-            ctx.rebuilds.failStopClosed(store.storageDeviceId, store.storeId, store.backend.path)
-          else if ctx.devices.devices.contains(store.storageDeviceId) then
-            ctx.reconciler.checkStorageDevice(store.storageDeviceId)
-        finally ctx.rebuilds.closeDone(store.storageDeviceId, tracked)
+        if purpose == ClosePurpose.FailStop then
+          ctx.rebuilds.failStopClosed(store.storageDeviceId, store.storeId, store.backend.path)
+        else if ctx.devices.devices.contains(store.storageDeviceId) then
+          ctx.reconciler.checkStorageDevice(store.storageDeviceId)
+      finally ctx.rebuilds.closeDone(store.storageDeviceId, tracked)
 
   /** The first step of a close, on the executor of `entry`, whose store the router no longer holds. Every task
    *  queued ahead of it has run against the open store. It then sets `closing`, so I/O completions posted from now on
@@ -860,8 +870,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       case None => completion.success(())
       case Some(entry) =>
         val store = entry.store
-        // Its device's unload waits for the close's end, failedOnClose's move included (StoreRebuilds.closeStarted)
-        val tracked = ctx.rebuilds.closeStarted(store.storageDeviceId)
         // isWriteFrozen may be read from any thread
         if store.backend.isWriteFrozen then
           // The close abandons the held writes as a crash would: they were never
@@ -875,7 +883,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         else if !ctx.copyRegistry.closePurposeOf(storeId).isDefined then
           ctx.copyRegistry.closingFor(storeId, ClosePurpose.Shutdown)
         router.remove(storeId)
-        startClose(entry):
+        val closed = startClose(entry):
           store.objectCache.clear()
           if extractCrl then
             store.crl.readStoreState(storeId).map(Some(_))
@@ -900,22 +908,29 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
               store.crl.deleteTransactions(storeId, state.entryIds).map: _ =>
                 // Every entry of the closed store has left the device CRL
                 store.frontend.admission.releaseRetained(storeId)
-        .onComplete: result =>
-          // The close has ended: the backend and directory belong to the control side again
-          ctx.threading.release(storeId)
-          ctx.copyRegistry.closeEnded(store.storageDeviceId, storeId)
-          try result match
-            case Success(_) =>
-              // An FSIF close completes even after a fail-stop during it, and this store is no
-              // longer served, so its BackendFailed (if any) would find nothing to act on.
-              if store.backend.hasFailed then
-                ctx.rebuilds.failedOnClose(store)
-                completion.failure(StoreFailedOnClose(storeId))
-              else
-                completion.success(())
-            case Failure(t) =>
-              logger.error(s"Failed to close store $storeId: $t")
-              completion.failure(t)
+        // Its device's unload waits for the close's end, failedOnClose's move included (StoreRebuilds.closeStarted).
+        // Taken last, once nothing before the callback can throw, and done whatever the callback meets
+        val tracked = ctx.rebuilds.closeStarted(store.storageDeviceId)
+        closed.onComplete: closeResult =>
+          try
+            // The close has ended: the backend and directory belong to the control side again. A throw here (a bug)
+            // still completes the close's caller, failed, so nothing waits on it for good
+            val ended = Try:
+              ctx.threading.release(storeId)
+              ctx.copyRegistry.closeEnded(store.storageDeviceId, storeId)
+            ended.failed.foreach(t => logger.error(s"Failed to end the close of store $storeId, a bug: $t"))
+            ended.flatMap(_ => closeResult) match
+              case Success(_) =>
+                // An FSIF close completes even after a fail-stop during it, and this store is no
+                // longer served, so its BackendFailed (if any) would find nothing to act on.
+                if store.backend.hasFailed then
+                  ctx.rebuilds.failedOnClose(store)
+                  completion.failure(StoreFailedOnClose(storeId))
+                else
+                  completion.success(())
+              case Failure(t) =>
+                logger.error(s"Failed to close store $storeId: $t")
+                completion.failure(t)
           finally ctx.rebuilds.closeDone(store.storageDeviceId, tracked)
 
 object StoreLoader:

@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, Metadata, ObjectId, ObjectPointer, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.StoreConfig
+import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, CommitState, CompletionHandler, DefaultBackendOpener, StoreCreation}
@@ -574,6 +574,32 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       os.exists(dev / RebuildingStore.RebuildDirectory / storeId.directoryName) should be(false)
       // Nothing in live/
       os.exists(dev / CopyLayout.LiveDirectory) should be(false)
+
+  // Final review I2: a rename that landed but was not forced completes with the copy's id, reported unforced, so the
+  // host records the copy unsynced rather than run a second rebuild over the copy in rebuilt/
+  atest("a finish whose rename into rebuilt lands unforced completes with its copy id, reported unforced"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    val episode = UUID.randomUUID()
+    val rebuiltDir = dev / CopyLayout.RebuiltDirectory
+    @volatile var failed = 0
+    val sync: os.Path => Unit = d =>
+      if d == rebuiltDir && failed == 0 then
+        failed += 1
+        throw new java.io.IOException("injected sync")
+      DurableFiles.syncDirectory(d)
+    for
+      _ <- populate(2)
+      _ <- net.waitForTransactionsToComplete()
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
+                                    CopyFixtures.existingCopy(dev, storeId), Some(episode), syncDirectory = sync)
+      outcome <- rebuild.complete.transform(scala.util.Success.apply)
+    yield
+      failed should be(1)
+      val copies = CopyLayout.list(dev).copies.filter(_.storeId == storeId)
+      copies.map(f => (f.phase, f.copyId)) should be(List((Phase.Rebuilt(episode.toString), copies.head.copyId)))
+      outcome should be(scala.util.Success(copies.head.copyId))
+      rebuild.placedUnforced.map(_.target) should be(Some(copies.head.path))
 
   atest("start takes a rebuilt copy of its own episode for done, and fails on any other copy"):
     given ExecutionContext = executionContext

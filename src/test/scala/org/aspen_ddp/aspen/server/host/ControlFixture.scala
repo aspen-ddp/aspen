@@ -525,8 +525,9 @@ trait ControlFixture:
                         keepInitializeTaskExecutor: Boolean = false,
                         verifyCopyRegistry: Boolean = true,
                         crlFactory: CrashRecoveryLogFactory = TestNetwork.TestCRL,
-                        adjustSeams: Host.Seams => Host.Seams = identity): Host =
-    val threading = new LockstepThreading(ec)
+                        adjustSeams: Host.Seams => Host.Seams = identity,
+                        threadingOf: ExecutionContext => LockstepThreading = new LockstepThreading(_)): Host =
+    val threading = threadingOf(ec)
     val scheduler = new ManualControlScheduler(threading.controlEvents)
     val recording = new RecordingSeams(ec, failFirstStoreLoad)
     val host = new Host(client, hostId, systemId, hostRoot, ec, threading,

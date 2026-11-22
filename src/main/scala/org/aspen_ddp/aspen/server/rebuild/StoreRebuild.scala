@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.server.rebuild
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.server.DurableFiles
 import org.aspen_ddp.aspen.server.host.Phase
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 
@@ -18,6 +19,11 @@ import scala.concurrent.Future
 trait StoreRebuild:
   val storeId: StoreId
   def complete: Future[UUID]
+
+  /** Read once `complete` has succeeded: the copy's rename into rebuilt/ when it landed but could not be forced
+   *  (DurableFiles.MoveNotForced). The copy is in place, and its handler records it unsynced, flipped only once a
+   *  device check has forced it (StoreRebuilds.startRebuild). None for a rename forced, or a copy found in place */
+  def placedUnforced: Option[DurableFiles.MoveNotForced] = None
 
   /** Stops the rebuild, leaving its staging directory and checkpoint in place as a crash would
    *  so a later rebuild resumes. `complete` then fails with `RebuildingStore.RebuildCancelled`

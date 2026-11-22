@@ -663,17 +663,21 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         logger.error(s"The CRL of storage device $devicePath is lost, but a store's save file or config could not " +
                      s"be read to tell whether it holds its own state. Retrying on the next scan: $t")
         throw t
-    // T10: into lost/. A move that fails throws, leaving the device unloaded (and its CRL where it is) for the next
-    // scan, which decides again; one not forced is held for the device's attach
-    toMove.foreach: found =>
-      ctx.moves.moveUnattached("lost device CRL", found.path, found.storeId, found.copyId, Phase.Lost)._1 match
-        case MoveResult.NotMoved(t) => throw t
-        case _ => ()
+    // T10: into lost/. A move that fails, or lands unforced, throws, leaving the device unloaded (and its CRL where it
+    // is) for the next scan, which decides again: a crash undoing an unforced move would put the copy back in live/
+    // over the empty replacement CRL. Then every copy in lost/, moved now or by an earlier scan whose move landed
+    // unforced, is forced before the CRL is replaced
+    val lostCopies = toMove.map: found =>
+      ctx.moves.moveUnattached("lost device CRL", found.path, found.storeId, found.copyId, Phase.Lost) match
+        case (MoveResult.NotMoved(t), _) => throw t
+        case (MoveResult.Unsynced(t), _) => throw t
+        case (MoveResult.Durable, path) => path
+    ctx.moves.forceUnattached(devicePath, storeDirs.filter(_.phase == Phase.Lost).map(_.path) ++ lostCopies)
     // A stat that fails throws (FileStat), leaving the device unloaded for the next scan, rather than leave a crl/ in
     // the replacement's way
     if FileStat.exists(crlDir) then
       DurableFiles.move(crlDir, devicePath / s"crl.lost-${UUID.randomUUID()}")
-    // A fresh CRL, which the stores now marked recover nothing from. Created apart and renamed into place only once
+    // A fresh CRL, which the copies now in lost/ recover nothing from. Created apart and renamed into place only once
     // finished, so a crash or a failure (ENOSPC while preallocating) leaves no crl/ beside the stores: the next load
     // declares the CRL lost again, moving nothing aside, and creates it afresh
     val replacement = CrashRecoveryLog.replacementCrlDir(devicePath)

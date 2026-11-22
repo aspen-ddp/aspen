@@ -105,6 +105,12 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
         ctx.copyRegistry.placed(site, sds, storeId, to, copyId, unsynced = result.isInstanceOf[MoveResult.Unsynced])
     result
 
+  /** A copy placed into a phase directory off the control thread (a rebuild's finish, T2) whose rename landed but was
+   *  not forced (`e`): its source's and target's directories are held for the resync, as `place` holds an unsynced
+   *  one's. Its record is HostCopies.rebuilt's, unsynced */
+  def placedUnforced(e: DurableFiles.MoveNotForced): Unit =
+    unforced += e.target -> List(e.target / os.up, e.source / os.up).distinct
+
   /** As `move`, for a copy of a device being loaded (lost CRL, adoption, P2), at `from` as `copyId`:
    *  returns the copy's new path, and an unsynced result is held for the device's attach, as an unsynced move
    *  of such a device is (HostCopies.unsynced) */
@@ -115,6 +121,19 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
       case MoveResult.Unsynced(_) => ctx.copyRegistry.unsynced(site, target)
       case _ => ()
     (result, target)
+
+  /** Forces every phase directory a copy of the device at `devicePath`, being loaded, may have left or entered (all
+   *  but pending-delete/), and each of `copies` (their paths), as `resync` does: the lost CRL's moves, this scan's or
+   *  an earlier one's whose rename landed unforced (in memory or not: a restart forgets it), made durable before the
+   *  CRL is replaced. A sync that fails throws, leaving the device unloaded for the next scan */
+  def forceUnattached(devicePath: os.Path, copies: List[os.Path]): Unit =
+    List(CopyLayout.LiveDirectory, CopyLayout.ArrivedDirectory, CopyLayout.OutboundDirectory,
+         CopyLayout.RebuiltDirectory, CopyLayout.ParkedDirectory, CopyLayout.LostDirectory)
+      .map(devicePath / _).filter(FileStat.exists(_)).foreach(syncDirectory)
+    copies.foreach: path =>
+      (unforced.getOrElse(path, Nil) :+ path).foreach(syncDirectory)
+      unforced -= path
+      ctx.copyRegistry.synced(path)
 
   /** Forces again each unsynced copy's source and target directories, and the copy's own (the device check). Returns
    *  the stores synced now */

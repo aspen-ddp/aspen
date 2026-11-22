@@ -40,7 +40,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Rebuild | Transactions | `CurrentAllocationsRequest` lists every unfinalized allocation and every held commit vote (`HeldVote`); reads of the pool's objects complete |
 | Rebuild | Repair | Everything the store missed while rebuilding is marked and repaired after promotion |
 | Rebuild (reassignment) | Host device lifecycle | The tombstoned device's former host stops serving its stores before the drain rebuilds them elsewhere: one best-effort nudge, else its hourly check; a running host that misses the nudge serving through the rebuild is an accepted limitation (rebuild-process.md B19) |
-| Transfer out (closed store) | Host loader | The store stays closed from its extraction until its `transferring-out` marker is written (an open seen meanwhile fails the extraction, or stops `startOut` in the task that would write the marker), and the extraction fails on a failed stat of the directory or save file rather than take it for an absence (crash-recovery-log.md 3.5). A load retry waits while `startOut` is closing the store (`StoreTransfersOut.isClosingForTransfer`) or its reconciled entry is TransferringOut, and any load of the save file is queued behind the extraction's final deletions (an empty `dropStore` is a barrier, crash-recovery-log.md 5.8), so its saves create records |
+| Transfer out (closed store) | Host loader | The store stays closed from its extraction until its `transferring-out` marker is written (its TransferOut work on the source device refuses every open of the copy meanwhile, `StoreLoader.startOpen`), and the extraction fails on a failed stat of the directory or save file rather than take it for an absence (crash-recovery-log.md 3.5). A load retry is refused by that work, and waits while its reconciled entry is TransferringOut; a load of a save file is queued behind a device CRL's earlier deletions (an empty `dropStore` is a barrier, crash-recovery-log.md 5.8), so its saves create records |
 | Rebuild completion | Transfers | A flip that finds the entry already Active adopts the copy without checking its episode (`DeviceMetadata.markRebuiltStoreActive`); no transfer starts onto an occupied store path, so the copy is this episode's (2.2). A flip retried after `TransactionOutcomeUnknown` that finds the entry moved on (TransferringOut, absent) keeps the copy offline rather than discarding it (`Unconfirmed`, rebuild-process.md 5.7) |
 | Rebuild, CRL | Store lifecycle | A rebuilt copy's first load recovers nothing an earlier copy left under its id in the device CRL: it is a save-file load of the empty state `RebuildingStore.finish` writes, which drops those entries first (rebuild-process.md 5.6) |
 | Lost device CRL | Rebuild | A finished rebuild awaiting its flip (`rebuild-complete`) has never served, so it holds nothing in the device CRL and is not marked (`DeviceDiscovery.holdsOwnState`) |
@@ -189,7 +189,7 @@ The premises other subsystems take from this:
 * A store whose entry names this device is served, or is in the device's `offlineStores`, where a reconcile pass (lost
   CRL, abandoned transfer out, cancelled shutdown, completed transfer in or rebuild) or a load retry takes it up. A
   backend open that fails for anything but a lost state (out of space, an I/O, lock or resource error) leaves the store
-  offline and retries the load at the device scans with backoff (`StoreLoader.storesAwaitingRetry`, `retryFailedLoads`,
+  offline and retries the load at the device scans with backoff (the copy's AwaitingRetry, `StoreLoader.retryFailedLoads`,
   capped at `Host.LoadRetryCap`); a create that left nothing at the path is created again by the next device check
   instead; a retry whose store config cannot be read keeps its entry and tries again at the next scan. A rebuilt copy
   whose `rebuild-complete` marker cannot be removed after its flip is kept in `offlineStores`
@@ -200,11 +200,11 @@ The premises other subsystems take from this:
   then loads the copy again. A failed `crl.loadStore` (`UnloadFailedStore`) is not retried, but it fails only with the
   CRL itself, whose failure unloads the device (`DeviceShutdown.crlFailed`). A store whose `config.yaml` cannot be read
   by `StoreLoader.tryLoadStore` (`awaitUnreadRetry`), or whose load finds its executor slot still held
-  (`HostThreading.AlreadyAssigned`), is left offline and in `storesAwaitingRetry` like a failed open, its `onServed`
+  (`HostThreading.AlreadyAssigned`), is left offline and AwaitingRetry like a failed open, its `onServed`
   kept for the load that serves it. A load's `onServed` (the `StoreMoved` gossip of `DeviceShutdown.reloadClosedStores`
   and `StoreTransfersOut.reinstateAbandonedOut`) runs only once its LoadStore has installed and recovered the store
   (`StoreLoader.awaitServed`); a LoadStore that leaves it offline with its data intact (no CRL room, no executor slot, a
-  save file whose removal failed, a Store whose build throws) hands the callback to its `storesAwaitingRetry` entry,
+  save file whose removal failed, a Store whose build throws) hands the callback to its copy's AwaitingRetry,
   and any other failure drops it, so peers never clear their offline mark for a store left offline. An Active entry on a loaded
   device with no `config.yaml` at its store path (the directory lost to a bad restore, a partial mount or a hand
   removal, or its config gone), not served, opening or retiring, is found by the reconcile's Missing Stores pass
@@ -222,7 +222,7 @@ The premises other subsystems take from this:
   recovers its own state. Its entries go when the rebuilt copy's empty `crl_save.log` is first loaded (5.6 of
   rebuild-process.md), when a retire saves them into a copy, or as leftovers once a re-placement takes the entry off the
   device.
-* A load retry (`StoreLoader.retryFailedLoads`, a store left in `storesAwaitingRetry` by a failed open, build or
+* A load retry (`StoreLoader.retryFailedLoads`, a copy left AwaitingRetry by a failed open, build or
   read) offers the store to `tryLoadStore`, which reads no tree, so the retry itself is held to the tree as the
   device's latest reconcile read it (`LocalStorageDeviceState.reconciledEntries`) and to the host's own work on the
   store: it waits while the entry is neither Active nor Offline, while the store is in `declaredMissing`, while

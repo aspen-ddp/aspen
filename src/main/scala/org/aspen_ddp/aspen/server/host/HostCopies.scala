@@ -21,6 +21,9 @@ import scala.util.control.NonFatal
  *  fails the next drain; otherwise it is logged at error and the store is left silent, the conservative answer, as
  *  clients retransmit.
  *
+ *  The loader's opens and load retries live here only: a copy's Opening and AwaitingRetry activities (isOpening,
+ *  retries), and an open of a copy with TransferOut work on its device is refused (transferOutWork, R12).
+ *
  *  The other updates (phases, activities, work) are still bookkept under `shadow`, which logs a throw (an illegal
  *  move, a missing record) at error with the site's name and swallows it. Each swallowed throw is recorded;
  *  `Host.testingOnlyHandleEvents` fails the drain on any of them, and on any mismatch `verifyAgainstDisk` finds, when
@@ -40,8 +43,9 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   private var untracked: Map[StorageDeviceId, DeviceCopies] = Map()
   // The purpose each close asked for (closingFor) is for, until the router removes its store
   private var closePurposes: Map[StoreId, ClosePurpose] = Map()
-  // Opens that began while their store had TransferOut work on the device (R1: refused from Task 7)
-  private var transferOutOpens: Vector[String] = Vector()
+  // The load retry of each copy that was Closing when the loader recorded it (awaitingRetry), by device and store:
+  // the copy takes it once its close ends (closeEnded). Every other retry is its copy's AwaitingRetry activity
+  private var retriesAfterClose: Map[(StorageDeviceId, StoreId), LoadRetry] = Map()
   // Throws of the silence path (onChange), for the drain check
   private var silenceErrors: Vector[String] = Vector()
 
@@ -50,9 +54,6 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
 
   /** Test-only: called after every change to a record, a work or a missing mark, with the device's copies */
   var observer: (DeviceCopies, StoreId) => Unit = (_, _) => ()
-
-  /** Every open that began while its store had TransferOut work on its device, each as a message (R1) */
-  def opensDuringTransferOut: Vector[String] = transferOutOpens
 
   /** The records of device `id`: a loaded one's, or those of the stores served from it untracked */
   def device(id: StorageDeviceId): Option[DeviceCopies] = attached.get(id).map(_.copies).orElse(untracked.get(id))
@@ -173,27 +174,33 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   private def recordOf(id: StorageDeviceId, storeId: StoreId): Option[(DeviceCopies, CopyRecord)] =
     device(id).flatMap(c => c.copies.get(storeId).map(c -> _))
 
-  /** StoreLoader.startOpen began open `openId` of the copy at `storeId`'s path on `sds`. A create has no record yet:
-   *  it is registered, and set Opening, once its copy is at the path (createOpened). An open of a store with
-   *  TransferOut work on the device is not refused yet (Task 7): the move is skipped and listed (opensDuringTransferOut) */
+  /** The TransferOut work of `storeId` on `sds`, if any: an open of the copy is refused while it lasts (R12), so the
+   *  open path asks before it opens (StoreLoader.startOpen), and DeviceCopies throws on the move to Opening */
+  def transferOutWork(sds: LocalStorageDeviceState, storeId: StoreId): Option[Work.TransferOut] =
+    copiesOf(sds).flatMap(_.work.get(storeId)).collect { case w: Work.TransferOut => w }
+
+  /** StoreLoader.startOpen began open `openId` of the copy at `storeId`'s path on `sds`: its record is Opening until
+   *  the open is served or ends, taking the loader's retry if it was AwaitingRetry. A create has no record yet: one is
+   *  registered Live, for the copy its create places at the path before the open (StoreCreation), and unregistered
+   *  if the create fails leaving nothing there (createFailed) */
   def opening(sds: LocalStorageDeviceState, storeId: StoreId, openId: Long, create: Boolean): Unit =
     shadow("startOpen"):
       copiesOf(sds).foreach: copies =>
-        if !create || copies.copies.contains(storeId) then
-          if copies.work.get(storeId).exists(_.isInstanceOf[Work.TransferOut]) then
-            logger.warn(s"Copy registry: store $storeId opens on device ${sds.storageDeviceId} during its transfer out")
-            transferOutOpens :+= s"device ${sds.storageDeviceId}: $storeId opened during ${copies.work(storeId)}"
-            // The open took the loader's retry, if any
-            if copies.copies.get(storeId).exists(_.activity.isInstanceOf[Activity.AwaitingRetry]) then
-              copies.setActivity(storeId, Activity.Idle)
-          else
-            copies.setActivity(storeId, Activity.Opening(openId))
+        if create && !copies.copies.contains(storeId) then
+          copies.register(storeId, Phase.Live)
+        copies.setActivity(storeId, Activity.Opening(openId))
 
-  /** A create's copy is at its path and its open succeeded: the record registered at the path is Opening until its
-   *  install */
-  def createOpened(sds: LocalStorageDeviceState, storeId: StoreId, openId: Long): Unit =
-    shadow("createOpened"):
-      copiesOf(sds).foreach(_.setActivity(storeId, Activity.Opening(openId)))
+  /** A create's open failed and left nothing at the path (StoreCreation): the record its open registered goes */
+  def createFailed(sds: LocalStorageDeviceState, storeId: StoreId): Unit =
+    shadow("create failed"):
+      copiesOf(sds).foreach: copies =>
+        if copies.copies.contains(storeId) then
+          copies.unregister(storeId)
+
+  /** Whether an open of `storeId` is under way on any device of the host: its copy is Opening, from startOpen until
+   *  its open fails or the LoadStore its open queued is handled (StoreLoader.handleLoad) */
+  def isOpening(storeId: StoreId): Boolean =
+    allCopies.exists(_.copies.get(storeId).exists(_.activity.isInstanceOf[Activity.Opening]))
 
   /** An open of `storeId` on `sds` ended without its store being served (StoreLoader.handleBackendOpened, handleLoad):
    *  an Opening record is Idle, unless the loader holds a retry for it (awaitingRetry took it already) */
@@ -203,8 +210,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         if copies.copies.get(storeId).exists(_.activity.isInstanceOf[Activity.Opening]) then
           copies.setActivity(storeId, Activity.Idle)
 
-  /** The loader holds `retry` for `storeId` (storesAwaitingRetry). A record Closing takes it once its close ends
-   *  (closeEnded), and a record Served never waits */
+  /** The loader records `retry` for `storeId`: its copy's record is AwaitingRetry(retry), learned Unread if it has
+   *  none. A record Closing takes it once its close ends (closeEnded), and a record Served never waits */
   def awaitingRetry(site: String, storeId: StoreId, retry: LoadRetry): Unit =
     shadow(site):
       copiesOf(retry.sds).foreach: copies =>
@@ -217,15 +224,33 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
             copies.register(storeId, Phase.Unread)
             copies.setActivity(storeId, Activity.AwaitingRetry(retry))
           case Some(r) => r.activity match
-            case Activity.Closing(_) => ()
+            case Activity.Closing(_) => retriesAfterClose += (copies.deviceId, storeId) -> retry
             case _ => copies.setActivity(storeId, Activity.AwaitingRetry(retry))
 
   /** The loader dropped the retry of `storeId` on `sds` */
   def retryDropped(site: String, sds: LocalStorageDeviceState, storeId: StoreId): Unit =
     shadow(site):
+      retriesAfterClose -= ((sds.storageDeviceId, storeId))
       copiesOf(sds).foreach: copies =>
         if copies.copies.get(storeId).exists(_.activity.isInstanceOf[Activity.AwaitingRetry]) then
           copies.setActivity(storeId, Activity.Idle)
+
+  /** The retry the copy of `storeId` on `sds` awaits, if its record is AwaitingRetry */
+  def retryOn(sds: LocalStorageDeviceState, storeId: StoreId): Option[LoadRetry] =
+    copiesOf(sds).flatMap(_.copies.get(storeId)).collect { case CopyRecord(_, _, _, Activity.AwaitingRetry(r)) => r }
+
+  /** A retry of `storeId` the loader holds on any loaded device: a record's AwaitingRetry, or one a closing record
+   *  takes once its close ends */
+  def retryOf(storeId: StoreId): Option[LoadRetry] =
+    retries.collectFirst { case (s, r) if s == storeId => r }
+      .orElse(retriesAfterClose.toList.sortBy(_._1._1.uuid).collectFirst { case ((_, s), r) if s == storeId => r })
+
+  /** Every copy awaiting a load retry on the loaded devices, with its store, in device then store order
+   *  (StoreLoader.retryFailedLoads) */
+  def retries: List[(StoreId, LoadRetry)] =
+    attached.toList.sortBy(_._1.uuid).flatMap: (_, sds) =>
+      sds.copies.copies.values.toList.sortBy(r => (r.storeId.poolId.uuid, r.storeId.poolIndex)).collect:
+        case CopyRecord(storeId, _, _, Activity.AwaitingRetry(r)) => storeId -> r
 
   /** The router installed `storeId`, loaded from device `id` (StoreRouter.install): its record (`known`) is Served */
   def installed(id: StorageDeviceId, storeId: StoreId): Unit =
@@ -284,13 +309,14 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
           copies.setActivity(storeId, Activity.Closing(purpose))
 
   /** The close of `storeId`, loaded from device `id`, ended (StoreLoader: handleClose, closeUnloaded): its record is
-   *  Idle, or AwaitingRetry if the loader holds a retry for it on that device */
+   *  Idle, or AwaitingRetry if the loader recorded a retry for it while it closed */
   def closeEnded(id: StorageDeviceId, storeId: StoreId): Unit =
     shadow("close ended"):
       device(id).foreach: copies =>
         if copies.copies.get(storeId).exists(_.activity.isInstanceOf[Activity.Closing]) then
           copies.setActivity(storeId, Activity.Idle)
-          ctx.loader.retryOf(storeId).filter(_.sds.storageDeviceId == id).foreach: retry =>
+          retriesAfterClose.get((id, storeId)).foreach: retry =>
+            retriesAfterClose -= ((id, storeId))
             copies.setActivity(storeId, Activity.AwaitingRetry(retry))
 
   /** StoreCopies.retire took the copy at `storeId`'s path on `local`, marked Lost, as its own */
@@ -383,6 +409,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def detach(id: StorageDeviceId, listed: Set[StoreId]): Unit =
     val had = attached.get(id).map(_.copies)
     attached -= id
+    retriesAfterClose = retriesAfterClose.filter((key, _) => key._1 != id)
     // A device unloaded before its first reconcile keeps what it listed before its load too
     val before = unloaded.getOrElse(id, Set())
     unloaded += id -> (listed ++ before)
@@ -493,7 +520,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   /** Test-only. For every loaded device, where its records and its disk disagree:
    *   - a record's phase is not the phase its directory's markers read, for records neither Unread nor unsynced;
    *   - a store directory with a config has no record;
-   *   - a record has no directory.
+   *   - a record has no directory, but one whose create is still placing it (Work.Create).
    *  Stats and reads that fail are skipped: they say nothing. Empty when consistent. */
   def verifyAgainstDisk(): List[String] =
     ctx.devices.devices.toList.sortBy(_._1.uuid).flatMap: (id, sds) =>
@@ -505,9 +532,13 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
           try storeDirectories(sds.devicePath).filter((_, path) =>
             FileStat.existence(path / StoreConfig.configFilename).contains(true))
           catch case NonFatal(t) => Nil
+        // A create's record is registered at its open, before its create places the copy (off the control thread
+        // for FSIF): its directory may not be there yet
         val dirMissing = records.keys.toList.sortBy(_.directoryName).flatMap: storeId =>
           val path = sds.devicePath / storeId.directoryName
-          if Try(FileStat.isDir(path)).toOption.contains(false) then
+          if sds.copies.work.get(storeId).contains(Work.Create) then
+            Nil
+          else if Try(FileStat.isDir(path)).toOption.contains(false) then
             List(s"device $id: record of $storeId (${records(storeId).phase}) has no directory at $path")
           else
             Nil

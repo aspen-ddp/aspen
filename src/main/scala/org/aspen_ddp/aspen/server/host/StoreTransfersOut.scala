@@ -27,9 +27,9 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   private var abortingLostTransfers: Set[StoreId] = Set()
 
   // Stores startOut is closing for a transfer out: from its close (and CRL extraction) until the control task that
-  // writes the transferring-out marker, or fails the request, has run. A load retry leaves them alone
-  // (StoreLoader.retryFailedLoads), so a store is never served from a save file whose entries the extraction is
-  // still deleting from the device CRL
+  // writes the transferring-out marker, or fails the request, has run. Their TransferOut work refuses every open of
+  // the copy meanwhile (StoreLoader.startOpen), so a store is never served from a save file whose entries the
+  // extraction is still deleting from the device CRL
   private var closingForTransfer: Set[StoreId] = Set()
 
   // Stores whose rebuild start waited for their close for a transfer out (deferRebuildUntilClosed): the close's end checks the
@@ -45,9 +45,6 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
       else
         None
     ctx.copyRegistry.work("transfer out", sds.storageDeviceId, storeId, _.isInstanceOf[Work.TransferOut], desired)
-
-  /** Whether startOut is closing the store for a transfer out, its marker not yet written */
-  private[host] def isClosingForTransfer(storeId: StoreId): Boolean = closingForTransfer.contains(storeId)
 
   /** Whether a rebuild of the store must wait for its close for a transfer out (I3: a discard of its copy would move
    *  the directory the close is extracting from). When it must, the close's end checks the source device again */
@@ -83,13 +80,12 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
    *  write the CRL's entries over a valid file. Runs on the control thread, as the marker writes beside it do;
    *  nothing blocks on the CRL.
    *
-   *  The store must stay closed throughout: one loaded meanwhile recovered the entries read, which the deletion would
-   *  take from under it, and may have saved others the file would lack (or, from a save file, removed the file).
-   *  Nothing keeps it closed, so an open started during the read, the deletion or the drop fails the extraction
-   *  (`opensStarted`, checked when each answers) and leaves the charge to the load; the transfer's retransmitted
-   *  request closes the store and extracts again. The release is of the charge read when the extraction began
-   *  (`releaseRetained(storeId, charge)`), so it never takes a later one. startOut checks again in the control task
-   *  that writes the transfer-out marker, which keeps every later open off the store.
+   *  The store must stay closed throughout: one loaded meanwhile would recover the entries read, which the deletion
+   *  would take from under it, and might save others the file would lack (or, from a save file, remove the file). The
+   *  store's TransferOut work on the device keeps it closed: an open of the copy is refused from startOut's close
+   *  until the control task that writes the transfer-out marker, which keeps every later open off the store
+   *  (StoreLoader.startOpen, R12). The release is of the charge read when the extraction began
+   *  (`releaseRetained(storeId, charge)`), so it never takes a later one.
    *
    *  Only `sds`, the transfer's source, is read: another device of the host may hold its own copy of the store (an
    *  earlier tenancy's, a transfer's source awaiting retire), whose entries are its retire's to save. */
@@ -103,19 +99,11 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
 
   private def extractFromDirectory(storeId: StoreId, sds: LocalStorageDeviceState): Future[Unit] =
     val saveFile = Backend.crlSaveFile(sds.devicePath / storeId.directoryName)
-    val opens = ctx.loader.opensStarted(storeId)
-    def openedMeanwhile: Option[Future[Unit]] =
-      if ctx.loader.opensStarted(storeId) != opens then
-        Some(Future.failed(new IllegalStateException(
-          s"store $storeId was opened while its CRL state was being extracted")))
-      else
-        None
     // Read before anything is, so the release below covers only the entries the extraction takes
     val charge = sds.admission.retainedCharge(storeId)
     def released(): Future[Unit] =
-      openedMeanwhile.getOrElse:
-        charge.foreach(sds.admission.releaseRetained(storeId, _))
-        Future.unit
+      charge.foreach(sds.admission.releaseRetained(storeId, _))
+      Future.unit
     Try(FileStat.exists(saveFile)) match
       case Failure(err) => Future.failed(err)
       case Success(true) =>
@@ -128,13 +116,12 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
           case Right(_) => sds.crl.dropStore(storeId).flatMap(_ => released())
       case Success(false) =>
         sds.crl.readStoreState(storeId).flatMap: state =>
-          openedMeanwhile.getOrElse:
-            if state.isEmpty then
-              Future.unit
-            else
-              // A failed save leaves them in the device CRL, for a retried request to extract again
-              CrashRecoveryLog.saveStoreState(storeId, state, saveFile)
-              sds.crl.deleteTransactions(storeId, state.entryIds).flatMap(_ => released())
+          if state.isEmpty then
+            Future.unit
+          else
+            // A failed save leaves them in the device CRL, for a retried request to extract again
+            CrashRecoveryLog.saveStoreState(storeId, state, saveFile)
+            sds.crl.deleteTransactions(storeId, state.entryIds).flatMap(_ => released())
 
   /** Returns the request's handling, which fails when the request is refused. Only tests look at
    *  it (they call this directly); the control thread drops it, as a refusal is answered by
@@ -234,10 +221,8 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
       if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut then
         // A retransmitted request finds the store already closed, and its going offline already gossiped
         val wasLoaded = ctx.router.loaded.contains(m.storeId)
-        // The store stays closed between its close and the marker below, written in a later control task, only as far
-        // as this host keeps it so: a load retry waits while it is closingForTransfer, and any other open meanwhile
-        // serves it, so it is not marked or shipped
-        val opens = ctx.loader.opensStarted(m.storeId)
+        // The store stays closed between its close and the marker below, written in a later control task: its
+        // TransferOut work, started here before the close, refuses every open of the copy until then (R12)
         closingForTransfer += m.storeId
         syncWork(m.storeId, sourceDs, devEntry.transferId)
         val fclosed =
@@ -245,7 +230,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
           catch case t: Throwable => Future.failed(t)
 
         fclosed.onComplete: result =>
-          try closedForTransfer(m, devEntry, sourceDs, toHostState, wasLoaded, opens, result)
+          try closedForTransfer(m, devEntry, sourceDs, toHostState, wasLoaded, result)
           finally
             closingForTransfer -= m.storeId
             syncWork(m.storeId, sourceDs, None)
@@ -258,7 +243,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
    *  task: either the transferring-out marker is written and the send begun, or the request is refused */
   private def closedForTransfer(m: StartStoreTransfer, devEntry: StorageDeviceState.StoreEntry,
                                 sourceDs: LocalStorageDeviceState, toHostState: HostState, wasLoaded: Boolean,
-                                opens: Long, result: Try[Unit]): Unit =
+                                result: Try[Unit]): Unit =
     result.failed.foreach:
       case e: StoreFailedOnClose =>
         logger.error(s"Not starting the transfer out of store ${m.storeId}, transfer ${m.transferUUID}: " +
@@ -281,10 +266,8 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
          !ctx.devices.isLoaded(sourceDs) then
         logger.info(s"Not starting the transfer out of store ${m.storeId}: source device " +
                     s"${sourceDs.storageDeviceId} began shutting down while the store closed")
-      else if ctx.router.loaded.contains(m.storeId) || ctx.loader.isOpening(m.storeId) ||
-              ctx.loader.opensStarted(m.storeId) != opens then
-        // Opened since its close: the open serves it, and a retransmitted request closes it again
-        logger.info(s"Not starting the transfer out of store ${m.storeId}: it was opened after its close")
+      // No open of the copy can have started since its close: its TransferOut work refused them (R12). An open of
+      // another device's copy of the store on this host reads that device's CRL, never this extraction's
       else if markedNow.isEmpty then
         // Its marker cannot be stat'd (FileStat): never shipped on a guess. Left closed and unmarked, as above, until a
         // retransmitted request closes it again and looks once more
@@ -355,7 +338,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
    *
    *  If the load fails after the marker is gone, this pass will not pick it up again, since it
    *  keys off the marker that is now removed: the store stays offline and the device scans retry
-   *  it (StoreLoader.storesAwaitingRetry), its gossip kept for the load that serves it.
+   *  it (its copy AwaitingRetry, StoreLoader.retryFailedLoads), its gossip kept for the load that serves it.
    *
    *  Caller has established the tree entry and the marker.
    */

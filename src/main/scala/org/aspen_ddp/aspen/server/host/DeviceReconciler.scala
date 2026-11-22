@@ -104,7 +104,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                      s"check. Error: $t")
       case Success(stores) =>
         def leftover(storeId: StoreId): Boolean =
-          !remote.stores.contains(storeId) && !local.loadedStores.contains(storeId) &&
+          !remote.stores.contains(storeId) && !ctx.copyRegistry.openCopies(local).contains(storeId) &&
             FileStat.existence(local.devicePath / storeId.directoryName).contains(false) &&
             !crlDropsRunning.contains(storeId) &&
             !ctx.copies.isRetiring(storeId)
@@ -222,9 +222,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     ctx.copyRegistry.offlineCopies(local).filter(storeId =>
       !remote.stores.contains(storeId)
     ).foreach: storeId =>
-      // Dropped from loadedStores at once, or a later shutdown would take this store for one still open and write
-      // a marker into a retired directory. It stays offline (silent) until its copy has left its path.
-      local.loadedStores -= storeId
+      // It stays offline (silent) until its copy has left its path.
       retireUnowned(local, storeId)
 
   /** Silences each Active entry with no store directory or config behind it and requests its rebuild (see the comment). */
@@ -245,7 +243,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // failed would otherwise leave it offline, with no pass to load or rebuild it, until a restart. The record is
     // in memory only: a restart's device load serves a store whose directory is back, with its kept CRL entries.
     def unserved(storeId: StoreId): Boolean =
-      ctx.router.get(storeId).isEmpty && !local.loadedStores.contains(storeId) &&
+      ctx.router.get(storeId).isEmpty && !ctx.copyRegistry.openCopies(local).contains(storeId) &&
         !ctx.loader.isOpening(storeId) && !ctx.copies.isRetiring(storeId)
     local.declaredMissing = local.declaredMissing.filter(storeId =>
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) && unserved(storeId))

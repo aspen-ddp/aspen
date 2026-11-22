@@ -184,11 +184,10 @@ object StoreRouterSuite:
       threading.controlEvents.execute(() => p.complete(scala.util.Try(f)))
       Await.result(p.future, Duration(Bound, SECONDS))
 
-    /** A device whose loadedStores already holds `storeId`, as serveOpened leaves it before its LoadStore runs. */
+    /** A loaded device, onto which `storeId` is loaded (its copy is learned at its LoadStore) */
     def addDevice(storeId: StoreId): LocalStorageDeviceState = onControl:
       val dir = os.temp.dir()
       val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl)
-      sds.loadedStores += storeId
       ctx.copyRegistry.attach(sds)
       ctx.devices.devices += deviceId -> sds
       sds
@@ -273,11 +272,11 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
 
   private def objectPtr(i: Int): DataObjectPointer = DataObjectPointer(ObjectId(new UUID(16, i)), poolId, Array[Byte]())
 
-  /** The load failed before its store was installed: nothing serves it, it is offline, its device no longer lists it
-   *  as loaded, and its backend is closed. */
+  /** The load failed before its store was installed: nothing serves it, it is offline, its copy is neither served nor
+   *  opening, and its backend is closed. */
   private def assertAbandoned(fx: Fixture, s0: StoreId, sds: LocalStorageDeviceState, backend: TrackingBackend): Unit =
     val (entry, offline, loaded, offlineInDevice) = fx.onControl:
-      (fx.ctx.router.entry(s0), fx.ctx.router.isOffline(s0), sds.loadedStores.contains(s0),
+      (fx.ctx.router.entry(s0), fx.ctx.router.isOffline(s0), fx.ctx.copyRegistry.openCopies(sds).contains(s0),
         fx.ctx.copyRegistry.offlineCopies(sds).contains(s0))
     entry should be(None)
     offline should be(true)
@@ -391,7 +390,6 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
 
           // A retry while the directory still cannot be forced fails the same way, even with the file gone
           val again = new TrackingBackend(s0, backend.path)
-          fx.onControl(sds.loadedStores += s0)
           intercept[Exception](await(fx.load(again)))
           awaitTrue(fx.onControl(fx.threading.threadOf(s0).isEmpty))
           assertAbandoned(fx, s0, sds, again)
@@ -399,7 +397,6 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
 
         // Once the directory is forced the retry serves the store, recovered from its device-CRL entries
         val retried = new TrackingBackend(s0, backend.path)
-        fx.onControl(sds.loadedStores += s0)
         await(fx.load(retried))
         os.exists(backend.crlSaveFile) should be(false)
         val store = fx.onControl(fx.ctx.router.entry(s0)).get.store
@@ -496,7 +493,6 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       fx.onControl:
         val dir = os.temp.dir()
         val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
-        sds.loadedStores += s0
         fx.ctx.copyRegistry.attach(sds)
         fx.ctx.devices.devices += deviceId -> sds
       intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, os.temp.dir()))))
@@ -541,7 +537,6 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       fx.onControl:
         val dir = os.temp.dir()
         val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
-        sds.loadedStores += s0
         fx.ctx.copyRegistry.attach(sds)
         fx.ctx.devices.devices += deviceId -> sds
       val first = bootstrappedBackend(s0)
@@ -560,12 +555,11 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       first.closed should be(true)
       second.closed should be(false)
 
-  /** A device over `crl` counting with `admission`, whose loadedStores already holds `storeId` */
+  /** A device over `crl` counting with `admission`, onto which `storeId` is loaded */
   private def addCountingDevice(fx: Fixture, storeId: StoreId, crl: CrashRecoveryLog,
                                 admission: CrlAdmission): LocalStorageDeviceState = fx.onControl:
     val dir = os.temp.dir()
     val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
-    sds.loadedStores += storeId
     fx.ctx.copyRegistry.attach(sds)
     fx.ctx.devices.devices += deviceId -> sds
     sds

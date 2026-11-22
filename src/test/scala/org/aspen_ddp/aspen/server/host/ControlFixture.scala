@@ -582,6 +582,12 @@ trait ControlFixture:
       TransactionDriver.noErrorRecoveryFactory, Duration(40, SECONDS), None)
     host.control.router.install(store, HostThreading.InlineStoreExecutor)
 
+  /** Whether `host` holds TransferOut work for `storeId` on any loaded device: from startOut's close until its
+   *  marker task has run, or while it aborts a lost transfer */
+  protected def hasTransferOutWork(host: Host, storeId: StoreId): Boolean =
+    host.control.devices.devices.keys.exists(id =>
+      host.control.copyRegistry.device(id).exists(_.work.get(storeId).exists(_.isInstanceOf[Work.TransferOut])))
+
   /** Whether `host` holds Rebuild work for `storeId` on any loaded device (the work keeps it silent) */
   protected def hasRebuildWork(host: Host, storeId: StoreId): Boolean =
     host.control.devices.devices.keys.exists(id =>
@@ -594,10 +600,9 @@ trait ControlFixture:
       host.control.copyRegistry.registered("placed after load", sds, storeId,
         CopyPhase.read(sds.devicePath / storeId.directoryName))
 
-  /** Records `storeIds` as served from `sds` without loading them, as the recording seams load nothing: in its
-   *  loadedStores, their copies (registered if placed after the load) Served. The recording shutdown close ends that */
+  /** Records `storeIds` as served from `sds` without loading them, as the recording seams load nothing: their copies
+   *  (registered if placed after the load) Served. The recording shutdown close ends that */
   protected def servedHere(host: Host, sds: LocalStorageDeviceState, storeIds: StoreId*): Unit =
-    sds.loadedStores ++= storeIds
     storeIds.foreach: storeId =>
       val copies = host.control.copyRegistry.copiesOf(sds).get
       if !copies.copies.contains(storeId) then

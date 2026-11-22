@@ -411,7 +411,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
         second.isFailure should be(true)
         sends.transfersOut.map(_._1) should be(Vector(shipped))
         FileStat.exists(storePath / StoreTransfer.TransferOutMarkerFile) should be(true)
-        host.control.transfersOut.isClosingForTransfer(shipped) should be(false)
+        hasTransferOutWork(host, shipped) should be(false)
 
   /** C3: a rebuild's flip commits Active but is reported Unknown. Before its retry reads the entry, an operator's
    *  transfer makes it TransferringOut and the receiver's StartStoreTransfer arrives. The request is refused while
@@ -481,9 +481,9 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       FileStat.exists(storePath / StoreTransfer.TransferOutMarkerFile) should be(true)
 
   /** Double open (audit Step 4): a store's backend has opened and its LoadStore is queued, not yet handled. A second
-   *  load offer meanwhile (a duplicate LoadStoreById, say) finds the store still opening and starts no second open,
-   *  which would fail on the backend's lock and drop the store, served once the LoadStore installs it, from its
-   *  device's loadedStores: the device's shutdown would then never close it */
+   *  load offer meanwhile (a duplicate LoadStoreById, say) finds the store still opening (its copy Opening) and starts
+   *  no second open, which would fail on the backend's lock and end the copy's Opening, leaving the store, served
+   *  once the LoadStore installs it, where the device's shutdown would never close it */
   atest("a second load offer between open and install starts no second open, and the device's shutdown closes the served store"):
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
@@ -501,19 +501,23 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       // RocksDB opens inline: the LoadStore is queued on return
       _ = host.control.loader.tryLoadStore(local, storePath)
       queued = recorded(host).loadStoreRequests.toList
+      activityBefore = host.control.copyRegistry.copiesOf(local).flatMap(_.copies.get(moving)).map(_.activity)
       _ = host.control.loader.tryLoadStore(local, storePath)
-      opens = host.control.loader.opensStarted(moving)
+      activityAfter = host.control.copyRegistry.copiesOf(local).flatMap(_.copies.get(moving)).map(_.activity)
       _ = host.testingOnlyHandleEvents()
       _ <- yieldUntil(host.control.router.loaded.contains(moving))
       served = host.control.router.loaded.get(moving)
-      listed = local.loadedStores.contains(moving)
+      listed = host.control.copyRegistry.openCopies(local).contains(moving)
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(!loadedDevices(host).contains(deviceA), drain = Some(host))
     yield
       queued should be(List((deviceA, moving)))
-      opens should be(1)
+      // One open: the second offer leaves the first's Opening as it is, and queues no second LoadStore
+      activityBefore.get should be(a[Activity.Opening])
+      activityAfter should be(activityBefore)
+      recorded(host).loadStoreRequests.toList should be(List((deviceA, moving)))
       served should be(defined)
       listed should be(true)
       recorded(host).shutdownCloses.toList should be(List(moving))
@@ -541,8 +545,8 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       close = recorded(host).holdTransferOutCloses()
       request = ask(host)
-      _ <- pumpUntil(host.control.transfersOut.isClosingForTransfer(shipped))
-      closingAtCheck = host.control.transfersOut.isClosingForTransfer(shipped)
+      _ <- pumpUntil(hasTransferOutWork(host, shipped))
+      closingAtCheck = hasTransferOutWork(host, shipped)
       // Its backend failed while it closed (StoreRebuilds.failedOnClose), and the store is requested for rebuild
       _ = os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
       _ = host.control.copyRegistry.markedLost("failedOnClose", storePath)

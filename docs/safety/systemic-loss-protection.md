@@ -382,7 +382,7 @@ These look like loss, or take a store or device out of service, but write no mar
 * **Out of space, and any other failed backend open.** ENOSPC freezes writes (FSIF) and keeps the store serving. At
   load, every open failure other than `BackendStateLost` (out of space, an I/O, lock or resource error) leaves the
   store offline and unmarked, retried at device scans with backoff doubling up to `Host.LoadRetryCap` (5 min)
-  (`StoreLoader.storesAwaitingRetry`, `LoadRetry`). So does a load that throws before any open starts (an unreadable
+  (its copy AwaitingRetry, holding a `LoadRetry`). So does a load that throws before any open starts (an unreadable
   store config, `StoreLoader.awaitUnreadRetry`) and a `LoadStore` that finds the store's executor slot still held
   (`HostThreading.AlreadyAssigned`). A failed create that left nothing at the path is created again by the next
   device check instead. A `crl_save.log` state that does not fit the device's CRL admission yet waits in the
@@ -397,12 +397,12 @@ These look like loss, or take a store or device out of service, but write no mar
   a device unloading), so the whole device is out of service with it and the store loads at the device's next load.
 * **A failed Store build** in `StoreLoader.handleLoad` (the `Store` constructor, the object cache or the backend's
   completion handler throws, for example with EMFILE): `abandonLoad` closes the backend and leaves the store offline
-  and unmarked, and `awaitBuildRetry` puts it in `storesAwaitingRetry`, so each device scan retries it with backoff
+  and unmarked, and `awaitBuildRetry` leaves its copy AwaitingRetry, so each device scan retries it with backoff
   (1, 2, 4 ... scans per build failure in a row, capped at `LoadRetryCap`, logged at error once per cap interval), as
   a failed open is. A new store's failed `created` promise fails `createNewStore`'s flip; the next check finds the
   directory and flips the entry Active, and the retry then serves it. A failed build of a reload over a served store
   leaves that store serving and starts no retry. (The `incarnation` file is read before the build: one that
-  cannot be stat'd, read or parsed waits in `storesAwaitingRetry`, and one known absent is D14.)
+  cannot be stat'd, read or parsed waits AwaitingRetry, and one known absent is D14.)
 * **A transferred copy with an unusable save file** is not promoted (X9) and the transfer restarts; the source still
   holds the state. The same holds for a promoted copy found lost before its pool update commits: a resume
   (`StoreTransfers.startIn`, the copy behind its `transferred-in` marker and the entry still TransferringIn) first

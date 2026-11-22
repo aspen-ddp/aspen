@@ -633,7 +633,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ <- yieldUntil(answerChecks())
     yield
       served(unlisted) should be(false)
-      loadedDevices(host)(deviceA).loadedStores should not contain unlisted
+      host.control.copyRegistry.openCopies(loadedDevices(host)(deviceA)) should not contain unlisted
       pending should have size 1
       pending.head.last should startWith(unlisted.directoryName)
       os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)

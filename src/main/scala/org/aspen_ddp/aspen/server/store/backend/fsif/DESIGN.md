@@ -390,8 +390,8 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
 
 - **Open and create** (`StoreLoader.startOpen`, `handleBackendOpened`, shared by every backend) run on
   `FsifOpenEc`. A create (`BackendOpener.create`, `StoreCreation`) builds the store in `<device>/creating/` and
-  renames it into place, then opens it as any load does; `open` never creates. While an open runs, the store is in its device's `loadedStores` and in `opening`, and the router
-  keeps it silent (`loading`) until it is installed. A `ShutdownStore` that arrives meanwhile is deferred and
+  renames it into place, then opens it as any load does; `open` never creates. While an open runs, its copy is Opening in the copy registry, which keeps
+  the store silent until it is installed. A `ShutdownStore` that arrives meanwhile is deferred and
   replayed after the store is served.
 - **Outcomes** (`handleBackendOpened`; FsifRecovery.StoreLost is a `BackendStateLost`):
 
@@ -400,7 +400,7 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
   | success | `serveOpened` and `LoadStore` |
   | `StoreLost` | mark `rebuild-required`, leave the store offline, `checkStorageDevice` |
   | a create that left nothing at the path | leave offline, not retried here: its entry is still Initializing and the next device check creates it again |
-  | any other failure (out of space, I/O, lock or resource error) | leave offline, not marked; `storesAwaitingRetry` retries every device scan with exponential backoff capped at `LoadRetryCap` (5 min) |
+  | any other failure (out of space, I/O, lock or resource error) | leave offline, not marked; its copy awaits a load retry (AwaitingRetry), offered every device scan with exponential backoff capped at `LoadRetryCap` (5 min) |
 
 - **No create on open** (systemic-loss-protection 4.1, row D5; 2.3 creation). A missing
   store directory, or one whose FSIF files are all absent or empty (`FsifRecovery.isBlank`), is `StoreLost` (L0):
@@ -762,7 +762,7 @@ These look like loss but never trigger a rebuild:
 - **A CRC mismatch on a read.** `CorruptedObject` goes to the repair path. The store stays served.
 - **An `IOException` during open that is not out of space.** It is logged ("its backend failed to open"), and the
   store is left offline and not marked. Like out of space at load, it is retried at device scans with backoff
-  doubling up to `Host.LoadRetryCap` (`StoreLoader.storesAwaitingRetry`, `retryFailedLoads`).
+  doubling up to `Host.LoadRetryCap` (the copy's AwaitingRetry, `StoreLoader.retryFailedLoads`).
 - **A failed `crl.loadStore`** after a valid save file. `UnloadFailedStore` takes the store offline and keeps the
   file. It is not marked.
 - **A failed removal of the loaded save file** (`StoreRouter.crlLoaded`). `SaveFileRemovalFailed` takes the store

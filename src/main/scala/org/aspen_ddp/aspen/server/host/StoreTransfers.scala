@@ -599,7 +599,6 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         retiringEarlier -= storeId
         syncWork(storeId, local.storageDeviceId)
         if clear then
-          local.loadedStores -= storeId
           ctx.reconciler.checkStorageDevice(local.storageDeviceId)
 
   /** Drops a TransferringIn entry whose source device has been declared failed.

@@ -699,9 +699,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       derived should be(Silence.Served)
       registryRepairable should be(true)
 
-  // R1 (shadow): an open that starts while the store has TransferOut work on its device is not refused yet (stage 1
-  // Task 7 refuses it); its Opening is skipped and listed, and the extraction's end finds the store opened
-  atest("an open during a transfer out's close is listed, not refused, and the transfer does not start"):
+  // R12: an open that starts while the store has TransferOut work on its device is refused (Task 7): the copy stays
+  // Idle, the close's end finds the store still closed, and the transfer starts
+  atest("an open during a transfer out's close is refused, and the transfer starts"):
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
     val dev = device(hostRoot, source)
@@ -717,26 +717,24 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       gate = recorded(host).holdTransferOutCloses()
       request = ask(host)
-      _ <- pumpUntil(host, host.control.transfersOut.isClosingForTransfer(shipped))
+      _ <- awaitLoudly("the transfer out's close to begin")(hasTransferOutWork(host, shipped))
       work = host.control.copyRegistry.device(source).get.work.get(shipped)
       _ = host.control.loader.tryLoadStore(local, storePath)
-      _ <- pumpUntil(host, host.control.router.loaded.contains(shipped))
-      opens = host.control.copyRegistry.opensDuringTransferOut
-      served = record(host, source, shipped).map(_.activity)
+      _ = host.testingOnlyHandleEvents()
+      refused = record(host, source, shipped).map(_.activity)
+      loaded = host.control.router.loaded.contains(shipped)
       repairableDuringClose = host.isRepairable(shipped)
       _ = gate.success(())
-      refused <- request
+      started <- request
       _ = host.testingOnlyHandleEvents()
       after = host.control.copyRegistry.device(source).get.work.get(shipped)
-      _ <- close(host, shipped)
     yield
       work.get should be(a[Work.TransferOut])
-      opens.size should be(1)
-      served should be(Some(Activity.Served))
-      // D3 of the old marks: its view counted the store repairable during the close; the TransferOut work does not
+      refused should be(Some(Activity.Idle))
+      loaded should be(false)
       repairableDuringClose should be(false)
-      refused should be(Success(()))
-      sends.transfersOut should be(empty)
+      started should be(Success(()))
+      sends.transfersOut.map(_._1) should be(Vector(shipped))
       after should be(None)
       consistent(host)
 
@@ -766,9 +764,10 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       host.control.copyRegistry.silence(created) should be(Silence.Silent(Set(SilenceReason.Opening)))
       consistent(host)
 
-  // R12 for a store served when its transfer out began: its close (Closing(TransferOut)) ends before the extraction's
-  // deletion, so an open that installs during the extraction moves the copy Idle -> Served, never Closing -> Served
-  atest("an open that installs during a served store's transfer-out extraction is Served, with no shadow error"):
+  // R12, made real (Task 7): an open of a store with TransferOut work on its device is refused. The registry throws on
+  // the move to Opening, and the open path asks first, so it refuses at debug and starts no open: the copy stays Idle,
+  // the extraction's deletion finds the store still closed, and the transfer ships
+  atest("an open started during a transfer-out extraction throws, and the extraction ships"):
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
     val deviceDir = hostRoot / os.up / "injected-device"
@@ -792,24 +791,32 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       request = ask(host)
       _ <- pumpUntil(host, !host.control.router.loaded.contains(shipped) &&
                            !seen.lastOption.exists(_.activity.exists(_.isInstanceOf[Activity.Closing])))
-      closedBeforeDeletion = record(host, source, shipped).map(_.activity)
-      // An open during the extraction's deletion: the store's backend is closed, so it opens and installs
+      copies = host.control.copyRegistry.device(source).get
+      work = copies.work.get(shipped)
+      // The registry refuses the move itself
+      direct = Try(copies.setActivity(shipped, Activity.Opening(99)))
+      // An open path asks first: refused, at debug, before any backend opens
       _ = host.control.loader.tryLoadStore(local, storePath)
-      _ <- pumpUntil(host, host.control.router.loaded.contains(shipped))
-      served = record(host, source, shipped).map(_.activity)
+      _ = host.testingOnlyHandleEvents()
+      refusedOpen = record(host, source, shipped).map(_.activity)
+      openingAfter = host.control.loader.isOpening(shipped)
+      loadedAfter = host.control.router.loaded.contains(shipped)
       _ = crl.hold = None
       _ = held.success(())
-      refused <- request
+      started <- request
+      _ <- awaitLoudly("the transfer out of the extracted store to begin")(sends.isTransferringOut(shipped))
       _ = host.testingOnlyHandleEvents()
       errors = host.control.copyRegistry.takeShadowErrors()
-      _ <- close(host, shipped)
     yield
-      closedBeforeDeletion should be(Some(Activity.Idle))
-      served should be(Some(Activity.Served))
+      work.get should be(a[Work.TransferOut])
+      direct.failed.get should be(an[IllegalStateException])
+      refusedOpen should be(Some(Activity.Idle))
+      openingAfter should be(false)
+      loadedAfter should be(false)
+      started should be(Success(()))
+      sends.isTransferringOut(shipped) should be(true)
+      record(host, source, shipped).map(_.phase).get should be(a[Phase.Outbound])
       errors should be(Vector())
-      refused should be(Success(()))
-      sends.transfersOut should be(empty)
-      host.control.copyRegistry.opensDuringTransferOut.size should be(1)
 
   // ---- The states of D1, D4, D5 and D6 of the old marks (spec, Stage 1 audit findings, Step 3 addenda), derived ----
 

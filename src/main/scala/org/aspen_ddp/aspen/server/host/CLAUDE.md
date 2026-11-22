@@ -23,20 +23,26 @@
   with its `CopyPhase` (`Unread` where it cannot be read); `detach` at unload. Every disk mutation site of a store
   path (create, rebuild finish's handler, transfer-in promotion, the four markers' writes and removals, retire into
   pending-delete, discards) updates it right after its durable step, through `HostCopies.shadow`, which logs and
-  records a throw instead of failing production. Activity: `startOpen` sets Opening (a create's record, registered at
-  its open's outcome, too), an open's unserved end Idle, each `storesAwaitingRetry` write AwaitingRetry and a dropped
-  retry Idle; `StoreRouter.install` Served (Served -> Served for a reload) and `remove` Closing, its purpose from
-  `closingFor` (DeviceShutdown: Shutdown / Relinquish; `handleClose` with `extractCrl`: TransferOut; else FailStop),
-  until `handleClose`/`closeUnloaded` end it (Idle, or AwaitingRetry when the loader holds a retry; a transfer-out
-  close ends once the store is closed, before the extraction's deletion); `StoreCopies.retire` Retiring. Work is
+  records a throw instead of failing production. Activity is the one home of the loader's opens and load retries:
+  `startOpen` sets Opening (a create's record is registered Live there, before its create places the copy, and
+  unregistered if the create fails leaving nothing; the disk check skips a record under Create work that has no
+  directory yet), an open's unserved end Idle, each load retry AwaitingRetry (`HostCopies.awaitingRetry`, holding the
+  `LoadRetry`) and a dropped retry Idle; `StoreRouter.install` Served (Served -> Served for a reload; a LoadStore no
+  open queued first drops the copy's retry) and `remove` Closing, its purpose from `closingFor` (DeviceShutdown:
+  Shutdown / Relinquish; `handleClose` with `extractCrl`: TransferOut; else FailStop), until
+  `handleClose`/`closeUnloaded` end it (Idle, or AwaitingRetry when a retry was recorded while it closed:
+  `retriesAfterClose`; a transfer-out close ends once the store is closed, before the extraction's deletion);
+  `StoreCopies.retire` Retiring. Work is
   synced from each owner's sets at every write: Create (`creatingStores`), Rebuild (`StoreRebuilds.heldWork` Queued,
   from the first reconcile that sees the Rebuilding entry until its outcome or the entry's leaving ends it;
   `droppingCrlState` DiscardingLost; `rebuildDevices` Running / Abandoned), TransferIn (`transferringIn` Receiving,
   `recordingTransfersIn` Recording, `abandoningTransferIns` Abandoning, `retireEarlierTenancy`
   RetiringEarlierTenancy), TransferOut (`closingForTransfer`, `abortingLostTransfers`); a second Work for a (device,
   store) is a shadow error (I3), so `startRebuild` does not even queue a store a transfer out is closing.
-  `declaredMissing` is mirrored as `missing`. An open during TransferOut work is not refused yet (R1, Task 7): its
-  Opening is skipped and listed (`opensDuringTransferOut`). An install on a loaded device with no record learns the
+  `declaredMissing` is mirrored as `missing`. An open of a copy with TransferOut work on its device is refused (R12):
+  `DeviceCopies.setActivity` throws on the move to Opening, and `StoreLoader.startOpen` asks first
+  (`HostCopies.transferOutWork`), logs at debug and opens nothing, the copy left Idle (or AwaitingRetry, which the
+  device scans offer again once the work ends). An install on a loaded device with no record learns the
   copy (`learned`), as `readAtLoad` does, and so do a LoadStore and a load retry that find none (copies put at a path
   after the device's load). Stores loaded onto a device this host has not loaded, through
   `Host.Seams.unloadedDeviceCrl` (TestNetwork), get an untracked record (Live) at install, Served there and Closing
@@ -102,10 +108,12 @@
   shutdown-marker lookup (or adoption) is deciding whether to load it
 - Backend opens are backend-neutral: `BackendOpener.open` (`server.store.backend`) returns a Future and decides where
   the open runs (RocksDB inline, FSIF on `FsifOpenEc`); `StoreLoader.startOpen` handles an already-completed one
-  inline and otherwise posts `BackendOpened`. A store stays opening (`StoreLoader.isOpening`) from `startOpen` until
-  its open fails or the LoadStore `serveOpened` queued is handled (`handleLoad` installs it or gives up in that one
-  task), so a second load offer in between (a duplicate `LoadStoreById`) starts no second open, and a ShutdownStore
-  then waits for the install and closes the served store. A rebuild's staging store opens through the same opener (passed by
+  inline and otherwise posts `BackendOpened`. A store stays opening (`StoreLoader.isOpening`: its copy's Opening
+  activity on any device of the host) from `startOpen` until its open fails or the LoadStore `serveOpened` queued is
+  handled (`handleLoad` installs it or gives up in that one task), so a second load offer in between (a duplicate
+  `LoadStoreById`) starts no second open, and a ShutdownStore then waits for the install (`deferredCloses`) and
+  closes the served store. A `serveOpened` that throws (its LoadStore not queued) ends the open as a failed one: the
+  backend is closed unserved, the copy AwaitingRetry, and the deferred closes put again. A rebuild's staging store opens through the same opener (passed by
   `StoreRebuildFactory.createRebuild`). The host and the rebuild see only `Backend.hasFailed`/`isWriteFrozen`,
   `BackendStateLost` and `Backend.isOutOfSpace`; only `DefaultBackendOpener` names concrete backends
 - Store creation is atomic (`BackendOpener.create`, `server.store.backend.StoreCreation`,
@@ -115,20 +123,21 @@
   fails or the create is skipped, not at the flip out of Initializing, which touches no copy: once the flip commits,
   a rebuild or transfer out of the served store may start, and must not overlap the create (I3). The pending flip
   is tracked apart (`pendingCreateFlips`), so a check meanwhile does not create the store again.
-  A failed create, out of space included, leaves nothing at the path and is not put in `storesAwaitingRetry`: its
+  A failed create, out of space included, leaves nothing at the path and awaits no retry: its record goes, its
   entry stays Initializing and the next device check creates it again. Any other failed open but a lost state (out of
-  space, an I/O, lock or resource error) leaves the store offline, unmarked, and in `storesAwaitingRetry`: each
-  device scan retries it with backoff (`StoreLoader.retryFailedLoads`, 1, 2, 4 ... scans, capped at
-  `Host.LoadRetryCap` 5 min), so an Active store is never left unserved and untracked until a restart. A load that
-  throws before its open (an unreadable `config.yaml`, `StoreLoader.awaitUnreadRetry`), one whose executor slot
-  an earlier close still holds (`HostThreading.AlreadyAssigned`) and one whose Store fails to build in `handleLoad`
-  (`awaitBuildRetry`, backoff per build failure in a row, kept in `buildRetryWaits` until an install) are left
-  offline and retried the same way. `tryLoadStore` reads no tree, so a retry is held to the entries the device's
-  latest reconcile read (`LocalStorageDeviceState.reconciledEntries`, set by `reconcileDeviceState`) and to the
-  host's own work: it waits while that entry is neither Active nor Offline, the store is `declaredMissing`,
-  `StoreTransfersOut.isClosingForTransfer` (from `startOut`'s close until its marker task has run) or
-  `StoreRebuilds.isRebuilding`, and is dropped once the entry has left the device (before a first reconcile only the
-  host-work checks apply). A retry
+  space, an I/O, lock or resource error) leaves the store offline, unmarked, and its copy AwaitingRetry (the retry
+  lives only there): each device scan retries it with backoff (`StoreLoader.retryFailedLoads`, over
+  `HostCopies.retries`, 1, 2, 4 ... scans, capped at `Host.LoadRetryCap` 5 min), so an Active store is never left
+  unserved and untracked until a restart. The next wait doubles the retry the copy awaited before (an open takes it,
+  and carries it to its outcome and, through `awaitingInstall`, to its LoadStore). A load that throws before its open
+  (an unreadable `config.yaml`, `StoreLoader.awaitUnreadRetry`), one whose executor slot an earlier close still holds
+  (`HostThreading.AlreadyAssigned`) and one whose Store fails to build in `handleLoad` (`awaitBuildRetry`, backoff
+  per failure in a row) are left offline and retried the same way. `tryLoadStore` reads no tree, so a retry is held
+  to the entries the device's latest reconcile read (`LocalStorageDeviceState.reconciledEntries`, set by
+  `reconcileDeviceState`) and to the host's own work: it waits while that entry is neither Active nor Offline, the
+  store is `declaredMissing` or `StoreRebuilds.isRebuilding`, its open is refused while the store has TransferOut
+  work on the device (from `startOut`'s close until its marker task has run), and it is dropped once the entry has
+  left the device (before a first reconcile only the host-work checks apply). A retry
   keeps the waiting load's `onServed` (e.g. its `StoreMoved` gossip) for the open that serves it. A load's `onServed`
   runs only once its LoadStore has installed and recovered the store (`StoreLoader.awaitServed`), never at backend
   open; a LoadStore that leaves the store awaiting a retry (no CRL room, no executor slot, a failed save-file removal,
@@ -154,7 +163,7 @@
   the Store and never writes it: `StoreCreation` writes it into every new store directory (bootstrap included) and a
   rebuild's `finish` replaces it (`server/store/CLAUDE.md`). A file known absent has the store retired unserved
   (`retireUnserved`: marked `rebuild-required`, rebuilt as a new incarnation); one that cannot be stat'd, read or
-  parsed is left alone and the load retried through `storesAwaitingRetry` (`awaitUnreadRetry`), so a format change
+  parsed is left alone and the load retried (`awaitUnreadRetry`, the copy AwaitingRetry), so a format change
   in a release is an outage, never a fresh identity over a store's data and CRL state
 - Every existence test under `server/` uses `server.FileStat`, never `os.exists`/`os.isDir`/`os.isFile`
   (`Files.exists`, false on any stat error; `FileStatUsageSuite` fails on one): absent only on ENOENT (or a parent
@@ -244,7 +253,7 @@
   directory even if it is gone, before recovering
 - A `crl_save.log` state is charged before `loadStore` saves it (`CrlAdmission.tryChargeLoaded`, at most the limit
   plus one transaction), after the Store is built and before install, retained for the store. Refused, the store
-  is left offline, its file kept, and retried every device scan through `storesAwaitingRetry` (one warning per
+  is left offline, its file kept, and retried every device scan (its copy AwaitingRetry; one warning per
   minute), and the CRL is asked to grow (`requestGrowth`). A state that can never fit (above the most limit any
   config allows, `maxAdmissionLimitBytes`, plus T, or a transaction above T) takes `crlSaveFileLost`: rebuilt; one
   that fits only after growth, even past this open's `crl-max-streams`, waits offline as above. Neither bound follows
@@ -331,7 +340,7 @@
     the discard would move the directory the send may still read. Each schedules a device re-check instead, as the
     Abandoned Transfers Out pass does; `startRebuild` asks only when no rebuild of the store is registered, since a
     registered one's end re-checks the device anyway. `startRebuild` also waits while a transfer out is still closing
-    the store (`StoreTransfersOut.deferRebuildUntilClosed`, i.e. `isClosingForTransfer`): the close's end, whatever its outcome,
+    the store (`StoreTransfersOut.deferRebuildUntilClosed`, i.e. `closingForTransfer`): the close's end, whatever its outcome,
     checks the device again, which starts the rebuild.
   - `StoreTransfers.startIn`, for a `rebuild-complete` or `rebuild-required` copy an earlier tenancy left at the
     path of a store transferring onto the device (re-placed away while the host was down, then transferred back;
@@ -370,11 +379,13 @@
   store is extracted on the transfer's source device only (`startOut` passes `sourceDs`), never on another copy of it
   another device of the host holds. Its directory and save file are tested with `FileStat`: a failed stat fails the
   extraction rather than read as an absence (which would write the CRL's entries over a valid file). The store must
-  stay closed from the extraction to the `transferring-out` marker: a load retry waits throughout
-  (`isClosingForTransfer`), an open started meanwhile by any other path (`opensStarted`, checked as each CRL call
-  answers) fails the extraction, and a load of the save file queues its saves behind the extraction's final deletions
-  (its empty `dropStore` is a CRL barrier, `server/crl/CLAUDE.md`), so they create records rather than being skipped, and `startOut` re-checks loaded / opening / `opensStarted` in the
-  control task that writes the marker. The extraction releases only the charge retained when it began
+  stay closed from the extraction to the `transferring-out` marker. Its TransferOut work on the source device, from
+  `startOut`'s close until the control task that writes the marker, refuses every open of the copy (R12,
+  `StoreLoader.startOpen`; a load retry included), so the extraction and the marker task need no re-check. An open of
+  the store's copy on another device of the host is not refused: it reads that device's CRL, never this extraction's
+  (the host-wide open count that failed the extraction for it was dropped on purpose). A load of a save file still
+  queues its saves behind a device CRL's earlier deletions (its empty `dropStore` is a CRL barrier,
+  `server/crl/CLAUDE.md`), so they create records rather than being skipped. The extraction releases only the charge retained when it began
   (`releaseRetained(storeId, charge)`). `startOut` is single flight per store (I3): a request (a retransmit, a
   readdress) that arrives while `closingForTransfer` holds the store, its close or `extractUnloaded` still running,
   does nothing (logged at debug); the receiver's retransmit tries again if the first fails (`WorkOverlapSuite`).

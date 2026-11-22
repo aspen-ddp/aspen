@@ -661,8 +661,6 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
     val storeDir = deviceDir / movingStore.directoryName
     os.makeDir.all(storeDir)
-    val local = loadedDevices(host)(sourceId)
-    local.loadedStores = local.loadedStores + movingStore
     def ask() = host.control.transfersOut.startOut(StartStoreTransfer(host.hostId, client.clientId,
       sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
 
@@ -677,8 +675,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       // The close fails as ShutdownStore's does for a backend that failed-stop: marked, offline, unloaded
       _ = recorded(host).failNextTransferOutClose.set(Some(() =>
-            os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
-            local.loadedStores = local.loadedStores - movingStore))
+            os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")))
       _ <- ask()
       _ <- pumpUntil(recorded(host).lostTransferAborts.nonEmpty)
       // A retransmit meanwhile is refused before anything is closed, written or sent
@@ -706,8 +703,6 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, transferService = sends)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
     os.makeDir.all(deviceDir / movingStore.directoryName)
-    val local = loadedDevices(host)(sourceId)
-    local.loadedStores = local.loadedStores + movingStore
 
     for
       _ <- net.createSecondDevice()

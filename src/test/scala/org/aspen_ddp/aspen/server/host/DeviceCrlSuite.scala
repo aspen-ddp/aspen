@@ -1793,7 +1793,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       saved.map(_.transactions.map(_.txd.transactionId)) should be(Right(List(fileTx)))
       heldAfter should be(Set(txid))
 
-  atest("a transfer out does not mark or ship a closed store opened between its extraction and its marker (CRL-W17)"):
+  atest("a transfer out refuses an open of its closed store between its extraction and its marker, and marks it (CRL-W17)"):
     given ExecutionContext = executionContext
     import StorageDeviceState.{StoreEntry, StoreStatus}
     val factory = newFactory()
@@ -1801,8 +1801,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeSmallCrlDevice(hostRoot, "dev0", deviceA)
     createCrl(deviceDir)
     var hostRef: Option[Host] = None
-    // Once the extraction is done, and before startOut's marker task runs, the store is opened: as retryFailedLoads
-    // opens a store awaiting a load retry
+    // Once the extraction is done, and before startOut's marker task runs, the store is offered an open, as
+    // retryFailedLoads offers one awaiting a load retry: its TransferOut work refuses it (R12)
     val seams = Host.Seams(closeForTransferOut = Some((sid, sds) =>
       val host = hostRef.get
       host.control.transfersOut.closeForTransferOut(sid, sds).map: _ =>
@@ -1828,15 +1828,16 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- host.control.transfersOut.startOut(StartStoreTransfer(host.hostId, client.clientId, deviceA, sid,
              HLCTimestamp.now, UUID.randomUUID()))
-      _ <- pumpUntil(host, host.control.router.loaded.contains(sid))
-      _ <- pumpUntil(host, false, rounds = 20)
+      _ <- pumpUntil(host, os.exists(storeDir / StoreTransfer.TransferOutMarkerFile))
       marked = os.exists(storeDir / StoreTransfer.TransferOutMarkerFile)
       served = host.control.router.loaded.get(sid)
+      opening = host.control.loader.isOpening(sid)
       _ <- served.map(_.backend.close()).getOrElse(Future.unit)
       _ = factory.shutdownAll()
     yield
-      served should be(defined)
-      marked should be(false)
+      served should be(None)
+      opening should be(false)
+      marked should be(true)
 
   /** A closed store's transfer-out extraction with a second copy of it on another device of the host (an earlier
    *  tenancy's, kept offline by its rebuild-required marker). The source, deviceA, is the directory `sourceName`, the
@@ -2244,7 +2245,12 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       afterReload should be(counted)
       afterExtraction should be(0L)
 
-  atest("an extraction during which its closed store loads again leaves the store's transactions in the device CRL"):
+  /** The store's TransferOut work on deviceA, as startOut holds it from its close until its marker task (R12) */
+  private def transferOutWork(host: Host, storeId: StoreId, held: Boolean): Unit =
+    host.control.copyRegistry.work("test", deviceA, storeId, _.isInstanceOf[Work.TransferOut],
+      if held then Some(Work.TransferOut(None)) else None)
+
+  atest("a load offered during an extraction's read is refused, and the extraction takes the store's transactions"):
     given ExecutionContext = executionContext
     val factory = newFactory()
     for
@@ -2258,26 +2264,29 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- closed
       gate = Promise[Unit]()
       _ = crl.readGate = Some(gate.future)
+      _ = transferOutWork(host, storeId, held = true)
       extracting = host.control.transfersOut.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       _ <- pumpUntil(host, crl.readCalled.isCompleted)
-      // The store loads again while the extraction's read is outstanding, recovering its transaction
+      // A load offered while the extraction's read is outstanding: refused, it opens nothing
       _ = host.loadStoreById(deviceA, storeId)
-      _ <- pumpUntil(host, recovered(host, storeId, txid))
+      _ = host.testingOnlyHandleEvents()
+      opening = host.control.loader.isOpening(storeId)
       _ = gate.success(())
       _ <- pumpUntil(host, extracting.isCompleted)
       outcome = extracting.value
+      _ = transferOutWork(host, storeId, held = false)
       heldAfter = held(crl, storeId)
-      served = recovered(host, storeId, txid)
-      _ <- host.control.router.loaded.get(storeId).map(_.backend.close()).getOrElse(Future.unit)
+      served = host.control.router.loaded.contains(storeId)
+      saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
       _ = factory.shutdownAll()
     yield
-      outcome.exists(_.isFailure) should be(true)
-      served should be(true)
-      heldAfter should be(Set(txid))
-      os.exists(Backend.crlSaveFile(storeDir)) should be(false)
-      heldOnDisk(deviceDir, storeId) should be(Set(txid))
+      opening should be(false)
+      outcome should be(Some(scala.util.Success(())))
+      served should be(false)
+      heldAfter should be(Set())
+      saved.map(_.transactions.map(_.txd.transactionId)) should be(Right(List(txid)))
 
-  atest("an extraction from a save file during which its closed store loads again fails, and the store serves the file"):
+  atest("a load offered during an extraction from a save file is refused, and the file ships unchanged"):
     given ExecutionContext = executionContext
     val factory = newFactory()
     val fileTx = TransactionId(new UUID(9, 43))
@@ -2293,21 +2302,29 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = CrashRecoveryLog.saveStoreState(storeId, fileState, Backend.crlSaveFile(storeDir))
       gate = Promise[Unit]()
       _ = crl.dropGate = Some(gate.future)
+      _ = transferOutWork(host, storeId, held = true)
       extracting = host.control.transfersOut.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       _ <- pumpUntil(host, crl.dropCalls.get == 1)
-      // The store loads again from its save file while the extraction's drop is outstanding
+      // A load offered while the extraction's drop is outstanding: refused, it opens nothing and drops nothing
       _ = host.loadStoreById(deviceA, storeId)
-      _ <- pumpUntil(host, crl.dropCalls.get == 2)
+      _ = host.testingOnlyHandleEvents()
+      opening = host.control.loader.isOpening(storeId)
       _ = crl.dropGate = None
       _ = gate.success(())
-      _ <- pumpUntil(host, extracting.isCompleted && recovered(host, storeId, fileTx))
+      _ <- pumpUntil(host, extracting.isCompleted)
       outcome = extracting.value
+      _ = transferOutWork(host, storeId, held = false)
       heldAfter = held(crl, storeId)
-      _ <- host.control.router.loaded(storeId).backend.close()
+      served = host.control.router.loaded.contains(storeId)
+      saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
       _ = factory.shutdownAll()
     yield
-      outcome.exists(_.isFailure) should be(true)
-      heldAfter should be(Set(fileTx))
+      opening should be(false)
+      outcome should be(Some(scala.util.Success(())))
+      served should be(false)
+      crl.dropCalls.get should be(1)
+      heldAfter should be(Set())
+      saved.map(_.transactions.map(_.txd.transactionId)) should be(Right(List(fileTx)))
 
   atest("a transfer out of an open store whose save file fails keeps its transactions in the device CRL"):
     given ExecutionContext = executionContext

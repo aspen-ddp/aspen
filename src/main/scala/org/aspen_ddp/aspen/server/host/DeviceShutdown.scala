@@ -327,21 +327,18 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
       .flatMap(_ => closeStoresToRelinquish(local, onClosed))
 
   /** The stores closeStoresForShutdown picks: those whose copy on the device is Served or Opening (not Closing: a
-   *  close is under way). The close of one opening waits for its install, then closes the served store
-   *  (StoreLoader.handleClose); so does a create's, whose copy has no record until its open's outcome. A crash
-   *  mid-shutdown reloads the device, ShuttingDown, with its stores served, and they are closed again. */
+   *  close is under way), a create's open included (its record is registered at its open). The close of one opening
+   *  waits for its install, then closes the served store (StoreLoader.handleClose). A crash mid-shutdown reloads the
+   *  device, ShuttingDown, with its stores served, and they are closed again. */
   private def storesToClose(local: LocalStorageDeviceState): List[StoreId] =
-    val creating = ctx.copyRegistry.copiesOf(local).toList.flatMap(_.work.collect {
-      case (storeId, Work.Create) if ctx.loader.isOpening(storeId) => storeId
-    })
-    (ctx.copyRegistry.openCopies(local) ++ creating).toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+    ctx.copyRegistry.openCopies(local).toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
 
   /** Run by the reconcile of an Operational device that is not shutting down: loads each store a
    *  cancelled shutdown of it closed, once its entry is Active with no transfer named. A store whose
    *  directory has since gained a marker (rebuild-required, a transfer's) is left to the pass that
    *  owns that marker. One that is no longer offline here was loaded by something else. Each is
    *  offered to tryLoadStore once; a load that fails with its data intact leaves it offline and retried at the
-   *  device scans (StoreLoader.storesAwaitingRetry). */
+   *  device scans (its copy AwaitingRetry, StoreLoader.retryFailedLoads). */
   def reloadClosedStores(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     val deviceId = local.storageDeviceId
     closedForShutdown.get(deviceId).foreach: closed =>
@@ -376,7 +373,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *
    *  The emptiness check and the unload run in one control-thread task, as does the
    *  LoadStoreById handler. A load that has not happened by then finds the device gone
-   *  and does nothing; one that has is in loadedStores and is closed by another round.
+   *  and does nothing; one that has is Opening or Served there and is closed by another round.
    */
   private def closeThenUnload(local: LocalStorageDeviceState): Future[Unit] =
     if storesToClose(local).isEmpty then

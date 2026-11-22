@@ -152,14 +152,14 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   /** Creates and loads an Initializing store, then flips its entry out of Initializing.
    *
    *  The flip writes serviceStatus: Active normally, Offline when the device has been asked to
-   *  shut down since the create began. The store is loaded either way, and recorded in
-   *  loadedStores, so the shutdown closes and marks it like the device's other open stores.
+   *  shut down since the create began. The store is loaded either way, its copy Opening then Served, so the
+   *  shutdown closes and marks it like the device's other open stores.
    *
    *  A create that has not started its local work by the time this device's shutdown begins (or
    *  its unload) does none: nothing is created or loaded, and the entry stays Initializing for a
    *  later check once the device is back in service. Writing Offline over a store that does not
-   *  exist would have a restart bring an empty slot into service. The decision and the
-   *  loadedStores record are made in one control-thread task, so a shutdown either sees the store or the
+   *  exist would have a restart bring an empty slot into service. The decision and the copy's
+   *  Opening record (startOpen) are made in one control-thread task, so a shutdown either sees the store or the
    *  create sees the shutdown.
    *
    *  Only a collision is retried. Any other failure -- the pool cannot be read, the directory
@@ -197,7 +197,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
               // Created wherever its backend opens, atomically (BackendOpener.create, StoreCreation): the
               // directory, config included, appears at storePath only complete, so the FileStat check above
-              // means the store exists. startOpen records the store in loadedStores now, so a shutdown of this
+              // means the store exists. startOpen registers its copy Opening now, so a shutdown of this
               // device waits for the create and then closes the store. A create that fails, out of space
               // included, leaves nothing at storePath, and the next device check tries again.
               val created = Promise[Unit]()
@@ -750,8 +750,6 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  The close is not awaited. */
   def retireUnserved(storageDeviceId: StorageDeviceId, backend: Backend): Unit =
     val storeId = backend.storeId
-    ctx.devices.devices.get(storageDeviceId).foreach: sds =>
-      sds.loadedStores -= storeId
     backend.close()
     try
       markRebuildRequired(backend.path)
@@ -764,8 +762,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
   /** A store closed by ShutdownStore whose backend failed-stop meanwhile: its page-cache state can't be trusted, so
    *  it is rebuilt rather than treated as cleanly closed. Marked rebuild-required, which every reader of the directory
-   *  checks before its CRL save file, so nothing takes it for a clean close; it is dropped from loadedStores so a
-   *  shutdown retry does not pick it again. A save file the close wrote (a transfer out's, whose entries have left the
+   *  checks before its CRL save file, so nothing takes it for a clean close; its copy is closed (Idle), so a shutdown
+   *  retry does not pick it again. A save file the close wrote (a transfer out's, whose entries have left the
    *  device CRL) is the only copy of the store's transaction state: it stays, and the rebuild's retire keeps it in the
    *  copy as its lost CRL state (StoreCopies.retire). */
   def failedOnClose(store: Store): Unit =
@@ -773,8 +771,6 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     val path = store.backend.path
     logger.error(s"Store $storeId failed on an I/O error while closing. Marking it for rebuild instead of " +
                  s"closing it cleanly. $path")
-    ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
-      sds.loadedStores -= storeId
     try
       markRebuildRequired(path)
     catch
@@ -796,8 +792,6 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         logger.error(s"Store $storeId $what and can no longer be trusted. Taking it offline and " +
                      s"rebuilding it. Error: $err")
         ctx.router.remove(storeId)
-        ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
-          sds.loadedStores -= storeId
         try
           markRebuildRequired(store.backend.path)
         catch

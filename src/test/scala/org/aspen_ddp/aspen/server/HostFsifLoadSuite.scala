@@ -44,6 +44,8 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
   /** While set, every write, force and truncate of an FSIF store opened from now on fails with ENOSPC */
   @volatile var deviceFull: Boolean = false
   @volatile var lastBackend: Option[FsifBackend] = None
+  /** LoadStores to fail by throwing from the loadStore seam, before anything is queued, as serveOpened then meets */
+  @volatile var throwingLoadStores: Int = 0
   /** Where FSIF opens run. Synchronous by default, so the open completes, and its outcome is handled, within the
    *  load that starts it; a test may set the production pool, or one that holds the open, instead. */
   @volatile var openEc: ExecutionContext = ExecutionContext.parasitic
@@ -154,13 +156,22 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
   private def newSeamHost(hostRoot: os.Path, configure: FsifSeams => Unit = _ => ()): Host =
     val seams = new FsifSeams(executionContext)
     configure(seams)
+    @volatile var built: Host = null
+    def loadStore(id: StorageDeviceId, backend: Backend, maxSliceSize: Option[Long],
+                  ida: Option[org.aspen_ddp.aspen.common.ida.IDA],
+                  tier: org.aspen_ddp.aspen.server.crl.AdmissionTier): Future[Unit] =
+      if seams.throwingLoadStores > 0 then
+        seams.throwingLoadStores -= 1
+        throw new IllegalStateException("Simulated LoadStore queueing failure")
+      built.loadStore(id, backend, maxSliceSize, ida, tier)
     val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net,
       BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL, net.FinalizerFactory,
       TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
       StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2,
       seams = compared(Host.Seams(backends = Some(seams), wrapMetadata = Some(seams.withDeviceStates),
-                         gossipStoreOnline = Some(seams.gossipStoreOnline))))
+                         gossipStoreOnline = Some(seams.gossipStoreOnline), loadStore = Some(loadStore))))
+    built = host
     host
     fsifSeams.put(host, seams)
     host
@@ -488,6 +499,43 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         host.control.router.silentStores should contain(storeId)
         os.exists(Backend.crlSaveFile(storeDir)) should be(false)
         os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+
+  // Task 1c's parked item: a serveOpened that throws (its LoadStore not queued) ended nothing, so the store stayed
+  // opening for good and the closes deferred behind its open were never put again. The open now ends: the copy
+  // awaits a load retry, the deferred close completes, and the retry serves the store
+  atest("an opened FSIF store whose LoadStore cannot be queued awaits a retry, and the close deferred behind it completes"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+      val queued = holdOpens(host)
+      load(host)
+      queued.size should be(1)
+      val closed = host.closeStore(storeId)
+      host.testingOnlyHandleEvents()
+      closed.isCompleted should be(false) // deferred until the open ends
+      fsif(host).throwingLoadStores = 1
+      queued.poll().run()
+      host.testingOnlyHandleEvents() // BackendOpened, whose serveOpened throws, then the deferred ShutdownStore
+      val activity = host.control.copyRegistry.device(deviceA).flatMap(_.copies.get(storeId)).map(_.activity)
+      val opening = host.control.copyRegistry.isOpening(storeId)
+      val waitScans = host.control.loader.awaitingRetryWaitScans(storeId)
+      closed.flatMap: _ =>
+        activity.get should be(a[org.aspen_ddp.aspen.server.host.Activity.AwaitingRetry])
+        opening should be(false)
+        waitScans should be(Some(1))
+        host.getStoreIds should not contain storeId
+        host.control.router.silentStores should contain(storeId)
+        // The retry opens the store again (its first backend was closed) and serves it
+        fsif(host).openEc = ExecutionContext.parasitic
+        host.control.loader.retryFailedLoads()
+        host.testingOnlyHandleEvents()
+        awaitLoudly("the retried load to serve the store")(
+          { host.testingOnlyHandleEvents(); host.getStoreIds.contains(storeId) }).map: _ =>
+            host.control.loader.awaitingRetryWaitScans(storeId) should be(None)
+            host.control.router.silentStores should not contain storeId
 
   /** Holds every FSIF open of `host` until the test runs it */
   private def holdOpens(host: Host): java.util.concurrent.ConcurrentLinkedQueue[Runnable] =

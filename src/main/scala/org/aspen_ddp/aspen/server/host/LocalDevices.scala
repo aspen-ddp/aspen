@@ -21,7 +21,6 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
   var onCopyChange: StoreId => Unit = _ => ()
   /** Called after every write of `reconciledEntries`, with the stores it held before and holds now (HostCopies) */
   var onReconciled: (Set[StoreId], Set[StoreId]) => Unit = (_, _) => ()
-  var loadedStores: Set[StoreId] = Set()
   /** Stores the reconcile's Missing Stores pass declared lost on this device, while their entry stays Active here.
    *  Its rebuild is requested again at each reconcile even once the directory is back, since nothing else would serve
    *  or rebuild such a store (rebuild-process). Held in memory only: a restart's load serves a store that is back. */

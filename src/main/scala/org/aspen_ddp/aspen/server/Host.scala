@@ -550,13 +550,11 @@ class Host(val client: AspenClient,
         val registry = deviceControl.copyRegistry
         val problems = registry.takeShadowErrors().toList ++ registry.takeSilenceErrors() ++
           registry.verifyAgainstDisk()
-        // A copy a load learned of, and an open during a transfer out (refused from stage 1 Task 7), are reported,
-        // not failed on: a test may place a copy after its device's load
+        // A copy a load learned of is reported, not failed on: a test may place a copy after its device's load
         if problems.nonEmpty then
           val learned = registry.learned.map(l => s"(learned) $l")
-          val opens = registry.opensDuringTransferOut.map(o => s"(open during transfer out) $o")
           throw new IllegalStateException(s"Copy registry of host $hostId after a drain:\n  " +
-                                          (problems ++ learned ++ opens).mkString("\n  "))
+                                          (problems ++ learned).mkString("\n  "))
       else if seams.strictCopyRegistry then
         val registry = deviceControl.copyRegistry
         val problems = registry.takeShadowErrors().toList ++ registry.takeSilenceErrors()

@@ -97,7 +97,7 @@
   backend failed right after its create never overlaps the create (`StoreRebuilds.createNewStore`).
   A rebuild is neither requested (Lost CRL pass) nor started (`startRebuild`) while a send of the store is still
   registered (`isTransferringOut`, host-wide by store): its discard would move the directory being shipped. A device re-check follows.
-  Nor is one started while a transfer out is still closing the store (`isClosingForTransfer`); the close's end
+  Nor is one started while a transfer out is still closing the store (`StoreTransfersOut.deferRebuildUntilClosed`); the close's end
   re-checks the device.
   Conversely, `StoreTransfersOut.startOut` refuses while a rebuild of the store is registered, its flip's retry
   included; the receiver's retransmit starts the transfer once it ends

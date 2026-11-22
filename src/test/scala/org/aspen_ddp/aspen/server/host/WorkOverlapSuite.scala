@@ -532,7 +532,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val sends = new StagedSendService
     val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
     // After the host's device load, which marks a store directory it finds beside no CRL state rebuild-required
-    val storePath = writeStoreConfig(deviceDir, shipped)
+    writeStoreConfig(deviceDir, shipped)
     placedCopies(host, loadedDevices(host)(source), shipped)
     val rebuilding = Map(shipped -> rebuildingIn(UUID.randomUUID()))
 
@@ -546,8 +546,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(hasTransferOutWork(host, shipped))
       closingAtCheck = hasTransferOutWork(host, shipped)
       // Its backend failed while it closed (StoreRebuilds.failedOnClose), and the store is requested for rebuild
-      _ = CopyFixtures.markCopy(deviceDir, shipped, Phase.Lost)
-      _ = host.control.copyRegistry.markedLost("failedOnClose", storePath)
+      _ = host.control.rebuilds.moveToLost("failedOnClose", loadedDevices(host)(source), shipped)
       _ <- check(host, source, rebuilding)
       startedWhileClosing = factory.created.nonEmpty || host.control.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(shipped)
       // Not even queued (silenced): the close's TransferOut work holds the (device, store) (I3)

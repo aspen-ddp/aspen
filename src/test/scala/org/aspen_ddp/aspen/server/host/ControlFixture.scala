@@ -9,6 +9,7 @@ import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.server.{DeviceMarkers, GossipRetransmitter, Host, StorageDeviceConfig, StorageDeviceManager,
   StoreConfig}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{AdoptOutcome, RebuildOutcome, ShutdownOutcome, TransferOutcome}
+import org.aspen_ddp.aspen.server.crl.CrashRecoveryLogFactory
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
@@ -154,7 +155,7 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
     p
 
   /** Stores whose shutdown close fails as a ShutdownStore does when the backend failed-stop during it, leaving the
-   *  store's directory (on the host's loaded devices) marked rebuild-required as StoreRebuilds.failedOnClose does. */
+   *  store's copy (on the host's loaded devices) in lost/ as StoreRebuilds.failedOnClose does. */
   val failingShutdownCloses = new AtomicReference[Set[StoreId]](Set())
 
   /** Every store the transfer-out close was called for, in call order. */
@@ -236,10 +237,10 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
                              devicePath: os.Path,
                              uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
                              crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],
-                             markRebuildRequired: os.Path => Unit): Future[AdoptOutcome] =
+                             moveToLost: StoreId => Unit): Future[AdoptOutcome] =
       synchronized:
         adoptCalls += ((storageDeviceId, previousHostId))
-      base.adoptDevice(storageDeviceId, previousHostId, devicePath, uncleanStores, crlLostStores, markRebuildRequired)
+      base.adoptDevice(storageDeviceId, previousHostId, devicePath, uncleanStores, crlLostStores, moveToLost)
 
     override def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
       val armed = synchronized:
@@ -311,9 +312,11 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
       shutdownCloses += storeId
     val closed =
       if failingShutdownCloses.get.contains(storeId) then
-        attached.control.devices.devices.valuesIterator.map(_.devicePath)
-          .filter(CopyFixtures.copyPath(_, storeId).isDefined)
-          .foreach(CopyFixtures.markCopy(_, storeId, Phase.Lost))
+        // As StoreRebuilds.failedOnClose leaves it once the close has ended: in lost/
+        endMarkedServed(storeId)
+        attached.control.devices.devices.valuesIterator
+          .filter(sds => attached.control.copyRegistry.copiesOf(sds).exists(_.copies.contains(storeId)))
+          .foreach(attached.control.rebuilds.moveToLost("failing shutdown close", _, storeId))
         Future.failed(Host.StoreFailedOnClose(storeId))
       else
         shutdownCloseGate.get match
@@ -509,7 +512,8 @@ trait ControlFixture:
    *  Of the events the constructor posts, the initial CheckAllDevices is dropped unless `keepCheckAllDevices` (it
    *  would race a test's own device checks) and InitializeTaskExecutor unless `keepInitializeTaskExecutor` (draining
    *  it starts a real task-executor bootstrap). Everything else the constructor's device scan queued (store loads,
-   *  marker resolutions, adoption continuations) stays queued for the test to drain. */
+   *  marker resolutions, adoption continuations) stays queued for the test to drain. `crlFactory` opens its devices'
+   *  CRLs; `adjustSeams` changes its seams (e.g. `tryLoadStore = None`, for a host that loads its stores for real). */
   protected def newHost(hostRoot: os.Path,
                         failFirstStoreLoad: Boolean = false,
                         ec: ExecutionContext = executionContext,
@@ -519,15 +523,17 @@ trait ControlFixture:
                         hostId: HostId = HostId.BootstrapHostId,
                         keepCheckAllDevices: Boolean = false,
                         keepInitializeTaskExecutor: Boolean = false,
-                        verifyCopyRegistry: Boolean = true): Host =
+                        verifyCopyRegistry: Boolean = true,
+                        crlFactory: CrashRecoveryLogFactory = TestNetwork.TestCRL,
+                        adjustSeams: Host.Seams => Host.Seams = identity): Host =
     val threading = new LockstepThreading(ec)
     val scheduler = new ManualControlScheduler(threading.controlEvents)
     val recording = new RecordingSeams(ec, failFirstStoreLoad)
     val host = new Host(client, hostId, systemId, hostRoot, ec, threading,
                         net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
-                        TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory,
+                        crlFactory, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory,
                         Duration(5, SECONDS), Duration(60, SECONDS), transferService, storeRebuildFactory,
-                        maxConcurrentRebuilds, seams = recording.seams(scheduler, verifyCopyRegistry))
+                        maxConcurrentRebuilds, seams = adjustSeams(recording.seams(scheduler, verifyCopyRegistry)))
     recording.attach(host)
     threading.removeQueued:
       case t: Host.EventTask =>

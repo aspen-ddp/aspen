@@ -9,7 +9,6 @@ import org.scalatest.matchers.should.Matchers
 
 class CopyPhaseSuite extends AnyFunSuite with Matchers:
 
-  private val RR = RebuildingStore.RebuildRequiredMarkerFile
   private val TO = StoreTransfer.TransferOutMarkerFile
   private val TI = StoreTransfer.TransferredInMarkerFile
   private val RC = RebuildingStore.RebuildCompleteMarkerFile
@@ -35,7 +34,6 @@ class CopyPhaseSuite extends AnyFunSuite with Matchers:
     withStore(TO -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Outbound(u.toString)))
     withStore(RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Rebuilt(u.toString)))
     withStore(RC -> "")(dir => CopyPhase.read(dir) should be(Phase.Rebuilt("")))
-    withStore(RR -> "")(dir => CopyPhase.read(dir) should be(Phase.Lost))
 
   test("content is kept verbatim: garbage is distinct from empty"):
     withStore(TO -> " xyz\n")(dir => CopyPhase.read(dir) should be(Phase.Outbound("xyz")))
@@ -44,9 +42,9 @@ class CopyPhaseSuite extends AnyFunSuite with Matchers:
     Phase.Rebuilt("xyz") should not be(Phase.Rebuilt(""))
     Phase.Outbound("xyz") should not be(Phase.Outbound(""))
 
-  test("precedence is RR > TO > TI > RC"):
+  test("precedence is TO > TI > RC, and Lost is never read from markers"):
     val u = UUID.randomUUID()
-    withStore(RR -> "", TO -> "")(dir => CopyPhase.read(dir) should be(Phase.Lost))
+    withStore("rebuild-required" -> "")(dir => CopyPhase.read(dir) should be(Phase.Live))
     withStore(TO -> "", TI -> "t1")(dir => CopyPhase.read(dir) should be(Phase.Outbound("")))
     withStore(TI -> "t1", RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Arrived("t1")))
     withStore(TO -> "", RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Outbound("")))

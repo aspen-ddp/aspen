@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.host
 
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{DurableFiles, FileStat}
 import scribe.Logging
@@ -42,23 +43,61 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
   // and whether it left the flat path, so its inert markers are stripped once the move is forced
   private var unforced: Map[os.Path, (List[os.Path], Boolean)] = Map()
 
+  // The copies whose move to Lost failed (StoreRebuilds.moveToLost), by device: held offline, never loaded, shipped
+  // or retired, until a device check moves them (retryPendingLost). In memory only: a crash forgets the hold, and the
+  // copy then reloads from where it is, as after any crash (P5)
+  private var lostPending: Map[StorageDeviceId, Set[StoreId]] = Map()
+
+  /** The stores of `local` whose move to Lost failed and is retried at each device check */
+  def pendingLost(local: LocalStorageDeviceState): Set[StoreId] =
+    if ctx.copyRegistry.copiesOf(local).isDefined then lostPending.getOrElse(local.storageDeviceId, Set()) else Set()
+
+  /** Whether the move to Lost of the copy of `storeId` on `local` failed and awaits its retry */
+  def isPendingLost(local: LocalStorageDeviceState, storeId: StoreId): Boolean = pendingLost(local).contains(storeId)
+
+  /** Holds the copy of `storeId` on `local` offline until its move to Lost succeeds (`held`), or releases it */
+  private[host] def holdLost(local: LocalStorageDeviceState, storeId: StoreId, held: Boolean): Unit =
+    val id = local.storageDeviceId
+    val now = lostPending.getOrElse(id, Set())
+    val next = if held then now + storeId else now - storeId
+    lostPending = if next.isEmpty then lostPending - id else lostPending + (id -> next)
+
+  /** The device `id` was unloaded: its holds go with its records */
+  private[host] def detached(id: StorageDeviceId): Unit =
+    lostPending -= id
+
   /** Moves the copy of `storeId` on the attached `sds` to `to`, recording the fact (HostCopies.moved). A copy with no
-   *  copyId gets a fresh one (P4) */
+   *  copyId gets a fresh one (P4). A copy that is opening, served or closing is never moved (no move of an installed
+   *  store's directory): refused, NotMoved, and logged at error as the caller's bug. A copy already unsynced stays
+   *  unsynced after the move, whose syncs force only the directories naming it, until a resync forces it whole */
   def move(site: String, sds: LocalStorageDeviceState, storeId: StoreId, to: Phase): MoveResult =
     ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(storeId)) match
       case None =>
         val t = IllegalStateException(s"No record of a copy of $storeId on device ${sds.storageDeviceId} to move")
         logger.error(s"Copy move ($site): $t")
         MoveResult.NotMoved(t)
+      case Some(r) if r.activity.isInstanceOf[Activity.Opening] || r.activity == Activity.Served ||
+                      r.activity.isInstanceOf[Activity.Closing] =>
+        val t = IllegalStateException(s"The copy of $storeId on device ${sds.storageDeviceId} is ${r.activity}: " +
+                                      s"its directory is never moved while its store is installed or opening")
+        logger.error(s"Copy move ($site), a bug: $t")
+        MoveResult.NotMoved(t)
       case Some(r) =>
         val copyId = r.copyId.getOrElse(UUID.randomUUID())
         val from = CopyLayout.path(sds.devicePath, storeId, r.copyId, r.phase)
         val target = CopyLayout.path(sds.devicePath, storeId, Some(copyId), to)
+        // An earlier unsynced change's directories still to force go with the copy to its new path
+        val earlier = unforced.get(from)
         val result = relocateCopy(site, from, CopyLayout.dirOf(r.phase).isEmpty, target, to)
         result match
-          case MoveResult.Durable => ctx.copyRegistry.moved(site, sds, storeId, to, copyId, unsynced = false)
-          case MoveResult.Unsynced(_) => ctx.copyRegistry.moved(site, sds, storeId, to, copyId, unsynced = true)
           case MoveResult.NotMoved(_) => ()
+          case _ =>
+            earlier.foreach: (dirs, leftFlat) =>
+              unforced -= from
+              val (now, nowLeft) = unforced.getOrElse(target, (Nil, false))
+              unforced += target -> ((dirs ++ now).distinct, leftFlat || nowLeft)
+            ctx.copyRegistry.moved(site, sds, storeId, to, copyId,
+              unsynced = result.isInstanceOf[MoveResult.Unsynced])
         result
 
   /** As `move`, for a copy of a device being loaded (lost CRL, adoption), at `from` as `copyId` (None while flat):

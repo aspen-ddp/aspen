@@ -367,7 +367,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       after should be(Map(sid(0) -> Phase.Live))
       consistent(host)
 
-  atest("markRebuildRequired moves a copy to Lost, and a retire takes it to pending-delete"):
+  atest("moveToLost moves a copy to Lost, and a retire takes it to pending-delete"):
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
     val dev = device(hostRoot, deviceA)
@@ -376,7 +376,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
     val local = loadedDevices(host)(deviceA)
-    host.control.rebuilds.markRebuildRequired(dir)
+    host.control.rebuilds.moveToLost("test", local, sid(0)) should be(MoveResult.Durable)
     consistent(host)
     val lost = phases(host, deviceA)
     for
@@ -933,9 +933,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       val copies = registry.copiesOf(local).get
       // Idle -> Closing is not in the table: applied anyway
       registry.removedFromRouter(deviceA, sid(0))
-      // Lost -> Live is not in the table: the disk reads Live, so Live is recorded
-      copies.setPhase(sid(1), Phase.Lost)
-      registry.placed("test", local, sid(1), Phase.Live)
+      // Outbound(t) -> Outbound(u) is not in the table: the disk reads Live, so Live is recorded
+      copies.setPhase(sid(1), Phase.Outbound("t"))
+      registry.placed("test", local, sid(1), Phase.Outbound("u"))
       val errors = registry.takeRegistryErrors()
       copies.copies(sid(0)).activity should be(Activity.Closing(ClosePurpose.FailStop))
       copies.copies(sid(1)).phase should be(Phase.Live)

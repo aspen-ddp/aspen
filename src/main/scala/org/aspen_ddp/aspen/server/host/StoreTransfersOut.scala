@@ -25,7 +25,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
 
   // A transfer out's work is its copy's Work.TransferOut on the source device: Closing from startOut's close (and CRL
   // extraction) until the control task that writes the transferring-out marker, or fails the request, has run, and
-  // AbortingLost while returnLostTransferToRebuild aborts the transfer of a copy marked rebuild-required. It refuses
+  // AbortingLost while returnLostTransferToRebuild aborts the transfer of a Lost copy. It refuses
   // every open of the copy meanwhile (StoreLoader.startOpen, R12), so a store is never served from a save file whose
   // entries the extraction is still deleting from the device CRL
 
@@ -210,15 +210,13 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
       // delays
       if ctx.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(m.storeId) then
         refuse(s"Not starting the transfer out of store ${m.storeId} yet: a rebuild of it is still registered")
-      val markedPath = ctx.copyRegistry.pathOrLive(sourceDs, m.storeId)
-      // A stat that fails throws (FileStat), failing the request: a marked copy never ships
-      if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut &&
-         FileStat.exists(markedPath / RebuildingStore.RebuildRequiredMarkerFile) then
-        // A store marked for rebuild (its backend failed, here during an earlier request's close;
-        // rebuild-process) has no trustworthy state to ship, and the destination would refuse
-        // its missing CRL save file forever. It goes back to the rebuild path instead.
+      // A Lost copy never ships
+      if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut && isLost(sourceDs, m.storeId) then
+        // A store in lost/ (its backend failed, here during an earlier request's close; rebuild-process), or whose
+        // move there awaits its retry, has no trustworthy state to ship, and the destination would refuse its
+        // missing CRL save file forever. It goes back to the rebuild path instead.
         returnLostTransferToRebuild(m.storeId, sourceDs)
-        err(s"Not starting the transfer out of store ${m.storeId}: it is marked rebuild-required")
+        err(s"Not starting the transfer out of store ${m.storeId}: it is Lost")
       if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut then
         // A retransmitted request finds the store already closed, and its going offline already gossiped
         val wasLoaded = ctx.router.loaded.contains(m.storeId)
@@ -259,7 +257,6 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
 
     result.foreach: _ =>
       val storePath = ctx.copyRegistry.pathOrLive(sourceDs, m.storeId)
-      lazy val markedNow = FileStat.existence(storePath / RebuildingStore.RebuildRequiredMarkerFile)
       // Checked again now the close is done: a shutdown that began during it has already
       // run stopDeviceWork, which found no send to cancel, so a send begun here would run
       // on a device being shelved. The store is left closed and unmarked, its state in the
@@ -272,15 +269,10 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
                     s"${sourceDs.storageDeviceId} began shutting down while the store closed")
       // No open of the copy can have started since its close: its TransferOut work refused them (R12). An open of
       // another device's copy of the store on this host reads that device's CRL, never this extraction's
-      else if markedNow.isEmpty then
-        // Its marker cannot be stat'd (FileStat): never shipped on a guess. Left closed and unmarked, as above, until a
-        // retransmitted request closes it again and looks once more
-        logger.warn(s"Not starting the transfer out of store ${m.storeId}: the stat of its " +
-                    s"${RebuildingStore.RebuildRequiredMarkerFile} marker failed")
-      else if markedNow.contains(true) then
-        // Marked while it closed (a BackendFailed for it): as above, never shipped.
-        logger.error(s"Not starting the transfer out of store ${m.storeId}: it was marked " +
-                     s"rebuild-required while it closed")
+      else if isLost(sourceDs, m.storeId) then
+        // Moved to lost/ while it closed (a BackendFailed for it), or its move there awaits its retry: as above, never
+        // shipped.
+        logger.error(s"Not starting the transfer out of store ${m.storeId}: it became Lost while it closed")
         returnLostTransferToRebuild(m.storeId, sourceDs)
       else try
         // Written before archiving, so it travels with the store and keeps this copy
@@ -303,7 +295,13 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
           logger.warn(s"Failed to start transfer out of store ${m.storeId}, transfer " +
                       s"${m.transferUUID}. Error: $t")
 
-  /** Takes a TransferringOut store marked rebuild-required back to the rebuild path (rebuild-process). The transfer
+  /** Whether the copy of `storeId` on `sds` is Lost (in lost/), or held for a move there that failed
+   *  (CopyMoves.pendingLost): such a copy is never shipped */
+  private def isLost(sds: LocalStorageDeviceState, storeId: StoreId): Boolean =
+    ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(storeId)).exists(_.phase == Phase.Lost) ||
+      ctx.moves.isPendingLost(sds, storeId)
+
+  /** Takes a TransferringOut store that is Lost back to the rebuild path (rebuild-process). The transfer
    *  is aborted (AspenClient.abortStoreTransfer: the source entry back to Active, or Offline on a device shutting down,
    *  and the destination's TransferringIn entry removed), and the device is checked, so the reconcile's lost-CRL pass
    *  flips the now Active entry to Rebuilding. One abort at a time per store: retransmits arriving meanwhile do nothing
@@ -311,7 +309,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   private def returnLostTransferToRebuild(storeId: StoreId, sds: LocalStorageDeviceState): Unit =
     if ! ctx.copyRegistry.transferringOut(storeId, TransferOutStage.AbortingLost) &&
        claimWork(storeId, sds, None, TransferOutStage.AbortingLost) then
-      logger.warn(s"Aborting the transfer out of store $storeId, which is marked rebuild-required, so it is rebuilt")
+      logger.warn(s"Aborting the transfer out of store $storeId, which is Lost, so it is rebuilt")
       val fabort =
         try ctx.metadata.abortLostTransfer(storeId)
         catch case t: Throwable => Future.failed(t)

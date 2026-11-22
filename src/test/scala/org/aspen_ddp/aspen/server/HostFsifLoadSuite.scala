@@ -78,8 +78,8 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
     override def adoptDevice(storageDeviceId: StorageDeviceId, previousHostId: HostId, devicePath: os.Path,
                              uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
                              crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],
-                             markRebuildRequired: os.Path => Unit) =
-      base.adoptDevice(storageDeviceId, previousHostId, devicePath, uncleanStores, crlLostStores, markRebuildRequired)
+                             moveToLost: StoreId => Unit) =
+      base.adoptDevice(storageDeviceId, previousHostId, devicePath, uncleanStores, crlLostStores, moveToLost)
     override def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
       heldLookups.get(storageDeviceId) match
         case Some(held) =>
@@ -261,6 +261,19 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.getStoreIds should not contain storeId
       fsif(host).opens should be(0)
 
+  /** Drains `host` until its copy of the suite's store is in lost/, which a close's end moves it to (an FSIF close
+   *  completes off the control thread), within 10 s */
+  private def lostOnceClosed(host: Host, deviceDir: os.Path): Future[Unit] =
+    given ExecutionContext = executionContext
+    val deadline = System.nanoTime() + 10_000_000_000L
+    def loop(): Future[Unit] =
+      host.testingOnlyHandleEvents()
+      if CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) || System.nanoTime() > deadline then
+        Future.unit
+      else
+        Future(Thread.sleep(1)).flatMap(_ => loop())
+    loop()
+
   atest("an FSIF store whose files hold no valid index is marked for rebuild, not emptied"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
@@ -275,7 +288,9 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.getStoreIds should not contain storeId
       host.control.router.silentStores should contain(storeId)
       CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) should be(true)
-      os.read.bytes(storeDir / FsifRecovery.DataFile).toList should be(List.fill[Byte](10)(1))
+      // Moved to lost/ whole, its files untouched
+      os.read.bytes(CopyFixtures.copyPath(deviceDir, storeId).get / FsifRecovery.DataFile).toList should be(
+        List.fill[Byte](10)(1))
 
   atest("an FSIF store whose recovery finds it lost is marked for rebuild and left offline"):
     val hostRoot = newHostDir()
@@ -357,7 +372,8 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     fsif(host).onFatals.head(new IOException("Input/output error"))
     host.testingOnlyHandleEvents()
 
-    Future.successful:
+    // Moved to lost/ once its close has ended
+    lostOnceClosed(host, deviceDir).map: _ =>
       host.getStoreIds should not contain storeId
       host.control.router.silentStores should contain(storeId)
       CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) should be(true)
@@ -778,9 +794,9 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       os.write.over(Backend.crlSaveFile(storeDir), Array[Byte](1, 2, 3))
       queued.poll().run()
       host.testingOnlyHandleEvents() // BackendOpened, then its LoadStore: the save file is unusable
-      CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) should be(true)
-      // Time for any callback of the failed load to run
-      yieldUntil(fsif(host).gossipedOnline.nonEmpty, maxYields = 10).map: _ =>
+      // Moved to lost/ once its unserved backend has closed. Time for any callback of the failed load to run
+      lostOnceClosed(host, deviceDir).flatMap(_ => yieldUntil(fsif(host).gossipedOnline.nonEmpty, maxYields = 10)).map: _ =>
+        CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) should be(true)
         host.getStoreIds should not contain storeId
         host.control.router.silentStores should contain(storeId)
         fsif(host).gossipedOnline should be(Nil)

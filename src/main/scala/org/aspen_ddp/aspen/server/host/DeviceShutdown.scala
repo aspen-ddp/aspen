@@ -214,7 +214,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
   private def closeStoresForShutdown(local: LocalStorageDeviceState): Future[Unit] =
     val deviceId = local.storageDeviceId
     runSequentially(storesToClose(local)): storeId =>
-      // A store whose backend failed while closing is marked rebuild-required instead of closed
+      // A store whose backend failed while closing is moved to lost/ instead of closed
       // cleanly (see StoreRebuilds.failedOnClose), and an adopter takes it as Rebuilding.
       ctx.copyRegistry.closingFor(storeId, ClosePurpose.Shutdown)
       ctx.closeStoreForShutdown(storeId).transform:
@@ -335,8 +335,8 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
 
   /** Run by the reconcile of an Operational device that is not shutting down: loads each store a
    *  cancelled shutdown of it closed, once its entry is Active with no transfer named. A store whose
-   *  directory has since gained a marker (rebuild-required, a transfer's) is left to the pass that
-   *  owns that marker. One that is no longer offline here was loaded by something else. Each is
+   *  copy has since left Live (moved to lost/, or a transfer's marker) is left to the pass that
+   *  owns that phase. One that is no longer offline here was loaded by something else. Each is
    *  offered to tryLoadStore once; a load that fails with its data intact leaves it offline and retried at the
    *  device scans (its copy AwaitingRetry, StoreLoader.retryFailedLoads). */
   def reloadClosedStores(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
@@ -358,7 +358,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
       // it would leave it unserved until a restart, and the load reads its phase again and holds it back until it
       // answers (StoreLoader.tryLoadStore)
       val plain = ready.filter: storeId =>
-        CopyPhase.known(storePath(storeId)) match
+        CopyLayout.knownPhase(storePath(storeId)) match
           case None | Some(Phase.Live) => true
           case Some(_) => false
       plain.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>

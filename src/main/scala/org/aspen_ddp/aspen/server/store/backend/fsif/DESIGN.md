@@ -398,7 +398,7 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
   | Outcome | Host action |
   |---|---|
   | success | `serveOpened` and `LoadStore` |
-  | `StoreLost` | mark `rebuild-required`, leave the store offline, `checkStorageDevice` |
+  | `StoreLost` | move the copy to `lost/`, leave the store offline, `checkStorageDevice` |
   | a create that left nothing at the path | leave offline, not retried here: its entry is still Initializing and the next device check creates it again |
   | any other failure (out of space, I/O, lock or resource error) | leave offline, not marked; its copy awaits a load retry (AwaitingRetry), offered every device scan with exponential backoff capped at `LoadRetryCap` (5 min) |
 
@@ -622,7 +622,7 @@ been modified.
 
 **The dominant real-world cause of data loss in a system like this is not hardware.** It is a systemic bug that
 wrongly fires one of the automatic paths below. A store then decides, from local evidence alone, that its content
-cannot be trusted. It marks itself `rebuild-required`, its directory is deleted, and it is rebuilt from its peers.
+cannot be trusted. Its copy is moved to `lost/`, then retired, and it is rebuilt from its peers.
 One store wrongly declared lost costs a rebuild. The same bug firing on many stores at once, for example on every
 host after an upgrade, loses the whole pool, because the peers the rebuild needs are the stores being thrown
 away. This cannot be solved inside the backend: each store sees only its own files. See the `Backlog.txt` item
@@ -634,8 +634,8 @@ step in `FsifRecovery.recover` (the numbered step comments) and the `StoreLost` 
 ### 4.1 Detected by FSIF recovery (`FsifRecovery.StoreLost`)
 
 All of these are thrown from `FsifBackend`'s constructor through `FsifBackend.open`. The host reaction is the same
-for each: `StoreLoader.handleBackendOpened` logs, leaves the store offline, writes `rebuild-required`
-(`StoreRebuilds.markRebuildRequired`), and calls `DeviceReconciler.checkStorageDevice`. The `rebuild-required` marker is acted on as
+for each: `StoreLoader.handleBackendOpened` logs, leaves the store offline, moves the copy to `lost/`
+(`StoreRebuilds.moveToLost`), and calls `DeviceReconciler.checkStorageDevice`. A copy in `lost/` is acted on as
 described in 4.5. A plain `IOException` from the open is not a loss (4.6). Every absence below is a known one: the
 directory and file tests are `server.FileStat`'s, so a stat that fails is such an `IOException`, never L0 or a
 missing index or journal.
@@ -688,9 +688,9 @@ but fail-stops no store. L13-L17 would fire together if an error classifier miss
 JDK that words it differently from `FsifIo.isOutOfSpace`'s strings), which turns every full device into a
 correlated loss.
 
-**Host routes for `BackendFailed` and other failed-backend checks.** Each of these writes `rebuild-required`:
+**Host routes for `BackendFailed` and other failed-backend checks.** Each of these moves the copy to `lost/` once it is closed (`StoreRebuilds.moveToLost`):
 
-- **Served store** (`StoreRebuilds.handleBackendFailed`, then `backendFailed`). The store is marked, unloaded and left
+- **Served store** (`StoreRebuilds.handleBackendFailed`, then `backendFailed`). The store is unloaded, moved to `lost/` when its close ends, and left
   offline, and the device is checked. Its CRL entries stay live in the device CRL (`closeUnloaded(dropDurably =
   false)`) until the rebuild's retire saves them with the copy it keeps and drops them.
 - **Not served, not replaced, directory on a loaded device** (`StoreRebuilds.backendFailed`).
@@ -698,8 +698,8 @@ correlated loss.
 - **Opened but not served** (device unloaded or another backend serves it) **and failed**
   (`StoreLoader.handleBackendOpened`).
 - **Failed during a `ShutdownStore` close** (`StoreLoader.handleClose`, then `StoreRebuilds.failedOnClose`). The
-  store is marked, so an adopter sees `rebuild-required` and treats the store as CrlLost (L22): every reader checks the
-  marker before the save file. A `crl_save.log` a transfer-out close just wrote is kept, since its entries have left
+  store is moved to `lost/`, so an adopter treats the store as CrlLost (L22), and nothing loads it to read its save
+  file. A `crl_save.log` a transfer-out close just wrote is kept, since its entries have left
   the device CRL; the rebuild's retire renames it to `lost-crl-state.log` in the retired copy. Entries left in the
   device CRL are saved and dropped by that retire, after the marker is durable.
 - **Transfer out** (`StoreTransfersOut.startOut`):
@@ -714,7 +714,7 @@ correlated loss.
 |---|---|---|---|---|---|
 | L20 | `crl_save.log` exists but `CrashRecoveryLog.loadValidStoreState` rejects it (truncated, unparsable, or naming another store), or its state can never fit the device's CRL (`StoreLoader.neverFits`: a transaction above `maxTransactionBytes`, or the whole above the admission limit at the most streams any config allows plus that bound) | `StoreLoader.handleLoad`, then `StoreRebuilds.crlSaveFileLost` and `retireUnserved` | Closed unserved, marked, offline, device checked | The file is the only copy of the store's transaction state | A CRL save format change: every store with a save file (every store closed by a network transfer out) is declared lost on its next load; for never-fits, a change to `CrlAdmission.recoveredBytes` or the CRL bounds in a release, or a transfer onto a device with a smaller CRL. **Generic: all backends** |
 | L21 | Adoption of a device: an Offline or Active store has a transfer-out marker (a network transfer out) but a missing or unusable `crl_save.log` | `DeviceDiscovery.adoptionClass`; marked in `DeviceMetadata.adoptDevice`; entry written Rebuilding in the same transaction | Adopted as Rebuilding, marked | The transfer's close forced the file, so it was lost afterwards | A save-file read path that fails on the adopting host's version (format, or a path change in `Backend.crlSaveFile`): every store on every moved device. **Generic** |
-| L22 | Adoption: an Offline or Active store's directory has `rebuild-required` | `DeviceDiscovery.adoptionClass` | CrlLost, so adopted Rebuilding | The previous host already marked it | Inherits whatever falsely marked it on the previous host. **Generic** |
+| L22 | Adoption: an Offline or Active store's copy is in `lost/` | `DeviceDiscovery.adoptionClass` | CrlLost, so adopted Rebuilding | The previous host already marked it | Inherits whatever falsely marked it on the previous host. **Generic** |
 
 At LoadStore a *missing* `crl_save.log` is not a loss: it loads with no saved state (`StoreLoader.handleLoad`). A missing file
 counts as loss only at adoption (L21), where a transfer-out marker shows that a transfer's close extracted the state.
@@ -730,7 +730,7 @@ In addition, the rebuild staging store is discarded on `StoreLost` (4.1, related
 
 ### 4.5 What happens after the mark
 
-1. `StoreLoader.tryLoadStore` never loads a directory with `rebuild-required`. Its copy stays offline on its
+1. `StoreLoader.tryLoadStore` never loads a copy in `lost/`. Its copy stays offline on its
    device (the copy registry's Lost record), which keeps the store silent.
 2. The reconcile's Lost CRL State pass (`DeviceReconciler.reconcileDeviceState`) finds marked offline stores whose
    entry is Active and calls `StoreRebuilds.requestRebuild`. That flips the entry to Rebuilding in a transaction, but only if the device is

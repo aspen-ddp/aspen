@@ -556,7 +556,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       CopyFixtures.copyPath(deviceDir, stale) should be(None)
       pending should have size 1
       os.exists(pending.head / "data") should be(true)
-      os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      os.exists(pending.head / RebuildingStore.LostCrlStateFile) should be(true)
 
   /** A checkpoint of `storeId` in its staging directory on `deviceDir`, as a pass that walked past one object leaves */
   private def writeCheckpoint(deviceDir: os.Path, storeId: StoreId): os.Path =
@@ -663,7 +663,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       host.control.copyRegistry.openCopies(loadedDevices(host)(deviceA)) should not contain unlisted
       pending should have size 1
       pending should be(CopyFixtures.retiredCopies(deviceDir, unlisted))
-      os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      os.exists(pending.head / RebuildingStore.LostCrlStateFile) should be(true)
       served(listed) should be(true)
       CopyFixtures.phaseOf(deviceDir, listed).contains(Phase.Lost) should be(false)
 
@@ -766,7 +766,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       factory.created.map(_.storeId).toSet should be(Set(storeN(0), storeN(1)))
       CopyFixtures.copyPath(deviceDir, storeN(0)) should be(None)
       pending should have size 1
-      os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      os.exists(pending.head / RebuildingStore.LostCrlStateFile) should be(true)
       CopyFixtures.phaseOf(deviceDir, storeN(1)) should be(Some(Phase.Rebuilt(current.toString)))
 
   atest("a finished copy whose rebuild-complete marker cannot be read is kept, and its rebuild waits (RB-W22)"):
@@ -845,10 +845,11 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).rebuildOutcomes((realDeviceId, rebuilt)) should be(RebuildOutcome.Superseded)
       recorded(host).loadStoreByIdRequests should not contain((realDeviceId, rebuilt))
       finalState.stores(rebuilt).rebuildEpisode should be(Some(current))
-      // Left for the current episode's rebuild to retire, and silent meanwhile
-      // Raw: the copy may carry rebuild-required beside it by now (the current episode's retire), which outranks it
-      os.read(CopyFixtures.copyPath(deviceDir, rebuilt).get / RebuildingStore.RebuildCompleteMarkerFile) should be(
-        earlier.toString)
+      // Left for the current episode's rebuild to retire, and silent meanwhile: still the earlier episode's Rebuilt
+      // copy, or already taken by that retire (moved to lost/, or on into pending-delete/), never loaded
+      val left = CopyFixtures.phaseOf(deviceDir, rebuilt)
+      (left == Some(Phase.Rebuilt(earlier.toString)) || left == Some(Phase.Lost) ||
+        CopyFixtures.retiredCopies(deviceDir, rebuilt).size == 1) should be(true)
       hasRebuildWork(host, rebuilt) should be(true)
 
   atest("a superseded copy whose entry then leaves the device is retired by the Deleted Stores pass (RB-W9)"):
@@ -903,7 +904,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).rebuildOutcomes((realDeviceId, rebuilt)) should be(RebuildOutcome.Superseded)
       factory.created should have size 1
       pending should have size 1
-      os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      os.exists(pending.head / RebuildingStore.LostCrlStateFile) should be(true)
       host.control.router.silentStores should not contain rebuilt
 
   atest("a copy whose flip failed permanently, whose entry then leaves the device, is retired (RB-W9)"):
@@ -940,7 +941,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     yield
       factory.created should have size 1
       pending should have size 1
-      os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      os.exists(pending.head / RebuildingStore.LostCrlStateFile) should be(true)
       host.control.router.silentStores should not contain storeN(0)
 
   atest("an unpromoted rebuilt copy does not silence the store served from another device here (X-W31)"):

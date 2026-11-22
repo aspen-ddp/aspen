@@ -34,19 +34,28 @@ object CopyFixtures:
     dir
 
   /** Puts the copy of `storeId` already on the device in `phase`, keeping its files, as something outside the host
-   *  would (a crash's leftovers, a hand edit, a stand-in for a host site): returns its path. Throws if it has none */
+   *  would (a crash's leftovers, a hand edit, a stand-in for a host site): returns its path. Throws if it has none. A
+   *  phase directory's copy is moved there (with the phase's parameter file), so on a loaded device the host's record
+   *  does not follow: use it before the device's load, or move through the host */
   def markCopy(deviceDir: os.Path, storeId: StoreId, phase: Phase): os.Path =
     val dir = copyPath(deviceDir, storeId).getOrElse(
       throw IllegalStateException(s"$storeId has no copy on $deviceDir to mark"))
     if CopyLayout.dirOf(phase).isDefined then
-      throw IllegalArgumentException(s"$phase is a phase directory: move the copy instead")
-    marker(phase).foreach((file, content) => os.write.over(dir / file, content))
-    dir
+      val target = CopyLayout.path(deviceDir, storeId, Some(UUID.randomUUID()), phase)
+      os.makeDir.all(target / os.up)
+      os.move(dir, target)
+      for
+        file <- CopyLayout.paramFile(phase)
+        p <- CopyLayout.param(phase)
+      do os.write.over(target / file, p)
+      target
+    else
+      marker(phase).foreach((file, content) => os.write.over(dir / file, content))
+      dir
 
   /** The marker file and content a flat copy in `phase` carries */
   private def marker(phase: Phase): Option[(String, String)] = phase match
     case Phase.Live => None
-    case Phase.Lost => Some(RebuildingStore.RebuildRequiredMarkerFile -> "")
     case Phase.Outbound(t) => Some(StoreTransfer.TransferOutMarkerFile -> t)
     case Phase.Arrived(t) => Some(StoreTransfer.TransferredInMarkerFile -> t)
     case Phase.Rebuilt(e) => Some(RebuildingStore.RebuildCompleteMarkerFile -> e)
@@ -68,12 +77,11 @@ object CopyFixtures:
   /** The phase of the one copy of `storeId` on the device, None if absent */
   def phaseOf(deviceDir: os.Path, storeId: StoreId): Option[Phase] = one(deviceDir, storeId).map(_.phase)
 
-  /** The retired copies of `storeId` in pending-delete/: by copy name, or by the stage-1 retire's name
-   *  (StoreCopies.pendingDeleteName) */
+  /** The retired copies of `storeId` in pending-delete/, by copy name */
   def retiredCopies(deviceDir: os.Path, storeId: StoreId): List[os.Path] =
     val dir = deviceDir / RebuildingStore.PendingDeleteDirectory
     if !os.isDir(dir) then
       Nil
     else
       os.list(dir).toList.filter: p =>
-        CopyLayout.parseName(p.last).map(_._1).orElse(StoreCopies.pendingDeleteStore(p.last)).contains(storeId)
+        CopyLayout.parseName(p.last).map(_._1).contains(storeId)

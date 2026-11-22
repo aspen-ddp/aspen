@@ -6,9 +6,10 @@ import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.Host.LoadRetry
 
-/** Why a served store is being closed */
+/** Why a served store is being closed. FailStop: the copy moves to lost/ when its close ends (P5). Reload: the copy
+ *  stays where it is, to load again (a failed CRL load, a failed save-file removal) */
 enum ClosePurpose:
-  case TransferOut, Shutdown, Relinquish, FailStop
+  case TransferOut, Shutdown, Relinquish, FailStop, Reload
 
 /** What the host is doing with a copy's open store right now */
 enum Activity:
@@ -28,7 +29,7 @@ enum TransferInStage:
 enum TransferOutStage:
   /** From startOut's close (and CRL extraction) until the control task that writes its marker has run */
   case Closing
-  /** returnLostTransferToRebuild is aborting the transfer of a copy marked rebuild-required */
+  /** returnLostTransferToRebuild is aborting the transfer of a Lost copy */
   case AbortingLost
 
 /** The long-running work a copy is in the middle of. Ids come from tree entries, so they may be absent */
@@ -150,14 +151,15 @@ final class DeviceCopies(val deviceId: StorageDeviceId, val devicePath: os.Path,
       onChange(storeId)
       Some(s"Illegal phase move for $storeId: ${r.phase} -> $to; recorded $disk, as its directory reads")
 
-  /** A fact: a move (CopyMoves) put the copy at its path in `to`, as `copyId`, durably unless `unsynced`. The copy's
-   *  location is its phase, so a move the table does not allow is applied all the same, and its description returned
-   *  for the caller to record */
+  /** A fact: a move (CopyMoves) put the copy at its path in `to`, as `copyId`, durably unless `unsynced`. A copy
+   *  unsynced before the move stays so: the move forced only the directories naming it. The copy's location is its
+   *  phase, so a move the table does not allow is applied all the same, and its description returned for the caller
+   *  to record */
   def applyMove(storeId: StoreId, to: Phase, copyId: UUID, unsynced: Boolean): Option[String] =
     val r = record(storeId)
     val illegal = Option.when(!Transitions.phaseLegal(r.phase, to))(
       s"Illegal phase move for $storeId: ${r.phase} -> $to, applied as a fact")
-    records += storeId -> r.copy(copyId = Some(copyId), phase = to, unsynced = unsynced)
+    records += storeId -> r.copy(copyId = Some(copyId), phase = to, unsynced = unsynced || r.unsynced)
     onChange(storeId)
     illegal
 

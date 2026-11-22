@@ -41,7 +41,7 @@ trait DeviceMetadata:
                   devicePath: os.Path,
                   uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
                   crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],
-                  markRebuildRequired: os.Path => Unit): Future[AdoptOutcome]
+                  moveToLost: StoreId => Unit): Future[AdoptOutcome]
 
   def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState]
 
@@ -163,7 +163,7 @@ object DeviceMetadata:
 /** Runs only on the control thread. See HostThreading.scala.
  *
  *  The real metadata reads and transactions. Its Future callbacks, including the functions passed in
- *  (`uncleanStores`, `crlLostStores`, `markRebuildRequired`, `gossipStoreOnline`), run on the control context it
+ *  (`uncleanStores`, `crlLostStores`, `moveToLost`, `gossipStoreOnline`), run on the control context it
  *  imports from `ctx`. */
 class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata with Logging:
   // By name: Host builds this before the DeviceControl that holds it, which only calls it once constructed. Used
@@ -519,7 +519,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
                   devicePath: os.Path,
                   uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
                   crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],
-                  markRebuildRequired: os.Path => Unit): Future[AdoptOutcome] =
+                  moveToLost: StoreId => Unit): Future[AdoptOutcome] =
     import StorageDeviceState.DeviceStatus
 
     case class PoolUpdate(pointer: KeyValueObjectPointer, kvos: KeyValueObjectState, config: StoragePoolState)
@@ -543,7 +543,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
 
     // An attempt that committed but was reported TransactionOutcomeUnknown leaves the device owned here, which the
     // retry recognizes as its own adoption rather than a change by someone else. Its disk-side steps
-    // (markRebuildRequired) ran before that commit and are idempotent; the re-read state is what it wrote
+    // (moveToLost) ran before that commit and are idempotent; the re-read state is what it wrote
     val retry = StopRetrying.collisionRetry()
     client.transactUntilSuccessfulWithRecovery(retry.onFailure): tx =>
       given Transaction = tx
@@ -591,14 +591,14 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
                   List(KeyRevision(StoragePoolState.ConfigKey, pu.kvos.contents(StoragePoolState.ConfigKey).revision)),
                   List(Insert(StoragePoolState.ConfigKey, pu.config.encode())))
 
-              // Stores whose CRL state is gone are rebuilt rather than refused. The marker is
-              // written before the commit and is correct whatever its outcome: the state is lost
-              // either way, and the marker is what keeps the directory from ever being loaded.
+              // Stores whose CRL state is gone are rebuilt rather than refused. The copy is moved
+              // to lost/ before the commit, which is correct whatever its outcome: the state is lost
+              // either way, and lost/ is what keeps the copy from ever being loaded.
               val crlLost = crlLostStores(devicePath, state)
               crlLost.foreach: storeId =>
                 logger.warn(s"Store $storeId on storage device $storageDeviceId has lost its CRL state. " +
                             s"Adopting it as Rebuilding")
-                markRebuildRequired(CopyLayout.path(devicePath, storeId, None, Phase.Live))
+                moveToLost(storeId)
               val reactivated = state.withOfflineStoresActive.copy(hostId = hostId, status = DeviceStatus.Operational)
               val newState = crlLost.foldLeft(reactivated): (st, storeId) =>
                 st.setRebuilding(storeId, UUID.randomUUID())

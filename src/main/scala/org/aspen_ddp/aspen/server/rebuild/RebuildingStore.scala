@@ -34,11 +34,6 @@ object RebuildingStore:
    *  down. That is what keeps a half-rebuilt store from being loaded and answering reads. */
   val RebuildDirectory = "rebuilding"
 
-  /** Present in a store directory whose CRL save file was found unusable. Its transaction state
-   *  is lost for good, so the directory is never loaded again: the store's entry is flipped to
-   *  Rebuilding and the directory is discarded before the rebuild starts. */
-  val RebuildRequiredMarkerFile = "rebuild-required"
-
   /** Device-root directory a marked store directory is renamed into before its rebuild starts, which clears the
    *  store's path (a rebuild takes a directory there for a store already in place). The copy is kept, with its former
    *  device-CRL entries in LostCrlStateFile, until the store is Active again wherever it was rebuilt: a rebuild that

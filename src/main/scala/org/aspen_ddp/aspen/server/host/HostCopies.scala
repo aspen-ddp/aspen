@@ -366,6 +366,11 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         if copies.copies.contains(storeId) then
           activityFact("install", copies, storeId, Activity.Served)
 
+  /** A copy of `storeId` found at its flat path on `sds` with no record, about to be moved (StoreRebuilds.moveToLost:
+   *  a copy put at the path by hand after the device's load): learned, as readAtLoad learns one */
+  def learn(site: String, sds: LocalStorageDeviceState, storeId: StoreId): Unit =
+    fact(site)(known(site, sds.storageDeviceId, storeId))
+
   /** A LoadStore of `storeId` onto device `id` is handled (StoreLoader.handleLoad): its copy has a record before the
    *  load's outcome, whatever it is (see `known`) */
   def loadHandled(id: StorageDeviceId, storeId: StoreId): Unit =
@@ -595,6 +600,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def detach(id: StorageDeviceId, listed: Set[StoreId]): Unit =
     val had = attached.get(id).map(_.copies)
     attached -= id
+    ctx.moves.detached(id)
     parkedRetries = parkedRetries.filter((key, _) => key._1 != id)
     // A later load of the device reads its copies anew, and its device load offers each
     heldForSync = heldForSync.filter(_._1 != id)
@@ -629,18 +635,21 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   /** The stores of `local`'s copies that the reconcile's passes may act on: Idle or awaiting a load retry (neither
    *  served, opening, closing nor retiring), with no work on the device. I3: a transfer in, rebuild, create or transfer
    *  out owns its copy, as a close or a retire does, and each one's end checks the device again. A Retired copy
-   *  recorded only until its move is forced (CopyMoves) is no pass's */
+   *  recorded only until its move is forced (CopyMoves) is no pass's, nor is one whose move to Lost failed
+   *  (CopyMoves.pendingLost): each device check retries that move before the passes */
   def offlineCopies(local: LocalStorageDeviceState): Set[StoreId] =
+    val lost = ctx.moves.pendingLost(local)
     copiesOf(local).map(c => c.copies.values.collect {
-      case r if r.phase != Phase.Retired &&
+      case r if r.phase != Phase.Retired && !lost.contains(r.storeId) &&
                 (r.activity == Activity.Idle || r.activity.isInstanceOf[Activity.AwaitingRetry]) &&
                 !c.work.contains(r.storeId) => r.storeId
     }.toSet).getOrElse(Set())
 
   /** Whether `local` holds a copy of `storeId` that is neither served nor opening, whatever work it has (a load
-   *  retry waits out that work rather than being dropped: StoreLoader.retryFailedLoads) */
+   *  retry waits out that work rather than being dropped: StoreLoader.retryFailedLoads), or one whose move to Lost
+   *  failed (CopyMoves.pendingLost: held offline until a device check moves it) */
   def heldOffline(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
-    copiesOf(local).exists(_.copies.get(storeId).exists(isOffline))
+    copiesOf(local).exists(_.copies.get(storeId).exists(isOffline)) || ctx.moves.isPendingLost(local, storeId)
 
   /** The stores of `local`'s copies that are served or opening */
   def openCopies(local: LocalStorageDeviceState): Set[StoreId] =
@@ -675,14 +684,16 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     pathOf(sds, storeId).getOrElse(CopyLayout.path(sds.devicePath, storeId, None, Phase.Live))
 
   /** A fact: CopyMoves moved the copy of `storeId` on `sds` to `to`, as `copyId`, durably unless `unsynced` (then held
-   *  for its load, as an unsynced marker change is). A move to Retired that is durable takes the copy out of the
-   *  registry (P3); one that is not stays recorded, Retired and unsynced, until a resync forces it (synced) */
+   *  for its load, as an unsynced marker change is; a copy unsynced before stays so). A move to Retired that leaves
+   *  the copy synced takes it out of the registry (P3); one that does not stays recorded, Retired and unsynced, until a
+   *  resync forces it (synced). A move releases any hold of the copy for a failed move to Lost (CopyMoves) */
   def moved(site: String, sds: LocalStorageDeviceState, storeId: StoreId, to: Phase, copyId: java.util.UUID,
             unsynced: Boolean): Unit =
     fact(site):
       copiesOf(sds).foreach: copies =>
+        ctx.moves.holdLost(sds, storeId, held = false)
         copies.applyMove(storeId, to, copyId, unsynced).foreach(violation(site, _))
-        if unsynced then
+        if copies.copies.get(storeId).exists(_.unsynced) then
           heldForSync += copies.deviceId -> storeId
         else if to == Phase.Retired then
           removed(site, sds, storeId)
@@ -698,20 +709,6 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
    *  copy there, which is already registered in `phase` */
   def rebuilt(site: String, sds: LocalStorageDeviceState, storeId: StoreId, phase: Phase): Unit =
     placed(site, sds, storeId, phase)
-
-  /** The copy at `storePath` was marked rebuild-required: Lost, unless it already was */
-  def markedLost(site: String, storePath: os.Path): Unit =
-    fact(site):
-      copiesAt(storePath).foreach: (copies, storeId) =>
-        copies.copies.get(storeId) match
-          case None =>
-            // Put back at its path after the device's load (a restore finishing late): learned, as readAtLoad learns
-            logger.warn(s"The copy of store $storeId at $storePath was not known to the copy registry. Learned at " +
-                        s"$site, Lost")
-            learnedCopy(s"device ${copies.deviceId}: $storeId learned at $site, Lost")
-            copies.register(storeId, Phase.Lost)
-          case Some(r) if r.phase != Phase.Lost => phaseFact(site, copies, storeId, Phase.Lost)
-          case Some(_) => ()
 
   /** A marker was written to or removed from the copy at `storePath` (CopyMarkers): its phase is what its markers
    *  say now (CopyPhase), Unread where they cannot be read */
@@ -778,6 +775,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def removed(site: String, sds: LocalStorageDeviceState, storeId: StoreId): Unit =
     fact(site):
       copiesOf(sds).foreach: copies =>
+        ctx.moves.holdLost(sds, storeId, held = false)
         parkedRetries -= ((copies.deviceId, storeId))
         heldForSync -= copies.deviceId -> storeId
         copies.unregister(storeId)

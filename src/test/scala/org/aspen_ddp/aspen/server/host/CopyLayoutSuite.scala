@@ -24,14 +24,15 @@ class CopyLayoutSuite extends FileBasedTests:
       (Phase.Arrived("t"), "arrived", false),
       (Phase.Outbound("t"), "outbound", false),
       (Phase.Rebuilt("e"), "rebuilt", false),
-      (Phase.Lost, "lost", false),
+      (Phase.Lost, "lost", true),
       (Phase.Retired, "pending-delete", true))
     table.foreach: (phase, name, converted) =>
       withClue(phase):
         CopyLayout.dirOf(phase) should be(if converted then Some(name) else None)
     val u = UUID.randomUUID()
     CopyLayout.path(tdir, s, Some(u), Phase.Retired) should be(tdir / "pending-delete" / CopyLayout.copyName(s, u))
-    CopyLayout.path(tdir, s, None, Phase.Lost) should be(tdir / s.directoryName)
+    CopyLayout.path(tdir, s, Some(u), Phase.Lost) should be(tdir / "lost" / CopyLayout.copyName(s, u))
+    CopyLayout.path(tdir, s, None, Phase.Outbound("t")) should be(tdir / s.directoryName)
     CopyLayout.path(tdir, s, Some(u), Phase.Live) should be(tdir / s.directoryName)
 
   test("param is the phase's parameter"):

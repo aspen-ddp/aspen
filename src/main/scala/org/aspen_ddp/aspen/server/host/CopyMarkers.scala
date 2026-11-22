@@ -31,18 +31,13 @@ final class CopyMarkers(ctx: DeviceControl) extends Logging:
   def write(sds: LocalStorageDeviceState, storeId: StoreId, marker: Marker, content: String): Unit =
     writeAt(ctx.copyRegistry.pathOrLive(sds, storeId), marker, content)
 
-  /** As `write`, for the copy at `storePath`: one of a loaded device, or of a device being loaded (an adoption's or a
-   *  lost CRL's marks), whose attach then takes an unsynced mark. rebuild-required is written through
-   *  DeviceControl.writeRebuildRequiredMarker, a test seam that only places the file */
+  /** As `write`, for the copy at `storePath`: one of a loaded device, or of a device being loaded, whose attach then
+   *  takes an unsynced mark */
   def writeAt(storePath: os.Path, marker: Marker, content: String): Unit =
     val site = s"write ${marker.fileName}"
-    marker match
-      case Marker.RebuildRequired => ctx.writeRebuildRequiredMarker(storePath)
-      case _ => DurableFiles.place(storePath / marker.fileName, content)
+    DurableFiles.place(storePath / marker.fileName, content)
     // In place: the copy's phase follows, whether or not the sync below holds
-    marker match
-      case Marker.RebuildRequired => ctx.copyRegistry.markedLost(site, storePath)
-      case _ => ctx.copyRegistry.markersChanged(site, storePath)
+    ctx.copyRegistry.markersChanged(site, storePath)
     force(site, storePath)
 
   /** Removes `marker` from the copy of `storeId` on `sds`. Returns whether the copy is now known durably free of it:

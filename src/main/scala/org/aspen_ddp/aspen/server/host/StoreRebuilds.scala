@@ -620,37 +620,44 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     ctx.markers.remove(sds, storeId, StoreDirMarkers.Marker.RebuildComplete)
 
   /** A directory at the path of a store being rebuilt here that carries neither the rebuild-complete
-   *  marker of this `episode` (a finished rebuild awaiting its flip) nor rebuild-required (a lost copy
-   *  discardLostStore clears) was not produced by this rebuild: a leftover of an earlier tenancy of the store on this
+   *  marker of this `episode` (a finished rebuild awaiting its flip), and is not Lost (in lost/, which
+   *  discardLostStore clears), was not produced by this rebuild: a leftover of an earlier tenancy of the store on this
    *  device (a transferred-away copy whose delete failed and whose marker was lost, or a copy finished for an earlier
    *  Rebuilding episode, superseded by a re-placement away and back), or a copy put there by hand. Nothing ties it to the store's
-   *  current state, so it is retired as a lost copy: marked rebuild-required, and then kept in pending-delete by
+   *  current state, so it is retired as a lost copy: moved to lost/, and then kept in pending-delete by
    *  discardLostStore like any other. A served one is first taken out of service as a failed backend is, and its
    *  rebuild waits for a later check. A stat that fails is no absence (FileStat): the rebuild waits for a later
    *  check, neither starting over a copy it cannot see nor retiring a finished one whose marker it cannot see.
    *
-   *  Any copy at the path other than this episode's finished one, a foreign or a rebuild-required one, may have served
+   *  Any copy at the path other than this episode's finished one, a foreign or a Lost one, may have served
    *  since the rebuild's first pass began: a restart's device load serves an unmarked copy until the device's first
-   *  reconcile, and a served copy that fails is marked rebuild-required. A resumed walk would leave its acknowledged
+   *  reconcile, and a served copy that fails is moved to lost/. A resumed walk would leave its acknowledged
    *  updates on the objects walked before the checkpoint stale with no mark, so the store's staging checkpoint is
    *  first removed durably, making the next pass a first pass (dropStagingCheckpoint). No rebuild of the store runs
    *  here when this is called. Returns whether the rebuild may go on now. */
   private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
     val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
-    // Some(None): nothing at the path or this episode's finished copy; Some(Some(marked)): another copy, rebuild-required
-    // or not
+    val lost = registry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase == Phase.Lost)
+    // Some(None): nothing at the path or this episode's finished copy; Some(Some(lost)): another copy, Lost (in
+    // lost/) or not
     val found =
-      try
-        if !FileStat.exists(storePath) ||
-           StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildComplete) &&
-             RebuildingStore.isRebuildCompleteFor(storePath, episode) then
-          Some(None)
-        else
-          Some(Some(StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildRequired)))
-      catch case NonFatal(t) =>
-        logger.error(s"Failed to stat the path of store $storeId at $storePath. Not rebuilding it yet: $t")
-        None
-    if found.isEmpty then
+      if lost then
+        Some(Some(true))
+      else
+        try
+          if !FileStat.exists(storePath) ||
+             StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildComplete) &&
+               RebuildingStore.isRebuildCompleteFor(storePath, episode) then
+            Some(None)
+          else
+            Some(Some(false))
+        catch case NonFatal(t) =>
+          logger.error(s"Failed to stat the path of store $storeId at $storePath. Not rebuilding it yet: $t")
+          None
+    if ctx.moves.isPendingLost(local, storeId) then
+      // Its move to lost/ failed: held offline until a device check moves it
+      false
+    else if found.isEmpty then
       false
     else if found.contains(None) then
       true
@@ -670,13 +677,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         case _ =>
           logger.error(s"Retiring a store directory before rebuilding: ${err.getMessage}. It is kept in " +
                        s"pending-delete until the store is Active again")
-          try
-            markRebuildRequired(storePath)
-            true
-          catch
-            case t: Throwable =>
-              logger.error(s"Failed to mark store $storeId for rebuild at $storePath. Not rebuilding it yet: $t")
-              false
+          // Durable in lost/, or the rebuild waits: a move not forced could be undone by a crash
+          moveToLost("retireForeignCopy", local, storeId) == MoveResult.Durable
 
   /** Removes the rebuild checkpoint of `storeId` from its staging directory on `local`, durably, then the rest of the
    *  directory (a first pass's createStaging discards whatever is left). A staging directory without a checkpoint is a
@@ -698,7 +700,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
   /** A store served from `local` that the device's entry does not list: a copy put at the store path by hand, loaded
    *  without reading the tree. Nothing ties it to the store's current state, so it is taken out of service as a
-   *  failed backend is (marked rebuild-required, closed, left offline, its CRL entries kept), and the Deleted Stores
+   *  failed backend is (closed, moved to lost/ when its close ends, its CRL entries kept), and the Deleted Stores
    *  pass of the check that follows retires it to pending-delete. A store still opening is left for a later check. */
   def retireUnlistedServed(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
@@ -711,15 +713,56 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           backendFailed(storeId, Some(entry.store.backend), err, "is served from a copy its device's entry does not list")
         case _ => ()
 
-  /** Writes the marker that keeps the store at `storePath` from ever being loaded again: its CRL
-   *  save file is unusable and was the only copy of its transaction state. */
-  def markRebuildRequired(storePath: os.Path): Unit =
-    ctx.markers.writeAt(storePath, StoreDirMarkers.Marker.RebuildRequired, "")
+  /** T10 for a closed copy of an attached device: moves the copy of `storeId` on `sds` into lost/, where it is never
+   *  loaded, shipped or promoted, and only retired (T11). A copy already Lost is left there (Durable). A move that
+   *  fails is logged at error and its copy held offline (CopyMoves.pendingLost: never loaded, shipped or retired) and
+   *  retried at each device check before the passes; a crash forgets the hold, and the copy then reloads from where it
+   *  is, as after any crash (P5). An unsynced move leaves the copy Lost and unsynced until a device check forces it.
+   *  Only ever called once the copy is closed: CopyMoves.move refuses one opening, served or closing */
+  def moveToLost(site: String, sds: LocalStorageDeviceState, storeId: StoreId): MoveResult =
+    registry.copiesOf(sds).flatMap(_.copies.get(storeId)) match
+      case Some(r) if r.phase == Phase.Lost =>
+        ctx.moves.holdLost(sds, storeId, held = false)
+        MoveResult.Durable
+      case found =>
+        // A copy at the flat path with no record (put there by hand after the device's load) is learned first. A
+        // stat that fails learns it too: the move's own rename then fails or not
+        val record = found.orElse:
+          if registry.copiesOf(sds).isDefined &&
+             Try(FileStat.isDir(CopyLayout.path(sds.devicePath, storeId, None, Phase.Live))).getOrElse(true) then
+            registry.learn(site, sds, storeId)
+          registry.copiesOf(sds).flatMap(_.copies.get(storeId))
+        val result = ctx.moves.move(site, sds, storeId, Phase.Lost)
+        result match
+          case MoveResult.NotMoved(t) if record.isDefined =>
+            logger.error(s"Failed to move the copy of store $storeId on device ${sds.storageDeviceId} to lost/ " +
+                         s"($site). It is held offline, and the move retried at each check of its device. Error: $t")
+            ctx.moves.holdLost(sds, storeId, held = true)
+          case _ => ()
+        result
+
+  /** Retries the move to lost/ of every copy of `local` whose move failed (CopyMoves.pendingLost): each device check
+   *  does, before its passes */
+  def retryPendingLost(local: LocalStorageDeviceState): Unit =
+    ctx.moves.pendingLost(local).toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
+      moveToLost("retry move to lost", local, storeId): Unit
+
+  /** The copy of `storeId` on device `deviceId`, if it is loaded here: moved to lost/ (moveToLost), then its device
+   *  checked so the reconcile flips its entry to Rebuilding */
+  private def moveClosedToLost(site: String, deviceId: StorageDeviceId, storeId: StoreId): Unit =
+    ctx.devices.devices.get(deviceId) match
+      case Some(sds) =>
+        moveToLost(site, sds, storeId): Unit
+        ctx.reconciler.checkStorageDevice(deviceId)
+      case None =>
+        // Its device was unloaded meanwhile: its next load finds the copy where it is, and a backend still broken
+        // fails its open again (P5)
+        logger.warn(s"Not moving the copy of store $storeId to lost/ ($site): its device $deviceId is not loaded")
 
   /** The LoadStore handler found `backend`'s CRL save file unusable. The file sits in the store's
    *  own directory, so it is the only copy of that state: the store is permanently failed. It
-   *  is closed unserved, marked, and left offline; the reconcile then flips its entry to
-   *  Rebuilding, and the rebuild discards the directory.
+   *  is closed unserved, moved to lost/, and left offline; the reconcile then flips its entry to
+   *  Rebuilding, and the rebuild discards the copy.
    *
    *  A store arriving over the network never reaches here with a bad file: its staged copy is
    *  checked before promotion, while the source still holds the state.
@@ -731,44 +774,44 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                  s"state is lost. Rebuilding it. Error: $err")
     retireUnserved(storageDeviceId, backend)
 
-  /** crlSaveFileLost's steps, for any store that must never serve: closes `backend` unserved, marks the store
-   *  rebuild-required, leaves it offline, and checks the device so the reconcile flips its entry to Rebuilding.
-   *  The close is not awaited. */
+  /** crlSaveFileLost's steps, for any store that must never serve: closes `backend` unserved and, once the close has
+   *  ended (no move is made of an open backend's directory), moves the copy to lost/, leaves it offline, and checks
+   *  the device so the reconcile flips its entry to Rebuilding. A crash before the move finds the same unusable state
+   *  at the next start and lands here again. */
   def retireUnserved(storageDeviceId: StorageDeviceId, backend: Backend): Unit =
     val storeId = backend.storeId
-    backend.close()
-    try
-      markRebuildRequired(backend.path)
-    catch
-      case t: Throwable =>
-        // Offline for the life of this process either way. The next start finds the same
-        // unusable state and lands here again.
-        logger.error(s"Failed to mark store $storeId for rebuild at ${backend.path}: $t")
-    ctx.reconciler.checkStorageDevice(storageDeviceId)
+    val closed =
+      try backend.close()
+      catch case NonFatal(t) => Future.failed(t)
+    closed.onComplete: result =>
+      result.failed.foreach(t => logger.warn(s"Failed to close the unserved backend of store $storeId: $t"))
+      moveClosedToLost("retireUnserved", storageDeviceId, storeId)
 
   /** A store closed by ShutdownStore whose backend failed-stop meanwhile: its page-cache state can't be trusted, so
-   *  it is rebuilt rather than treated as cleanly closed. Marked rebuild-required, which every reader of the directory
-   *  checks before its CRL save file, so nothing takes it for a clean close; its copy is closed (Idle), so a shutdown
-   *  retry does not pick it again. A save file the close wrote (a transfer out's, whose entries have left the
-   *  device CRL) is the only copy of the store's transaction state: it stays, and the rebuild's retire keeps it in the
-   *  copy as its lost CRL state (StoreCopies.retire). */
+   *  it is rebuilt rather than treated as cleanly closed. Its copy, closed (Idle), is moved to lost/, where nothing
+   *  takes it for a clean close and a shutdown retry does not pick it again. A save file the close wrote (a transfer
+   *  out's, whose entries have left the device CRL) is the only copy of the store's transaction state: it moves with
+   *  the copy, and the rebuild's retire keeps it in the copy as its lost CRL state (StoreCopies.retire). */
   def failedOnClose(store: Store): Unit =
     val storeId = store.storeId
-    val path = store.backend.path
-    logger.error(s"Store $storeId failed on an I/O error while closing. Marking it for rebuild instead of " +
-                 s"closing it cleanly. $path")
-    try
-      markRebuildRequired(path)
-    catch
-      case t: Throwable => logger.error(s"Failed to mark store $storeId for rebuild at $path: $t")
-    ctx.reconciler.checkStorageDevice(store.storageDeviceId)
+    logger.error(s"Store $storeId failed on an I/O error while closing. Moving it to lost/ instead of closing it " +
+                 s"cleanly. ${store.backend.path}")
+    moveClosedToLost("failedOnClose", store.storageDeviceId, storeId)
+
+  /** The FailStop close of `storeId` on device `deviceId` ended (StoreLoader.closeUnloaded): the copy is moved to
+   *  lost/ now it is closed (P5). A crash between the close and the move leaves it where it was, and the restart loads
+   *  it as after any crash */
+  def failStopClosed(deviceId: StorageDeviceId, storeId: StoreId): Unit =
+    moveClosedToLost("fail-stop close ended", deviceId, storeId)
 
   /** A backend failed-stop: its state can no longer be trusted, so the store is rebuilt. If it is
-   *  served, it is unloaded, its CRL state left for the rebuild's discard to save and drop,
-   *  marked rebuild-required and left offline, and its device checked so the reconcile flips its entry to
-   *  Rebuilding. The mark is written before the close, so a crash meanwhile still never serves it. Nothing is
-   *  awaited: the close completes in the background. A backend not (or no longer) served is ignored: either its
-   *  LoadStore is still queued, and retires it on seeing it failed, or it was closed and replaced. */
+   *  served, it is unloaded, its CRL state left for the rebuild's discard to save and drop, and closed with purpose
+   *  FailStop: when the close ends its copy is moved to lost/ and left offline, and its device checked so the
+   *  reconcile flips its entry to Rebuilding (StoreLoader.closeUnloaded, failStopClosed). A crash between the close
+   *  and the move leaves the copy where it was: the restart recovers it from its CRL as after any crash, and a backend
+   *  still broken fails again (P5). Nothing is awaited: the close completes in the background. A backend not (or no
+   *  longer) served is moved to lost/ if it is closed, unless replaced: its LoadStore, still queued, or its close,
+   *  still running, retires it on seeing it failed. */
   private def backendFailed(storeId: StoreId, backend: Option[Backend], err: Throwable,
                             what: String = "failed on an I/O error"): Unit =
     // Store.backend and Backend.path are immutable, so the control side may read them while the store is served
@@ -777,33 +820,37 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         val store = entry.store
         logger.error(s"Store $storeId $what and can no longer be trusted. Taking it offline and " +
                      s"rebuilding it. Error: $err")
+        ctx.copyRegistry.closingFor(storeId, ClosePurpose.FailStop)
         ctx.router.remove(storeId)
-        try
-          markRebuildRequired(store.backend.path)
-        catch
-          case t: Throwable =>
-            // Offline for the life of this process either way. A restart recovers whatever is
-            // durable, which a failed store may well still hold.
-            logger.error(s"Failed to mark store $storeId for rebuild at ${store.backend.path}: $t")
-        // Its object cache cleared and close run on its executor; its slot released after. Its CRL entries stay in the
-        // device CRL: the rebuild's discard saves them with the copy it keeps, then drops them (discardLostStore)
-        ctx.loader.closeUnloaded(entry, dropDurably = false)
+        // Its object cache cleared and close run on its executor; its slot released after, and its copy moved to lost/.
+        // Its CRL entries stay in the device CRL: the rebuild's discard saves them with the copy it keeps, then drops
+        // them (discardLostStore)
+        ctx.loader.closeUnloaded(entry, dropDurably = false, ClosePurpose.FailStop)
         ctx.reconciler.checkStorageDevice(store.storageDeviceId)
       case served =>
         // Not served: its LoadStore is still queued (and retires it), it was replaced by a newer
-        // backend, or it was closed. Unless replaced, its directory is marked, so a store closed
+        // backend, or it was closed. Unless replaced, its copy is moved to lost/, so a store closed
         // around the failure is never later served, shipped or adopted as cleanly closed.
+        def recordAt(b: Backend): Option[(LocalStorageDeviceState, CopyRecord)] =
+          ctx.devices.devices.valuesIterator.flatMap(sds =>
+            registry.copiesOf(sds).flatMap(_.copies.get(storeId)).filter(_ =>
+              registry.pathOf(sds, storeId).contains(b.path)).map(sds -> _)).nextOption()
         backend match
-          // A directory whose stat fails (FileStat) is marked as a present one: the mark's own write then fails or not
-          case Some(b) if served.isEmpty && !ctx.router.loaded.valuesIterator.exists(_.backend.path == b.path) &&
-                          scala.util.Try(FileStat.isDir(b.path)).getOrElse(true) &&
-                          ctx.devices.devices.valuesIterator.exists(_.devicePath == b.path / os.up) =>
-            logger.error(s"Store $storeId failed on an I/O error after it stopped being served. Marking it for " +
-                         s"rebuild. Error: $err")
-            try
-              markRebuildRequired(b.path)
-            catch
-              case t: Throwable => logger.error(s"Failed to mark store $storeId for rebuild at ${b.path}: $t")
+          case Some(b) if served.isEmpty && !ctx.router.loaded.valuesIterator.exists(_.backend.path == b.path) =>
+            recordAt(b) match
+              case Some((_, r)) if r.activity.isInstanceOf[Activity.Opening] ||
+                                   r.activity.isInstanceOf[Activity.Closing] =>
+                // Its LoadStore (handleLoad: failed before served) or its close's end (failedOnClose) retires it
+                logger.error(s"Store $storeId failed on an I/O error while it was ${r.activity}. Its " +
+                             s"${if r.activity.isInstanceOf[Activity.Opening] then "load" else "close"} retires it. " +
+                             s"Error: $err")
+              case Some((sds, _)) =>
+                logger.error(s"Store $storeId failed on an I/O error after it stopped being served. Moving it to " +
+                             s"lost/. Error: $err")
+                moveToLost("backendFailed", sds, storeId): Unit
+              case None =>
+                logger.info(s"Ignoring the failure of a backend of store $storeId whose copy is not recorded at " +
+                            s"${b.path}. Error: $err")
           case _ =>
             logger.info(s"Ignoring the failure of a replaced backend of store $storeId. Error: $err")
 
@@ -814,7 +861,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *
    *  Only a collision is retried, as everywhere else in Host. A permanent failure is logged and
    *  left for a later reconcile: the Lost CRL State pass requests it again while the store's
-   *  rebuild-required marker is in place, and the Missing Stores pass (which has no marker) while
+   *  copy is in lost/, and the Missing Stores pass (which has no marker) while
    *  the store it declared stays Active and unserved (LocalStorageDeviceState.declaredMissing),
    *  its directory back or not.
    */
@@ -881,14 +928,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    */
   private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
                                held: StoreRebuilds.HeldRebuild): Boolean =
-    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
-    // A stat that fails is no absence (FileStat): the rebuild waits for a later check rather than start over the copy
-    val marked = FileStat.existence(storePath / RebuildingStore.RebuildRequiredMarkerFile)
-    if marked.contains(false) then
+    // Only a Lost copy is discarded: retireForeignCopy, before it, moved any other copy at the path to lost/
+    if !registry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase == Phase.Lost) then
       true
-    else if marked.isEmpty then
-      logger.error(s"Failed to stat the rebuild-required marker of store $storeId at $storePath. Not rebuilding it yet")
-      false
     else
       val deviceId = local.storageDeviceId
       // Host-wide by store id: one discard of the store at a time
@@ -942,7 +984,4 @@ object StoreRebuilds:
     val doubled = Host.RebuildRetryInitialDelay * (1L << math.min(failures, 20))
     if doubled > Host.RebuildRetryMaxDelay then Host.RebuildRetryMaxDelay else doubled
 
-  /** Places the rebuild-required marker of the store at `storePath`, forced and renamed into place; CopyMarkers forces
-   *  the store directory after it (DeviceControl.writeRebuildRequiredMarker, a test seam) */
-  def writeRebuildRequiredMarker(storePath: os.Path): Unit =
-    DurableFiles.place(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+

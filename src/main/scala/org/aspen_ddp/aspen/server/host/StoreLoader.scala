@@ -113,15 +113,15 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         try
           val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath)
           val storeId = storeCfg.storeId
-          val phase = CopyPhase.read(potentialStoreFile)
+          // A copy in a phase directory is in its phase by its location; a flat one's markers say it
+          val phase = CopyLayout.readPhase(potentialStoreFile)
           ctx.copyRegistry.readAtLoad(sds, potentialStoreFile, storeId, phase)
           if phase != Phase.Live then
             phase match
               case Phase.Lost =>
                 // Its CRL state is gone. The reconcile flips its entry to Rebuilding, and the rebuild
-                // discards this directory before writing a fresh copy.
-                logger.warn(s"Not loading store $storeId: its CRL save file was lost and it " +
-                            s"awaits a rebuild. $potentialStoreFile")
+                // retires this copy before writing a fresh one.
+                logger.warn(s"Not loading store $storeId: it is in lost/ and awaits a rebuild. $potentialStoreFile")
               case Phase.Outbound(_) =>
                 logger.info(s"Skipping load of offline store marked for transfer out. StoreId $storeId. " +
                             s"$potentialStoreFile")
@@ -140,6 +140,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             // Its copy's record (readAtLoad) keeps it silent and offline on its device
           else if isOpening(storeCfg.storeId) || router.get(storeCfg.storeId).isDefined then
             logger.debug(s"Not loading store ${storeCfg.storeId} again: it is already open or opening")
+          else if ctx.moves.isPendingLost(sds, storeId) then
+            // Its move to lost/ failed: held offline until a check of its device moves it (StoreRebuilds.moveToLost)
+            logger.info(s"Not loading store $storeId: its move to lost/ failed and is retried. $potentialStoreFile")
           else if ctx.copyRegistry.isUnsynced(sds, storeId) then
             // A marker change a crash could undo (CopyMarkers): the next check of its device forces its directory
             // and loads it (DeviceReconciler.loadResynced)
@@ -263,7 +266,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   /** The outcome of startOpen, on the control thread:
    *  - opened: the store is served (LoadStore, which retires a backend that failed-stop meanwhile), unless its
    *    device was unloaded meanwhile or another backend serves it, when it is closed unserved;
-   *  - BackendStateLost: the store's acknowledged state is gone. It is marked rebuild-required and left offline, as
+   *  - BackendStateLost: the store's acknowledged state is gone. It is moved to lost/ and left offline, as
    *    crlSaveFileLost leaves a store, and the reconcile then flips its entry to Rebuilding;
    *  - a failed create that left nothing at the path: left offline; its entry is still Initializing, so the next
    *    device check creates it again;
@@ -293,12 +296,18 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       case Success(backend) if (!inline && !registered) || router.get(storeId).isDefined =>
         logger.warn(s"Not serving store $storeId opened at $storePath: its device was unloaded or another " +
                     s"backend serves it meanwhile. Closing it")
-        if backend.hasFailed then
-          try ctx.rebuilds.markRebuildRequired(storePath)
-          catch case t: Throwable => logger.error(s"Failed to mark store $storeId for rebuild at $storePath: $t")
-        backend.close()
+        val failed = backend.hasFailed
+        val closed =
+          try backend.close()
+          catch case NonFatal(t) => Future.failed(t)
         created.foreach(_.tryFailure(new IllegalStateException(s"store $storeId was opened but not served")))
         openEnded()
+        if failed then
+          // Moved to lost/ once its backend has closed: never a move of an open backend's directory (P5)
+          closed.onComplete: _ =>
+            if ctx.devices.isLoaded(sds) then
+              ctx.rebuilds.moveToLost("failed unserved backend", sds, storeId): Unit
+              ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
       case Success(backend) =>
         if create then
           newStores += storeId
@@ -324,13 +333,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         logger.error(s"Store $storeId cannot be loaded: its backend found its acknowledged state lost. " +
                      s"Rebuilding it. $storePath. Error: ${e.getMessage}")
         openEnded()
-        try
-          ctx.rebuilds.markRebuildRequired(storePath)
-        catch
-          case t: Throwable =>
-            // Offline for the life of this process either way. The next start recovers the
-            // same files and lands here again.
-            logger.error(s"Failed to mark store $storeId for rebuild at $storePath: $t")
+        // No backend opened, so the copy is closed: moved to lost/ now. A move that fails holds it offline for the
+        // checks to retry; a crash before the move recovers the same files at the next start and lands here again
+        ctx.rebuilds.moveToLost("BackendStateLost", sds, storeId): Unit
         // A device still being loaded is checked once it is registered.
         if registered then
           ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
@@ -763,11 +768,13 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   def handleUnloadFailed(e: UnloadFailedStore): Unit =
     val UnloadFailedStore(storeId, store) = e
     router.entry(storeId).filter(_.store eq store).foreach: entry =>
+      // Its copy stays where it is, to load again: no fail-stop
+      ctx.copyRegistry.closingFor(storeId, ClosePurpose.Reload)
       router.remove(storeId)
       // Drops whatever part of the saved state did reach the CRL. The save file is not
       // rewritten from it: the file on disk is still the whole state.
       // The save file on disk still holds the whole state, so the entries may go for good
-      closeUnloaded(entry, dropDurably = true)
+      closeUnloaded(entry, dropDurably = true, ClosePurpose.Reload)
 
   /** Unloads a store whose crl_save.log could not be removed durably after its load (StoreRouter.crlLoaded), if it
    *  is still the one installed. It has not recovered, so it served nothing: its device-CRL entries, the whole of
@@ -777,17 +784,19 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   def handleSaveFileRemovalFailed(e: Host.SaveFileRemovalFailed): Unit =
     val Host.SaveFileRemovalFailed(storeId, store) = e
     router.entry(storeId).filter(_.store eq store).foreach: entry =>
+      ctx.copyRegistry.closingFor(storeId, ClosePurpose.Reload)
       router.remove(storeId)
       ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
         awaitRetry("save file removal failed", storeId, LoadRetry(sds, store.backend.path, 1, 1))
-      closeUnloaded(entry, dropDurably = false)
+      closeUnloaded(entry, dropDurably = false, ClosePurpose.Reload)
 
   /** Closes the store of `entry`, already removed from the router, without saving its CRL state: clears its object
    *  cache on its executor, then closes it there, and releases its executor slot once the close completes. Nothing
    *  is awaited. With `dropDurably` its entries are deleted from the CRL (CrashRecoveryLog.dropStore), which only a
-   *  caller whose state is recoverable elsewhere (a save file still on disk) or whose `rebuild-required` marker is on
-   *  disk may ask for; otherwise they stay live in the device CRL, and a restart recovers them. */
-  private[host] def closeUnloaded(entry: StoreRouter.Entry, dropDurably: Boolean): Unit =
+   *  caller whose state is recoverable elsewhere (a save file still on disk) may ask for; otherwise they stay live in
+   *  the device CRL, and a restart recovers them. A close for `ClosePurpose.FailStop` moves the copy to lost/ when it
+   *  ends (StoreRebuilds.failStopClosed, P5); any other leaves it where it is */
+  private[host] def closeUnloaded(entry: StoreRouter.Entry, dropDurably: Boolean, purpose: ClosePurpose): Unit =
     val store = entry.store
     startClose(entry):
       store.objectCache.clear()
@@ -804,7 +813,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         ctx.copyRegistry.closeEnded(store.storageDeviceId, store.storeId)
         // The reconcile's passes leave a closing copy to its close (HostCopies.offlineCopies): its end checks the
         // device again, so a fail-stopped or unloaded copy is retired or rebuilt without waiting for the periodic check
-        if ctx.devices.devices.contains(store.storageDeviceId) then
+        if purpose == ClosePurpose.FailStop then
+          ctx.rebuilds.failStopClosed(store.storageDeviceId, store.storeId)
+        else if ctx.devices.devices.contains(store.storageDeviceId) then
           ctx.reconciler.checkStorageDevice(store.storageDeviceId)
 
   /** The first step of a close, on the executor of `entry`, whose store the router no longer holds. Every task
@@ -846,8 +857,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  fail-stop check decides the completion; a failed step fails it. Extracted entries are deleted from the device
    *  CRL (memory and files) only once the save file is durable, so a crash or a failed save before that leaves the
    *  device CRL holding them. A store whose backend failed-stop
-   *  is marked rebuild-required (failedOnClose); its entries are dropped when the rebuild discards it
-   *  (StoreRebuilds.discardLostStore), after that marker is durable. */
+   *  is moved to lost/ once closed (failedOnClose); its entries are dropped when the rebuild discards it
+   *  (StoreRebuilds.discardLostStore), after that move is durable. */
   def handleClose(e: ShutdownStore): Unit =
     val ShutdownStore(storeId, extractCrl, completion) = e
     router.entry(storeId) match

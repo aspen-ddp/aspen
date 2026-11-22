@@ -57,7 +57,7 @@ object Host:
    *  why, for the log */
   private[server] case class StoreFailStopped(store: Store, err: Throwable, what: String) extends Event
 
-  /** The close of a store (ShutdownStore) found its backend failed-stop: the store was marked rebuild-required
+  /** The close of a store (ShutdownStore) found its backend failed-stop: the store is moved to lost/
    *  rather than closed cleanly, so a caller must not mark it as cleanly closed (transfer-out marker) or ship it. */
   final case class StoreFailedOnClose(storeId: StoreId)
     extends Exception(s"Store $storeId failed on an I/O error while closing; it is marked for rebuild")
@@ -156,9 +156,9 @@ object Host:
                          /** The CRL of stores that loadStore loads onto a device this host has not loaded, for tests
                           *  that load stores directly. Without it such a load fails: a store uses its device's CRL. */
                          unloadedDeviceCrl: Option[CrashRecoveryLog] = None,
-                         /** Writes a store directory's rebuild-required marker (StoreRebuilds.markRebuildRequired), for
-                          *  tests of a write that fails and leaves nothing behind */
-                         writeRebuildRequiredMarker: Option[os.Path => Unit] = None,
+                         /** How a phase change renames a copy (CopyMoves.rename, from, to), installed before the first
+                          *  device load, for tests of a rename that fails and moves nothing */
+                         copyRename: Option[(os.Path, os.Path) => Unit] = None,
                          /** A failure for StoreRebuilds.requestRebuild to report instead of running its flip, by
                           *  store, for tests of a request that fails permanently */
                          rebuildRequestFailure: StoreId => Option[Throwable] = _ => None,
@@ -340,7 +340,6 @@ class Host(val client: AspenClient,
       (_, fn) => controlScheduler.schedule(shutdownWorkTimeout)(fn())),
     scheduleEndpointRetry = fn => controlScheduler.schedule(Duration(5, SECONDS))(fn()),
     ec = ec,
-    writeRebuildRequiredMarker = seams.writeRebuildRequiredMarker.getOrElse(StoreRebuilds.writeRebuildRequiredMarker),
     rebuildRequestFailure = seams.rebuildRequestFailure,
     unackedLookup = seams.wrapUnackedLookup.fold(unackedLookup)(wrap => wrap(unackedLookup)),
     heldVoteQuery = heldVoteQuery,
@@ -404,6 +403,7 @@ class Host(val client: AspenClient,
   private val repairService = new RepairService(client, hostId, this, backgroundTasks)(using ec)
 
   deviceControl.copyRegistry.strict = seams.verifyCopyRegistry || seams.strictCopyRegistry
+  seams.copyRename.foreach(deviceControl.moves.rename = _)
 
   deviceControl.discovery.checkForNewDevices()
 

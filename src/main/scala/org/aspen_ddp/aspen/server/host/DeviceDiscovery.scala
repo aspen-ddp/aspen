@@ -22,7 +22,7 @@ import scala.util.control.NonFatal
 private[aspen] enum AdoptionClass:
   /** Its state is on the device (the device CRL, or a network transfer's save file): adopted Active. */
   case Clean
-  /** Its transaction state is gone (marked rebuild-required, or a transfer's save file missing or
+  /** Its transaction state is gone (in lost/, or a transfer's save file missing or
    *  unusable): adopted Rebuilding. */
   case CrlLost
   /** Its directory is missing: the device is refused. */
@@ -303,8 +303,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *
    *  - No directory: the store's close or creation did not finish (or its directory was lost), and
    *    adopting it would drop whatever it held: Unclean, and the device is refused.
-   *  - `rebuild-required`: CrlLost whatever else the directory holds. Its host marked it because
-   *    its state cannot be trusted (a backend that failed while closing, a lost CRL).
+   *  - In lost/: CrlLost. Its host moved it there because its state cannot be trusted (a backend that failed while
+   *    closing, a lost CRL).
    *  - `transferred-in`: Clean. A transfer in that landed during the shutdown (PoolRepointedOffline);
    *    it was never opened on this device, so it has no CRL state to carry.
    *  - `transferring-out`: a network transfer out had taken its state out of the device CRL into
@@ -320,19 +320,23 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *
    *  A stat that fails is no absence (FileStat): it throws, failing the adoption for the next scan to retry.
    */
-  private def adoptionClass(storeId: StoreId, storePath: os.Path): AdoptionClass =
-    if !FileStat.isDir(storePath) then
-      AdoptionClass.Unclean
-    else
-      CopyPhase.read(storePath) match
-        case Phase.Lost =>
-          AdoptionClass.CrlLost
-        case Phase.Outbound(_) =>
-          CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storePath), storeId) match
-            case Right(_) => AdoptionClass.Clean
-            case Left(_) => AdoptionClass.CrlLost
-        case _ =>
-          AdoptionClass.Clean
+  private def adoptionClass(storeId: StoreId, copy: Option[CopyLayout.Found]): AdoptionClass =
+    copy match
+      case None => AdoptionClass.Unclean
+      case Some(found) if CopyLayout.dirOf(found.phase).isEmpty && !FileStat.isDir(found.path) =>
+        AdoptionClass.Unclean
+      case Some(found) =>
+        // A flat copy is read again: its listing's Unread is no phase. A failed read throws
+        val phase = if CopyLayout.dirOf(found.phase).isDefined then found.phase else CopyPhase.read(found.path)
+        phase match
+          case Phase.Lost =>
+            AdoptionClass.CrlLost
+          case Phase.Outbound(_) =>
+            CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(found.path), storeId) match
+              case Right(_) => AdoptionClass.Clean
+              case Left(_) => AdoptionClass.CrlLost
+          case _ =>
+            AdoptionClass.Clean
 
   /** Validates a device last owned by `previousHostId`, shut down or not, and adopts it if its CRL
    *  is on it and every store it serves has its directory. On success the post-commit steps run
@@ -388,7 +392,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       val fadopt =
         try ctx.metadata.adoptDevice(deviceId, previousHostId, path, uncleanStores,
                                      (p, s) => servedStoresIn(p, s, AdoptionClass.CrlLost),
-                                     ctx.rebuilds.markRebuildRequired)
+                                     moveToLostUnattached(path))
         catch case t: Throwable => Future.failed(t)
       fadopt.onComplete: result =>
         pendingResolutions -= path
@@ -400,12 +404,25 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   def servedStoresIn(path: os.Path,
                      state: StorageDeviceState,
                      cls: AdoptionClass): List[StoreId] =
+    // A failed listing throws, failing the adoption for the next scan
+    val copies = CopyLayout.list(path).copies.filter(_.phase != Phase.Retired)
     state.stores.collect {
       case (storeId, entry) if (entry.status == StorageDeviceState.StoreStatus.Offline ||
                                 entry.status == StorageDeviceState.StoreStatus.Active) &&
-                               adoptionClass(storeId, CopyLayout.path(path, storeId, None, Phase.Live)) == cls =>
+                               adoptionClass(storeId, copies.find(_.storeId == storeId)) == cls =>
         storeId
     }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+
+  /** T10 for an adoption's CrlLost store on the device at `path`, not attached yet: its copy moved to lost/ unless it
+   *  is there. A move that fails throws, failing the adoption's transaction for the next scan to retry; one not
+   *  forced is held for the device's attach (CopyMoves.moveUnattached) */
+  private def moveToLostUnattached(path: os.Path)(storeId: StoreId): Unit =
+    CopyLayout.list(path).copies.find(f => f.storeId == storeId && f.phase != Phase.Retired) match
+      case Some(found) if found.phase != Phase.Lost =>
+        ctx.moves.moveUnattached("adoption CrlLost", found.path, storeId, found.copyId, Phase.Lost)._1 match
+          case MoveResult.NotMoved(t) => throw t
+          case _ => ()
+      case _ => ()
 
   /** The Offline and Active entries of `state` whose directories under `path` are missing. */
   def uncleanStores(path: os.Path, state: StorageDeviceState): List[StoreId] =
@@ -545,7 +562,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  stream files there (CrlMissing: stores exist only on a device whose CRL was opened), or when opening it throws
    *  anything but a transient error (DeviceDiscovery.isTransient) or a transient error on CrlOpenAttempts device
    *  scans in a row (an open outside a scan neither counts nor declares; a success anywhere resets). The stores'
-   *  transaction state was in it, so each is marked rebuild-required (the reconcile pass turns them into rebuilds),
+   *  transaction state was in it, so each is moved to lost/ (the reconcile pass turns them into rebuilds),
    *  except one that held nothing in it (holdsOwnState: its valid crl_save.log is its whole state, or it is a
    *  finished rebuild awaiting its flip). The old directory is kept aside as
    *  `crl.lost-<uuid>`, and a fresh CRL is created in `crl.creating` (CrashRecoveryLog.replacementCrlDir), renamed
@@ -568,8 +585,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     // one (CopyLayout.list): missing it could take an emptied crl/ for a new CRL. A failed stat of crl/ itself throws,
     // leaving the device unloaded for the next scan, rather than declare a crl/ that is there lost. Retired copies
     // keep their CRL state in their own files
-    val storeDirs = listing.copies.filter(_.phase != Phase.Retired).map(_.path)
-      .filter(dir => FileStat.existence(dir / StoreConfig.configFilename).forall(identity))
+    val storeDirs = listing.copies.filter(_.phase != Phase.Retired)
+      .filter(f => FileStat.existence(f.path / StoreConfig.configFilename).forall(identity))
     val lost =
       if storeDirs.nonEmpty && ! FileStat.exists(crlDir) then
         logger.error(s"Storage device $devicePath holds stores but has no CRL directory. Its stores must be rebuilt")
@@ -628,14 +645,20 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
               case _ =>
                 logger.error(s"Failed to recover the CRL of storage device $devicePath. Its stores must be rebuilt: $t")
             true
-    // Decided for every store before any is marked: a read that fails leaves all of them as they are
-    val toMark =
-      try storeDirs.filterNot(holdsOwnState)
+    // Decided for every store before any is moved: a read that fails leaves all of them as they are. A copy already
+    // in lost/ stays there
+    val toMove =
+      try storeDirs.filter(_.phase != Phase.Lost).filterNot(holdsOwnState)
       catch case t: Throwable =>
         logger.error(s"The CRL of storage device $devicePath is lost, but a store's save file or config could not " +
                      s"be read to tell whether it holds its own state. Retrying on the next scan: $t")
         throw t
-    toMark.foreach(ctx.rebuilds.markRebuildRequired)
+    // T10: into lost/. A move that fails throws, leaving the device unloaded (and its CRL where it is) for the next
+    // scan, which decides again; one not forced is held for the device's attach
+    toMove.foreach: found =>
+      ctx.moves.moveUnattached("lost device CRL", found.path, found.storeId, found.copyId, Phase.Lost)._1 match
+        case MoveResult.NotMoved(t) => throw t
+        case _ => ()
     // A stat that fails throws (FileStat), leaving the device unloaded for the next scan, rather than leave a crl/ in
     // the replacement's way
     if FileStat.exists(crlDir) then
@@ -668,7 +691,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  transaction state is empty. Its rebuild or the reconcile's Completed Rebuilds pass flips and loads it as it
    *  would have over the old CRL; one finished for an earlier episode is retired by retireForeignCopy as before. A
    *  failed stat throws (FileStat), leaving the device unloaded for the next scan. */
-  private def holdsOwnState(storeDir: os.Path): Boolean =
+  private def holdsOwnState(copy: CopyLayout.Found): Boolean =
+    val storeDir = copy.path
     val saveFile = Backend.crlSaveFile(storeDir)
     def configuredStoreId: Option[StoreId] =
       try Some(StoreConfig.loadStoreConfig(storeDir / StoreConfig.configFilename).storeId)
@@ -678,7 +702,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     def ownSaveFile: Boolean =
       FileStat.exists(saveFile) && configuredStoreId.exists: storeId =>
         CrashRecoveryLog.loadValidStoreState(saveFile, storeId).isRight
-    CopyPhase.read(storeDir) match
+    val phase = if CopyLayout.dirOf(copy.phase).isDefined then copy.phase else CopyPhase.read(storeDir)
+    phase match
       case Phase.Rebuilt(_) => true
       case _ => ownSaveFile
 
@@ -746,13 +771,15 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
             try
               // Its copies registered before any store is offered (HostCopies)
-              // Listed again: a lost CRL's open marked copies since the listing above
+              // Listed again: a lost CRL's open moved copies to lost/ since the listing above
               val copies = CopyLayout.list(storageDevicePath)
               ctx.copyRegistry.attach(sds, copies)
-              // Every child of the device root is offered, as tryLoadStore decides what is a store; then each copy in
-              // a phase directory but pending-delete/
-              val inPhases = copies.copies.filter(f => f.phase != Phase.Retired && f.copyId.isDefined).map(_.path)
-              (children ++ inPhases).foreach: potentialStoreFile =>
+              // Every child of the device root but the phase directories is offered, as tryLoadStore decides what is
+              // a store; then each copy in a phase directory but lost/ and pending-delete/, whose copies are never
+              // loaded
+              val inPhases = copies.copies.filter(f => f.phase != Phase.Retired && f.phase != Phase.Lost &&
+                f.copyId.isDefined).map(_.path)
+              (children.filterNot(c => CopyLayout.isPhaseDirectory(c.last)) ++ inPhases).foreach: potentialStoreFile =>
                 ctx.tryLoadStore(sds, potentialStoreFile, None)
             catch
               case t: Throwable =>

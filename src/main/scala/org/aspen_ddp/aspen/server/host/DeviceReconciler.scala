@@ -147,8 +147,9 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                                    remote: StorageDeviceState): Unit =
     local.reconciledEntries = Some(remote.stores)
     // Copies whose marker change or move was not durable (CopyMarkers, CopyMoves) are forced again first, so the passes
-    // see them synced
+    // see them synced, and copies whose move to lost/ failed are moved (StoreRebuilds.moveToLost)
     ctx.moves.resync(local)
+    ctx.rebuilds.retryPendingLost(local)
     if remote.isFailed then
       // An operator has declared this device dead. Its directory can still mount -- a dead
       // controller rather than a dead platter -- and its zeroed host id must not be mistaken for
@@ -268,9 +269,10 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     local.declaredMissing.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
       ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
 
-  /** Flips each store marked rebuild-required whose entry still reads Active to Rebuilding. Returns the offline stores so marked. */
+  /** Flips each store whose copy is Lost (in lost/) and whose entry still reads Active to Rebuilding. Returns the
+   *  offline stores so found. */
   private def flipLostCrlStores(local: LocalStorageDeviceState, remote: StorageDeviceState) =
-    // A store marked rebuild-required (crlSaveFileLost, or an adoption) whose entry still
+    // A store whose copy is Lost (crlSaveFileLost, a failed backend, or an adoption) whose entry still
     // reads Active is flipped to Rebuilding; startRebuilds then discards its
     // directory and rebuilds it. Before the abandoned-transfers-out pass, which would
     // otherwise take a marked store left behind a transfer-out marker for one to reinstate.
@@ -279,7 +281,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // same check) waits, re-checked shortly: its rebuild's discard would move the directory the send may still be
     // reading (I3, one piece of work per (device, store)).
     val lostCrl = ctx.copyRegistry.offlineCopies(local).filter(storeId =>
-      hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildRequired))
+      ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase == Phase.Lost))
     lostCrl.foreach: storeId =>
       if remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) then
         if ctx.storeTransferService.isTransferringOut(storeId) then

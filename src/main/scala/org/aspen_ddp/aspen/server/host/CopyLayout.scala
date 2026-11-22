@@ -16,17 +16,41 @@ import scala.util.Try
  *  (CopyPhase). Code never builds a copy's path
  *  itself: it asks here, or the registry (HostCopies.pathOf).
  *
- *  Stage 2 converts the phases one task at a time; so far only Retired (`pending-delete/`) is a directory. */
+ *  Stage 2 converts the phases one task at a time; so far Lost (`lost/`) and Retired (`pending-delete/`) are
+ *  directories. */
 object CopyLayout:
+  /** The directory of Lost copies: their CRL state is gone or unusable, and they await their retire */
+  val LostDirectory = "lost"
+
   /** The converted phase directories, by name, each with the phase of a child copy there (reading that phase's own
    *  parameter file, readParam, for a phase that carries one). Each task that converts a phase adds its row */
   private val phaseDirectories: List[(String, os.Path => Phase)] = List(
+    LostDirectory -> (_ => Phase.Lost),
     RebuildingStore.PendingDeleteDirectory -> (_ => Phase.Retired))
+
+  /** Whether `name`, a child of a device root, is a phase directory (it holds copies; it is none itself) */
+  def isPhaseDirectory(name: String): Boolean = phaseDirectories.exists(_._1 == name)
 
   /** The directory of `phase` under the device root, None while the phase is still a flat marker copy */
   def dirOf(phase: Phase): Option[String] = phase match
+    case Phase.Lost => Some(LostDirectory)
     case Phase.Retired => Some(RebuildingStore.PendingDeleteDirectory)
     case _ => None
+
+  /** The phase a copy at `path` is in by its location: Some for a copy named as one (copyName) in a converted phase
+   *  directory, None for any other path (a flat copy, whose markers say its phase) */
+  def phaseAt(path: os.Path): Option[Phase] =
+    if parseName(path.last).isEmpty then
+      None
+    else
+      phaseDirectories.collectFirst { case (name, phaseOf) if (path / os.up).last == name => phaseOf(path) }
+
+  /** The phase of the copy at `path`: by location in a phase directory (phaseAt), else what its markers read
+   *  (CopyPhase.known), None where they cannot be read */
+  def knownPhase(path: os.Path): Option[Phase] = phaseAt(path).orElse(CopyPhase.known(path))
+
+  /** As knownPhase, throwing a failed read (CopyPhase.read) */
+  def readPhase(path: os.Path): Phase = phaseAt(path).getOrElse(CopyPhase.read(path))
 
   def copyName(storeId: StoreId, copyId: UUID): String = s"${storeId.directoryName}.$copyId"
 

@@ -33,8 +33,9 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
 
   private[server] def releaseLookupsInFlight: Set[os.Path] = releaseLookups
 
-  /** Retires the copy at `storeId`'s path on `local`, in a fixed order, each step durable before the next:
-   *   1. the `rebuild-required` marker, which keeps the copy from ever being loaded, shipped or adopted as clean;
+  /** Retires the copy of `storeId` on `local`, in a fixed order, each step durable before the next:
+   *   1. the copy moved to lost/ (T10; StoreRebuilds.moveToLost), unless it is there, where it is never loaded,
+   *      shipped or adopted as clean;
    *   2. its CRL state saved in the copy as RebuildingStore.LostCrlStateFile: an existing one is kept (a crash left
    *      it), else the copy's `crl_save.log` is renamed to it (it already holds the state, which a transfer-out
    *      close deleted from the device CRL; any entries the device CRL still holds for the store, after a crash
@@ -42,20 +43,23 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
    *      device-CRL entries are read and saved;
    *   3. the store's device-CRL entries dropped (CrashRecoveryLog.dropStore): a store loaded or rebuilt onto this
    *      device later would recover them otherwise;
-   *   4. the directory renamed into the device's pending-delete directory.
-   *  A crash at any step leaves the marker and the copy, and the next retire redoes what remains. The copy is never
-   *  served meanwhile, so its entries cannot change.
+   *   4. the copy moved from lost/ to pending-delete/ under its copy name (T11; CopyMoves.move to Retired).
+   *  A crash at any step after the first leaves the copy in lost/, and the next retire redoes what remains. The copy
+   *  is never served meanwhile, so its entries cannot change.
    *
    *  The result is whether the store's path is clear: true once the copy is in pending-delete, or if there was none.
    *  False on a failure (logged, everything left for a later call), for a device unloaded meanwhile, while a retire
-   *  of the store is already running, or while the copy is unsynced (CopyMarkers: a marker change a crash could undo;
-   *  the next device check forces it). */
+   *  of the store is already running, while the copy is unsynced (a marker change or move a crash could undo; the
+   *  next device check forces it), or while its move to lost/ awaits its retry (CopyMoves.pendingLost). */
   def retire(local: LocalStorageDeviceState, storeId: StoreId): Future[Boolean] =
     val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
     if isRetiring(storeId) then
       Future.successful(false)
     else if ctx.copyRegistry.isUnsynced(local, storeId) then
-      logger.info(s"Not retiring the copy of store $storeId at $storePath yet: a marker change to it is not durable")
+      logger.info(s"Not retiring the copy of store $storeId at $storePath yet: a change to it is not durable")
+      Future.successful(false)
+    else if ctx.moves.isPendingLost(local, storeId) then
+      logger.info(s"Not retiring the copy of store $storeId at $storePath yet: its move to lost/ is still to retry")
       Future.successful(false)
     else
       // A stat that fails is no absence (FileStat): the retire fails, to be retried, rather than report a clear path
@@ -70,12 +74,21 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
         case Success(false) => Future.successful(true)
         case Success(true) => retirePresent(local, storeId, storePath)
 
-  /** retire's steps for a copy known to be at `storePath` */
-  private def retirePresent(local: LocalStorageDeviceState, storeId: StoreId, storePath: os.Path): Future[Boolean] =
+  /** retire's steps for a copy known to be at `at` */
+  private def retirePresent(local: LocalStorageDeviceState, storeId: StoreId, at: os.Path): Future[Boolean] =
+    // Step 1: into lost/, durably, unless it is there. A move not forced is retried once a device check forces it
+    ctx.rebuilds.moveToLost("retire", local, storeId) match
+      case MoveResult.Durable if ctx.copyRegistry.pathOf(local, storeId).isDefined =>
+        retireLost(local, storeId, ctx.copyRegistry.pathOf(local, storeId).get)
+      case result =>
+        logger.error(s"Failed to move the copy of store $storeId at $at to lost/ before retiring it ($result). " +
+                     s"Retrying at a later check")
+        Future.successful(false)
+
+  /** retire's steps 2-4 for a copy durably in lost/ at `storePath` */
+  private def retireLost(local: LocalStorageDeviceState, storeId: StoreId, storePath: os.Path): Future[Boolean] =
     val dropped =
       try
-        if !StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildRequired) then
-          ctx.markers.writeAt(storePath, StoreDirMarkers.Marker.RebuildRequired, "")
         // Retiring from here until it ends: isRetiring, and a second retire does nothing
         ctx.copyRegistry.retiring(local, storeId)
         val lostState = storePath / RebuildingStore.LostCrlStateFile
@@ -108,23 +121,14 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
           Success(ctx.devices.isLoaded(local) &&
                   moveToPendingDelete(local, storeId))
 
-  /** Step 4 of retire. Returns whether the path is clear. */
+  /** Step 4 of retire: lost/ to pending-delete/ (T11). Returns whether the path is clear: the move is durable, and
+   *  the copy left the registry (P3). One not forced stays recorded, Retired and unsynced, until a device check
+   *  forces it; one that failed leaves the copy in lost/ for the next retire */
   private def moveToPendingDelete(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
     val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
-    try
-      if FileStat.exists(storePath) then
-        val pendingDir = StoreCopies.ensureDirectory(local.devicePath, RebuildingStore.PendingDeleteDirectory)
-        val target = pendingDir / StoreCopies.pendingDeleteName(storeId)
-        logger.warn(s"Retiring the copy of store $storeId at $storePath to $target. It is deleted once the store " +
-                    s"is Active on the device its pool names")
-        DurableFiles.move(storePath, target)
-        ctx.copyRegistry.removed("moveToPendingDelete", local, storeId)
-      true
-    catch
-      case t: Throwable =>
-        logger.error(s"Failed to move the copy of store $storeId at $storePath into pending-delete. Retrying at a " +
-                     s"later check. Error: $t")
-        false
+    logger.warn(s"Retiring the copy of store $storeId at $storePath to pending-delete. It is deleted once the store " +
+                s"is Active on the device its pool names")
+    ctx.moves.move("moveToPendingDelete", local, storeId, Phase.Retired) == MoveResult.Durable
 
   /** Deletes each copy in the device's pending-delete directory whose store is Active on its owner device: this
    *  device by its own entry, or else the device the pool names, by that device's state. Anything else keeps the
@@ -182,20 +186,8 @@ object StoreCopies extends Logging:
    *  StoreLoader.tryLoadStore (it holds no store config of its own) */
   val DeletingDirectory = "deleting"
 
-  /** The name a retired copy of `storeId` takes in pending-delete: the store's directory name, then a fresh UUID */
-  def pendingDeleteName(storeId: StoreId): String = s"${storeId.directoryName}-${UUID.randomUUID()}"
-
-  /** The store a pending-delete copy named `name` (pendingDeleteName) belongs to */
-  def pendingDeleteStore(name: String): Option[StoreId] =
-    // "-" and a 36-character UUID
-    val suffix = 37
-    if name.length <= suffix || name.charAt(name.length - suffix) != '-' then
-      None
-    else
-      Try:
-        UUID.fromString(name.takeRight(suffix - 1))
-        StoreId(name.dropRight(suffix))
-      .toOption
+  /** The store a pending-delete copy named `name` belongs to: a copy name (CopyLayout.copyName), parsed */
+  def pendingDeleteStore(name: String): Option[StoreId] = CopyLayout.parseName(name).map(_._1)
 
   /** `devicePath / name`, created durably if absent. A stat that fails throws (FileStat) */
   private[host] def ensureDirectory(devicePath: os.Path, name: String): os.Path =

@@ -161,8 +161,8 @@ private class HookedMetadata(base: DeviceMetadata, beforeComplete: () => Future[
   def adoptDevice(storageDeviceId: StorageDeviceId, previousHostId: HostId, devicePath: os.Path,
                   uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
                   crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],
-                  markRebuildRequired: os.Path => Unit): Future[AdoptOutcome] =
-    base.adoptDevice(storageDeviceId, previousHostId, devicePath, uncleanStores, crlLostStores, markRebuildRequired)
+                  moveToLost: StoreId => Unit): Future[AdoptOutcome] =
+    base.adoptDevice(storageDeviceId, previousHostId, devicePath, uncleanStores, crlLostStores, moveToLost)
   def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
     base.lookupStorageDeviceState(storageDeviceId)
   def readTransferSourceState(fromDeviceId: StorageDeviceId): Future[StorageDeviceState] =
@@ -1361,7 +1361,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       pool <- client.createNewStoragePool("pending-delete-pool", Replication(1, 1), None, RocksDBConfig(),
                 StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
       elsewhere = StoreId(pool, 0.toByte)
-      copy = deviceDir / RebuildingStore.PendingDeleteDirectory / StoreCopies.pendingDeleteName(elsewhere)
+      copy = deviceDir / RebuildingStore.PendingDeleteDirectory / CopyLayout.copyName(elsewhere, UUID.randomUUID())
       _ <- setPoolEntry(elsewhere, deviceB)
       _ <- setDeviceState(deviceB)(_.copy(stores = Map(
              elsewhere -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None))))
@@ -1439,7 +1439,9 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(host, closing.isCompleted)
       closed <- closing.transform(r => scala.util.Success(r))
       _ = opener.failing = false
-      saveFileKept = os.exists(Backend.crlSaveFile(storeDir))
+      // Moved to lost/ once its close ended (failedOnClose), its save file with it
+      _ <- pumpUntil(host, markedLost(deviceDir))
+      saveFileKept = CopyFixtures.copyPath(deviceDir, storeId).exists(c => os.exists(Backend.crlSaveFile(c)))
       // The extraction deleted them from the device CRL: the save file is the only copy
       heldAfterClose = held(crl, storeId)
       // The rebuild starts once the copy is retired; the copy is kept until the store is Active again
@@ -1463,7 +1465,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       (hostRoot, deviceDir, _) <- activeStoreDevice()
       pendingDir = deviceDir / RebuildingStore.PendingDeleteDirectory
       // storeId is Active on this device: its copy goes, though its store config does not parse
-      released = pendingDir / StoreCopies.pendingDeleteName(storeId)
+      released = pendingDir / CopyLayout.copyName(storeId, UUID.randomUUID())
       _ = os.makeDir.all(released)
       _ = os.write.over(released / StoreConfig.configFilename, "not: [a store config")
       // A name that identifies no store copy is kept, whatever it holds
@@ -2031,36 +2033,42 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       crl.dropCalls.get should be(1)
       markedLost(deviceDir, second) should be(true)
 
-  atest("a failed backend whose rebuild-required marker cannot be written keeps its CRL entries on disk"):
+  atest("a failed backend whose move to lost/ fails keeps its CRL entries on disk and is held offline"):
     given ExecutionContext = executionContext
     val factory = newFactory()
     val opener = new FailingRocksOpener(executionContext)
-    // The marker's write fails and leaves nothing behind, as a failed write does. (Anything left at the marker's path
-    // counts as a marker: a reconcile would then rebuild the store and drop its entries itself.)
-    @volatile var markerWrites = 0
-    val failingMarker: os.Path => Unit = _ =>
-      markerWrites += 1
-      throw new java.io.IOException("Input/output error")
+    // The rename into lost/ fails and moves nothing, as a failed rename does
+    @volatile var lostRenames = 0
+    val failingRename: (os.Path, os.Path) => Unit = (from, to) =>
+      if (to / os.up).last == CopyLayout.LostDirectory then
+        lostRenames += 1
+        throw new java.io.IOException("Input/output error")
+      DurableFiles.atomicRename(from, to)
     for
       (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
       host = newCrlHost(hostRoot, factory,
-               seams = Host.Seams(backends = Some(opener), writeRebuildRequiredMarker = Some(failingMarker)))
+               seams = Host.Seams(backends = Some(opener), copyRename = Some(failingRename)))
       _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
       _ <- prepareInFlight(host, factory.opened.head, storeId, txid)
       _ = opener.onFatals.head(new java.io.IOException("Input/output error"))
       _ <- pumpUntil(host, !host.control.router.loaded.contains(storeId))
       unloaded = !host.control.router.loaded.contains(storeId)
-      // Lets the close run on the store's executor, ahead of the shutdown below
+      // Lets the close run on the store's executor, and its end's move to lost/ fail, ahead of the shutdown below
+      _ <- pumpUntil(host, lostRenames > 0)
       _ <- pumpUntil(host, false, rounds = 50)
+      held = host.control.moves.isPendingLost(host.control.devices.devices(deviceA), storeId)
       _ = factory.shutdownAll()
     yield
       unloaded should be(true)
-      markerWrites should be >= 1
+      lostRenames should be >= 1
       markedLost(deviceDir) should be(false)
-      // Left in the device CRL: a restart, which may serve the unmarked store, recovers them
+      CopyFixtures.copyPath(deviceDir, storeId) should be(Some(storeDir))
+      // Held offline, never loaded, shipped or retired, until a check of its device moves it
+      held should be(true)
+      // Left in the device CRL: a restart, which may serve the copy where it is, recovers them
       heldOnDisk(deviceDir, storeId) should be(Set(txid))
 
-  atest("a store that fail-stops is unloaded and marked rebuild-required"):
+  atest("a store that fail-stops is unloaded and moved to lost/"):
     given ExecutionContext = executionContext
     val factory = newFactory()
     for
@@ -2069,6 +2077,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
       _ = host.control.router.loaded(storeId).frontend.failStop("test")
       _ <- pumpUntil(host, !host.control.router.loaded.contains(storeId))
+      // Moved once its close has ended
+      _ <- pumpUntil(host, markedLost(deviceDir))
       marked = markedLost(deviceDir)
       _ <- pumpUntil(host, false, rounds = 50)
       _ = factory.shutdownAll()

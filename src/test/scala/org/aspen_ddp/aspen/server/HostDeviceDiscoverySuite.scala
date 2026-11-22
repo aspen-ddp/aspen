@@ -1877,13 +1877,15 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         recorded(host2).transferOutcomes.get(t.movingStore) should be(None)
         poolState.stores(t.movingStore.poolIndex).storageDeviceId should not be net.secondDeviceId
 
-  // CopyPhase ranks rebuild-required above transferred-in: an arrived copy found lost is retired like any lost copy, not
-  // deleted. Likewise a copy carrying transferring-out beside transferred-in is Outbound, retired rather than deleted.
-  for (what, markers) <- List[(String, Seq[String])](
-        "rebuild-required and transferred-in" -> Seq(RebuildingStore.RebuildRequiredMarkerFile),
-        "transferring-out and transferred-in" -> Seq(StoreTransfer.TransferOutMarkerFile))
+  // An arrived copy found lost (moved to lost/, its transferred-in marker inert there) is retired like any lost copy,
+  // not deleted. Likewise a copy carrying transferring-out beside transferred-in is Outbound (CopyPhase ranks it
+  // first), retired rather than deleted.
+  for (what, mark) <- List[(String, (os.Path, StoreId, os.Path) => Unit)](
+        "in lost/" -> ((dev, s, _) => CopyFixtures.markCopy(dev, s, Phase.Lost): Unit),
+        "carrying transferring-out and transferred-in" -> ((_, _, promoted) =>
+          os.write.over(promoted / StoreTransfer.TransferOutMarkerFile, "")))
   do
-    atest(s"a promoted copy carrying $what is retired on resume and the store shipped again"):
+    atest(s"a promoted copy $what is retired on resume and the store shipped again"):
       given ExecutionContext = executionContext
 
       for
@@ -1892,7 +1894,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         _ = t.transfers.finishTransferIn(t.movingStore)
         _ <- pumpUntil(CopyFixtures.copyPath(t.deviceDir, t.movingStore).isDefined)
         promoted = CopyFixtures.copyPath(t.deviceDir, t.movingStore).get
-        _ = markers.foreach(m => os.write.over(promoted / m, ""))
+        _ = mark(t.deviceDir, t.movingStore, promoted)
 
         transfers2 = new StagedTransferService
         host2 = newHost(t.hostRoot, transferService = transfers2)
@@ -1963,7 +1965,6 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         val retired = os.list(deviceDir / RebuildingStore.PendingDeleteDirectory).toList
         retired should be(CopyFixtures.retiredCopies(deviceDir, movingStore))
         retired should have size 1
-        os.exists(retired.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
         os.exists(retired.head / RebuildingStore.LostCrlStateFile) should be(true)
         host.control.transfers.receiving.keySet should be(Set(movingStore))
 
@@ -2151,13 +2152,19 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val loaded = host.loadStore(deviceA, backend, None)
     host.testingOnlyHandleEvents()
 
-    loaded.failed.map: err =>
+    for
+      err <- loaded.failed
+      // Moved to lost/ once its unserved backend has closed
+      _ <- yieldUntil:
+        host.testingOnlyHandleEvents()
+        CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost)
+    yield
       err shouldBe a[CrashRecoveryLog.InvalidSaveFile]
       host.getStoreIds should not contain storeId
       host.control.router.silentStores should contain(storeId)
       CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) should be(true)
-      // Left in place: it is not this host's to delete, only to stop trusting.
-      os.exists(Backend.crlSaveFile(storeDir)) should be(true)
+      // Kept, moved with its copy: it is not this host's to delete, only to stop trusting.
+      os.exists(Backend.crlSaveFile(CopyFixtures.copyPath(deviceDir, storeId).get)) should be(true)
 
   atest("a host restarting over a store with a truncated CRL save file does not serve it"):
     val hostRoot = newHostDir()
@@ -2173,11 +2180,11 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       host.control.router.silentStores should contain(storeId)
       CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) should be(true)
 
-  atest("a store marked rebuild-required is not loaded at startup"):
+  atest("a store in lost/ is not loaded at startup"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    val storeDir = writeStoreDir(deviceDir)
-    CopyFixtures.markCopy(deviceDir, storeId, Phase.Lost)
+    writeStoreDir(deviceDir)
+    val storeDir = CopyFixtures.markCopy(deviceDir, storeId, Phase.Lost)
     val filesBefore = os.list(storeDir).toSet
 
     val host = newRealHost(hostRoot)

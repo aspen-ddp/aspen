@@ -425,12 +425,12 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         // source has accepted since, so resuming it would install stale data. One whose save file is no longer valid
         // would be repointed onto, and the source's intact copy then released, as promotion refuses for a staged copy.
         // Until the pool update commits the source still holds the state, so either is discarded and the transfer
-        // started over. One found lost since its promotion (rebuild-required) has the phase Lost, which is retired
-        // below like any copy of an earlier tenancy.
+        // started over. One found lost since its promotion (in lost/) has the phase Lost, which is retired below like
+        // any copy of an earlier tenancy.
         // A phase that cannot be read (CopyPhase.known), a save file that cannot be read
         // (CrashRecoveryLog.isUnreadable), or a copy whose delete could not stat it (StoreCopies.delete answers not
         // gone), says nothing of the copy: it is neither resumed nor discarded, and the next check reads it again.
-        val phase: Option[Phase] = CopyPhase.known(finalPath) match
+        val phase: Option[Phase] = CopyLayout.knownPhase(finalPath) match
           case None =>
             logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: the phase of the copy at " +
                          s"$finalPath could not be read. Retrying at a later check")
@@ -610,7 +610,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
             ctx.client.sendHostMessage(msg)
 
   /** Clears the path of a store transferring onto `local` that holds a copy of an earlier tenancy of the store there:
-   *  a finished rebuild awaiting its flip (`rebuild-complete`) or a lost copy (`rebuild-required`), left when the
+   *  a finished rebuild awaiting its flip (`rebuild-complete`) or a lost copy (in `lost/`), left when the
    *  store was re-placed away (AspenClient.replaceRebuild) while this host was down. No other pass clears it while
    *  the entry is TransferringIn. The copy is retired (StoreCopies.retire), not deleted: it is not the owner's, and
    *  the source still is. Once the path is clear the device is checked again, which starts the transfer.

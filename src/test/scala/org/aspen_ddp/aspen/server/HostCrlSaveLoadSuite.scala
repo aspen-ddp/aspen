@@ -15,7 +15,7 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlClosed, CrlFailed, StoreRecoveryState,
   TransactionRecoveryState}
-import org.aspen_ddp.aspen.server.host.{ControlFixture, LockstepThreading, StoreLoader}
+import org.aspen_ddp.aspen.server.host.{Activity, ClosePurpose, ControlFixture, LockstepThreading, StoreLoader}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.{Frontend, Store, StoreIncarnationFile}
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
@@ -198,6 +198,7 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     crl.save(txid, commitVote(), () => ())
     val backend = storeWithObject()
     val host = newCrlHost(crl)
+    val closes = closesSeen(host)
     val loaded = host.loadStore(deviceId, backend, None)
     val other = TransactionId(new UUID(7, 6))
 
@@ -251,8 +252,20 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       DataBuffer(Array[Byte](0)))
     (backend, storeDir)
 
+  /** The close purposes `host`'s copy records took, from now on */
+  private def closesSeen(host: Host): () => List[ClosePurpose] =
+    val seen = scala.collection.mutable.ListBuffer[ClosePurpose]()
+    host.control.copyRegistry.observer = (copies, s) =>
+      copies.copies.get(s).map(_.activity).foreach:
+        case Activity.Closing(p) => seen += p
+        case _ => ()
+    () => seen.toList
+
+  /** The store is not served, and was closed as a fail-stop: the close that moves an attached device's copy to lost/
+   *  when it ends (this one's device is not loaded, so nothing on disk changes) */
   private def assertRetired(host: Host, loaded: Future[Unit], storeDir: os.Path): Future[compatible.Assertion] =
     given ExecutionContext = executionContext
+    val closes = closesSeen(host)
     def retired: Boolean =
       host.testingOnlyHandleEvents()
       loaded.isCompleted && storeOf(host).isEmpty
@@ -261,9 +274,9 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     yield
       withClue("a store that failed to recover part of its transactions is not served: "):
         storeOf(host) should be (None)
-      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be (true)
+      closes() should be (List(ClosePurpose.FailStop))
 
-  atest("a store whose device-CRL recovery throws is not served, and is marked for rebuild"):
+  atest("a store whose device-CRL recovery throws is not served, and is closed as a fail-stop"):
     val crl = new ThrowingCRL
     crl.save(txid, commitVote(), () => ())
     crl.failing = true
@@ -271,7 +284,7 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newCrlHost(crl)
     assertRetired(host, host.loadStore(deviceId, backend, None), storeDir)
 
-  atest("a store whose recovery from its crl_save.log throws is not served, and is marked for rebuild"):
+  atest("a store whose recovery from its crl_save.log throws is not served, and is closed as a fail-stop"):
     val crl = new ThrowingCRL
     crl.failing = true
     val backend = storeWithSaveFile()
@@ -284,6 +297,7 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
                                            err: Throwable): Future[compatible.Assertion] =
     given ExecutionContext = executionContext
     val host = newCrlHost(crl)
+    val closes = closesSeen(host)
     val loaded = host.loadStore(deviceId, backend, None)
     val other = TransactionId(new UUID(7, 6))
     def reading: Boolean =
@@ -301,23 +315,23 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       withClue("the store is still the one installed: "):
         storeOf(host).exists(_ eq store) should be (true)
       withClue("a CRL failure is the device's, not the store's: "):
-        os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be (false)
+        closes() should be (Nil)
       withClue("the store still holds its messages: "):
         store.frontend.transactions.keySet should be (Set())
 
   for (what, err) <- List("dies" -> (() => CrlFailed(new java.io.IOException("injected"))),
                           "shuts down" -> (() => CrlClosed())) do
-    atest(s"a store whose device-CRL recovery read fails as its CRL $what is not marked for rebuild (CRL-W12)"):
+    atest(s"a store whose device-CRL recovery read fails as its CRL $what is not closed as a fail-stop (CRL-W12)"):
       val crl = new SlowReadCRL
       crl.save(txid, commitVote(), () => ())
       val (backend, storeDir) = storeInDir()
       assertReadFailureLeavesStore(crl, backend, storeDir, err())
 
-    atest(s"a store loaded from its crl_save.log whose read fails as its CRL $what is not marked for rebuild (CRL-W12)"):
+    atest(s"a store loaded from its crl_save.log whose read fails as its CRL $what is not closed as a fail-stop (CRL-W12)"):
       val backend = storeWithSaveFile()
       assertReadFailureLeavesStore(new SlowReadCRL, backend, backend.path, err())
 
-  atest("a store whose device-CRL recovery read fails otherwise is not served, and is marked for rebuild"):
+  atest("a store whose device-CRL recovery read fails otherwise is not served, and is closed as a fail-stop"):
     val crl = new SlowReadCRL
     crl.save(txid, commitVote(), () => ())
     val (backend, storeDir) = storeInDir()

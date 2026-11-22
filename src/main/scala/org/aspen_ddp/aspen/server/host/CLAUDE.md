@@ -8,12 +8,11 @@
   end: close with CRL extraction, answering a receiver's request, reinstating an abandoned transfer), `StoreCopies`
   (retire, release and rename-first delete of store copies) and `LocalDevices` (the loaded devices). `StoreRouter`,
   `StoreThreadPool`/`StoreMailbox`/`StoreBalancer` and `HostStoreView` are the store-side and cross-thread pieces
-- `StoreDirMarkers` is the single source for the marker files a store directory carries (`rebuild-required`,
-  `transferred-in`, `transferring-out`, `rebuild-complete`). Its tests are FileStat's: `has` throws on a failed stat,
+- `StoreDirMarkers` is the single source for the marker files a flat store directory carries (`transferred-in`,
+  `transferring-out`, `rebuild-complete`; Lost is `lost/`, below). Its tests are FileStat's: `has` throws on a failed stat,
   `knownPresent` answers false for a pass that waits for a later one
 - `CopyMarkers` (`DeviceControl.markers`) makes every marker write and removal at a store path (R6): the marker is
-  placed (`DurableFiles.place`; rebuild-required through the `writeRebuildRequiredMarker` seam, which only places it)
-  or unlinked, the copy's phase recorded (`markedLost` / `markersChanged`), then the store directory forced
+  placed (`DurableFiles.place`) or unlinked, the copy's phase recorded (`markersChanged`), then the store directory forced
   (`CopyMarkers.syncDirectory`, which is `CopyMoves.syncDirectory`: one seam). A write or unlink that lands but
   whose sync fails sets the record's `unsynced` (`HostCopies.unsynced`; a copy of a device not attached yet, an
   adoption's or a lost CRL's marks, is held in `unsyncedPaths` until its attach): a write then throws, a removal
@@ -26,8 +25,7 @@
   marker and will not see it again, and a check that finds the entry not Active or work holding the copy only defers
   it. A removal that finds the marker absent forces the directory only if the copy is unsynced.
   The sites: `clearRebuildCompleteMarker`, `clearTransferredInMarker`, `reinstateAbandonedOut`, `bringIntoService`'s
-  transfer-out removal, `keepRebuiltStoreOffline`, `closedForTransfer`'s transfer-out marker, `markRebuildRequired`
-  and `StoreCopies.retire`'s rebuild-required marker. Markers in staging (a transfer's, a rebuild's) travel with the
+  transfer-out removal, `keepRebuiltStoreOffline` and `closedForTransfer`'s transfer-out marker. Markers in staging (a transfer's, a rebuild's) travel with the
   move that places the copy, which `DurableFiles.move` forces
 - Copy layout (store copy state machine, stage 2; spec "Device layout"): `CopyLayout` says where each copy lives.
   A converted phase is a directory under the device root holding copies named `<storeId.directoryName>.<copyId>`
@@ -35,7 +33,10 @@
   phase, `phase-param.<phase directory>` (`paramFile`, `param`, `readParam(copy, phase)`: "" when known absent, a
   failed stat throws). Each location reads only its own phase's file and a move writes only its target's, so a
   failed move or a crash before the rename leaves the source's parameter as it was; an earlier phase's file is
-  inert. So far only Retired (`pending-delete/`) is a directory (`dirOf`); every other phase is the flat path `<device>/<storeId.directoryName>`, whose markers say it.
+  inert. So far Lost (`lost/`, `CopyLayout.LostDirectory`) and Retired (`pending-delete/`) are directories (`dirOf`);
+  every other phase is the flat path `<device>/<storeId.directoryName>`, whose markers say it. A copy in a phase
+  directory has its phase by location (`CopyLayout.phaseAt`; `knownPhase`/`readPhase` for any copy path, which
+  `tryLoadStore`, `startIn` and `reloadClosedStores` read), never by markers.
   `CopyLayout.list` is the one listing of a device's copies (device load and its CRL-lost decision, `storesIn`,
   `HostCopies.attach`/`rescan`/`verifyAgainstDisk`): flat store-named directories (config or not; a failed stat
   counts) and each converted directory's children; a child that is no copy name is a stray, logged at warn at the
@@ -52,9 +53,35 @@
   stays recorded, Retired, out of `offlineCopies`, and `StoreCopies.release` skips it, until the resync. Markers in
   a phase directory are inert: a copy leaving the flat path is stripped of them once its move is durable, one going
   back to it first (a failed strip is NotMoved). Tests place, find and read copies only through `CopyFixtures`
-  (`placeCopy`, `markCopy`, `copyPath`, `phaseOf`, `retiredCopies`)
-- `CopyPhase` (`Phase`: Live, Arrived, Outbound, Rebuilt, Lost, Retired) is the one reader of a copy's markers and
-  the one place that ranks them: RR > TO > TI > RC, first present wins (`read` throws a failed stat or read, `known`
+  (`placeCopy`, `markCopy`, `copyPath`, `phaseOf`, `retiredCopies`). `CopyMoves.move` refuses (NotMoved, logged at
+  error as a bug) a record that is Opening, Served or Closing, and a copy unsynced before a move stays unsynced after
+  it (its earlier directories still to force move with it), until the resync
+- Lost is `lost/<copy>` (T10). Nothing writes `rebuild-required`. Every T10 trigger moves a closed copy there through
+  `StoreRebuilds.moveToLost(site, sds, storeId): MoveResult` (a copy already Lost is left, Durable): a served copy's
+  close for `ClosePurpose.FailStop` (`backendFailed`, so `handleFailStopped`, `retireForeignCopy`'s and
+  `retireUnlistedServed`'s served copies) moves it when the close ends (`StoreLoader.closeUnloaded`,
+  `StoreRebuilds.failStopClosed`; P5, the move never made while the backend is open); `failedOnClose` once
+  `handleClose` has ended the close; `retireUnserved` (failed before served, lost incarnation, `crlSaveFileLost`) once
+  the unserved backend's close completes; `handleBackendOpened`'s failed unserved backend likewise; a
+  `BackendStateLost` open at once (no backend opened); `backendFailed` for a backend no longer served, unless its copy
+  is Opening or Closing (its LoadStore or its close's end retires it); a foreign copy `retireForeignCopy` finds
+  closed, and retire step 1. A crash between a FailStop close and its move leaves the copy where it was, and the
+  restart loads it as after any crash (its CRL holds what the backend had not applied; a backend still broken fails
+  again). `ClosePurpose.Reload` (a failed CRL load, `handleUnloadFailed`; a failed save-file removal,
+  `handleSaveFileRemovalFailed`) leaves the copy where it is, to load again. A move that fails is logged at error and
+  the copy held offline in `CopyMoves.pendingLost(local)` (in memory, per device, dropped at detach): never loaded
+  (`tryLoadStore`), shipped (`startOut`, `closedForTransfer`: treated as Lost), retired (`StoreCopies.retire` answers
+  false) or acted on by a pass (`offlineCopies` excludes it; `heldOffline` includes it); each device check retries the
+  move first, beside `resync` (`StoreRebuilds.retryPendingLost`). A crash forgets the hold. Every reader of "is it
+  lost" reads the record's phase: the Lost CRL pass (`flipLostCrlStores`), `discardLostStore`, `retireForeignCopy`,
+  `startOut`/`closedForTransfer`. A device being loaded moves copies with `CopyMoves.moveUnattached`: a lost device
+  CRL moves every copy that does not hold its own state (a failed move throws, leaving the device unloaded for the next
+  scan), and adoption's `CrlLost` stores move through the `DeviceMetadata.adoptDevice` callback `moveToLost:
+  StoreId => Unit` (a failed move fails the adoption's transaction). The device load offers no phase directory, and
+  no copy in `lost/` or `pending-delete/`, to `tryLoadStore`. Tests fail renames with `Host.Seams.copyRename`
+  (installed as `CopyMoves.rename` before the first device load)
+- `CopyPhase` (`Phase`: Live, Arrived, Outbound, Rebuilt, Lost, Retired) is the one reader of a flat copy's markers
+  and the one place that ranks them: TO > TI > RC, first present wins (`read` throws a failed stat or read, `known`
   answers None for a pass that waits). `tryLoadStore`, `adoptionClass` (Outbound needs a valid save file, else
   CrlLost), `holdsOwnState` (Rebuilt), `reloadClosedStores` (offers Live, and a copy whose phase cannot be read) and
   `startIn` (Arrived: stale check; Lost, Rebuilt and Outbound: `retireEarlierTenancy`; Live: refuse or receive; None:
@@ -233,7 +260,7 @@
 - Store identity: `StoreLoader.handleLoad` reads the `incarnation` file (`StoreIncarnationFile.load`) before building
   the Store and never writes it: `StoreCreation` writes it into every new store directory (bootstrap included) and a
   rebuild's `finish` replaces it (`server/store/CLAUDE.md`). A file known absent has the store retired unserved
-  (`retireUnserved`: marked `rebuild-required`, rebuilt as a new incarnation); one that cannot be stat'd, read or
+  (`retireUnserved`: moved to `lost/`, rebuilt as a new incarnation); one that cannot be stat'd, read or
   parsed is left alone and the load retried (`awaitUnreadRetry`, the copy AwaitingRetry), so a format change
   in a release is an outage, never a fresh identity over a store's data and CRL state
 - Every existence test under `server/` uses `server.FileStat`, never `os.exists`/`os.isDir`/`os.isFile`
@@ -250,7 +277,7 @@
   a failed stat as an arrival now; `adoptionClass` throws (adoption retried next scan), and so does
   `bringIntoService` on a store directory it cannot stat, before it rewrites `owning-host`, so no adopted store loads
   without its `ArrivedAtFile`; `RebuildingStore.isRebuildCompleteFor` throws on a marker it cannot stat or read;
-  `startOut` never ships a store whose `rebuild-required` stat fails; `retireForeignCopy`/`discardLostStore` and `startIn` wait for a later check (`startIn`
+  `startOut` never ships a Lost copy; `retireForeignCopy` and `startIn` wait for a later check (`startIn`
   also when the promoted copy's `transferred-in` marker cannot be read: it says nothing of which transfer the copy
   belongs to); reconcile
   passes act on a marker only when a stat finds it. Tests fail a stat with a directory lacking search permission, or
@@ -351,17 +378,17 @@
   EIO, EMFILE, out of memory; `loadValidStoreState` throws it rather than return `Left`) is never taken for that:
   `handleLoad` retries through `awaitUnreadRetry`, `holdsOwnState` (which reads the store config the same way) throws
   before any store is marked, `adoptionClass` fails the adoption for the next scan, and `StoreTransfers` neither
-  resumes nor discards a promoted copy it cannot read. It gets a `rebuild-required` marker, its entry is flipped to Rebuilding by the reconcile, and the
+  resumes nor discards a promoted copy it cannot read. It is moved to `lost/`, its entry is flipped to Rebuilding by the reconcile, and the
   copy is retired (below) before the rebuild. Adoption of a device does the same for a `transferring-out` store
-  without a valid save file instead of refusing the device, and adopts any `rebuild-required` directory as Rebuilding
+  without a valid save file instead of refusing the device, and adopts any copy in `lost/` as Rebuilding
   whatever its other markers. A network transfer validates the staged copy's save file before promotion and retries on
   failure, since the source still holds the state; a resume of a promoted copy's pool update (`StoreTransfers.startIn`)
-  checks it again, and a copy marked `rebuild-required` or whose save file no longer validates is deleted and the
+  checks it again, and a copy whose save file no longer validates is deleted and the
   transfer restarted, as is one whose marker names another transfer
 - A lost device CRL does the same to every store on the device: if `<device>/crl` is absent from a device holding store
   dirs, or holds no stream files there (`openCRL(..., holdsStores = true)` throws `CrlMissing`: a device's stores exist
   only once its CRL was opened, so an emptied `crl/` is never taken as a new CRL), or `openCRL` throws (a corrupt
-  CRL, `CrlCorrupt`, is logged as such), each store dir gets `rebuild-required` except one that held nothing in it
+  CRL, `CrlCorrupt`, is logged as such), each store copy is moved to `lost/` (one there stays) except one that held nothing in it
   (`holdsOwnState`): one whose `crl_save.log` validates as its own (its whole state is the file, which its load uses
   over any CRL), or a finished rebuild carrying `rebuild-complete` (never served, so its state is empty; its flip and
   load proceed as over the old CRL), the old
@@ -379,29 +406,30 @@
 - `Host.StoreFailStopped` (a store's CRL read failed other than by the CRL's death or shutdown, its recovery threw,
   or its Frontend fail-stopped, `server/store/CLAUDE.md`) is handled as a backend failure (`StoreRebuilds.handleFailStopped`), but only while that Store is still the one
   installed under its id: a late fail-stop of a closed or replaced store is ignored, so its directory is not marked
-- A backend fail-stop during a store's close marks it `rebuild-required` instead of closing it cleanly. A
+- A backend fail-stop during a store's close moves it to `lost/` instead of closing it cleanly. A
   `crl_save.log` a transfer-out close wrote stays: its entries have left the device CRL, so it is the only copy of
-  the store's transaction state, and the retire keeps it as the copy's lost CRL state. Every reader of a store
-  directory checks `rebuild-required` before its save file. Such a store is never transferred: its transfer is
-  aborted so it is rebuilt
+  the store's transaction state, and the retire keeps it as the copy's lost CRL state. A copy in `lost/` is never
+  loaded, so its save file is never read as its state. Such a store is never transferred: its transfer is aborted
+  so it is rebuilt
 - Store copies (`StoreCopies`). A store has one owner: the device its pool names. Ownership moves by a transfer or a
   rebuild and takes effect when the new device's entry becomes Active. From then on every other copy, whatever it
   is, may go, and only then. So a copy that stops being the owner's is never deleted where it stands. This covers a
   completed transfer out's source and a lost copy, whether its rebuild runs here or was re-placed away. Instead it is
   **retired** (`StoreCopies.retire`), each step durable before the next:
-  1. the `rebuild-required` marker is written;
+  1. the copy is moved to `lost/` (`StoreRebuilds.moveToLost`), unless it is there;
   2. its CRL state is saved into the copy's `lost-crl-state.log`. A file already there is kept. Otherwise the copy's
      `crl_save.log` is renamed to that name (with any device-CRL entries the store still has, after a crash before
      a transfer out deleted them, saved beside it first as `lost-crl-entries.log`: the file may be what was found
      unusable), or else the store's device-CRL entries are read and saved;
   3. `CrashRecoveryLog.dropStore` removes the entries from the device CRL;
-  4. the copy is renamed to `<device>/pending-delete/<store-dir>-<uuid>`.
+  4. the copy is moved from `lost/` to `<device>/pending-delete/<copy>` under its copy name (`CopyMoves.move` to
+     Retired; T11).
 
-  A crash at any step leaves the marker, so the next retire redoes what remains. Three passes retire:
-  - The Rebuilding pass, for a `rebuild-required` copy at the path of a store rebuilt here
+  A crash at any later step leaves the copy in `lost/`, so the next retire redoes what remains. Three passes retire:
+  - The Rebuilding pass, for a Lost copy of a store rebuilt here
     (`StoreRebuilds.discardLostStore`). It holds a rebuild slot from its start (`maxConcurrentRebuilds` counts its
     Rebuild work's DiscardingLost stage), and the slot passes straight to the rebuild in the same callback
-    (DiscardingLost -> Running), so one reconcile cannot retire every marked store at once. Discards count only on
+    (DiscardingLost -> Running), so one reconcile cannot retire every Lost store at once. Discards count only on
     loaded devices (`HostCopies.discards`), as does `isRetiring`: a device unloaded mid-retire (`crlFailed`, a
     relinquish) drops its discard work and frees the slot while the orphaned retire's CRL calls finish. That is safe:
     the orphan's only remaining destructive step, the move to `pending-delete/`, is skipped once its device is not
@@ -411,13 +439,13 @@
     the other devices and schedules this device's backoff re-check (`scheduleRebuildRetry`), which also starts a
     transfer in the discard held back. Neither the Lost CRL pass
     (`DeviceReconciler.flipLostCrlStores`) nor `startRebuild` acts on a store while
-    `storeTransferService.isTransferringOut` (host-wide, by store id) holds it (a transfer aborted while its send runs, its copy then marked):
+    `storeTransferService.isTransferringOut` (host-wide, by store id) holds it (a transfer aborted while its send runs, its copy then Lost):
     the discard would move the directory the send may still read. Each schedules a device re-check instead, as the
     Abandoned Transfers Out pass does; `startRebuild` asks only when no rebuild of the store is registered, since a
     registered one's end re-checks the device anyway. `startRebuild` also waits while a transfer out is still closing
     the store (`StoreTransfersOut.deferRebuildUntilClosed`: TransferOut work Closing on any device): the close's end, whatever its outcome,
     checks the device again, which starts the rebuild.
-  - `StoreTransfers.startIn`, for a `rebuild-complete` or `rebuild-required` copy an earlier tenancy left at the
+  - `StoreTransfers.startIn`, for a `rebuild-complete` or Lost copy an earlier tenancy left at the
     path of a store transferring onto the device (re-placed away while the host was down, then transferred back;
     rebuild-process). It retires before asking for bytes, waits while a rebuild of the store runs here, the
     store is opening, or a copy is served from this path (not while the transfer's source is served from another
@@ -426,8 +454,8 @@
   - The Deleted Stores pass, for an offline store whose entry has left the device. The store stays offline until its
     path is clear, so a failed retire is retried.
     A store served from the device that its entry does not list (a copy put back by hand: `tryLoadStore` reads no
-    tree) is first taken out of service as a failed backend is (`StoreRebuilds.retireUnlistedServed`: marked,
-    closed, offline), so the check that follows retires it.
+    tree) is first taken out of service as a failed backend is (`StoreRebuilds.retireUnlistedServed`: closed,
+    then moved to `lost/`, offline), so the check that follows retires it.
 
   The reconcile **releases** (`StoreCopies.release`) a `pending-delete/` copy once its store is Active on its owner
   device: on this device by its own entry, elsewhere by the pool's entry and that device's state. This is the only
@@ -445,7 +473,7 @@
   only by `StoreRebuilds.abandonUnlisted` or a first pass's `createStaging`.
 
   Every rename of a copy, of a store's CRL state, or of a lost device CRL goes through `DurableFiles.move`, which
-  forces both directories. Without the marker on disk, a store's entries stay in the device CRL. A transfer out reads
+  forces both directories. Until a retire drops them, a store's entries stay in the device CRL. A transfer out reads
   them (`readStoreState`, leaving them live) into `crl_save.log`, whether the store is loaded or not
   (`StoreTransfersOut.closeForTransferOut`), and deletes them from the device CRL (`deleteTransactions`) only once that
   file is durable: a crash or failed save before that leaves the device CRL holding them. A closed store that already

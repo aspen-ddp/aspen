@@ -75,7 +75,7 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     val tdir = scratch()
     val copy = tdir / "a" / "copy"
     os.makeDir.all(copy)
-    os.write(copy / RebuildingStore.RebuildRequiredMarkerFile, "")
+    os.write(copy / RebuildingStore.RebuildCompleteMarkerFile, "")
     host.control.moves.syncDirectory = d => if d == copy then throw injected()
     host.control.moves.relocate(copy, tdir / "flat", fromFlat = false, toFlat = true, Phase.Live) shouldBe
       a[MoveResult.NotMoved]

@@ -688,7 +688,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       // The close fails as ShutdownStore's does for a backend that failed-stop: marked, offline, unloaded
       _ = recorded(host).failNextTransferOutClose.set(Some(() =>
-            CopyFixtures.markCopy(deviceDir, movingStore, Phase.Lost): Unit))
+            host.control.rebuilds.moveToLost("failedOnClose", loadedDevices(host)(sourceId), movingStore): Unit))
       _ <- ask()
       _ <- pumpUntil(recorded(host).lostTransferAborts.nonEmpty)
       // A retransmit meanwhile is refused before anything is closed, written or sent
@@ -699,7 +699,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       st <- state(sourceId)
       dest <- state(net.secondDeviceId)
     yield
-      retransmit.getMessage should include("rebuild-required")
+      retransmit.getMessage should include("Lost")
       sends.transfersOut should be(Vector())
       recorded(host).transferOutCloses.toList should be(List(movingStore))
       outbound(deviceDir, movingStore) should be(false)

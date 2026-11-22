@@ -75,8 +75,6 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           /** The host's general-purpose context: stores' transaction drivers and client
                            *  transactions run on it. Never a given. */
                           val ec: ExecutionContext,
-                          /** Writes a store directory's rebuild-required marker (a test seam) */
-                          val writeRebuildRequiredMarker: os.Path => Unit = StoreRebuilds.writeRebuildRequiredMarker,
                           /** A failure for StoreRebuilds.requestRebuild to report instead of running its flip (a test
                            *  seam, Host.Seams.rebuildRequestFailure) */
                           val rebuildRequestFailure: StoreId => Option[Throwable] = _ => None,

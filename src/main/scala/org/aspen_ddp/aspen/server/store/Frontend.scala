@@ -1576,8 +1576,8 @@ class Frontend(val storeId: StoreId,
   def failStopped: Boolean = stopped
 
   /** Fail-stops the store: it can no longer be trusted to hold what its votes promised. From now on it drops every
-    * transaction message, read and repair, as an offline store would, and `onFailStop` tells its host, which marks it
-    * rebuild-required and unloads it. Never for a condition that freezes writes, such as a full device: such a store
+    * transaction message, read and repair, as an offline store would, and `onFailStop` tells its host, which unloads it
+    * and moves its copy to lost/. Never for a condition that freezes writes, such as a full device: such a store
     * keeps serving reads (Backlog: "Full storage devices").
     *
     * The triggers (Tx.issueCommits, Tx.objectLoadFailed) are a commit voter that cannot hold the update it voted for:

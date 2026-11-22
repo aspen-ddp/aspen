@@ -277,7 +277,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
   private def assertAbandoned(fx: Fixture, s0: StoreId, sds: LocalStorageDeviceState, backend: TrackingBackend): Unit =
     val (entry, offline, loaded, offlineInDevice) = fx.onControl:
       (fx.ctx.router.entry(s0), fx.ctx.router.isOffline(s0), fx.ctx.copyRegistry.openCopies(sds).contains(s0),
-        fx.ctx.copyRegistry.offlineCopies(sds).contains(s0))
+        fx.ctx.copyRegistry.heldOffline(sds, s0))
     entry should be(None)
     offline should be(true)
     loaded should be(false)
@@ -556,6 +556,14 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       second.closed should be(false)
 
   /** A device over `crl` counting with `admission`, onto which `storeId` is loaded */
+  /** Whether the load retired the copy of `s0` on `sds` unserved (StoreRebuilds.retireUnserved): its copy moved to
+   *  lost/, or, its backend in a bare directory with nothing at its record's path, held for that move to retry
+   *  (CopyMoves.pendingLost). The move runs in a control task once the backend's close completes, queued before the
+   *  load's promise fails */
+  private def retiredLost(fx: Fixture, sds: LocalStorageDeviceState, s0: StoreId): Boolean = fx.onControl:
+    fx.ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(s0)).exists(_.phase == Phase.Lost) ||
+      fx.ctx.moves.isPendingLost(sds, s0)
+
   private def addCountingDevice(fx: Fixture, storeId: StoreId, crl: CrashRecoveryLog,
                                 admission: CrlAdmission): LocalStorageDeviceState = fx.onControl:
     val dir = os.temp.dir()
@@ -652,7 +660,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       admission.admittedBytes should be(before)
       admission.retainedBytes(s0) should be(0)
       os.exists(backend.crlSaveFile) should be(true)
-      os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      retiredLost(fx, sds, s0) should be(false)
       crl.getFullRecoveryState(s0) should be(empty)
       // The full CRL is asked to grow
       crl.growthRequests.get should be(1)
@@ -674,7 +682,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       assertAbandoned(fx, s0, sds, backend)
       admission.admittedBytes should be(0)
       os.exists(backend.crlSaveFile) should be(true)
-      os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      retiredLost(fx, sds, s0) should be(false)
       crl.growthRequests.get should be(1)
       fx.onControl(fx.ctx.loader.awaitingRetryHasCallback(s0)) should be(Some(false))
 
@@ -700,7 +708,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
           assertAbandoned(fx, s0, sds, backend)
           admission.admittedBytes should be(0)
           os.exists(backend.crlSaveFile) should be(true)
-          os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+          retiredLost(fx, sds, s0) should be(false)
           fx.onControl(fx.ctx.loader.awaitingRetryHasCallback(s0)) should be(Some(false))
       finally crl.shutdown()
 
@@ -718,7 +726,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
         intercept[Exception](await(fx.load(backend)))
         assertAbandoned(fx, s0, sds, backend)
         admission.admittedBytes should be(0)
-        os.exists(backend.path / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+        retiredLost(fx, sds, s0) should be(true)
         crl.getFullRecoveryState(s0) should be(empty)
         fx.onControl(fx.ctx.loader.awaitingRetryHasCallback(s0)) should be(None)
 

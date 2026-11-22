@@ -77,12 +77,14 @@
   `REBUILD OUT OF SPACE` (from any write of the walk, the sweep, a checkpoint, or `finish`'s flush and completion
   files), and a warning for a store with no recorded usage. The remedy for either is re-placement,
   `transfer-store` on the Rebuilding store (`server/host/CLAUDE.md`)
-- Silence (rebuild-process 6.2): `StoreRebuilds.startRebuild` marks a store offline in the router at the first
-  reconcile that sees its Rebuilding entry, queued or running (`silenced`), so its host drops its messages rather than
-  answering UnknownStore. While it is in `silenced`, no other path clears the mark (`StoreRouter.clearOfflineUnlessHeld`
-  keeps it, e.g. for another device's Deleted Stores pass after a same-host re-placement). An adopted store's load
-  clears it; `Discard`, a cancel for an entry that left the device, and `abandonUnlisted` for a queued one clear it
-  unless a device's `offlineStores` holds it; other outcomes keep it
+- Silence (rebuild-process 6.2): `StoreRebuilds.startRebuild` registers the store's Rebuild work on its device at the
+  first reconcile that sees its Rebuilding entry, queued or running (`heldWork`), and the work keeps the store silent
+  (derived silence, `server/host/CLAUDE.md`), so its host drops its messages rather than answering UnknownStore. No
+  other path can unsilence it while the work is held (another device's Deleted Stores pass after a same-host
+  re-placement only removes that device's copy). `Adopt`, `AdoptOffline`, `Discard`, `Unconfirmed`, `NotOwned`, a
+  cancel for an entry that left the device and `abandonUnlisted` for a queued one end the work; whatever else names
+  the store (the finished copy, until its load serves it; an unloaded device's entry) keeps it silent. Other outcomes
+  (Superseded, a failed flip, pass or a shutdown's cancel) keep the work, queued, for the retry
 - One piece of host work per (device, store) at a time (I3): while a rebuild of a store is registered on a device
   (queued, discarding its lost copy, running, or cancelled and not yet released), a transfer in of that store onto
   the device waits (`StoreRebuilds.hasRebuildWork`, checked by `StoreTransfers.startIn`; `server/host/CLAUDE.md`).

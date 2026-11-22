@@ -108,8 +108,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // (RocksDB) or off the control thread. It never runs if the store is not served (skipped, already open or opening,
   // its open fails, or its LoadStore leaves it offline), except that a load that fails with its data intact (an open
   // error, an unreadable config, no executor slot, no CRL room yet) hands it to the store's next open (LoadRetry). It
-  // runs at most once. A caller that must act once the store is served passes it rather than reading offlineStores
-  // after the call.
+  // runs at most once. A caller that must act once the store is served passes it rather than reading the copy
+  // registry after the call.
   def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: os.Path,
                    onServed: Option[() => Unit] = None): Unit =
     val storeCfgPath = potentialStoreFile / StoreConfig.configFilename
@@ -148,7 +148,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 logger.info("Skipping load of rebuilt store awaiting its device entry's flip out of Rebuilding. " +
                             s"StoreId $storeId. $potentialStoreFile")
               case _ => ()
-            keepMarkedCopyOffline(sds, storeId)
+            // Its copy's record (readAtLoad) keeps it silent and offline on its device
           else if opening.contains(storeCfg.storeId) || router.get(storeCfg.storeId).isDefined then
             logger.debug(s"Not loading store ${storeCfg.storeId} again: it is already open or opening")
           else
@@ -162,11 +162,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         // config was lost. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass
         logger.error(s"Not loading $potentialStoreFile: it has no ${StoreConfig.configFilename}")
       case Right(false) => ()
-
-  /** Records a store directory a marker keeps from loading as offline on its device, silencing the store unless it is
-   *  served or opening here (DeviceControl.markCopyOffline) */
-  private def keepMarkedCopyOffline(sds: LocalStorageDeviceState, storeId: StoreId): Unit =
-    ctx.markCopyOffline(sds, storeId)
 
   /** A load that threw before any open started: its config could not be read (an I/O error, a resource limit, a
    *  corrupt file), or the stat of its config or a marker failed (FileStat). Also a LoadStore whose save file or
@@ -195,7 +190,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         else
           logger.warn(s"Store $storeId cannot be loaded: its directory could not be read. Leaving it offline and " +
                       s"retrying, with backoff. $storePath. Error: $err")
-        ctx.markStoreOffline(sds, storeId)
         awaitRetry("awaitUnreadRetry", storeId, LoadRetry(sds, storePath, waitScans, waitScans,
           composeServed(previous.flatMap(_.onServed), onServed)))
 
@@ -218,13 +212,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   /** How many opens of the store have started in this process */
   private[host] def opensStarted(storeId: StoreId): Long = openCounts.getOrElse(storeId, 0L)
 
-  /** Records an opened backend as loaded and queues its LoadStore. The store keeps its router loading mark until
+  /** Records an opened backend as loaded and queues its LoadStore. Its copy stays Opening, so the store silent, until
    *  that LoadStore installs it or gives up (handleLoad). */
   private[host] def serveOpened(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                                   backend: Backend): Future[Unit] =
     sds.loadedStores += backend.storeId
-    sds.offlineStores -= backend.storeId
-    router.clearOffline(backend.storeId)
     logger.info(s"Loading store ${storeCfg.storeId}: $storePath")
     ctx.loadStore(sds.storageDeviceId, backend, storeCfg.effectiveMaxSliceSize.map(_.toLong), Some(storeCfg.ida),
       storeCfg.admissionTier)
@@ -233,7 +225,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  runs. An open that has completed by the time the opener returns (one run in the caller) is handled here and
    *  now; any other's outcome is posted back as BackendOpened, so the control thread never waits on I/O or fsync.
    *  Meanwhile the store is in its device's loadedStores and in `opening`, so a shutdown waits for it and no second
-   *  open starts, and the router keeps it silent (loading) rather than answering that it is not here. */
+   *  open starts, and its copy is Opening, which keeps the store silent rather than answered as not here. */
   private[host] def startOpen(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                               create: Boolean, created: Option[Promise[Unit]],
                               onServed: Option[() => Unit] = None): Unit =
@@ -247,7 +239,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     openCounts += storeId -> (opensStarted(storeId) + 1)
     ctx.copyRegistry.opening(sds, storeId, opensStarted(storeId), create)
     sds.loadedStores += storeId
-    router.markLoading(storeId)
     val fopen =
       try openBackend(storeCfg, storePath, create, sds.devicePath / StoreCreation.CreatingDirectory)
       catch case NonFatal(t) => Future.failed(t)
@@ -288,9 +279,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     if create && (result.isSuccess || FileStat.existence(storePath).contains(true)) then
       ctx.copyRegistry.registered("store create", sds, storeId, Phase.Live)
     def leaveOffline(): Unit =
-      router.markOffline(storeId)
-      router.clearLoading(storeId)
-      sds.offlineStores += storeId
       sds.loadedStores -= storeId
     // The open's copy, unless served below: Opening -> Idle, or AwaitingRetry (shadow)
     def openEnded(): Unit = ctx.copyRegistry.openEnded("open ended", sds, storeId)
@@ -300,7 +288,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                     s"backend serves it meanwhile. Closing it")
         if router.get(storeId).isEmpty then
           sds.loadedStores -= storeId
-          router.clearLoading(storeId)
         if backend.hasFailed then
           try ctx.rebuilds.markRebuildRequired(storePath)
           catch case t: Throwable => logger.error(s"Failed to mark store $storeId for rebuild at $storePath: $t")
@@ -397,7 +384,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       val deviceId = wait.sds.storageDeviceId
       val entry = wait.sds.reconciledEntries.map(_.get(storeId))
       if ! ctx.devices.isLoaded(wait.sds) || router.get(storeId).isDefined ||
-         ! wait.sds.offlineStores.contains(storeId) || opening.contains(storeId) then
+         ! ctx.copyRegistry.offlineCopies(wait.sds).contains(storeId) || opening.contains(storeId) then
         dropRetry(storeId, wait)
       else if entry.contains(None) then
         logger.info(s"Store $storeId awaiting a load retry has no entry on device $deviceId any more. Dropping the " +
@@ -507,7 +494,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       case (Left(err), _) if failed =>
         logger.error(s"Store ${backend.storeId} cannot be loaded: its backend failed. Rebuilding it. Error: $err")
         ctx.rebuilds.retireUnserved(storageDeviceId, backend)
-        router.clearLoading(backend.storeId)
         p.failure(err)
 
       case _ if hasSaveFile.isFailure || savedRead.isLeft || rebuiltGates.isFailure ||
@@ -527,7 +513,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
       case (Left(err), _) =>
         ctx.rebuilds.crlSaveFileLost(storageDeviceId, backend, err)
-        router.clearLoading(backend.storeId)
         p.failure(err)
 
       case _ if incarnation.isFailure =>
@@ -536,7 +521,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         logger.error(s"Store ${backend.storeId} cannot be loaded: its incarnation file is missing. Rebuilding it. " +
                      s"Error: $err")
         ctx.rebuilds.retireUnserved(storageDeviceId, backend)
-        router.clearLoading(backend.storeId)
         p.failure(err)
 
       case (Right(Some(_)), Some(_)) if neverFitsReason.nonEmpty =>
@@ -545,7 +529,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         val err = new IllegalStateException(s"the CRL state of store ${backend.storeId} can never fit its device's " +
           s"CRL: ${neverFitsReason.get}")
         ctx.rebuilds.crlSaveFileLost(storageDeviceId, backend, err)
-        router.clearLoading(backend.storeId)
         p.failure(err)
 
       case (Right(_), None) =>
@@ -706,12 +689,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   private def abandonLoad(storageDeviceId: StorageDeviceId, backend: Backend, replaced: Boolean, err: Throwable,
                           p: Promise[Unit]): Unit =
     val storeId = backend.storeId
-    router.clearLoading(storeId)
     if ! replaced then
-      router.markOffline(storeId)
       ctx.devices.devices.get(storageDeviceId).foreach: sds =>
         sds.loadedStores -= storeId
-        sds.offlineStores += storeId
     try
       backend.close().onComplete:
         case Failure(t) => logger.warn(s"Failed to close the unserved backend of store $storeId: $t")
@@ -760,8 +740,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val UnloadFailedStore(storeId, store) = e
     router.entry(storeId).filter(_.store eq store).foreach: entry =>
       router.remove(storeId)
-      ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
-        sds.offlineStores += storeId
       // Drops whatever part of the saved state did reach the CRL. The save file is not
       // rewritten from it: the file on disk is still the whole state.
       // The save file on disk still holds the whole state, so the entries may go for good
@@ -778,7 +756,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       router.remove(storeId)
       ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
         sds.loadedStores -= storeId
-        sds.offlineStores += storeId
         awaitRetry("save file removal failed", storeId, LoadRetry(sds, store.backend.path, 1, 1))
       closeUnloaded(entry, dropDurably = false)
 
@@ -866,8 +843,6 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         else if !ctx.copyRegistry.closePurposeOf(storeId).isDefined then
           ctx.copyRegistry.closingFor(storeId, ClosePurpose.Shutdown)
         router.remove(storeId)
-        ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
-          sds.offlineStores += storeId
         startClose(entry):
           store.objectCache.clear()
           if extractCrl then

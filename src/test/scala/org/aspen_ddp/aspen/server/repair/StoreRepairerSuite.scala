@@ -773,7 +773,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
 
   /** missedByTx for a `build` that completes asynchronously, as a TKVL write does */
   private def missedByTxAsync(i: Int, newTx: => Transaction)(build: Transaction => Future[Unit]): Future[TransactionId] =
-    net.offlineStores = Set(sid(i))
+    net.unreachableStores = Set(sid(i))
     val tx = TestTransactions.replaySafe(newTx)
     build(tx).flatMap: _ =>
       net.droppedTx = net.droppedTx + ((sid(i), tx.id))
@@ -781,7 +781,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     .transformWith: committed =>
       settle().transform: settled =>
         net.droppedTx = net.droppedTx - ((sid(i), tx.id))
-        net.offlineStores = Set()
+        net.unreachableStores = Set()
         committed.flatMap(_ => settled).map(_ => tx.id)
 
   /** missedByTx, standing in for a commit voter that crashed holding its vote and dropped it on recovery: its copies
@@ -842,7 +842,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     */
   private def kvUpdate(ptr: KeyValueObjectPointer, ops: List[org.aspen_ddp.aspen.common.objects.KeyValueOperation])
                       (tx: Transaction): Unit =
-    val online = (0 until net.stores.size).filterNot(i => net.offlineStores.contains(sid(i)))
+    val online = (0 until net.stores.size).filterNot(i => net.unreachableStores.contains(sid(i)))
     def heldAt(key: Key) = online.map(i => stored(i, ptr.id).flatMap(_.kvState).flatMap(_.content.get(key)))
     val checks = ops.collect {
       case d: org.aspen_ddp.aspen.common.objects.Delete =>
@@ -980,7 +980,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     val held = scala.collection.mutable.ListBuffer[TxPrepare]()
     net.recordTxMessage = m => m.transactionId == tx.id
     net.dropTxMessage = m => m.transactionId == tx.id
-    net.offlineStores = missing.map(sid)
+    net.unreachableStores = missing.map(sid)
     val committed = tx.commit().map(_ => ())
 
     def untilHeld(until: Long): Future[Unit] =
@@ -994,17 +994,17 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       val dropped = missing.map(sid)
       net.recordTxMessage = _ => false
       net.dropTxMessage = _ => false
-      net.offlineStores = dropped
+      net.unreachableStores = dropped
       net.droppedTx = net.droppedTx ++ dropped.map(s => (s, tx.id))
       held.filterNot(p => dropped.contains(p.to)).foreach(net.deliverTransactionMessage)
       pump(committed, deadline()).transformWith: c =>
         settle().transform: s =>
           net.droppedTx = net.droppedTx -- dropped.map(s => (s, tx.id))
-          net.offlineStores = Set()
+          net.unreachableStores = Set()
           c.flatMap(_ => s)
 
     untilHeld(deadline()).map: _ =>
-      net.offlineStores = Set()
+      net.unreachableStores = Set()
       (tx.id, committed, () => deliver())
 
   /** Store `i`'s object timestamp for `ptr` */

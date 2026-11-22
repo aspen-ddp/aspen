@@ -178,14 +178,12 @@ object Host:
                          /** How far past the start lead each renewal sets the join ceiling (JoinCeiling.Step) */
                          joinCeilingStep: FiniteDuration = JoinCeiling.Step,
                          /** Lockstep only: each testingOnlyHandleEvents checks the copy registry once drained, failing
-                          *  on a throw its shadow updates swallowed, a disagreement with the disk
-                          *  (HostCopies.verifyAgainstDisk) or with the router's silence marks
-                          *  (HostCopies.compareWithRouter) */
+                          *  on a throw its shadow updates swallowed, a throw of its silence path or a disagreement
+                          *  with the disk (HostCopies.verifyAgainstDisk). Implies strictCopyRegistry */
                          verifyCopyRegistry: Boolean = false,
-                         /** Lockstep only: each testingOnlyHandleEvents compares the copy registry's derived silence
-                          *  and repairability with the router's marks once drained (HostCopies.compareWithRouter),
-                          *  failing on a disagreement. Implied by verifyCopyRegistry */
-                         compareCopyRegistry: Boolean = false)
+                         /** A throw of the copy registry's silence path (HostCopies.onChange) propagates rather than
+                          *  leaving the store silent, and each lockstep testingOnlyHandleEvents fails on one recorded */
+                         strictCopyRegistry: Boolean = false)
 
   object Seams:
     val default: Seams = Seams()
@@ -404,6 +402,8 @@ class Host(val client: AspenClient,
     */
   private val repairService = new RepairService(client, hostId, this, backgroundTasks)(using ec)
 
+  deviceControl.copyRegistry.strict = seams.verifyCopyRegistry || seams.strictCopyRegistry
+
   deviceControl.discovery.checkForNewDevices()
 
   // After the LoadStores the scan queued: until it is handled, messages for stores not loaded get no reply
@@ -547,8 +547,8 @@ class Host(val client: AspenClient,
       t.drain()
       if seams.verifyCopyRegistry then
         val registry = deviceControl.copyRegistry
-        val problems = registry.takeShadowErrors().toList ++ registry.verifyAgainstDisk() ++
-          registry.compareWithRouter()
+        val problems = registry.takeShadowErrors().toList ++ registry.takeSilenceErrors() ++
+          registry.verifyAgainstDisk()
         // A copy a load learned of, and an open during a transfer out (refused from stage 1 Task 7), are reported,
         // not failed on: a test may place a copy after its device's load
         if problems.nonEmpty then
@@ -556,11 +556,11 @@ class Host(val client: AspenClient,
           val opens = registry.opensDuringTransferOut.map(o => s"(open during transfer out) $o")
           throw new IllegalStateException(s"Copy registry of host $hostId after a drain:\n  " +
                                           (problems ++ learned ++ opens).mkString("\n  "))
-      else if seams.compareCopyRegistry then
-        val problems = deviceControl.copyRegistry.compareWithRouter()
+      else if seams.strictCopyRegistry then
+        val problems = deviceControl.copyRegistry.takeSilenceErrors()
         if problems.nonEmpty then
-          throw new IllegalStateException(s"Copy registry of host $hostId after a drain, against the router's " +
-                                          s"marks:\n  " + problems.mkString("\n  "))
+          throw new IllegalStateException(s"Copy registry of host $hostId after a drain, its silence path threw:\n  " +
+                                          problems.mkString("\n  "))
     case _ => ()
 
   /** The components, for tests. */

@@ -115,25 +115,9 @@ final class DeviceControl(val metadata: DeviceMetadata,
   /** The latest snapshot published by the control thread. Safe to read from any thread. */
   def currentView: HostStoreView = view
 
-  /** Records `storeId` as offline on `sds` and in the router, where it is silent */
-  def markStoreOffline(sds: LocalStorageDeviceState, storeId: StoreId): Unit =
-    router.markOffline(storeId)
-    sds.offlineStores += storeId
-
-  /** Records a copy of `storeId` that is not served as offline on `sds`, and silences the store unless it is served
-   *  or opening here. The router's mark is by store id, and the store may be served from another device of this host
-   *  (a transfer or re-placement between two of its devices, the source of a transfer onto this one whose path holds
-   *  an earlier tenancy's copy): marking it would report that store offline (HostStoreView), stopping its repair
-   *  scans, and keep the shutdown of its own device from closing it (DeviceShutdown.storesToClose). */
-  def markCopyOffline(sds: LocalStorageDeviceState, storeId: StoreId): Unit =
-    if router.get(storeId).isEmpty && !loader.isOpening(storeId) then
-      router.markOffline(storeId)
-    sds.offlineStores += storeId
-
-  /** Rebuilds the snapshot from the router's maps, the loaded devices, the rebuilds running and the stores
-   *  transferring out, and publishes it. Called on the control thread after every change to any of them. */
+  /** Rebuilds the snapshot from the router's maps, the copy registry's derived repairability and the loaded devices,
+   *  and publishes it. Called on the control thread after every change to any of them (HostCopies.onChange). */
   private[server] def publishView(): Unit =
     val loaded = router.loaded
-    view = HostStoreView.of(loaded.keySet, router.offlineStores, rebuilds.rebuildingStoreIds,
-      storeTransferService.transferringOutStores, devices.devices.map((id, sds) => id -> sds.devicePath),
-      loaded.map((id, s) => id -> s.storageDeviceId))
+    view = HostStoreView.of(loaded.keySet, router.silentStores, loaded.keySet.filter(copyRegistry.repairable),
+      devices.devices.map((id, sds) => id -> sds.devicePath), loaded.map((id, s) => id -> s.storageDeviceId))

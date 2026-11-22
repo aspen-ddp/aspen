@@ -346,9 +346,8 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
    *  the repair survive a restart; loading is what makes it take effect now.
    *
    *  Loading goes through tryLoadStore rather than opening a backend here, because that method
-   *  owns the rest of the bookkeeping -- reading the store config, and clearing the store from
-   *  both this device's offlineStores and the host.s. Those two sets and the marker file are
-   *  three representations of one fact and must not be allowed to disagree.
+   *  owns the rest of the bookkeeping -- reading the store config, and taking its copy from offline
+   *  to Opening in the copy registry, which derives the host's silence from it.
    *
    *  StoreMoved is gossiped from tryLoadStore's onServed, once the store is served: once the LoadStore its open
    *  queues has installed it and it has recovered, whether the backend opened in the caller or off the control

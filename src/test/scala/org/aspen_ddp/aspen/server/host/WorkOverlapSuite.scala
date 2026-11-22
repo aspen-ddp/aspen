@@ -185,8 +185,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, transferService = transfers, storeRebuildFactory = factory)
     val local = new LocalStorageDeviceState(deviceA, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl)
     injectLoadedDevice(host, local)
-    // Held back offline, as a device load holds a marked copy (tryLoadStore)
-    host.control.markCopyOffline(local, moving)
+    // Its copy, registered Lost at the injection, is held back offline, as a device load holds a marked copy
 
     for
       _ <- check(host, deviceA, Map(moving -> rebuildingIn(UUID.randomUUID())))
@@ -249,10 +248,10 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
           for
             _ <- setDeviceState(deviceA)(_.setRebuilding(creating, UUID.randomUUID()))
             _ = host.control.reconciler.checkStorageDevice(deviceA)
-            _ <- yieldUntil(host.control.rebuilds.silencedStores.contains(creating) &&
+            _ <- yieldUntil(hasRebuildWork(host, creating) &&
                             !host.control.reconciler.activeDeviceChecks.contains(deviceA))
           yield
-            queued = host.control.rebuilds.silencedStores.contains(creating)
+            queued = hasRebuildWork(host, creating)
             createWorkWhileQueued = host.control.rebuilds.isCreating(creating)
         case _ => Future.unit
       _ = host.control.reconciler.checkStorageDevice(deviceA)
@@ -279,8 +278,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val sends = new StagedSendService
     val factory = new HeldRebuildFactory
     val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
-    // Held back offline, as a device load holds a marked copy (tryLoadStore)
-    host.control.markCopyOffline(loadedDevices(host)(deviceA), moving)
+    // Its copy, registered Lost at the device's load, is held back offline, as a device load holds a marked copy
     sends.beginTransferOut(moving, UUID.randomUUID(), storePath, "localhost", 1, org.aspen_ddp.aspen.common.HLCTimestamp.now)
 
     def entry(): Future[Option[StorageDeviceState.StoreStatus]] =
@@ -315,8 +313,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val sends = new StagedSendService
     val factory = new HeldRebuildFactory
     val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
-    // Held back offline, as a device load holds a marked copy (tryLoadStore)
-    host.control.markCopyOffline(loadedDevices(host)(deviceA), moving)
+    // Its copy, registered Lost at the device's load, is held back offline, as a device load holds a marked copy
     sends.beginTransferOut(moving, UUID.randomUUID(), storePath, "localhost", 1, org.aspen_ddp.aspen.common.HLCTimestamp.now)
     val rebuilding = Map(moving -> rebuildingIn(UUID.randomUUID()))
 
@@ -365,10 +362,9 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       val host = newHost(hostRoot, transferService = sends)
       val local = new LocalStorageDeviceState(source, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl)
       injectLoadedDevice(host, local)
+      // Not loaded: its copy, registered at the injection, is offline
       if loaded then
         installServedElsewhere(host, shipped)
-      else
-        local.offlineStores += shipped
 
       // The first close, completed by hand once the second request is refused
       def finishFirstClose(): Unit =
@@ -535,7 +531,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
     // After the host's device load, which marks a store directory it finds beside no CRL state rebuild-required
     val storePath = writeStoreConfig(deviceDir, shipped)
-    loadedDevices(host)(source).offlineStores += shipped
+    placedCopies(host, loadedDevices(host)(source), shipped)
     val rebuilding = Map(shipped -> rebuildingIn(UUID.randomUUID()))
 
     for
@@ -614,4 +610,4 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
         outcome.exists(_.isSuccess) should be(true)
         host.control.router.loaded.contains(moving) should be(false)
         host.control.loader.isOpening(moving) should be(false)
-        local.offlineStores should contain(moving)
+        offlineCopies(host, local) should contain(moving)

@@ -42,7 +42,7 @@ class StoreAvailabilityTracker(cacheFile: Option[os.Path] = None) extends Loggin
   def isOffline(storeId: StoreId): Boolean = synchronized:
     stores.get(storeId).exists(_.offline)
 
-  def offlineStores: Set[StoreId] = synchronized:
+  def unavailableStores: Set[StoreId] = synchronized:
     stores.collect { case (storeId, a) if a.offline => storeId }.toSet
 
   /** Every store held, online ones included. Sent to a client when its gossip subscription starts. */
@@ -77,7 +77,7 @@ class StoreAvailabilityTracker(cacheFile: Option[os.Path] = None) extends Loggin
       if pruned.size != stores.size then
         stores = pruned
         save()
-    val checks = offlineStores.toList.map: storeId =>
+    val checks = unavailableStores.toList.map: storeId =>
       // Taken before the reads, so a StoreOffline sent while they are in flight is newer and wins
       val checkedAt = HLCTimestamp.now
       val f = for

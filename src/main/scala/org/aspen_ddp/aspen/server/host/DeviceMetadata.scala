@@ -197,7 +197,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
    *
    *  The returned TransferOutcome is how the caller learns which of the two happened. It must not
    *  load the arrived copy on the restore path: nothing would ever reclaim it, since the
-   *  deleted-stores pass looks only at offlineStores and reconcileDeviceState ignores a failed
+   *  deleted-stores pass looks only at offline copies and reconcileDeviceState ignores a failed
    *  device outright.
    *
    *  A test reaches it through the `Host.Seams` metadata seam (`metadata` or `wrapMetadata`), whose DeviceMetadata

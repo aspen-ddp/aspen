@@ -19,15 +19,23 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
   val copies: DeviceCopies = new DeviceCopies(storageDeviceId, devicePath, s => onCopyChange(s))
   /** Called after every change to `copies` (HostCopies.observer, for tests) */
   var onCopyChange: StoreId => Unit = _ => ()
+  /** Called after every write of `reconciledEntries`, with the stores it held before and holds now (HostCopies) */
+  var onReconciled: (Set[StoreId], Set[StoreId]) => Unit = (_, _) => ()
   var loadedStores: Set[StoreId] = Set()
-  var offlineStores: Set[StoreId] = Set()
   /** Stores the reconcile's Missing Stores pass declared lost on this device, while their entry stays Active here.
    *  Its rebuild is requested again at each reconcile even once the directory is back, since nothing else would serve
    *  or rebuild such a store (rebuild-process). Held in memory only: a restart's load serves a store that is back. */
   var declaredMissing: Set[StoreId] = Set()
   /** The store entries the device's latest reconcile read from its StorageDeviceState, None before its first. A load
    *  retry serves only a store whose entry here is Active or Offline (StoreLoader.retryFailedLoads) */
-  var reconciledEntries: Option[Map[StoreId, StorageDeviceState.StoreEntry]] = None
+  def reconciledEntries: Option[Map[StoreId, StorageDeviceState.StoreEntry]] = reconciled
+
+  def reconciledEntries_=(entries: Option[Map[StoreId, StorageDeviceState.StoreEntry]]): Unit =
+    val before = reconciled.map(_.keySet).getOrElse(Set())
+    reconciled = entries
+    onReconciled(before, entries.map(_.keySet).getOrElse(Set()))
+
+  private var reconciled: Option[Map[StoreId, StorageDeviceState.StoreEntry]] = None
 
   def totalSize: Long = configFile.toIO.getTotalSpace
   def currentUsage: Long = totalSize - configFile.toIO.getFreeSpace

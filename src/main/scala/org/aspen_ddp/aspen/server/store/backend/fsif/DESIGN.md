@@ -730,8 +730,8 @@ In addition, the rebuild staging store is discarded on `StoreLost` (4.1, related
 
 ### 4.5 What happens after the mark
 
-1. `StoreLoader.tryLoadStore` never loads a directory with `rebuild-required`. It goes into
-   `offlineStores`.
+1. `StoreLoader.tryLoadStore` never loads a directory with `rebuild-required`. Its copy stays offline on its
+   device (the copy registry's Lost record), which keeps the store silent.
 2. The reconcile's Lost CRL State pass (`DeviceReconciler.reconcileDeviceState`) finds marked offline stores whose
    entry is Active and calls `StoreRebuilds.requestRebuild`. That flips the entry to Rebuilding in a transaction, but only if the device is
    not failed and is owned by this host.

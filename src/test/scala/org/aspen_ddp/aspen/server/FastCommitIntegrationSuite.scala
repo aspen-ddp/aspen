@@ -166,14 +166,14 @@ class FastCommitIntegrationSuite extends IntegrationTestSuite with org.scalatest
       // does not lead. Stores 0 and 1 commit it (writeThreshold 2)
       t0 <- {
         val t0 = client.newTransaction()
-        net.offlineStores = Set(sid(behind))
+        net.unreachableStores = Set(sid(behind))
         net.droppedTx = Set((sid(behind), t0.id))
         t0.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
         for
           _ <- pump(t0.commit(), clock = false)
           _ <- settle(clock = false)
         yield
-          net.offlineStores = Set()
+          net.unreachableStores = Set()
           net.droppedTx = Set()
           t0.id
       }

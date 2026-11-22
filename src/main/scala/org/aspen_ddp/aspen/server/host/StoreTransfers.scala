@@ -331,22 +331,14 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                    ctx.rebuilds.clearRebuildCompleteMarker(storeId, storePath)
                 then
                   ctx.loadStoreById(toDeviceid, storeId)
-                else
-                  ctx.markStoreOffline(sds, storeId)
-              else
-                // Recorded as a restart's scan would have, which is what the transferred-in
-                // pass keys off.
-                ctx.markStoreOffline(sds, storeId)
+              // Otherwise its copy stays offline on its device, as a restart's scan would leave it, which is what
+              // the transferred-in and Completed Rebuilds passes key off
 
           case Success(TransferOutcome.PoolRepointedOffline) =>
-            // Left exactly as it arrived, behind its transferred-in marker, and recorded offline
-            // as a restart's scan would record it. Once a restart or adoption makes the entry
-            // Active, the reconcile's completed-transfers-in pass clears the marker and loads it.
-            // Unlike the shutdown's own markers this needs no disk write, so it is the same
-            // whether or not the device is still loaded.
-            ctx.router.markOffline(storeId)
-            ctx.devices.devices.get(toDeviceid).foreach: sds =>
-              sds.offlineStores += storeId
+            // Left exactly as it arrived, behind its transferred-in marker, offline as a restart's scan
+            // would leave it. Once a restart or adoption makes the entry Active, the reconcile's
+            // completed-transfers-in pass clears the marker and loads it. Unlike the shutdown's own markers
+            // this needs no disk write, so it is the same whether or not the device is still loaded.
             logger.info(s"Store $storeId has transferred onto device $toDeviceid, which is being " +
                         s"shut down. It stays offline")
 
@@ -431,8 +423,6 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                 // Rename-first: a failure leaves the copy whole behind its marker. The source still owns the store
                 if StoreCopies.delete(devicePath, finalPath, s"an unusable arrived copy of store $storeId") then
                   ctx.copyRegistry.removed("startIn unusable arrived copy", toDevice, storeId)
-                  toDevice.offlineStores -= storeId
-                  ctx.router.clearOfflineUnlessHeld(storeId)
                   Some(Phase.Live)
                 else
                   logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: the unusable arrived " +
@@ -610,8 +600,6 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         syncWork(storeId, local.storageDeviceId)
         if clear then
           local.loadedStores -= storeId
-          local.offlineStores -= storeId
-          ctx.router.clearOfflineUnlessHeld(storeId)
           ctx.reconciler.checkStorageDevice(local.storageDeviceId)
 
   /** Drops a TransferringIn entry whose source device has been declared failed.

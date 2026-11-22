@@ -222,9 +222,6 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         case other => other.map(_ => true)
       .map: clean =>
         ctx.copyRegistry.closeAskEnded(storeId)
-        // ShutdownStore records this too. Done here as well so the bookkeeping that later
-        // steps read does not depend on how the store was closed.
-        ctx.markStoreOffline(local, storeId)
         if clean then
           closedForShutdown += deviceId -> (closedForShutdown.getOrElse(deviceId, Set()) + storeId)
         ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
@@ -326,15 +323,18 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         ctx.copyRegistry.closingFor(storeId, ClosePurpose.Relinquish)
         ctx.closeStoreForShutdown(storeId).transform(_ => Success(())).map: _ =>
           ctx.copyRegistry.closeAskEnded(storeId)
-          ctx.markStoreOffline(local, storeId)
           onClosed(storeId)
       .flatMap(_ => closeStoresToRelinquish(local, onClosed))
 
-  /** The stores closeStoresForShutdown picks: those loaded on the device and not offline. A crash
+  /** The stores closeStoresForShutdown picks: those whose copy on the device is Served or Opening (not Closing: a
+   *  close is under way). The close of one opening waits for its install, then closes the served store
+   *  (StoreLoader.handleClose); so does a create's, whose copy has no record until its open's outcome. A crash
    *  mid-shutdown reloads the device, ShuttingDown, with its stores served, and they are closed again. */
   private def storesToClose(local: LocalStorageDeviceState): List[StoreId] =
-    local.loadedStores.filter(storeId => !ctx.router.isOffline(storeId))
-      .toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+    val creating = ctx.copyRegistry.copiesOf(local).toList.flatMap(_.work.collect {
+      case (storeId, Work.Create) if ctx.loader.isOpening(storeId) => storeId
+    })
+    (ctx.copyRegistry.openCopies(local) ++ creating).toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
 
   /** Run by the reconcile of an Operational device that is not shutting down: loads each store a
    *  cancelled shutdown of it closed, once its entry is Active with no transfer named. A store whose
@@ -346,7 +346,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
     val deviceId = local.storageDeviceId
     closedForShutdown.get(deviceId).foreach: closed =>
       def storePath(storeId: StoreId): os.Path = local.devicePath / storeId.directoryName
-      val (ready, notYet) = closed.filter(local.offlineStores.contains).partition: storeId =>
+      val (ready, notYet) = closed.filter(ctx.copyRegistry.offlineCopies(local).contains).partition: storeId =>
         remote.stores.get(storeId).exists(entry =>
           entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty)
       if notYet.isEmpty then
@@ -380,8 +380,8 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
     else
       closeStoresForShutdown(local).flatMap(_ => closeThenUnload(local))
 
-  /** Forgets a device that has been shut down. Its stores stay in offlineStores, so messages for
-   *  them are dropped rather than answered with UnknownStore, and it stays in this host's
+  /** Forgets a device that has been shut down. Its stores stay silent (the copy registry's unloaded entries), so
+   *  messages for them are dropped rather than answered with UnknownStore, and it stays in this host's
    *  HostState: this host still owns it until another host adopts it.
    *
    *  Dropping its loadedDeviceDirs entry means the scan reads the directory again, finds

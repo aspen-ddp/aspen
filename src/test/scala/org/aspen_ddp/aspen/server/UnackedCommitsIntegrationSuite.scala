@@ -141,7 +141,7 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite with org.scala
   private def commitHeldBy(holders: Set[StoreId], silent: Set[StoreId] = Set())
                           (build: Transaction => Future[Unit]): Future[TransactionId] =
     val tx = TestTransactions.replaySafe(client.newTransaction())
-    net.offlineStores = holders ++ silent
+    net.unreachableStores = holders ++ silent
     def outcome(m: TxMessage) = m.isInstanceOf[TxResolved] || m.isInstanceOf[TxFinalized]
     net.dropTxMessage = (m: TxMessage) => m.transactionId == tx.id &&
       (silent.contains(m.to) || silent.contains(m.from) || (holders.contains(m.to) && outcome(m)))
@@ -151,7 +151,7 @@ class UnackedCommitsIntegrationSuite extends IntegrationTestSuite with org.scala
       // The finalizer marks the holders, which sent no TxCommitted, and its own transactions complete
       _ <- settle(clock = false)
     yield
-      net.offlineStores = Set()
+      net.unreachableStores = Set()
       tx.id
 
   /** Store `i` crashed after saving its commit vote on `txid` and before accepting the commit: its recovered Paxos

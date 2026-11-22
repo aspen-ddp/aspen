@@ -35,7 +35,7 @@ object StoreRouter:
 
 /** The loaded stores, and the delivery of messages, I/O completions and repairs to them (spec section 4).
  *
- *  The map of loaded stores and the set of offline stores are concurrent: only the control thread writes them, and
+ *  The map of loaded stores and the set of silent stores are concurrent: only the control thread writes them, and
  *  any thread may read them. Every write republishes the host's HostStoreView.
  *
  *  Work for a store reaches it in one of two ways:
@@ -48,23 +48,19 @@ object StoreRouter:
  *  - From the control thread: `onStore` and `onEachStore`, straight to the executor with no dispatch step, and any
  *    result returned through a Future whose callbacks name the control context.
  *
- *  A store that is not loaded but is marked offline is silent: a message for it is dropped instead of answered with
- *  an UnknownStore reply. The mark is set when a store is removed and cleared when one is installed; stores that were
- *  never loaded are marked and unmarked directly, so `offline` is not a subset of the stores loaded. `remove` marks
- *  the store offline before it leaves the map, so any thread that finds it gone also finds it offline.
- *
- *  A store whose load is under way is silent too: it is marked loading while its backend opens (StoreLoader.startOpen)
- *  and until its LoadStore installs it, and the stores of a device are marked awaiting their device while its
- *  shutdown-marker lookup (or the adoption it leads to) decides whether to load it (DeviceDiscovery). Clients
- *  retransmit rather than being told the store is not here and dropping its location. The two marks are separate so
- *  each owner clears only its own, and neither is `offline`, which the HostStoreView reports. */
+ *  A store that is not loaded but is silent is not answered: a message for it is dropped instead of answered with an
+ *  UnknownStore reply, so clients retransmit rather than being told the store is not here and dropping its location.
+ *  Silence is derived (HostCopies.silence): a store is silent while a copy of it on a loaded device (any phase, being
+ *  opened, closed or retired), its rebuild, create or transfer in, a declared-missing mark, an unloaded device's last
+ *  tree entry or a device awaiting its ownership decision names it, unless a copy is served. The copy registry sets
+ *  the mark (`setSilent`) after every change to what it derives from (HostCopies.onChange); nothing else writes it.
+ *  `remove` marks the store silent before it leaves the map, so any thread that finds it gone also finds it silent
+ *  until the registry's recompute, which keeps it so while its copy closes. */
 class StoreRouter(ctx: DeviceControl) extends Logging:
   import StoreRouter.Entry
 
   private val stores = new ConcurrentHashMap[StoreId, Entry]()
-  private val offline: java.util.Set[StoreId] = ConcurrentHashMap.newKeySet[StoreId]()
-  private val loading: java.util.Set[StoreId] = ConcurrentHashMap.newKeySet[StoreId]()
-  private val awaitingDevice: java.util.Set[StoreId] = ConcurrentHashMap.newKeySet[StoreId]()
+  private val silent: java.util.Set[StoreId] = ConcurrentHashMap.newKeySet[StoreId]()
   // crl_save.log files whose removal after their load failed (crlLoaded), so may not be durable: written on store
   // executors, read on the control thread. Lost at a restart, whose load finds a file brought back by a crash and
   // loads it again, harmlessly: the store served nothing since it was written
@@ -81,10 +77,10 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   /** Called on the control thread once the stores found at startup have been loaded (their LoadStores handled). */
   private[server] def markReady(): Unit = ready = true
 
-  /** Whether a message for a store that is not loaded should be answered: never while starting, nor for an offline
-   *  or loading store, nor one awaiting its device. */
-  private def answersUnknown(storeId: StoreId): Boolean =
-    ready && ! offline.contains(storeId) && ! loading.contains(storeId) && ! awaitingDevice.contains(storeId)
+  /** Whether a message for a store that is not loaded should be answered UnknownStore: never while starting, nor for
+   *  a store installed (by the time a close or reload made the message miss it), nor a silent one. */
+  private[host] def answersUnknown(storeId: StoreId): Boolean =
+    ready && !stores.containsKey(storeId) && !silent.contains(storeId)
 
   /** Runs `task` on the store's executor if it is loaded, unless its close has started there by then. */
   def post(storeId: StoreId)(task: Store => Unit): Unit = route(storeId, () => ())(task)
@@ -306,11 +302,9 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   /** The store's entry, if it is loaded */
   private[host] def entry(storeId: StoreId): Option[Entry] = Option(stores.get(storeId))
 
-  def isOffline(storeId: StoreId): Boolean = offline.contains(storeId)
-
-  def isLoading(storeId: StoreId): Boolean = loading.contains(storeId)
-
-  def isAwaitingDevice(storeId: StoreId): Boolean = awaitingDevice.contains(storeId)
+  /** Whether the copy registry derives the store silent (HostCopies.silence): not served, and named by some copy,
+   *  work or device here. Control thread */
+  def isOffline(storeId: StoreId): Boolean = ctx.copyRegistry.silence(storeId).isInstanceOf[Silence.Silent]
 
   /** Callable from any thread (the repair scan): Store.holdsTransaction reads volatile snapshots. False for a store not
     * loaded here, whose repair fails with StoreNotHosted anyway
@@ -332,19 +326,17 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   /** A snapshot of the loaded stores, by id */
   private[aspen] def loaded: Map[StoreId, Store] = stores.asScala.view.mapValues(_.store).toMap
 
-  /** A snapshot of the stores marked offline */
-  private[server] def offlineStores: Set[StoreId] = offline.asScala.toSet
+  /** A snapshot of the stores marked silent */
+  private[server] def silentStores: Set[StoreId] = silent.asScala.toSet
 
-  /** A snapshot of the stores marked loading (HostCopies.compareWithRouter) */
-  private[host] def loadingStores: Set[StoreId] = loading.asScala.toSet
-
-  /** A snapshot of the stores marked awaiting their device (HostCopies.compareWithRouter) */
-  private[host] def awaitingDeviceStores: Set[StoreId] = awaitingDevice.asScala.toSet
+  /** Sets the store's silent mark as the copy registry derives it (HostCopies.onChange, its only caller) */
+  private[host] def setSilent(storeId: StoreId, isSilent: Boolean): Unit =
+    if isSilent then silent.add(storeId) else silent.remove(storeId)
 
   /** `install` of a new entry, for a store whose backend needs no completion handler bound to it (tests). */
   private[host] def install(store: Store, executor: StoreExecutor): Unit = install(new Entry(store, executor))
 
-  /** Makes the entry's store loaded and clears its offline and loading marks. From here on only the executor touches
+  /** Makes the entry's store loaded, its copy Served. From here on only the executor touches
    *  the store: the map's put is the happens-before edge for everything the control thread did to it first. */
   private[host] def install(entry: Entry): Unit =
     val store = entry.store
@@ -374,52 +366,15 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
           replaced.store.close().failed.foreach(t =>
             logger.warn(s"Failed to close the replaced store ${store.storeId}: $t"))(
             using scala.concurrent.ExecutionContext.parasitic)
-    offline.remove(store.storeId)
-    loading.remove(store.storeId)
-    // Its copy's record is Served (shadow)
+    // Its copy's record is Served, so the store is not silent
     ctx.copyRegistry.installed(store.storageDeviceId, store.storeId)
-    ctx.publishView()
+    ctx.copyRegistry.onChange(store.storeId)
 
-  /** Marks the store offline, then unloads it, returning the entry it had. */
+  /** Marks the store silent, then unloads it, returning the entry it had. Its copy is Closing until the close ends,
+   *  which keeps it silent */
   private[host] def remove(storeId: StoreId): Option[Entry] =
-    offline.add(storeId)
+    silent.add(storeId)
     val removed = Option(stores.remove(storeId))
-    // Its copy's record is Closing until the close ends (shadow)
     removed.foreach(e => ctx.copyRegistry.removedFromRouter(e.store.storageDeviceId, storeId))
-    ctx.publishView()
+    ctx.copyRegistry.onChange(storeId)
     removed
-
-  /** Marks a store offline without touching the loaded stores */
-  private[host] def markOffline(storeId: StoreId): Unit =
-    offline.add(storeId)
-    ctx.publishView()
-
-  /** Clears a store's offline mark without touching the loaded stores */
-  private[host] def clearOffline(storeId: StoreId): Unit =
-    ctx.copyRegistry.offlineClearAsked(storeId)
-    offline.remove(storeId)
-    ctx.publishView()
-
-  /** Clears a store's offline mark unless a loaded device of this host still holds the store offline, or a Rebuilding
-   *  entry here does (`StoreRebuilds.silencedStores`, rebuild-process 6.2). The mark is by store id, and two devices
-   *  of one host can each hold a copy (a transfer between them, an earlier tenancy's copy, a rebuild re-placed between
-   *  them): a copy that leaves one device's offlineStores does not unsilence the other's, nor a rebuild's destination,
-   *  which never held the store and so lists it in no offlineStores. Callers remove it from their own record first. */
-  private[host] def clearOfflineUnlessHeld(storeId: StoreId): Unit =
-    ctx.copyRegistry.offlineClearAsked(storeId)
-    if !ctx.devices.devices.values.exists(_.offlineStores.contains(storeId)) &&
-       !ctx.rebuilds.silencedStores.contains(storeId) then
-      clearOffline(storeId)
-
-  /** Marks a store whose load is under way, so its messages are dropped rather than answered UnknownStore. Not part
-   *  of the HostStoreView, so nothing is published. */
-  private[host] def markLoading(storeId: StoreId): Unit = loading.add(storeId)
-
-  /** Clears a store's loading mark: its load ended without installing it */
-  private[host] def clearLoading(storeId: StoreId): Unit = loading.remove(storeId)
-
-  /** Marks a store of a device whose load is still being decided (DeviceDiscovery), so its messages are dropped */
-  private[host] def markAwaitingDevice(storeId: StoreId): Unit = awaitingDevice.add(storeId)
-
-  /** Clears a store's awaiting-device mark */
-  private[host] def clearAwaitingDevice(storeId: StoreId): Unit = awaitingDevice.remove(storeId)

@@ -70,7 +70,7 @@ class CommitApplyOrderIntegrationSuite extends IntegrationTestSuite:
       dBefore <- client.read(d)
       // T: led by store 1, never seen by store 2. Store 0 votes and accepts, but its outcome messages are held
       tx = client.newTransaction()
-      _ = net.offlineStores = Set(sid(0), sid(2))
+      _ = net.unreachableStores = Set(sid(0), sid(2))
       _ = net.droppedTx = Set((sid(2), tx.id))
       _ = net.dropTxMessage =
             case m @ (_: TxResolved | _: TxFinalized) if m.to == sid(0) && m.transactionId == tx.id =>
@@ -84,10 +84,10 @@ class CommitApplyOrderIntegrationSuite extends IntegrationTestSuite:
                vote(0, tx.id).contains(TransactionDisposition.VoteCommit)
       // T2: a refcount change started after T, led by store 2. Store 0 collides with T's lock
       tx2 = client.newTransaction()
-      _ = net.offlineStores = Set(sid(0), sid(1))
+      _ = net.unreachableStores = Set(sid(0), sid(1))
       _ = tx2.setRefcount(d, dBefore.refcount, dBefore.refcount.increment())
       _ <- pump(tx2.commit())
-      _ = net.offlineStores = Set()
+      _ = net.unreachableStores = Set()
       _ <- eventually("store 0 learned T2"):
              frontend(0).forall(_.transactions.get(tx2.id).forall(_.knownOutcome.contains(true)))
       // T's outcome reaches store 0 at last

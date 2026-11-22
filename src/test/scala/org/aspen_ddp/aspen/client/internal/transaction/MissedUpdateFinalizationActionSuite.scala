@@ -22,7 +22,7 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
   * The trigger (markMissedUpdates() called directly) is synthetic because none of the three ways
   * to make a store miss a commit work in TestNetwork: leaving store2 unloaded makes Host reply
   * StoreNotFound, which BaseReadDriver answers by immediately re-reading, and TestNetwork's
-  * synchronous re-entrant loop turns that into unbounded recursion; offlineStores is only
+  * synchronous re-entrant loop turns that into unbounded recursion; a silent store is only
   * reachable via the private closeStore; and backend commit errors are discarded by
   * Tx.commitComplete. Everything downstream of the trigger is real — real TKVL, real transaction,
   * real Paxos across three MapBackends.

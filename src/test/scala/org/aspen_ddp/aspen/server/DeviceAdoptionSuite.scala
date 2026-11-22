@@ -620,11 +620,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       host = newHost(hostRoot)
       _ <- resolve(host)
       st <- state(deviceA)
-      markerKeptByAdoption = os.exists(d1 / StoreTransfer.TransferredInMarkerFile)
-      attemptsAfterAdoption = recorded(host).storeLoadAttempts.map(_._2).toList
-      // RecordingSeams' tryLoadStore (ControlFixture) does not record the skipped store offline, as
-      // the real one does on seeing the marker; done by hand so the completed-transfers-in pass sees it.
-      _ = loadedDevices(host)(deviceA).offlineStores += s1
+      // Its copy, registered Arrived at the device's load, is offline there, so the completed-transfers-in pass of
+      // the adoption's own reconcile, or of the check below, completes it
       _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(!os.exists(d1 / StoreTransfer.TransferredInMarkerFile) &&
                      host.control.reconciler.activeDeviceChecks.isEmpty)
@@ -632,8 +629,6 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
       st.status should be(DeviceStatus.Operational)
       st.stores(s1).status should be(StoreStatus.Active)
-      markerKeptByAdoption should be(true)
-      attemptsAfterAdoption.count(_ == d1) should be(1)
       os.exists(d1 / StoreTransfer.TransferredInMarkerFile) should be(false)
       recorded(host).storeLoadAttempts.map(_._2).count(_ == d1) should be(2)
 

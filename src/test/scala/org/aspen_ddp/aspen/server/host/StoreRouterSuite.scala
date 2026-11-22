@@ -189,6 +189,7 @@ object StoreRouterSuite:
       val dir = os.temp.dir()
       val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl)
       sds.loadedStores += storeId
+      ctx.copyRegistry.attach(sds)
       ctx.devices.devices += deviceId -> sds
       sds
 
@@ -276,7 +277,8 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
    *  as loaded, and its backend is closed. */
   private def assertAbandoned(fx: Fixture, s0: StoreId, sds: LocalStorageDeviceState, backend: TrackingBackend): Unit =
     val (entry, offline, loaded, offlineInDevice) = fx.onControl:
-      (fx.ctx.router.entry(s0), fx.ctx.router.isOffline(s0), sds.loadedStores.contains(s0), sds.offlineStores.contains(s0))
+      (fx.ctx.router.entry(s0), fx.ctx.router.isOffline(s0), sds.loadedStores.contains(s0),
+        fx.ctx.copyRegistry.offlineCopies(sds).contains(s0))
     entry should be(None)
     offline should be(true)
     loaded should be(false)
@@ -451,38 +453,37 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       fx.ctx.router.deliverTx(prepare)
       fx.net.tx.asScala.toList.map(_._1) should be(List(TxUnknownStore(peer, unknown, txid)))
 
-  test("a store whose load is under way, or whose device is undecided, gets no reply until its mark is cleared"):
+  test("a store whose device is undecided gets no reply until its device is decided"):
     val unknown = StoreId(poolId, 2)
     val peer = StoreId(poolId, 1)
     val txid = TransactionId(new UUID(15, 9))
     withRouter(emptyCrl): fx =>
       def prepare = TxPrepare(unknown, peer, overwriteTxd(txid), ProposalId.initialProposal(0), Nil, true)
       val router = fx.ctx.router
-      router.markLoading(unknown)
-      router.markAwaitingDevice(unknown)
+      val undecided = os.temp.dir()
+      fx.onControl(fx.ctx.copyRegistry.awaitDevice(undecided, Set(unknown)))
       router.deliverTx(prepare)
       router.deliverClient(read(unknown))
-      router.clearLoading(unknown)
-      router.deliverTx(prepare)
-      router.deliverClient(read(unknown))
+      fx.awaitControl()
       fx.net.tx.asScala.toList should be(empty)
       fx.net.client.asScala.toList should be(empty)
-      // Neither mark is reported as offline
-      fx.ctx.currentView.offline should be(empty)
+      fx.ctx.currentView.offline should be(Set(unknown))
 
-      router.clearAwaitingDevice(unknown)
+      fx.onControl(fx.ctx.copyRegistry.deviceDecided(undecided))
       router.deliverTx(prepare)
       router.deliverClient(read(unknown))
       fx.net.tx.asScala.toList.map(_._1) should be(List(TxUnknownStore(peer, unknown, txid)))
       fx.net.client.asScala.toList.collect { case r: ReadResponse => r.result } should be(
         List(Left(ReadError.StoreNotFound)))
 
-  test("installing a store clears its loading mark"):
+  test("installing a store serves it, silent no more"):
     val s0 = StoreId(poolId, 0)
     withRouter(emptyCrl): fx =>
-      fx.ctx.router.markLoading(s0)
+      val sds = fx.addDevice(s0)
       await(fx.load(bootstrappedBackend(s0)))
-      fx.ctx.router.isLoading(s0) should be(false)
+      fx.onControl(fx.ctx.router.answersUnknown(s0)) should be(false)
+      fx.onControl(fx.ctx.copyRegistry.silence(s0)) should be(Silence.Served)
+      fx.ctx.currentView.offline should be(empty)
 
   test("a load whose store fails to build releases what its recovered transactions were counted for"):
     val s0 = StoreId(poolId, 0)
@@ -496,6 +497,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
         val dir = os.temp.dir()
         val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
         sds.loadedStores += s0
+        fx.ctx.copyRegistry.attach(sds)
         fx.ctx.devices.devices += deviceId -> sds
       intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, os.temp.dir()))))
       admission.admittedBytes should be(0)
@@ -540,6 +542,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
         val dir = os.temp.dir()
         val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
         sds.loadedStores += s0
+        fx.ctx.copyRegistry.attach(sds)
         fx.ctx.devices.devices += deviceId -> sds
       val first = bootstrappedBackend(s0)
       await(fx.load(first))
@@ -563,6 +566,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
     val dir = os.temp.dir()
     val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
     sds.loadedStores += storeId
+    fx.ctx.copyRegistry.attach(sds)
     fx.ctx.devices.devices += deviceId -> sds
     sds
 

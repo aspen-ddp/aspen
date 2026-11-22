@@ -84,13 +84,13 @@ class ConcurrentSliceGrowthIntegrationSuite extends IntegrationTestSuite:
     val keys = List(k("b0"), k("b1"), k("b2"))
     def missing(i: Int)(tx: Transaction): Unit =
       net.droppedTx += ((net.stores(i).storeId, tx.id))
-      net.offlineStores = Set(net.stores(i).storeId)
+      net.unreachableStores = Set(net.stores(i).storeId)
     for
       kp <- allocateNearlyFull(2 * 68 + 10)
       c0 <- insert(kp, keys(0), missing(2))._2
       c1 <- insert(kp, keys(1), missing(0))._2
       c2 <- insert(kp, keys(2), missing(1))._2
-      _ = net.offlineStores = Set()
+      _ = net.unreachableStores = Set()
       _ <- net.waitForTransactionsToComplete()
       kvos <- client.read(kp)
     yield

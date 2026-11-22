@@ -299,12 +299,12 @@ class CommittedUnknownRetrySuite extends IntegrationTestSuite:
       devPtr <- client.getStorageDevicePointer(net.secondDeviceId)
       _ = net.reportCommitAsUnknown(touches(devPtr))
       _ = net.smgr.control.rebuilds.requestRebuild(net.secondDeviceId, lost)
-      _ <- pollUntil(System.nanoTime() + 10_000_000_000L)(router.offlineStores.contains(lost))
+      _ <- pollUntil(System.nanoTime() + 10_000_000_000L)(router.silentStores.contains(lost))
       dev <- client.getStorageDeviceState(net.secondDeviceId)
     yield
       net.pendingUnknownCommits should be(0)
       dev.stores(lost).status should be(StorageDeviceState.StoreStatus.Rebuilding)
-      router.offlineStores should contain(lost)
+      router.silentStores should contain(lost)
 
   /** Drives the network until `condition` holds or `deadline` (System.nanoTime) passes, waiting in real time between
     * rounds for work the client schedules on its background timer, such as a retry's backoff */

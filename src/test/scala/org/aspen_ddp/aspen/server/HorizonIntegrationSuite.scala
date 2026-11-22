@@ -234,7 +234,7 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       // of theirs learns the outcome early
       t0Outcomes <- {
         val t0 = TestTransactions.replaySafe(client.newTransaction())
-        net.offlineStores = blocked
+        net.unreachableStores = blocked
         net.dropTxMessage = outcomeTo(t0.id)
         net.recordTxMessage = outcomeTo(t0.id)
         t0.exclusiveLockRevision(x, xBefore.revision)
@@ -258,7 +258,7 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
             prepares.size shouldBe 5
       // The collision clears: T0's outcome reaches stores 3 and 4, so T's requirements hold again everywhere
       _ = net.dropTxMessage = _ => false
-      _ = net.offlineStores = Set()
+      _ = net.unreachableStores = Set()
       _ = withClue("T0's outcomes to stores 3 and 4 were recorded: ")(t0Outcomes should not be empty)
       _ = t0Outcomes.foreach(net.deliverTransactionMessage)
       _ <- settle(clock = false)
@@ -335,7 +335,7 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       // T: a pinned overwrite of x, which commits and is finalized without the late store ever hearing of it. It is
       // reported offline meanwhile, so it does not lead
       tx = client.newTransaction()
-      _ = net.offlineStores = Set(sid(late))
+      _ = net.unreachableStores = Set(sid(late))
       _ = net.droppedTx = Set(sid(late) -> tx.id)
       _ = net.recordTxMessage = (m: TxMessage) => isClientPrepare(tx.id)(m) && m.to == sid(late)
       _ = tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
@@ -344,7 +344,7 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       prepare = recordedClientPrepares(tx.id)
       _ = net.recordTxMessage = _ => false
       _ = net.droppedTx = Set()
-      _ = net.offlineStores = Set()
+      _ = net.unreachableStores = Set()
       _ = withClue("T's client prepare to the late store was recorded, and T committed elsewhere: "):
             prepare.size shouldBe 1
             (0 until 4).foreach(i => storeRevision(i, x) shouldBe Some(ObjectRevision(tx.id)))
@@ -390,7 +390,7 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       // width - writeThreshold = 1. Every holder's driver (the designated leader's, and the idle recovery drivers of
       // the others) is stuck
       tx = client.newTransaction()
-      _ = net.offlineStores = absent
+      _ = net.unreachableStores = absent
       _ = net.dropTxMessage = (m: TxMessage) => m.transactionId == tx.id && absent.contains(m.to) &&
             !m.isInstanceOf[TxStatusRequest]
       _ = tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
@@ -408,7 +408,7 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       _ <- eventually("every holder discarded T", clock = true)(holders(tx.id).isEmpty && crlStores(tx.id).isEmpty)
       _ <- settle(clock = true)
       _ = net.dropTxMessage = _ => false
-      _ = net.offlineStores = Set()
+      _ = net.unreachableStores = Set()
       _ = withClue("no store applied T: ")((0 until 5).foreach(i => storeRevision(i, x) shouldBe Some(xBefore.revision)))
       // The holders' locks are released: a new overwrite at the same revision commits at a write threshold of stores
       next = client.newTransaction()
@@ -443,13 +443,13 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       lostData = net.stores(lost).m
       tx = client.newTransaction()
       // Store 0 leads; no store hears T's outcome; store 4 hears nothing but status requests; the finalizer never runs
-      _ = net.offlineStores = (1 until 5).map(sid).toSet
+      _ = net.unreachableStores = (1 until 5).map(sid).toSet
       _ = net.FinalizerFactory.stalled = _.transactionId == tx.id
       _ = net.dropTxMessage = (m: TxMessage) => m.transactionId == tx.id &&
             (isOutcome(tx.id)(m) || (m.to == absent && !m.isInstanceOf[TxStatusRequest]))
       _ = tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
       result <- outcome(tx.commit(), clock = false)
-      _ = net.offlineStores = Set()
+      _ = net.unreachableStores = Set()
       _ = withClue("the client was told T committed: ")(result shouldBe a[Success[?]])
       _ = withClue("stores 1-3 hold T unresolved, with commit votes: "):
             (1 until 4).foreach: i =>

@@ -382,9 +382,6 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val lost = phases(host, deviceA)
     for
       retired <- host.control.copies.retire(local, sid(1))
-      // As each pass that retires a copy then does (the Deleted Stores pass, retireEarlierTenancy)
-      _ = local.offlineStores -= sid(1)
-      _ = host.control.router.clearOfflineUnlessHeld(sid(1))
     yield
       lost should be(Map(sid(0) -> Phase.Lost, sid(1) -> Phase.Live))
       retired should be(true)
@@ -668,12 +665,12 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       record(smgr, net.storageDeviceId, storeId).map(r => (r.phase, r.activity)) should be(
         Some((Phase.Live, Activity.Served)))
       smgr.control.copyRegistry.repairable(storeId) should be(true)
-      smgr.control.copyRegistry.compareWithRouter() should be(Nil)
+      smgr.isRepairable(storeId) should be(true)
 
-  // Known defect D2 of the router's marks (spec, Stage 1 audit findings, Step 3 addenda; HostCopies.KnownDefects): a
-  // check of a device not loaded here marks every store its entry lists offline, by store id, one served from another
-  // device of this host included. Served dominates the derived silence, so the registry keeps it repairable
-  atest("a check of an unloaded device that lists a store served here takes it out of the router's repairable view"):
+  // D2 of the old marks (spec, Stage 1 audit findings, Step 3 addenda): a check of a device not loaded here marked every
+  // store its entry lists offline, by store id, one served from another device of this host included. Served
+  // dominates the derived silence, so the store stays answered and repairable
+  atest("a check of an unloaded device that lists a store served here leaves it served and repairable"):
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
     val dev = device(hostRoot, deviceA)
@@ -687,8 +684,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       _ = host.control.reconciler.checkStorageDevice(deviceB)
       _ = armed.success(deviceState(deviceB,
             Map(sid(0) -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
-      _ <- pumpUntil(host, host.control.router.isOffline(sid(0)))
-      // A drain while the store is served and marked: its check would report the disagreement but for the whitelist
+      _ <- pumpUntil(host, host.control.copyRegistry.unloadedEntries.contains(deviceB))
       _ = host.testingOnlyHandleEvents()
       served = host.control.router.loaded.contains(sid(0))
       offline = host.control.router.isOffline(sid(0))
@@ -698,8 +694,8 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       _ <- close(host, sid(0))
     yield
       served should be(true)
-      offline should be(true)
-      viewRepairable should be(false)
+      offline should be(false)
+      viewRepairable should be(true)
       derived should be(Silence.Served)
       registryRepairable should be(true)
 
@@ -727,6 +723,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(host, host.control.router.loaded.contains(shipped))
       opens = host.control.copyRegistry.opensDuringTransferOut
       served = record(host, source, shipped).map(_.activity)
+      repairableDuringClose = host.isRepairable(shipped)
       _ = gate.success(())
       refused <- request
       _ = host.testingOnlyHandleEvents()
@@ -736,6 +733,8 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       work.get should be(a[Work.TransferOut])
       opens.size should be(1)
       served should be(Some(Activity.Served))
+      // D3 of the old marks: its view counted the store repairable during the close; the TransferOut work does not
+      repairableDuringClose should be(false)
       refused should be(Success(()))
       sends.transfersOut should be(empty)
       after should be(None)
@@ -758,7 +757,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Initializing, None)))
     host.control.rebuilds.createNewStore(local, created)
     for
-      // Not drained before its open: the router has no mark for a create's pool read (D4)
+      // Not drained before its open: a rebuild's copy and a create's are placed off the control thread
       _ <- pumpUntil(host, !host.control.rebuilds.isCreating(created), drain = false)
       _ = host.testingOnlyHandleEvents()
     yield
@@ -812,8 +811,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       sends.transfersOut should be(empty)
       host.control.copyRegistry.opensDuringTransferOut.size should be(1)
 
-  // ---- Fix round 3: each state-recognised defect (HostCopies.knownDefect) is exempt only inside its window. One
-  //      state just outside each window, which the drain must report ----
+  // ---- The states of D1, D4, D5 and D6 of the old marks (spec, Stage 1 audit findings, Step 3 addenda), derived ----
 
   /** A second loaded device directory, dev1 */
   private def secondDevice(hostRoot: os.Path, deviceId: StorageDeviceId): os.Path =
@@ -821,24 +819,20 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(CrashRecoveryLog.deviceCrlDir(dev))
     dev
 
-  /** The drain's report on `storeId`, which it must make */
-  private def reported(host: Host, storeId: StoreId): String =
-    val thrown = intercept[IllegalStateException](host.testingOnlyHandleEvents())
-    thrown.getMessage should include(s"$storeId: the router's marks say")
-    thrown.getMessage
-
-  test("D4's exemption needs Create work: an Initializing entry alone is reported"):
+  test("an Initializing entry alone, its create not started, is silent (D4's state)"):
     val hostRoot = newHostDir()
     device(hostRoot, deviceA)
     val host = newHost(hostRoot, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
     // Read Initializing by a reconcile, its create not started (the reconcile's read before createNewStore, or a
-    // device shutting down): no Create work, no copy, no router mark
+    // device shutting down): no Create work, no copy
     loadedDevices(host)(deviceA).reconciledEntries = Some(Map(sid(5) ->
       StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Initializing, None)))
-    reported(host, sid(5)) should include("Silent(Set(Opening))")
+    host.testingOnlyHandleEvents()
+    host.control.copyRegistry.silence(sid(5)) should be(Silence.Silent(Set(SilenceReason.Opening)))
+    host.control.router.answersUnknown(sid(5)) should be(false)
 
-  atest("D5's exemption ends with the retire's lagging clear: an offline mark left after it is reported"):
+  atest("a copy retired into pending-delete leaves its store unknown at once (D5's state)"):
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
     val dev = device(hostRoot, deviceA)
@@ -846,30 +840,30 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
     val local = loadedDevices(host)(deviceA)
+    val before = host.control.router.answersUnknown(sid(1))
     for
       retired <- host.control.copies.retire(local, sid(1))
-      // The caller's clear (the Deleted Stores pass's forget), then a mark leaked by another path
-      _ = local.offlineStores -= sid(1)
-      _ = host.control.router.clearOfflineUnlessHeld(sid(1))
-      _ = host.control.router.markOffline(sid(1))
     yield
+      before should be(false)
       retired should be(true)
-      reported(host, sid(1)) should include("the registry Unknown")
+      host.control.copyRegistry.silence(sid(1)) should be(Silence.Unknown)
+      host.control.router.answersUnknown(sid(1)) should be(true)
 
-  test("D1's exemption is the transfer's own device: an unmarked copy on another device is reported"):
+  test("a copy on one device and a transfer in on another keep the store silent (D1's state)"):
     val hostRoot = newHostDir()
     val dev = device(hostRoot, deviceA)
     secondDevice(hostRoot, deviceB)
     writeStoreConfig(dev, sid(2))
     val host = newHost(hostRoot, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
-    // Device A's copy is left unmarked, and a transfer in of the store runs onto device B
-    host.control.router.clearOffline(sid(2))
     host.control.copyRegistry.work("test", deviceB, sid(2), _.isInstanceOf[Work.TransferIn],
       Some(Work.TransferIn(None, TransferInStage.Receiving)))
-    reported(host, sid(2)) should include("CopyHere")
+    host.testingOnlyHandleEvents()
+    host.control.copyRegistry.silence(sid(2)) should be(
+      Silence.Silent(Set(SilenceReason.CopyHere, SilenceReason.TransferringIn)))
+    host.control.router.answersUnknown(sid(2)) should be(false)
 
-  test("D6's exemption needs every copy without its config: an unmarked configured copy is reported"):
+  test("a store directory without its config is silent from its device's load (D6's state)"):
     val hostRoot = newHostDir()
     val dev = device(hostRoot, deviceA)
     val other = secondDevice(hostRoot, deviceB)
@@ -878,5 +872,5 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     writeStoreConfig(other, sid(3))
     val host = newHost(hostRoot, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
-    host.control.router.clearOffline(sid(3))
-    reported(host, sid(3)) should include("Silent(Set(CopyHere))")
+    host.control.copyRegistry.silence(sid(3)) should be(Silence.Silent(Set(SilenceReason.CopyHere)))
+    host.control.router.answersUnknown(sid(3)) should be(false)

@@ -217,7 +217,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         storeId
     }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
       ctx.rebuilds.retireUnlistedServed(local, storeId)
-    local.offlineStores.filter(storeId =>
+    ctx.copyRegistry.offlineCopies(local).filter(storeId =>
       !remote.stores.contains(storeId)
     ).foreach: storeId =>
       // Dropped from loadedStores at once, or a later shutdown would take this store for one still open and write
@@ -259,7 +259,6 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     missing.foreach: storeId =>
       logger.error(s"Store $storeId is Active on storage device ${local.storageDeviceId}, but " +
                    s"${local.devicePath / storeId.directoryName} holds no store. Rebuilding it")
-      ctx.markStoreOffline(local, storeId)
       local.declaredMissing += storeId
       ctx.copyRegistry.missingIs(local)
     local.declaredMissing.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
@@ -275,7 +274,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // A store still being shipped (its transfer aborted while the send runs: the abandoned-out pass below makes the
     // same check) waits, re-checked shortly: its rebuild's discard would move the directory the send may still be
     // reading (I3, one piece of work per (device, store)).
-    val lostCrl = local.offlineStores.filter(storeId =>
+    val lostCrl = ctx.copyRegistry.offlineCopies(local).filter(storeId =>
       hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildRequired))
     lostCrl.foreach: storeId =>
       if remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) then
@@ -292,7 +291,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // normally has the source's whole store directory deleted by the pass above -- the marker
     // goes with it. So a transfer that ends without completing, which is what a destination
     // declared failed mid-flight produces, strands the marker forever, and tryLoadStore re-reads
-    // it on every restart and puts the store straight back into offlineStores.
+    // it on every restart and keeps the store's copy offline.
     //
     // That pairs badly with the metadata repair for the same event. That repair puts this
     // entry back to Active and leaves the pool naming this device, so afterwards the metadata
@@ -314,7 +313,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // A store still sending is left alone but re-checked shortly. An abort's nudge usually
     // arrives while the send is still running, and the send ends (the destination cancels its
     // receive) with nothing to prompt another check for a full checkStorageDevicePeriod.
-    val (stillSending, abandonedOut) = (local.offlineStores -- lostCrl).filter(storeId =>
+    val (stillSending, abandonedOut) = (ctx.copyRegistry.offlineCopies(local) -- lostCrl).filter(storeId =>
       remote.stores.get(storeId).exists(entry =>
         entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
       ) &&
@@ -333,7 +332,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // removes the marker. Active is the tree's word that the pool now names this device, so
     // the copy is ours to load. transferringIn covers the window where this process's own
     // metadata step has committed but has not yet removed the marker itself.
-    local.offlineStores.filter(storeId =>
+    ctx.copyRegistry.offlineCopies(local).filter(storeId =>
       !ctx.transfers.transferringIn.contains(storeId) &&
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
       hasMarker(local, storeId, StoreDirMarkers.Marker.TransferredIn)
@@ -351,7 +350,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // Active is the tree's word that the flip committed, so the copy is ours to load. A rebuild still running here
     // removes its own marker once its flip commits. A removal that failed here or in the rebuild's completion is
     // retried too, marker or not: an unlink whose directory sync failed leaves none.
-    local.offlineStores.filter(storeId =>
+    ctx.copyRegistry.offlineCopies(local).filter(storeId =>
       !ctx.rebuilds.rebuildingStoreIds.contains(storeId) &&
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
       (ctx.rebuilds.markerRemovalsPending.contains(storeId) ||
@@ -442,22 +441,19 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     ).toList.sortBy(_._1.poolIndex).foreach: (storeId, entry) =>
       ctx.rebuilds.startRebuild(local, storeId, entry.rebuildEpisode, entry.acceptLoss)
 
-  /** The Deleted Stores pass's retire of `storeId`'s copy on `local`, whose entry no longer names it. The store
-   *  leaves offlineStores, and its router offline mark goes (unless another device here holds the store offline), only
-   *  once its path is clear, so a failed retire is retried by the next pass. A copy that reaches pending-delete has the
-   *  device checked again, so it is released without waiting for the periodic check. */
+  /** The Deleted Stores pass's retire of `storeId`'s copy on `local`, whose entry no longer names it. Its copy's
+   *  record, which keeps the store silent, goes only once its path is clear (the retire's move into pending-delete),
+   *  so a failed retire is retried by the next pass. A copy that reaches pending-delete has the device checked again,
+   *  so it is released without waiting for the periodic check. A record whose directory is known gone (removed by
+   *  hand) goes at once. */
   private def retireUnowned(local: LocalStorageDeviceState, storeId: StoreId): Unit =
-    def forget(): Unit =
-      local.offlineStores -= storeId
-      ctx.router.clearOfflineUnlessHeld(storeId)
     val present = FileStat.existence(local.devicePath / storeId.directoryName)
     if present.contains(false) then
-      forget()
+      ctx.copyRegistry.removed("retireUnowned: no directory", local, storeId)
     else if present.isDefined && !ctx.copies.isRetiring(storeId) then
       logger.info(s"Store $storeId is no longer owned by device ${local.storageDeviceId}. Retiring its copy")
       ctx.copies.retire(local, storeId).foreach: clear =>
         if clear then
-          forget()
           checkStorageDevice(local.storageDeviceId)
 
   /** Checks `storageDeviceId` again after TransferOutRecheckDelay, so a store left offline behind
@@ -498,7 +494,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   /** Issues the one outstanding lookup for a device and acts on its result: a loaded device
    *  is reconciled against the tree, a device this process has not loaded -- never seen on disk,
    *  rejected by the load decision, or unloaded by a shutdown -- has its stores
-   *  added to offlineStores so they stay silent rather than answering UnknownStore, and a
+   *  recorded as an unloaded device's (HostCopies.recordUnloadedEntries) so they stay silent rather than answering
+   *  UnknownStore unless served here, and a
    *  failed lookup is warned about. The guard entry is then released and any request deferred
    *  behind it re-dispatched.
    *
@@ -506,11 +503,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *
    *  Which of those two branches runs is decided when the lookup completes, not when it is
    *  issued. Runtime device discovery can load a device while its check is in flight, and a
-   *  branch chosen at dispatch time would then mark a loaded device's stores offline --
-   *  re-adding ids that tryLoadStore and the LoadStore handler have just removed, and that
-   *  nothing removes again: the only other site that clears offlineStores is
-   *  reconcileDeviceState's deleted-stores pass, which touches ids recorded in the device's
-   *  own offlineStores set, which these never enter.
+   *  branch chosen at dispatch time would then record a loaded device's stores as an unloaded
+   *  device's, silent until its next reconcile, rather than reconciling it now.
    *
    *  The lookup is issued on the control thread and the callback runs there too, so the whole
    *  of reconcileDeviceState -- filesystem work included -- runs with the control thread busy.
@@ -602,9 +596,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                   case None =>
                     // A device not loaded right now: one that has not appeared on disk in this
                     // process, one the load decision rejected, or one a shutdown unloaded.
-                    // Silence its stores rather than sending "UnknownStore".
-                    remote.stores.keysIterator.foreach: storeId =>
-                      ctx.router.markOffline(storeId)
+                    // Silence its stores rather than sending "UnknownStore". Served dominates: a store served from
+                    // another device of this host stays served
                     ctx.copyRegistry.recordUnloadedEntries(storageDeviceId, remote.stores.keySet)
 
               // The lookup fails whenever the device has no entry in the storage-devices tree:

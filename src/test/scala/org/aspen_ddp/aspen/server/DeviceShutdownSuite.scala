@@ -106,8 +106,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newHost(hostRoot, transferService = transfers, storeRebuildFactory = rebuilds)
     loaded.foreach(s => os.makeDir.all(deviceDir / s.directoryName))
-    val local = loadedDevices(host)(deviceA)
-    local.loadedStores = local.loadedStores ++ loaded
+    servedHere(host, loadedDevices(host)(deviceA), loaded.toSeq*)
     for
       _ <- net.createDevice(deviceA)
       _ <- setDeviceState(deviceA)(_.copy(stores = stores))
@@ -220,8 +219,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       // Active and loads it.
       _ = recorded(host).beforeNextShutdownCommit: () =>
             os.makeDir.all(deviceDir / s1.directoryName)
-            val local = loadedDevices(host)(deviceA)
-            local.loadedStores = local.loadedStores + s1
+            servedHere(host, loadedDevices(host)(deviceA), s1)
             setDeviceState(deviceA)(_.setStoreEntry(s1, StoreStatus.Active, None))
       _ <- shutDown(host)
       st <- state(deviceA)
@@ -403,7 +401,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).loadStoreByIdRequests.toList should be(Nil)
       // Kept as it arrived, behind its transferred-in marker, and not served.
       os.exists(arrived / StoreTransfer.TransferredInMarkerFile) should be(true)
-      host.control.router.offlineStores should contain(movingStore)
+      host.control.router.silentStores should contain(movingStore)
       st.stores(movingStore).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
 
@@ -432,7 +430,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
       // Kept beside the marker, so an adopter accepts it.
       os.exists(Backend.crlSaveFile(deviceDir / s0.directoryName)) should be(true)
-      host.control.router.offlineStores should contain(s0)
+      host.control.router.silentStores should contain(s0)
       st.stores(s0).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
 
@@ -452,7 +450,8 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntilEntry(deviceA, creating)(!_.exists(_.status == StoreStatus.Initializing))
       entryAfterFlip <- state(deviceA).map(_.stores.get(creating))
       _ = host.control.reconciler.checkAll()
-      _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
+      // The shutdown's close of the opening store waits for its LoadStore to install it, then closes it
+      _ <- pumpUntil({ host.testingOnlyHandleEvents(); !loadedDevices(host).contains(deviceA) })
       st <- state(deviceA)
     yield
       recorded(host).loadStoreRequests.toList should be(List((deviceA, creating)))
@@ -650,8 +649,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       // The close fails as ShutdownStore's does for a backend that failed-stop: marked, offline, unloaded
       _ = recorded(host).failNextTransferOutClose.set(Some(() =>
             os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
-            local.loadedStores = local.loadedStores - movingStore
-            local.offlineStores = local.offlineStores + movingStore))
+            local.loadedStores = local.loadedStores - movingStore))
       _ <- ask()
       _ <- pumpUntil(recorded(host).lostTransferAborts.nonEmpty)
       // A retransmit meanwhile is refused before anything is closed, written or sent

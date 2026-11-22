@@ -223,11 +223,11 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
                          hostId: HostId = HostId.BootstrapHostId, seams: Host.Seams = Host.Seams.default,
                          rebuilds: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
                          maxConcurrentRebuilds: Int = 2): Host =
-    named(new Host(client, hostId, systemId, hostRoot, executionContext,
+    new Host(client, hostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net,
       BackgroundTaskManager.NoBackgroundTaskManager, crlFactory, net.FinalizerFactory,
       TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
-      StoreTransferService.Disabled, rebuilds, maxConcurrentRebuilds, seams = compared(seams)))
+      StoreTransferService.Disabled, rebuilds, maxConcurrentRebuilds, seams = compared(seams))
 
   /** Drains `host`'s events and yields until `condition` holds. The caller asserts it.
    *

@@ -17,52 +17,59 @@
   CrlLost), `holdsOwnState` (Rebuilt), `reloadClosedStores` (offers Live, and a copy whose phase cannot be read) and
   `startIn` (Arrived: stale check; Lost, Rebuilt and Outbound: `retireEarlierTenancy`; Live: refuse or receive; None:
   wait) match on it. The single-marker tests of the reconciler passes, `retire` and the rebuilds stay `StoreDirMarkers`
-- Copy registry (store copy state machine, stage 1, shadow mode): `HostCopies` (`DeviceControl.copyRegistry`) holds
-  one `DeviceCopies` per loaded device, the device state's `LocalStorageDeviceState.copies`. `attach` at device load
+- Copy registry (store copy state machine, stage 1): `HostCopies` (`DeviceControl.copyRegistry`) holds one
+  `DeviceCopies` per loaded device, the device state's `LocalStorageDeviceState.copies`. `attach` at device load
   (before any store is offered; `ControlFixture.injectLoadedDevice` too) registers every store directory, by name,
   with its `CopyPhase` (`Unread` where it cannot be read); `detach` at unload. Every disk mutation site of a store
   path (create, rebuild finish's handler, transfer-in promotion, the four markers' writes and removals, retire into
   pending-delete, discards) updates it right after its durable step, through `HostCopies.shadow`, which logs and
-  records a throw instead of failing production. Nothing reads it yet. Activity and work are mirrored from the old
-  sets (spec mapping table), also through `shadow`: `startOpen` sets Opening (a create's record, registered at its
-  open's outcome, too), an open's unserved end Idle, each `storesAwaitingRetry` write AwaitingRetry and a dropped
+  records a throw instead of failing production. Activity: `startOpen` sets Opening (a create's record, registered at
+  its open's outcome, too), an open's unserved end Idle, each `storesAwaitingRetry` write AwaitingRetry and a dropped
   retry Idle; `StoreRouter.install` Served (Served -> Served for a reload) and `remove` Closing, its purpose from
   `closingFor` (DeviceShutdown: Shutdown / Relinquish; `handleClose` with `extractCrl`: TransferOut; else FailStop),
-  until `handleClose`/`closeUnloaded` end it (Idle, or AwaitingRetry when the loader holds a retry); `StoreCopies.retire`
-  Retiring. Work is synced from each owner's sets at every write: Create (`creatingStores`), Rebuild
-  (`silenced` Queued, `droppingCrlState` DiscardingLost, `rebuildDevices` Running / Abandoned), TransferIn
-  (`transferringIn` Receiving, `recordingTransfersIn` Recording, `abandoningTransferIns` Abandoning,
-  `retireEarlierTenancy` RetiringEarlierTenancy), TransferOut (`closingForTransfer`, `abortingLostTransfers`); a second
-  Work for a (device, store) is a shadow error (I3), so `startRebuild` does not even queue (silence) a store a transfer
-  out is closing. `declaredMissing` is mirrored as `missing`. An open during TransferOut work is not refused yet (R1,
-  Task 7): its Opening is skipped and listed (`opensDuringTransferOut`). `silence` derives the router's answer
-  (Served if any copy is Served; else Silent with its reasons: a record, Opening, Rebuild / TransferIn / Create work,
-  missing, an unloaded device's entries, awaiting device, an entry the latest reconcile read Initializing; else
-  Unknown) and `repairable` (Served, not Closing, no Rebuild or TransferOut work, not being sent). A transfer-out
-  close ends its copy's Closing once the store is closed, before the extraction's deletion, so an open installing
-  during it goes Idle -> Served. An install on a loaded device with no record learns the copy (`learned`), as
-  `readAtLoad` does, and so do a LoadStore and a load retry that find none (copies put at a path after the device's load);
-  an unload lists the device's records among its unloaded entries, and a Shutdown device's decision lists its stores. With `Host.Seams.verifyCopyRegistry` (TestNetwork; ControlFixture's
-  `newHost(verifyCopyRegistry = ...)`, default off) each lockstep drain throws on a recorded throw, on any
-  `verifyAgainstDisk` mismatch (phase, unrecorded config'd directory, record without directory) or on any
-  `compareWithRouter` disagreement (silence or repairability against the router's marks); with
-  `Host.Seams.compareCopyRegistry` (every ControlFixture host: `newHost`, and `ControlFixture.compared`/`named` for
-  a host a suite builds itself) on a `compareWithRouter` disagreement alone. Defects of the old marks (spec, Step 3
-  addenda D1-D6) are exempt: D2 and D3 by test name (`HostCopies.KnownDefects`), the timing windows D1, D4, D5 and D6
-  by their state (`HostCopies.knownDefect`). A ControlFixture host with `verifyCopyRegistry` holds each load its recording seam skips offline
-  (`RecordingSeams.holdLoadsOffline`), as a production load holding a copy back does; every ControlFixture host's
-  shutdown close seam closes a store a test did serve for real. `attach` never throws: a child whose stat fails is
-  registered `Unread`, and so is one whose markers cannot be read. `tryLoadStore` reports each phase it reads
-  (`readAtLoad`): an `Unread` record takes it, a copy with no record (put at its path after the device's load, by
-  hand or by a test) is registered and listed in `learned` (reported by the drain check, not failed on), and any
-  other disagreement is a shadow error. Stores loaded onto a device this host has not loaded, through `Host.Seams.unloadedDeviceCrl`
-  (TestNetwork), get an untracked record (Live) at install, Served there and Closing then Idle once the router
-  removes the store, kept as a closed copy's record is kept on a loaded device, so the store stays silent;
-  `HostCopies.device` returns them like any other, and the disk check skips them. The drain check can land between
-  an off-thread step and its control-thread handler (a rebuild's copy placed before its completion callback runs),
-  so a test does not drain while such a step is in flight
-- `DeviceControl.markStoreOffline` keeps the router's offline mark and the device's
-  `offlineStores` together; `LocalDevices.isLoaded(sds)` says whether a device state is still the loaded one
+  until `handleClose`/`closeUnloaded` end it (Idle, or AwaitingRetry when the loader holds a retry; a transfer-out
+  close ends once the store is closed, before the extraction's deletion); `StoreCopies.retire` Retiring. Work is
+  synced from each owner's sets at every write: Create (`creatingStores`), Rebuild (`StoreRebuilds.heldWork` Queued,
+  from the first reconcile that sees the Rebuilding entry until its outcome or the entry's leaving ends it;
+  `droppingCrlState` DiscardingLost; `rebuildDevices` Running / Abandoned), TransferIn (`transferringIn` Receiving,
+  `recordingTransfersIn` Recording, `abandoningTransferIns` Abandoning, `retireEarlierTenancy`
+  RetiringEarlierTenancy), TransferOut (`closingForTransfer`, `abortingLostTransfers`); a second Work for a (device,
+  store) is a shadow error (I3), so `startRebuild` does not even queue a store a transfer out is closing.
+  `declaredMissing` is mirrored as `missing`. An open during TransferOut work is not refused yet (R1, Task 7): its
+  Opening is skipped and listed (`opensDuringTransferOut`). An install on a loaded device with no record learns the
+  copy (`learned`), as `readAtLoad` does, and so do a LoadStore and a load retry that find none (copies put at a path
+  after the device's load). Stores loaded onto a device this host has not loaded, through
+  `Host.Seams.unloadedDeviceCrl` (TestNetwork), get an untracked record (Live) at install, Served there and Closing
+  then Idle once the router removes the store, kept so the store stays silent; `HostCopies.device` returns them like
+  any other, and the disk check skips them
+- Derived silence (authoritative): the router keeps its installed-store map and one `silent` set, which only
+  `HostCopies.onChange` writes (`StoreRouter.setSilent`), after every change to what `silence` reads (a record, a
+  work, a missing mark, an unloaded device's or awaiting device's listing, a reconcile's entries), then republishes
+  the view. `silence(storeId)`: Served if any copy is Served on a device of the host (or the router has it
+  installed); else Silent with its reasons: a record of any phase or activity (CopyHere, or Opening), Rebuild /
+  TransferIn / Create work, missing, an unloaded device's last tree entry (`detach`, `recordUnloadedEntries`: the
+  device check of a device not loaded here, a Shutdown device's decision), a device directory awaiting its
+  ownership decision (`awaitDevice`/`deviceDecided`), an entry a loaded device's latest reconcile read Initializing;
+  else Unknown. Served dominates, so a device check of an unloaded device never silences a store served from another
+  device here. A reloaded device keeps its unloaded listing until its first reconcile writes `reconciledEntries`
+  (`LocalStorageDeviceState.onReconciled`). `StoreRouter.remove` marks the store silent before it leaves the map;
+  `answersUnknown` is `ready`, not installed, not silent. The view's `repairable` is `HostCopies.repairable`
+  (Served, not Closing, no Rebuild or TransferOut work on any device, not being sent). A throw of the silence path is
+  a bug: in production it is logged at error and the store left silent (clients retransmit); with
+  `HostCopies.strict` (`Host.Seams.strictCopyRegistry`, every ControlFixture host; implied by
+  `verifyCopyRegistry`) it propagates as `SilenceFailure`, which `shadow` never swallows, and the next lockstep drain
+  fails on it too. With `verifyCopyRegistry` (TestNetwork; ControlFixture's `newHost(verifyCopyRegistry = ...)`) each
+  lockstep drain also throws on a recorded shadow throw and on any `verifyAgainstDisk` mismatch (phase, unrecorded
+  config'd directory, record without directory). The drain check can land between an off-thread step and its
+  control-thread handler (a rebuild's copy placed before its completion callback runs), so a test does not drain
+  while such a step is in flight
+- The reconcile passes select from the device's offline copies (`HostCopies.offlineCopies`: records whose activity is
+  not Served or Opening): the Deleted Stores, Lost CRL, Abandoned Transfers Out, Completed Transfers In and
+  Completed Rebuilds passes, `reloadClosedStores` and `retryFailedLoads`. A shutdown or relinquish closes the device's
+  copies that are Served or Opening (`openCopies`, plus a create's open, whose copy has no record yet;
+  `DeviceShutdown.storesToClose`). Tests place copies after a device's load with `ControlFixture.placedCopies`, and
+  fake a served copy with `servedHere` (the recording shutdown close ends it). `LocalDevices.isLoaded(sds)` says
+  whether a device state is still the loaded one
 
 ### Host threading model
 - `HostThreading` decides where a host's work runs. It is a `Host` constructor parameter, chosen in
@@ -79,17 +86,9 @@
 - The hot path (network messages, I/O completions, heartbeats, repairs) goes through `StoreRouter` straight to the
   store's executor: a concurrent map lookup on the calling thread, then the task, which runs only if that store is
   not closed when the task runs (tasks queued ahead of a close still run). Unknown stores are answered from the
-  calling thread; offline ones are silent, as are all unknown ones until the startup scan's LoadStores are handled.
-  A store whose load is under way is silent too: `loading` from `StoreLoader.startOpen` until install, and
-  `awaitingDevice` while its device's shutdown-marker lookup (or adoption) decides. Neither mark is `offline`.
-  The router's `offline` mark is by store id, but two devices of one host can each hold a copy of a store (a transfer
-  between them, an earlier tenancy's copy at the destination's path): `tryLoadStore` keeps a marked copy offline on
-  its device without silencing a store served or opening here (`keepMarkedCopyOffline`), as does a rebuild's
-  unpromoted copy (`StoreRebuilds.keepUnpromotedCopyOffline`; both through `DeviceControl.markCopyOffline`, never
-  `markStoreOffline`, which marks unconditionally), and a pass that removes a
-  copy clears the mark only if no other loaded device holds the store offline and no Rebuilding entry here silences
-  it (`StoreRebuilds.silencedStores`: a rebuild's destination never held the store, so lists it in no
-  `offlineStores`; `StoreRouter.clearOfflineUnlessHeld`)
+  calling thread; silent ones (derived, above) are not answered, nor are any until the startup scan's LoadStores
+  are handled. A store whose load is under way is silent (its copy Opening), as are the stores of a device whose
+  shutdown-marker lookup (or adoption) is deciding whether to load it
 - Backend opens are backend-neutral: `BackendOpener.open` (`server.store.backend`) returns a Future and decides where
   the open runs (RocksDB inline, FSIF on `FsifOpenEc`); `StoreLoader.startOpen` handles an already-completed one
   inline and otherwise posts `BackendOpened`. A store stays opening (`StoreLoader.isOpening`) from `startOpen` until
@@ -125,7 +124,7 @@
   a failed build) hands the callback to that entry, and any other failure drops it. An unreadable config
   is logged at error once per retry cap. An Active entry on a loaded device with no `config.yaml` at its store path
   (directory or config lost), not served, opening or retiring, is rebuilt by the reconcile's Missing Stores pass:
-  marked offline, recorded in the device's `declaredMissing`, and `StoreRebuilds.requestRebuild`; the request is made
+  recorded in the device's `declaredMissing` (silent: `missing`), and `StoreRebuilds.requestRebuild`; the request is made
   again at each reconcile while the entry stays Active and the store unserved, even once its directory is back, so a
   failed request never leaves it offline until a restart. Its device-CRL entries stay (nothing durable records the
   declaration, and the directory may come back before the flip commits): the rebuild's retire of a copy that is back
@@ -134,7 +133,7 @@
   starts from a directory, so nothing else would notice it while the pool counted it writable.
   `DeviceDiscovery` deletes `creating/` when it loads a device. Bootstrap (`cmdline`) creates its stores the same way (`DefaultBackendOpener.createStore`)
 - Store lifecycle: the control thread builds the `Store` and calls `router.install`, where ownership passes to the
-  executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before
+  executor; a close removes it from the router (its copy Closing, so silent) and then runs the close on its executor. Before
   install and after close the backend and directory belong to the control side, which otherwise reads only
   `storeId`, `path`, `crlSaveFile` and the thread-safe `hasFailed`/`isWriteFrozen`. `release` frees the slot.
   Every exit (transfer out, shutdown, relinquish, fail-stop, failed CRL load) runs `Store.close`, which stops the
@@ -376,7 +375,7 @@
   remove, and its recovery releases the whole charge
 - A rebuilt store's directory carries `rebuild-complete` from its move into place until its entry leaves
   Rebuilding; `tryLoadStore` leaves such a store offline (`server/rebuild/CLAUDE.md`). An `Adopt` whose marker
-  removal fails records the copy in `offlineStores` (`keepUnpromotedCopyOffline`) and in
+  removal fails leaves the copy offline on its device (its Rebuilt record) and records it in
   `StoreRebuilds.pendingMarkerRemovals`, so the Completed Rebuilds pass retries the removal and the load at each device
   check. The pass selects by the pending record as well as the marker, and `clearRebuildCompleteMarker` forces the
   directory even with the marker absent: an unlink whose directory sync failed leaves no marker to select by. Tests
@@ -396,14 +395,14 @@
   checks the device again; the slot release clears its `abandonedRebuilds` mark whatever the outcome, since a rebuild
   past finish's latch re-check ignores the cancel), and deletes a `rebuilding/<id>` staging copy only when no rebuild of it is running.
   The reconcile runs it before the transfers-in pass, and `StoreTransfers.startIn` receives nothing while rebuild work
-  of the store is registered on the device (`StoreRebuilds.hasRebuildWork`: queued in `silenced`, discarding in
+  of the store is registered on the device (`StoreRebuilds.hasRebuildWork`: queued in `heldWork`, discarding in
   `droppingCrlState`, or running, a cancelled one included until its slot is released): the store re-placed away and
   transferred back must not be received while its earlier rebuild still runs here. The rebuild's end checks the device
   again, which starts the receive (I3, `WorkOverlapSuite`). A
   flip of a rebuild whose entry has since moved to another episode is `RebuildOutcome.Superseded`: nothing is
   written, and its copy, marked for the earlier episode, is retired by the next `startRebuild`. That copy, like one
-  whose flip failed permanently, is added to the device's `offlineStores` (`keepUnpromotedCopyOffline`, as a
-  restart's load would), so the Deleted Stores pass retires it if its entry leaves the device first. A flip retried
+  whose flip failed permanently, stays offline on its device (its Rebuilt record, as a restart's load would leave
+  it), so the Deleted Stores pass retires it if its entry leaves the device first. A flip retried
   after `TransactionOutcomeUnknown` never discards its copy on a device not Failed: its earlier attempt may have made
   the copy the owner's before a transfer out or removal moved the entry on, so an entry it would otherwise `Discard`
   for is `RebuildOutcome.Unconfirmed`, kept the same way for the transfer, Abandoned Transfers Out, Completed Rebuilds

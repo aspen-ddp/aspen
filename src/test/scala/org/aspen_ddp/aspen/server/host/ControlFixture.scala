@@ -29,21 +29,12 @@ import scala.concurrent.duration.{Duration, SECONDS}
  *  Replaces the recordings of the former RecordingHost, which overrode Host's protected methods. Nothing here loads
  *  a store: `tryLoadStore` records the candidate path and does nothing else, so it never touches the router, the
  *  loaded devices or the offline set. A test asserting that it put something there would pass vacuously; assert on
- *  `storeLoadAttempts` instead. The exception is a host whose copy registry is checked (`holdLoadsOffline`). */
+ *  `storeLoadAttempts` instead. The copy registry still holds each copy the device load registered, offline. */
 final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = false):
   @volatile private var host: Host = null
 
   def attach(h: Host): Unit =
     host = h
-    heldBack.foreach((sds, storeId) => h.control.markCopyOffline(sds, storeId))
-    heldBack = Nil
-
-  /** Set for a host whose copy registry is checked (HostCopies.compareWithRouter): each load the seam skips leaves its
-   *  copy offline on its device, as a production load holding it back does, rather than neither served, opening nor
-   *  offline, which no production load leaves */
-  @volatile var holdLoadsOffline: Boolean = false
-  // Loads held back before attach, the device scan in the Host constructor
-  private var heldBack: List[(LocalStorageDeviceState, StoreId)] = Nil
 
   private def attached: Host =
     if host == null then throw new IllegalStateException("RecordingSeams used before attach")
@@ -293,10 +284,6 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
       if storeLoadFailureOwed.getAndSet(false) then
         throw new RuntimeException(s"Simulated store load failure for $potentialStoreFile")
       storeLoadAttempts += ((sds.storageDeviceId, potentialStoreFile))
-      if holdLoadsOffline then
-        HostCopies.storeIdOf(potentialStoreFile).foreach: storeId =>
-          if host == null then heldBack ::= (sds, storeId)
-          else host.control.markCopyOffline(sds, storeId)
 
   private def loadStoreById(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
     synchronized:
@@ -322,18 +309,31 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
   private def closeForShutdown(storeId: StoreId): Future[Unit] =
     synchronized:
       shutdownCloses += storeId
-    if failingShutdownCloses.get.contains(storeId) then
-      attached.control.devices.devices.valuesIterator.map(_.devicePath / storeId.directoryName).filter(os.isDir)
-        .foreach(dir => os.write.over(dir / RebuildingStore.RebuildRequiredMarkerFile, ""))
-      Future.failed(Host.StoreFailedOnClose(storeId))
-    else
-      shutdownCloseGate.get match
-        case Some(gate) => gate.future
-        // A store a test did serve is closed for real: left installed, the shutdown would mark a served store offline,
-        // which no production close leaves (HostCopies.compareWithRouter)
-        case None if attached.control.router.loaded.contains(storeId) =>
-          attached.control.shutdown.closeForShutdown(storeId)
-        case None => Future.unit
+    val closed =
+      if failingShutdownCloses.get.contains(storeId) then
+        attached.control.devices.devices.valuesIterator.map(_.devicePath / storeId.directoryName).filter(os.isDir)
+          .foreach(dir => os.write.over(dir / RebuildingStore.RebuildRequiredMarkerFile, ""))
+        Future.failed(Host.StoreFailedOnClose(storeId))
+      else
+        shutdownCloseGate.get match
+          case Some(gate) => gate.future
+          // A store a test did serve, or one opening, is closed for real: left installed, the shutdown would leave a
+          // served store installed and Served, which no production close leaves (an opening one's close waits for its
+          // install, StoreLoader.handleClose)
+          case None if attached.control.router.loaded.contains(storeId) || attached.control.loader.isOpening(storeId) =>
+            attached.control.shutdown.closeForShutdown(storeId)
+          case None => Future.unit
+    // A copy a test marked Served without installing it (`servedHere`) is closed as a real close leaves it
+    closed.andThen(_ => endMarkedServed(storeId))(using attached.control.threading.control)
+
+  /** Ends the Served activity of `storeId`'s records that no installed store backs, Closing then Idle */
+  private def endMarkedServed(storeId: StoreId): Unit =
+    val control = attached.control
+    if !control.router.loaded.contains(storeId) then
+      control.devices.devices.foreach: (id, sds) =>
+        if control.copyRegistry.copiesOf(sds).exists(_.copies.get(storeId).exists(_.activity == Activity.Served)) then
+          control.copyRegistry.removedFromRouter(id, storeId)
+          control.copyRegistry.closeEnded(id, storeId)
 
   private def closeForTransferOut(storeId: StoreId, sourceDs: LocalStorageDeviceState): Future[Unit] =
     synchronized:
@@ -350,8 +350,8 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
   def seams(scheduler: ControlScheduler, verifyCopyRegistry: Boolean = false): Host.Seams =
     Host.Seams(
       verifyCopyRegistry = verifyCopyRegistry,
-      // Every ControlFixture host compares the registry's derived silence with the router's marks (Task 5, R16)
-      compareCopyRegistry = true,
+      // A throw of the copy registry's silence path fails the test
+      strictCopyRegistry = true,
       wrapMetadata = Some(base => new RecordingMetadata(base)),
       scheduler = Some(scheduler),
       warn = Some((path, msg) => synchronized(deviceDirWarnings += ((path, msg)))),
@@ -506,7 +506,6 @@ trait ControlFixture:
     val threading = new LockstepThreading(ec)
     val scheduler = new ManualControlScheduler(threading.controlEvents)
     val recording = new RecordingSeams(ec, failFirstStoreLoad)
-    recording.holdLoadsOffline = verifyCopyRegistry
     val host = new Host(client, hostId, systemId, hostRoot, ec, threading,
                         net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
                         TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory,
@@ -519,18 +518,11 @@ trait ControlFixture:
           (!keepInitializeTaskExecutor && t.event.isInstanceOf[Host.InitializeTaskExecutor])
       case _ => false
     rigs.put(host, new Rig(recording, scheduler))
-    // For HostCopies.KnownDefects
-    host.control.copyRegistry.testName = testName
     host
 
-  /** `seams` for a host a suite builds itself, outside newHost: its drains compare the copy registry with the
-   *  router's marks, as every ControlFixture host's do (Task 5, R16). Pass the host to `named` once built */
-  protected def compared(seams: Host.Seams = Host.Seams.default): Host.Seams = seams.copy(compareCopyRegistry = true)
-
-  /** `host`, its copy registry told the running test's name (HostCopies.KnownDefects) */
-  protected def named(host: Host): Host =
-    host.control.copyRegistry.testName = testName
-    host
+  /** `seams` for a host a suite builds itself, outside newHost: a throw of its copy registry's silence path fails
+   *  the test, as every ControlFixture host's does */
+  protected def compared(seams: Host.Seams = Host.Seams.default): Host.Seams = seams.copy(strictCopyRegistry = true)
 
   /** What `host` did, and the knobs that make it do something else. */
   protected def recorded(host: Host): RecordingSeams = rigs.get(host).seams
@@ -569,6 +561,32 @@ trait ControlFixture:
       new org.aspen_ddp.aspen.server.transaction.TransactionStatusCache(), null,
       TransactionDriver.noErrorRecoveryFactory, Duration(40, SECONDS), None)
     host.control.router.install(store, HostThreading.InlineStoreExecutor)
+
+  /** Whether `host` holds Rebuild work for `storeId` on any loaded device (the work keeps it silent) */
+  protected def hasRebuildWork(host: Host, storeId: StoreId): Boolean =
+    host.control.devices.devices.keys.exists(id =>
+      host.control.copyRegistry.device(id).exists(_.work.get(storeId).exists(_.isInstanceOf[Work.Rebuild])))
+
+  /** Registers the copies at `storeIds`' paths on `sds`, placed after its load, with the phases their markers read,
+   *  as a production load would have found them: offline on the device, which keeps their stores silent */
+  protected def placedCopies(host: Host, sds: LocalStorageDeviceState, storeIds: StoreId*): Unit =
+    storeIds.foreach: storeId =>
+      host.control.copyRegistry.registered("placed after load", sds, storeId,
+        CopyPhase.read(sds.devicePath / storeId.directoryName))
+
+  /** Records `storeIds` as served from `sds` without loading them, as the recording seams load nothing: in its
+   *  loadedStores, their copies (registered if placed after the load) Served. The recording shutdown close ends that */
+  protected def servedHere(host: Host, sds: LocalStorageDeviceState, storeIds: StoreId*): Unit =
+    sds.loadedStores ++= storeIds
+    storeIds.foreach: storeId =>
+      val copies = host.control.copyRegistry.copiesOf(sds).get
+      if !copies.copies.contains(storeId) then
+        placedCopies(host, sds, storeId)
+      copies.setActivity(storeId, Activity.Served)
+
+  /** The stores of `sds`'s copies that are not served or opening (HostCopies.offlineCopies) */
+  protected def offlineCopies(host: Host, sds: LocalStorageDeviceState): Set[StoreId] =
+    host.control.copyRegistry.offlineCopies(sds)
 
   /** The devices `host` has loaded. */
   protected def loadedDevices(host: Host): Map[StorageDeviceId, LocalStorageDeviceState] =

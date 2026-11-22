@@ -15,9 +15,14 @@ import scala.util.control.NonFatal
  *  its LocalStorageDeviceState, attached here at the device's load and detached at its unload, plus what the host
  *  knows of the stores of devices it has not loaded.
  *
- *  Shadow mode: every disk mutation site keeps the phases up to date, but nothing reads the registry. A registry call
- *  at a production site goes through `shadow`, which logs a throw (an illegal move, a missing record) at error with
- *  the site's name and swallows it, so a bookkeeping gap never becomes an outage. Each swallowed throw is recorded;
+ *  The router's silence and the view's repairability are derived from it (`silence`, `repairable`): after every change
+ *  to what they read, `onChange` recomputes the store's silence, sets the router's mark and republishes the view. A
+ *  throw there is a bug: with `strict` (tests) it propagates (SilenceFailure, which `shadow` does not swallow) and
+ *  fails the next drain; otherwise it is logged at error and the store is left silent, the conservative answer, as
+ *  clients retransmit.
+ *
+ *  The other updates (phases, activities, work) are still bookkept under `shadow`, which logs a throw (an illegal
+ *  move, a missing record) at error with the site's name and swallows it. Each swallowed throw is recorded;
  *  `Host.testingOnlyHandleEvents` fails the drain on any of them, and on any mismatch `verifyAgainstDisk` finds, when
  *  `Host.Seams.verifyCopyRegistry` is set. */
 final class HostCopies(ctx: DeviceControl) extends Logging:
@@ -35,14 +40,13 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   private var untracked: Map[StorageDeviceId, DeviceCopies] = Map()
   // The purpose each close asked for (closingFor) is for, until the router removes its store
   private var closePurposes: Map[StoreId, ClosePurpose] = Map()
-  // Stores a copy of which was retired into pending-delete, for compareWithRouter's D5 (the router's offline mark
-  // trails the move by one control task)
-  private var retiredStores: Set[StoreId] = Set()
   // Opens that began while their store had TransferOut work on the device (R1: refused from Task 7)
   private var transferOutOpens: Vector[String] = Vector()
+  // Throws of the silence path (onChange), for the drain check
+  private var silenceErrors: Vector[String] = Vector()
 
-  /** Test-only: the name of the test that built this host, for KnownDefects */
-  var testName: String = ""
+  /** Tests: a throw of the silence path propagates rather than leaving the store silent (Host.Seams) */
+  var strict: Boolean = false
 
   /** Test-only: called after every change to a record, a work or a missing mark, with the device's copies */
   var observer: (DeviceCopies, StoreId) => Unit = (_, _) => ()
@@ -62,12 +66,48 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   /** The device directories awaiting their ownership decision, with their stores */
   def awaitingDevices: Map[os.Path, Set[StoreId]] = awaiting
 
-  /** Runs `f`, a registry update at the production site `site`. A throw is logged, recorded and swallowed */
+  /** Runs `f`, a registry update at the production site `site`. A throw is logged, recorded and swallowed, except a
+   *  strict silence path's (SilenceFailure) */
   def shadow(site: String)(f: => Unit): Unit =
     try f
-    catch case NonFatal(t) =>
-      logger.error(s"Copy registry ($site): $t")
-      errors :+= s"$site: ${t.getMessage}"
+    catch
+      case e: SilenceFailure => throw e
+      case NonFatal(t) =>
+        logger.error(s"Copy registry ($site): $t")
+        errors :+= s"$site: ${t.getMessage}"
+
+  /** The throws of the silence path since the last call, which clears them */
+  def takeSilenceErrors(): Vector[String] =
+    val e = silenceErrors
+    silenceErrors = Vector()
+    e
+
+  /** Something `silence(storeId)` reads changed: recomputes it, sets the router's mark, and republishes the view. A
+   *  throw is a bug: logged at error, the store left silent (clients retransmit), and recorded for the drain check;
+   *  with `strict` it then propagates */
+  def onChange(storeId: StoreId): Unit = onChange(List(storeId))
+
+  /** `onChange` of each of `storeIds`, publishing the view once */
+  def onChange(storeIds: Iterable[StoreId]): Unit =
+    val failed = storeIds.flatMap: storeId =>
+      try
+        ctx.router.setSilent(storeId, silence(storeId).isInstanceOf[Silence.Silent])
+        None
+      catch case NonFatal(t) =>
+        logger.error(s"Copy registry: the silence of store $storeId could not be derived. Leaving it silent: $t")
+        ctx.router.setSilent(storeId, true)
+        Some(s"silence of $storeId: $t" -> t)
+    val published =
+      try
+        ctx.publishView()
+        None
+      catch case NonFatal(t) =>
+        logger.error(s"Copy registry: the host's store view could not be published: $t")
+        Some(s"publishView: $t" -> t)
+    val all = failed.toList ++ published
+    silenceErrors ++= all.map(_._1)
+    if strict then
+      all.headOption.foreach((msg, t) => throw SilenceFailure(msg, t))
 
   /** The throws `shadow` swallowed since the last call, which clears them */
   def takeShadowErrors(): Vector[String] =
@@ -81,8 +121,15 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
    *  (readAtLoad) */
   def attach(sds: LocalStorageDeviceState, children: Seq[os.Path]): Unit =
     attached += sds.storageDeviceId -> sds
-    unloaded -= sds.storageDeviceId
-    sds.onCopyChange = s => observer(sds.copies, s)
+    // Its last tree entry's stores (unloaded) stay silent until its first reconcile reads the entry anew
+    sds.onCopyChange = s =>
+      onChange(s)
+      observer(sds.copies, s)
+    sds.onReconciled = (before, after) =>
+      val listed = unloaded.getOrElse(sds.storageDeviceId, Set())
+      if attached.get(sds.storageDeviceId).exists(_ eq sds) then
+        unloaded -= sds.storageDeviceId
+      onChange(listed ++ before ++ after)
     shadow("attach"):
       children.foreach: path =>
         HostCopies.storeIdOf(path).foreach: storeId =>
@@ -199,7 +246,9 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
    *  readAtLoad learns one. A device neither loaded nor seamed (a test's stand-in) has no records */
   private def known(site: String, id: StorageDeviceId, storeId: StoreId): Unit =
     if !attached.contains(id) && !ctx.devices.devices.contains(id) && ctx.unloadedDeviceCrl.isDefined then
-      val copies = untracked.getOrElse(id, new DeviceCopies(id, os.root, s => observer(untracked(id), s)))
+      val copies = untracked.getOrElse(id, new DeviceCopies(id, os.root, s =>
+        onChange(s)
+        observer(untracked(id), s)))
       untracked += id -> copies
       if !copies.copies.contains(storeId) then
         copies.register(storeId, Phase.Live)
@@ -284,7 +333,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         (copies.missing -- local.declaredMissing).foreach(copies.clearMissing)
         (local.declaredMissing -- copies.missing).foreach(copies.declareMissing)
 
-  // ---- Derived silence (shadow): compared with the router's marks after each test drain ----
+  // ---- Derived silence: the router's silent marks and the view's repairable stores ----
 
   private def allCopies: Iterable[DeviceCopies] = attached.values.map(_.copies) ++ untracked.values
 
@@ -293,7 +342,9 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
    *  its copy is registered only once at its path), and an entry a loaded device's latest reconcile read
    *  Initializing (a create to come, a failed one's included), are Opening reasons */
   def silence(storeId: StoreId): Silence =
-    if allCopies.exists(_.copies.get(storeId).exists(_.activity == Activity.Served)) then
+    // A store installed with no record (a test's stand-in, served from a device neither loaded nor seamed) is served
+    if allCopies.exists(_.copies.get(storeId).exists(_.activity == Activity.Served)) || ctx.router.get(storeId).isDefined
+    then
       Silence.Served
     else
       val onDevices = allCopies.flatMap: c =>
@@ -312,16 +363,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
       val reasons = onDevices.toSet ++
         (if creating then Set(SilenceReason.Opening) else Set()) ++
         (if unloaded.valuesIterator.exists(_.contains(storeId)) then Set(SilenceReason.UnloadedDevice) else Set()) ++
-        (if awaiting.valuesIterator.exists(_.contains(storeId)) then Set(SilenceReason.AwaitingDevice) else Set())
+        (if awaiting.valuesIterator.exists(_.contains(storeId)) then Set(SilenceReason.DeviceUndecided) else Set())
       if reasons.isEmpty then Silence.Unknown else Silence.Silent(reasons)
-
-  /** The records and work of `storeId` on every device, for a disagreement's message */
-  private def describe(storeId: StoreId): String =
-    allCopies.flatMap: c =>
-      val r = c.copies.get(storeId).map(r => s"${r.phase}/${r.activity}")
-      val w = c.work.get(storeId).map(_.toString)
-      if r.isEmpty && w.isEmpty then None else Some(s"${c.deviceId}: ${r.getOrElse("no record")} ${w.getOrElse("")}")
-    .mkString("; ")
 
   /** Whether a repair scan may run against `storeId` here: Served, not Closing, with no Rebuild or TransferOut work on
    *  any device, and not being sent out (storeTransferService) */
@@ -332,109 +375,44 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
                                                        w.isInstanceOf[Work.TransferOut])) &&
       !ctx.storeTransferService.transferringOutStores.contains(storeId)
 
-  /** Test-only. Each store whose silence or repairability the registry derives otherwise than the router's marks
-   *  give it: silent there when not installed and offline, loading or awaiting its device; repairable when installed
-   *  and not offline, rebuilding or transferring out (HostStoreView.of). Empty for a test whose name
-   *  HostCopies.KnownDefects lists (a defect of the router's marks, Task 6 removes them) */
-  def compareWithRouter(): List[String] =
-    if HostCopies.KnownDefects.contains(testName) then
-      Nil
-    else
-      val router = ctx.router
-      val installed = router.loaded.keySet
-      val offline = router.offlineStores
-      val marked = offline ++ router.loadingStores ++ router.awaitingDeviceStores
-      val rebuilding = ctx.rebuilds.rebuildingStoreIds
-      val sending = ctx.storeTransferService.transferringOutStores
-      val known = allCopies.flatMap(c => c.copies.keySet ++ c.work.keySet ++ c.missing) ++
-        unloaded.values.flatten ++ awaiting.values.flatten ++
-        attached.values.flatMap(_.reconciledEntries.map(_.keySet).getOrElse(Set()))
-      (installed ++ marked ++ known).toList.sortBy(_.directoryName).flatMap: storeId =>
-        val oldSilent = !installed.contains(storeId) && marked.contains(storeId)
-        val derived = silence(storeId)
-        val oldRepairable = installed.contains(storeId) && !offline.contains(storeId) &&
-          !rebuilding.contains(storeId) && !sending.contains(storeId)
-        val newRepairable = repairable(storeId)
-        (if oldSilent != derived.isInstanceOf[Silence.Silent] && knownDefect(storeId, oldSilent, derived).isEmpty then
-           List(s"$storeId: the router's marks say ${if oldSilent then "silent" else "not silent"} (installed " +
-                s"${installed.contains(storeId)}, offline ${offline.contains(storeId)}, loading " +
-                s"${router.isLoading(storeId)}, awaiting device ${router.isAwaitingDevice(storeId)}), the registry " +
-                s"$derived (${describe(storeId)})")
-         else Nil) ++
-        (if oldRepairable != newRepairable then
-           List(s"$storeId: repairable by the router's view $oldRepairable (installed ${installed.contains(storeId)}, " +
-                s"offline ${offline.contains(storeId)}, rebuilding ${rebuilding.contains(storeId)}, sending " +
-                s"${sending.contains(storeId)}), by the registry $newRepairable (${describe(storeId)})")
-         else Nil)
-
-  /** The defect of the router's marks (spec, Step 3 addenda) that explains a silence disagreement over `storeId`, if
-   *  one does. These four arise in windows whose timing varies from run to run, so they are recognised by their
-   *  state, not whitelisted by test name:
-   *   - D1: not marked, silent only for a transfer in: every copy on the receiving device, or Arrived;
-   *   - D4: not marked, silent only by its Create work, before the create's copy exists;
-   *   - D5: offline, Unknown, its copy retired into pending-delete here and the retiring caller's clear of the mark
-   *     not yet run (a device still lists it offline);
-   *   - D6: not marked, silent only for Live, Idle copies whose directories all lack their config (silenced by the
-   *     Missing Stores pass only) */
-  private def knownDefect(storeId: StoreId, oldSilent: Boolean, derived: Silence): Option[String] =
-    val withRecord = allCopies.filter(_.copies.contains(storeId)).toList
-    val records = withRecord.map(_.copies(storeId))
-    val works = allCopies.flatMap(_.work.get(storeId)).toList
-    val receiving = allCopies.filter(_.work.get(storeId).exists(_.isInstanceOf[Work.TransferIn])).map(_.deviceId).toSet
-    derived match
-      case Silence.Silent(reasons) if !oldSilent =>
-        // D1: each copy is the transfer's own (on the device receiving it) or Arrived
-        if reasons.subsetOf(Set(SilenceReason.TransferringIn, SilenceReason.CopyHere)) &&
-           (receiving.nonEmpty || records.nonEmpty) &&
-           withRecord.forall(c => receiving.contains(c.deviceId) || c.copies(storeId).phase.isInstanceOf[Phase.Arrived])
-        then
-          Some("D1")
-        // D4: the create's pool read, before its open: its Create work, and no copy yet
-        else if reasons == Set(SilenceReason.Opening) && records.isEmpty && works.contains(Work.Create) then
-          Some("D4")
-        // D6: every copy is a Live, Idle directory on a loaded device whose config is known absent
-        else if reasons == Set(SilenceReason.CopyHere) && withRecord.nonEmpty &&
-                withRecord.forall: c =>
-                  val r = c.copies(storeId)
-                  r.phase == Phase.Live && r.activity == Activity.Idle &&
-                    attached.get(c.deviceId).exists(sds => (sds.copies eq c) &&
-                      FileStat.existence(sds.devicePath / storeId.directoryName / StoreConfig.configFilename)
-                        .contains(false))
-        then
-          Some("D6")
-        else
-          None
-      // D5: its copy retired here, and the retiring device's lagging clear not yet run (it still lists the store)
-      case Silence.Unknown if oldSilent && retiredStores.contains(storeId) &&
-                              attached.values.exists(_.offlineStores.contains(storeId)) =>
-        Some("D5")
-      case _ => None
-
-  /** A caller cleared, or asked to clear, the router's offline mark of `storeId` (StoreRouter.clearOffline,
-   *  clearOfflineUnlessHeld): a retire's lagging clear has run, ending D5's window */
-  def offlineClearAsked(storeId: StoreId): Unit =
-    retiredStores -= storeId
-
   /** At unload: the device's records go with it, and `listed` is kept as its unloaded entries */
   def detach(id: StorageDeviceId, listed: Set[StoreId]): Unit =
+    val had = attached.get(id).map(_.copies)
     attached -= id
-    unloaded += id -> listed
+    // A device unloaded before its first reconcile keeps what it listed before its load too
+    val before = unloaded.getOrElse(id, Set())
+    unloaded += id -> (listed ++ before)
+    onChange(before ++ listed ++ had.toList.flatMap(c => c.copies.keySet ++ c.work.keySet ++ c.missing))
 
   /** The stores a device not loaded here lists (DeviceReconciler, a device check of an unloaded device) */
   def recordUnloadedEntries(id: StorageDeviceId, listed: Set[StoreId]): Unit =
     if !attached.contains(id) then
+      val before = unloaded.getOrElse(id, Set())
       unloaded += id -> listed
+      onChange(before ++ listed)
 
   /** The stores of the device directory `path` await its ownership decision */
   def awaitDevice(path: os.Path, stores: Set[StoreId]): Unit =
+    val before = awaiting.getOrElse(path, Set())
     awaiting += path -> stores
-    stores.foreach(ctx.router.markAwaitingDevice)
+    onChange(before ++ stores)
 
   /** The ownership of the device directory `path` has been decided */
   def deviceDecided(path: os.Path): Unit =
     awaiting.get(path).foreach: stores =>
       awaiting -= path
-      stores.foreach(ctx.router.clearAwaitingDevice)
+      onChange(stores)
+
+  /** The stores of `local`'s copies that are not served or opening: Idle, awaiting a load retry, closing or retiring.
+   *  The reconcile's passes select their stores from these */
+  def offlineCopies(local: LocalStorageDeviceState): Set[StoreId] =
+    copiesOf(local).map(_.copies.values.collect {
+      case r if !(r.activity == Activity.Served || r.activity.isInstanceOf[Activity.Opening]) => r.storeId
+    }.toSet).getOrElse(Set())
+
+  /** The stores of `local`'s copies that are served or opening: the complement of offlineCopies */
+  def openCopies(local: LocalStorageDeviceState): Set[StoreId] =
+    copiesOf(local).map(c => c.copies.keySet -- offlineCopies(local)).getOrElse(Set())
 
   /** The registry of `sds`, while it is the attached state of its device */
   def copiesOf(sds: LocalStorageDeviceState): Option[DeviceCopies] =
@@ -489,8 +467,6 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def removed(site: String, sds: LocalStorageDeviceState, storeId: StoreId): Unit =
     shadow(site):
       copiesOf(sds).foreach(_.unregister(storeId))
-      if site == "moveToPendingDelete" then
-        retiredStores += storeId
 
   /** Test-only. For every loaded device, where its records and its disk disagree:
    *   - a record's phase is not the phase its directory's markers read, for records neither Unread nor unsynced;
@@ -537,7 +513,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
 
 /** Why a store the router does not serve is silent (HostCopies.silence) */
 enum SilenceReason:
-  case CopyHere, Opening, Rebuilding, TransferringIn, Missing, UnloadedDevice, AwaitingDevice
+  case CopyHere, Opening, Rebuilding, TransferringIn, Missing, UnloadedDevice, DeviceUndecided
 
 /** What the router should do with a message for a store (HostCopies.silence) */
 enum Silence:
@@ -546,20 +522,6 @@ enum Silence:
   case Unknown
 
 object HostCopies:
-  /** Tests whose drain disagrees with the router's marks through a defect of those marks (spec, Stage 1 audit
-   *  findings, Step 3 addenda), by test name: compareWithRouter reports nothing for them until Task 6 removes the
-   *  marks. The defects of timing windows (D1, D4, D5, D6) are recognised by their state instead (knownDefect) */
-  val KnownDefects: Map[String, String] =
-    Map(
-      "a check of an unloaded device that lists a store served here takes it out of the router's repairable view" ->
-        ("D2: a check of a device not loaded here (DeviceReconciler, the unloaded-device branch) marks every store " +
-         "its entry lists offline by id, one served from another device of this host included"),
-      "an open during a transfer out's close is listed, not refused, and the transfer does not start" ->
-        ("D3: the view counts a store repairable while a transfer out is closing it, its CRL state being extracted " +
-         "(an open during the close serves it; R1, refused from Task 7)"),
-      "an open that installs during a served store's transfer-out extraction is Served, with no shadow error" ->
-        ("D3, for a store served when its transfer out began"))
-
   /** `w`, with any id it lacks taken from `current`, of the same kind */
   private def keepIds(current: Work, w: Work): Work = (current, w) match
     case (Work.Rebuild(Some(e), _), Work.Rebuild(None, stage)) => Work.Rebuild(Some(e), stage)
@@ -570,3 +532,6 @@ object HostCopies:
   /** The store a directory's name identifies, if it is a store directory name */
   def storeIdOf(path: os.Path): Option[StoreId] =
     Try(StoreId(path.last)).toOption.filter(_.directoryName == path.last)
+
+/** A throw of the copy registry's silence path (HostCopies.onChange) when `strict`: never swallowed by `shadow` */
+final class SilenceFailure(message: String, cause: Throwable) extends RuntimeException(message, cause)

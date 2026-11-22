@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
-import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, LockstepThreading, StagedSendService, StagedTransferService, StoreLoader, StoreTransfers}
+import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, LockstepThreading, Silence, SilenceReason, StagedSendService, StagedTransferService, StoreLoader, StoreTransfers}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
@@ -156,7 +156,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     host.control.reconciler.checkAll()
     host.control.reconciler.checkAll()
 
-    // Same instance: the device's offlineStores tracking survives a rescan.
+    // Same instance: the device's copy registry survives a rescan.
     loadedDevices(host)(deviceA) should be theSameInstanceAs firstState
     Future.successful(recorded(host).storeLoadAttempts.toList should be(attemptsAfterConstruction))
 
@@ -374,11 +374,11 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       host.control.reconciler.deferredDeviceChecks should be(empty)
 
       // The device was loaded before the lookup returned, so its stores must not be marked
-      // offline by a decision taken back when it was not. In production nothing would clear
-      // them afterwards: tryLoadStore and the LoadStore handler both ran on the way in, and
-      // reconcileDeviceState's deleted-stores pass only removes ids recorded in the device's
-      // own offlineStores set, which ids marked by this branch never enter.
-      host.control.router.offlineStores should not contain storeId
+      // offline by a decision taken back when it was not: it is reconciled instead, and its
+      // stores are not recorded as an unloaded device's. Its copy, not loaded by the recording
+      // seams, keeps the store silent on its own
+      host.control.copyRegistry.unloadedEntries should not contain key(deviceA)
+      host.control.copyRegistry.silence(storeId) should be(Silence.Silent(Set(SilenceReason.CopyHere)))
 
   atest("a check for a device that never loads marks its stores offline"):
     val hostRoot = newHostDir()
@@ -404,7 +404,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       // Suppresses TxUnknownStore and ReadResponse(StoreNotFound) for stores on a device that
       // is down. Deleting this marking is silent in production and, until this test, silent in
       // the suite too.
-      host.control.router.offlineStores should contain(storeId)
+      host.control.router.silentStores should contain(storeId)
 
   atest("a check request arriving during an in-flight check is deferred, not dropped"):
     val hostRoot = newHostDir()
@@ -528,12 +528,11 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // carries its transferred-in marker. Against the Active entry armed below,
     // reconcileDeviceState's completed-transfers-in pass removes the marker and calls
     // tryLoadStore with no try/catch around it, and the owed failure throws out of the reconcile.
-    // local.offlineStores holds the id that makes the pass iterate at all.
+    // Its copy, registered at the injection and offline, is what makes the pass iterate at all.
     val devDir = hostRoot / "injected-device"
     os.write(devDir / storeId.directoryName / StoreTransfer.TransferredInMarkerFile, "", createFolders = true)
     val local = new LocalStorageDeviceState(
       deviceA, devDir, devDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL())
-    local.offlineStores = Set(storeId)
     injectLoadedDevice(host, local)
 
     val p1 = recorded(host).armLookup(deviceA)
@@ -824,17 +823,15 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
   /** Stages a store that this host skipped at load time because of its transfer-out marker.
    *
-   *  The directory and the marker are written after construction and `offlineStores` is set by
-   *  hand, because the recording tryLoadStore does neither: it never honours the marker and
-   *  never maintains the offline sets. Writing them before construction would only add a
-   *  recorded attempt, not the state under test.
+   *  The directory and the marker are written after construction and the copy registered by
+   *  hand, as the device's load would have registered it. Writing them before construction would
+   *  only add a recorded attempt, not the state under test.
    */
   private def stageOfflineTransferringOutStore(host: Host,
                                                deviceDir: os.Path,
                                                sids: StoreId*): List[os.Path] =
     val dirs = sids.map(sid => writeTransferringOutStore(deviceDir, sid)).toList
-    val local = loadedDevices(host)(deviceA)
-    local.offlineStores = local.offlineStores ++ sids
+    placedCopies(host, loadedDevices(host)(deviceA), sids*)
     dirs
 
   atest("an abandoned transfer-out's marker is cleared and the store loaded"):
@@ -866,8 +863,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
 
       // And the load goes back through tryLoadStore rather than a parallel path, which is what
-      // clears the two offlineStores sets in production. The recording override does not
-      // maintain those sets, so this attempt is the assertion available here.
+      // takes the copy from offline to served in production. The recording override loads
+      // nothing, so this attempt is the assertion available here.
       recorded(host).storeLoadAttempts.toList.drop(before) should be(List((deviceA, storeDir)))
 
   atest("a store whose transfer-out is still outstanding keeps its marker"):
@@ -1048,7 +1045,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       // The disk half. Loading the arrived copy would put a live store on a device the metadata
       // has just decided must not own it, with nothing to reclaim it: the deleted-stores pass
-      // only considers offlineStores, and reconcileDeviceState ignores a failed device outright.
+      // only considers offline copies, and reconcileDeviceState ignores a failed device outright.
       // Same host as the source and it would replace the source's entry in `stores`, silently
       // discarding every update applied to it.
       recorded(host).loadStoreByIdRequests.toList should be(Nil)
@@ -1612,7 +1609,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(storeDir)
     os.write.over(storeDir / StoreTransfer.TransferOutMarkerFile, Array.emptyByteArray)
     val local = loadedDevices(host)(sourceId)
-    local.offlineStores = local.offlineStores + movingStore
+    placedCopies(host, local, movingStore)
 
     for
       _ <- net.createSecondDevice()
@@ -1654,12 +1651,12 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, transferService = sends)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
 
-    // The recording seams never load the store, so closeStore has nothing to close and does not
-    // mark it offline; that is done by hand, as ShutdownStore would.
+    // The recording seams never load the store, so closeStore has nothing to close; its copy,
+    // placed after the device's load, is registered by hand, offline as ShutdownStore leaves it.
     val storeDir = deviceDir / movingStore.directoryName
     os.makeDir.all(storeDir)
     val local = loadedDevices(host)(sourceId)
-    local.offlineStores = local.offlineStores + movingStore
+    placedCopies(host, local, movingStore)
 
     for
       _ <- net.createSecondDevice()
@@ -1999,7 +1996,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         // A scan of the destination device offers the marked copy: it is kept offline there without silencing the
         // store served from the other device
         _ = host.control.loader.tryLoadStore(local, earlier)
-        markedOffline = local.offlineStores.contains(movingStore)
+        markedOffline = offlineCopies(host, local).contains(movingStore)
         routerOfflineAfterScan = host.control.router.isOffline(movingStore)
 
         _ <- client.transferStore(movingStore, net.secondDeviceId)
@@ -2029,13 +2026,13 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     os.write.over(storeDir / StoreTransfer.TransferredInMarkerFile, Array.emptyByteArray)
     val filesBefore = os.list(storeDir).toSet
 
-    val host = named(new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+    val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
       TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
-      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared()))
+      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared())
 
     Future.successful:
-      host.control.router.offlineStores should contain(storeId)
+      host.control.router.silentStores should contain(storeId)
       host.getStoreIds should not contain storeId
       // Nothing was opened in the copy's directory.
       os.list(storeDir).toSet should be(filesBefore)
@@ -2052,13 +2049,13 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, Array.emptyByteArray)
     val filesBefore = os.list(storeDir).toSet
 
-    val host = named(new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+    val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
       TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
-      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared()))
+      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared())
 
     Future.successful:
-      host.control.router.offlineStores should contain(storeId)
+      host.control.router.silentStores should contain(storeId)
       host.getStoreIds should not contain storeId
       os.list(storeDir).toSet should be(filesBefore)
 
@@ -2075,7 +2072,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
           def cancel(): Unit = ()
     val host = newHost(hostRoot, storeRebuildFactory = factory)
 
-    // As tryLoadStore leaves them: marked offline by hand, since the recording tryLoadStore honours no marker.
+    // As tryLoadStore leaves them: offline, registered by hand since they are placed after the device's load.
     // storeId: the flip committed and the host crashed before removing the marker. storeIdB: the flip has not
     // committed; its rebuild (held here) is what flips and loads it.
     val List(activeDir, rebuildingDir) = List(storeId, storeIdB).map: sid =>
@@ -2084,7 +2081,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       os.write.over(dir / RebuildingStore.RebuildCompleteMarkerFile, Array.emptyByteArray)
       dir
     val local = loadedDevices(host)(deviceA)
-    local.offlineStores = local.offlineStores ++ Set(storeId, storeIdB)
+    placedCopies(host, local, storeId, storeIdB)
     val before = recorded(host).storeLoadAttempts.size
 
     val armed = recorded(host).armLookup(deviceA)
@@ -2108,15 +2105,14 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newHost(hostRoot)
 
-    // Written after construction and marked offline by hand, as stageOfflineTransferringOutStore
-    // does, because the recording tryLoadStore neither honours the marker nor keeps the sets.
+    // Written after construction and registered by hand, as stageOfflineTransferringOutStore does.
     val List(activeDir, pendingDir) = List(storeId, storeIdB).map: sid =>
       val dir = deviceDir / sid.directoryName
       os.makeDir.all(dir)
       os.write.over(dir / StoreTransfer.TransferredInMarkerFile, Array.emptyByteArray)
       dir
     val local = loadedDevices(host)(deviceA)
-    local.offlineStores = local.offlineStores ++ Set(storeId, storeIdB)
+    placedCopies(host, local, storeId, storeIdB)
     val before = recorded(host).storeLoadAttempts.size
 
     val armed = recorded(host).armLookup(deviceA)
@@ -2141,10 +2137,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
   /** A real Host, which opens RocksDB backends and honours the markers, over `hostRoot`. */
   private def newRealHost(hostRoot: os.Path): Host =
-    named(new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+    new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
       TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
-      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared()))
+      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared())
 
   private def writeStoreDir(deviceDir: os.Path, storeId: StoreId = storeId): os.Path =
     val storeDir = deviceDir / storeId.directoryName
@@ -2166,7 +2162,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     loaded.failed.map: err =>
       err shouldBe a[CrashRecoveryLog.InvalidSaveFile]
       host.getStoreIds should not contain storeId
-      host.control.router.offlineStores should contain(storeId)
+      host.control.router.silentStores should contain(storeId)
       os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
       // Left in place: it is not this host's to delete, only to stop trusting.
       os.exists(Backend.crlSaveFile(storeDir)) should be(true)
@@ -2182,7 +2178,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
     Future.successful:
       host.getStoreIds should not contain storeId
-      host.control.router.offlineStores should contain(storeId)
+      host.control.router.silentStores should contain(storeId)
       os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
 
   atest("a store marked rebuild-required is not loaded at startup"):
@@ -2197,6 +2193,6 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
     Future.successful:
       host.getStoreIds should not contain storeId
-      host.control.router.offlineStores should contain(storeId)
+      host.control.router.silentStores should contain(storeId)
       // Nothing was opened in its directory.
       os.list(storeDir).toSet should be(filesBefore)

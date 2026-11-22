@@ -126,7 +126,7 @@ class RebuiltVoterLockIntegrationSuite extends IntegrationTestSuite with org.sca
       fBefore <- client.read(f)
       // T: an update of D and a lock on F, led by store 0
       tx = client.newTransaction()
-      _ = net.offlineStores = Set(sid(1), sid(2))
+      _ = net.unreachableStores = Set(sid(1), sid(2))
       _ = net.droppedTx = Set((sid(2), tx.id))
       _ = net.dropTxMessage = store0Vote(tx.id)
       _ = net.dropClientResponse = store0ClientVote(tx.id)
@@ -136,7 +136,7 @@ class RebuiltVoterLockIntegrationSuite extends IntegrationTestSuite with org.sca
       _ <- eventually("stores 0 and 1 voted commit on T", clock = false):
              vote(0, tx.id).contains(TransactionDisposition.VoteCommit) &&
                vote(1, tx.id).contains(TransactionDisposition.VoteCommit)
-      _ = net.offlineStores = Set()
+      _ = net.unreachableStores = Set()
       _ = withClue("T is undecided: ")(tCommit.isCompleted shouldBe false)
       rebuiltDir <- loseAndRebuildStore1()
       _ = withClue("the rebuilt store is muted for T: ")(frontend(1).flatMap(_.acceptorSince).isDefined shouldBe true)
@@ -145,10 +145,10 @@ class RebuiltVoterLockIntegrationSuite extends IntegrationTestSuite with org.sca
              frontend(1).flatMap(_.inheritedVoteTransactions).contains(Set(tx.id))
       // T': a fence takeover, bumping F, led by store 2
       tx2 = client.newTransaction()
-      _ = net.offlineStores = Set(sid(0), sid(1))
+      _ = net.unreachableStores = Set(sid(0), sid(1))
       _ = tx2.bumpVersion(f, fBefore.revision)
       t2Commit = tx2.commit()
-      _ = net.offlineStores = Set()
+      _ = net.unreachableStores = Set()
       t2Result <- outcome(t2Commit, clock = true)
       _ = withClue(s"T' must not commit while T, which locks F, may still commit ($t2Result): "):
             t2Result.failed.toOption.exists(_.isInstanceOf[TransactionAborted]) shouldBe true
@@ -215,14 +215,14 @@ class RebuiltVoterLockIntegrationSuite extends IntegrationTestSuite with org.sca
     for
       kp <- allocateKV()
       tx = growth(kp, "t")
-      _ = net.offlineStores = Set(sid(1), sid(2), sid(3), sid(4))
+      _ = net.unreachableStores = Set(sid(1), sid(2), sid(3), sid(4))
       _ = net.droppedTx = Set((sid(2), tx.id))
       _ = net.dropTxMessage = store0Vote(tx.id)
       _ = net.dropClientResponse = store0ClientVote(tx.id)
       tCommit = tx.commit()
       _ <- eventually("stores 0, 1, 3 and 4 voted commit on T", clock = false):
              List(0, 1, 3, 4).forall(i => vote(i, tx.id).contains(TransactionDisposition.VoteCommit))
-      _ = net.offlineStores = Set()
+      _ = net.unreachableStores = Set()
       _ = withClue("store 1's copy, which the rebuild serves, lacks T: "):
             net.stores(1).m.get(kp.id).flatMap(_.kvState).exists(_.content.contains(kvKey("t"))) shouldBe false
       rebuiltDir <- loseAndRebuildStore1()

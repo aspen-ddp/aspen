@@ -115,7 +115,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  problems are logged once (warnOnce) and then rechecked silently.
    *
    *  Repeated scans are safe: tryLoadDevice also skips any device already present in
-   *  storageDevices, so a device's LocalStorageDeviceState -- and with it the offlineStores set
+   *  storageDevices, so a device's LocalStorageDeviceState -- and with it the copy registry
    *  that reconcileDeviceState reads -- survives, and its children are not re-offered to
    *  tryLoadStore over already-open backends.
    *
@@ -255,10 +255,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             else if previousHost == ctx.hostId then
               state.status match
                 case DeviceStatus.Shutdown if ownedHere =>
-                  // Awaiting a restart or a move: silent, as unloadDevice leaves the stores of a
-                  // device shut down while this host ran
-                  marked.foreach(ctx.router.markOffline)
-                  // Its stores are an unloaded device's, silent in the copy registry too (shadow)
+                  // Awaiting a restart or a move: its stores are an unloaded device's, silent, as unloadDevice
+                  // leaves the stores of a device shut down while this host ran
                   ctx.copyRegistry.recordUnloadedEntries(deviceId, state.stores.keySet ++ marked)
                 case DeviceStatus.ShuttingDown if ownedHere =>
                   logger.info(s"Storage device $deviceId at $path was being shut down when this host " +

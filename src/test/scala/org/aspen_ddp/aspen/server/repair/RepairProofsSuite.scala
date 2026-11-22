@@ -161,12 +161,12 @@ class RepairProofsSuite extends IntegrationTestSuite:
       _ <- unmark(2, ptr.id)
       markedBefore <- marked(2, ptr.id)
       _ = markedBefore shouldBe false
-      _ = net.offlineStores = Set(s2)
+      _ = net.unreachableStores = Set(s2)
       _ = net.dropTxMessage = m => m.to == s2
       proven <- RepairProofs.proveObjectLevel(client, read)
       _ <- net.waitForTransactionsToComplete()
       _ = net.dropTxMessage = _ => false
-      _ = net.offlineStores = Set()
+      _ = net.unreachableStores = Set()
       after <- client.read(ptr)
       isMarked <- marked(2, ptr.id)
     yield

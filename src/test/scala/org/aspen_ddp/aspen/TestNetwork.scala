@@ -351,7 +351,7 @@ class TestNetwork(executionContext: ExecutionContext,
 
   /** Stores the client messenger reports offline, so no transaction chooses one as its designated leader: a leader
    *  whose messages are dropped would stall a transaction, as clients here do not recover them */
-  @volatile var offlineStores: Set[StoreId] = Set()
+  @volatile var unreachableStores: Set[StoreId] = Set()
 
   /** Further transaction messages to drop, as a test chooses (a store missing a transaction's outcome, say) */
   @volatile var dropTxMessage: TxMessage => Boolean = _ => false
@@ -375,11 +375,11 @@ class TestNetwork(executionContext: ExecutionContext,
     given ExecutionContext = executionContext
     synchronized:
       behind = Some((store, objectId))
-    offlineStores += store
+    unreachableStores += store
     f.andThen: _ =>
       synchronized:
         behind = None
-      offlineStores -= store
+      unreachableStores -= store
 
   /** A client's initial prepares for a transaction are held until it has sent one to every store, then delivered
    *  together before events are drained. The client sends them one at a time, and draining after each would let the
@@ -518,7 +518,7 @@ class TestNetwork(executionContext: ExecutionContext,
 
     override def isHostOnline(hostId: HostId): Boolean = !offlineHostIds.contains(hostId)
 
-    override def isStoreOffline(storeId: StoreId): Boolean = offlineStores.contains(storeId)
+    override def isStoreOffline(storeId: StoreId): Boolean = unreachableStores.contains(storeId)
   }
 
   /** Transactions still to be reported Unknown although they commit, by how many remain to be reported */
@@ -711,7 +711,7 @@ class TestNetwork(executionContext: ExecutionContext,
     */
   def crashHost(host: Host): Unit =
     require(!(host eq smgr), "the bootstrap host cannot crash")
-    offlineStores ++= storesOf(host).map(_.storeId)
+    unreachableStores ++= storesOf(host).map(_.storeId)
     synchronized:
       crashedHosts = host :: crashedHosts
 
@@ -726,7 +726,7 @@ class TestNetwork(executionContext: ExecutionContext,
     val restarted = buildHost(ceiling)
     val served = storesOf(host)
     Future.traverse(served)(s => moveStore(s, restarted, closeFirst = false)).map: _ =>
-      offlineStores --= served.map(_.storeId)
+      unreachableStores --= served.map(_.storeId)
       restarted
 
   /** Serves store `backend` on `to` from now on: a new Store there recovers its transactions from `crl`, as a store

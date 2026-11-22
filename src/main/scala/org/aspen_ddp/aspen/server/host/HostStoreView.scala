@@ -11,8 +11,9 @@ import org.aspen_ddp.aspen.common.store.StoreId
  *  of a store that has left fails with StoreNotHosted there.
  *
  *  @param served the stores loaded on this host
- *  @param offline the stores marked offline: their messages are dropped rather than answered UnknownStore
- *  @param repairable the served stores that are not offline, not rebuilding and not transferring out
+ *  @param offline the stores marked silent: their messages are dropped rather than answered UnknownStore
+ *  @param repairable the served stores a repair scan may run against (HostCopies.repairable): not closing, with no
+ *         rebuild or transfer out here, and not being sent out
  *  @param devicePaths the directory of each loaded storage device
  *  @param storeDevices the device each served store is loaded from (the repair fence: RepairTarget.localDevice) */
 final case class HostStoreView(served: Set[StoreId],
@@ -24,12 +25,11 @@ final case class HostStoreView(served: Set[StoreId],
 object HostStoreView:
   val Empty: HostStoreView = HostStoreView(Set(), Set(), Set(), Map(), Map())
 
-  /** The view of these inputs. A store is repairable when it is served and neither offline, rebuilding nor
-   *  transferring out: a rebuild already reads everything, and a store transferring out is about to stop being ours. */
+  /** The view of these inputs. `repairable` is taken as given (HostCopies.repairable): a rebuild already reads
+   *  everything, and a store transferring out is about to stop being ours. */
   def of(served: Set[StoreId],
          offline: Set[StoreId],
-         rebuilding: Set[StoreId],
-         transferringOut: Set[StoreId],
+         repairable: Set[StoreId],
          devicePaths: Map[StorageDeviceId, os.Path],
          storeDevices: Map[StoreId, StorageDeviceId]): HostStoreView =
-    HostStoreView(served, offline, served -- offline -- rebuilding -- transferringOut, devicePaths, storeDevices)
+    HostStoreView(served, offline, repairable, devicePaths, storeDevices)

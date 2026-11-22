@@ -295,7 +295,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
       // messages (they are recorded) and is reported offline, so it does not lead
       t <- {
         val tx = client.newTransaction()
-        net.offlineStores = Set(sid(lagging))
+        net.unreachableStores = Set(sid(lagging))
         net.droppedTx = Set((sid(lagging), tx.id))
         net.recordTxMessage = (m: TxMessage) => m.transactionId == tx.id && m.to == sid(lagging)
         tx.update(y, None, None, List(KeyValueUpdate.KeyRevision(k, rev0)), List(Insert(k, Array[Byte](2))))
@@ -304,7 +304,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
           _ <- settle(clock = false)
         yield
           net.recordTxMessage = _ => false
-          net.offlineStores = Set()
+          net.unreachableStores = Set()
           tx.id
       }
       marked <- errorEntries((0 until 5).toList, y.id)
@@ -373,7 +373,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
       // reported offline, so neither leads. Without them only 3 stores vote, below the write threshold of 4
       isClientPrepareToHeld = (m: TxMessage) => m.transactionId == tx.id && held.contains(m.to) &&
                                 (m match { case p: TxPrepare => p.fromClient; case _ => false })
-      _ = net.offlineStores = held
+      _ = net.unreachableStores = held
       _ = net.dropTxMessage = isClientPrepareToHeld
       _ = net.recordTxMessage = (m: TxMessage) => m.transactionId == tx.id &&
             ((held.contains(m.to) && m.isInstanceOf[TxPrepare]) ||
@@ -395,7 +395,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
       _ = clientPrepares.foreach(net.deliverTransactionMessage)
       _ <- pump(commit, clock = true)
       _ <- settle(clock = true)
-      after = { net.recordTxMessage = _ => false; net.offlineStores = Set(); net.takeRecordedTxMessages() }
+      after = { net.recordTxMessage = _ => false; net.unreachableStores = Set(); net.takeRecordedTxMessages() }
       xAfter <- client.read(x)
     yield
       // The first held store to get the client's prepare checked the requirements, as usual, and answered the leader's
@@ -423,7 +423,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
       // are reported offline meanwhile, so neither leads it
       t0Outcomes <- {
         val tx = TestTransactions.replaySafe(client.newTransaction())
-        net.offlineStores = blocked
+        net.unreachableStores = blocked
         net.dropTxMessage = outcomeTo(tx.id, blocked)
         net.recordTxMessage = outcomeTo(tx.id, blocked)
         tx.exclusiveLockRevision(x, xBefore.revision)
@@ -439,7 +439,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
       // prepares to stores 3 and 4 are held until store 1 has voted: on the host's shared status cache, a prepare
       // reaching store 1 after the abort would be answered from it, with no vote
       tx = TestTransactions.replaySafe(client.newTransaction())
-      _ = net.offlineStores = blocked + sid(voter)
+      _ = net.unreachableStores = blocked + sid(voter)
       _ = net.dropTxMessage = outcomeTo(tx.id, Set(sid(voter)))
       _ = net.droppedTx = blocked.map(_ -> tx.id)
       _ = net.recordTxMessage = (m: TxMessage) => m.transactionId == tx.id && blocked.contains(m.to) &&
@@ -458,7 +458,7 @@ class ReplayIntegrationSuite extends IntegrationTestSuite with org.scalatest.Par
             aborted shouldBe true
             voterVote() shouldBe Some((TransactionDisposition.VoteCommit, TransactionStatus.Unresolved))
       // The collision clears: T0's outcome reaches stores 3 and 4
-      _ = net.offlineStores = Set()
+      _ = net.unreachableStores = Set()
       _ = withClue("T0's outcomes to stores 3 and 4 were recorded: ")(t0Outcomes should not be empty)
       _ = t0Outcomes.foreach(net.deliverTransactionMessage)
       _ <- eventually("the status cache forgot T", clock = false):

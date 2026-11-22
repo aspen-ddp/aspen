@@ -38,10 +38,10 @@ class StoreAvailabilityTrackerSuite extends AnyFunSuite with Matchers:
     t.gossipReceived(offline(storeA, ts(10.minutes)))
     t.isOffline(storeA) shouldBe true
     t.isOffline(storeB) shouldBe false
-    t.offlineStores shouldBe Set(storeA)
+    t.unavailableStores shouldBe Set(storeA)
     t.gossipReceived(moved(storeA, ts(5.minutes)))
     t.isOffline(storeA) shouldBe false
-    t.offlineStores shouldBe empty
+    t.unavailableStores shouldBe empty
 
   test("a StoreOffline older than the store's last StoreMoved is ignored"):
     val t = new StoreAvailabilityTracker()
@@ -77,7 +77,7 @@ class StoreAvailabilityTrackerSuite extends AnyFunSuite with Matchers:
     t.merge(Map(
       storeA -> StoreAvailability(offline = true, ts(10.minutes)),
       storeB -> StoreAvailability(offline = true, ts(10.minutes))))
-    t.offlineStores shouldBe Set(storeB)
+    t.unavailableStores shouldBe Set(storeB)
 
   test("state survives a restart through the cache file"):
     val file = cacheFile
@@ -89,7 +89,7 @@ class StoreAvailabilityTrackerSuite extends AnyFunSuite with Matchers:
 
     val restored = new StoreAvailabilityTracker(Some(file))
     restored.snapshot shouldBe t.snapshot
-    restored.offlineStores shouldBe Set(storeA)
+    restored.unavailableStores shouldBe Set(storeA)
     // The remembered online entry still beats a stale retransmit after the restart
     restored.gossipReceived(offline(storeB, ts(10.minutes)))
     restored.isOffline(storeB) shouldBe false
@@ -138,10 +138,10 @@ class StoreAvailabilityTrackerSuite extends AnyFunSuite with Matchers:
       deviceA -> device(deviceA, storeA, StorageDeviceState.StoreStatus.Active),
       deviceB -> device(deviceB, storeB, StorageDeviceState.StoreStatus.Rebuilding)))
     Await.result(t.recheck(client), 5.seconds)
-    t.offlineStores shouldBe Set(storeB)
+    t.unavailableStores shouldBe Set(storeB)
 
   test("recheck keeps a store offline when its reads fail"):
     val t = new StoreAvailabilityTracker()
     t.gossipReceived(offline(storeA, ts(10.minutes)))
     Await.result(t.recheck(new StubClient(Map())), 5.seconds)
-    t.offlineStores shouldBe Set(storeA)
+    t.unavailableStores shouldBe Set(storeA)

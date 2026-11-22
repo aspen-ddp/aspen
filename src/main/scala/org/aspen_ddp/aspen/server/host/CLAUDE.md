@@ -256,7 +256,9 @@
   - The Rebuilding pass, for a `rebuild-required` copy at the path of a store rebuilt here
     (`StoreRebuilds.discardLostStore`). It holds a rebuild slot from its start (`maxConcurrentRebuilds` counts
     `droppingCrlState`), and the slot passes straight to the rebuild in the same callback, so one reconcile cannot
-    retire every marked store at once.
+    retire every marked store at once. The handoff re-reads `reconciledEntries`: the rebuild starts only if the entry
+    is still Rebuilding under the episode the discard began for; otherwise the slot is released and the device checked
+    again (a retire held up by a slow CRL can outlast a re-placement).
   - `StoreTransfers.startIn`, for a `rebuild-complete` or `rebuild-required` copy an earlier tenancy left at the
     path of a store transferring onto the device (re-placed away while the host was down, then transferred back;
     rebuild-process). It retires before asking for bytes, waits while a rebuild of the store runs here, the

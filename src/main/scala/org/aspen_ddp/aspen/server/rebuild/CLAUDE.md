@@ -85,7 +85,9 @@
   unless a device's `offlineStores` holds it; other outcomes keep it
 - One piece of host work per (device, store) at a time (I3): while a rebuild of a store is registered on a device
   (queued, discarding its lost copy, running, or cancelled and not yet released), a transfer in of that store onto
-  the device waits (`StoreRebuilds.hasRebuildWork`, checked by `StoreTransfers.startIn`; `server/host/CLAUDE.md`)
+  the device waits (`StoreRebuilds.hasRebuildWork`, checked by `StoreTransfers.startIn`; `server/host/CLAUDE.md`).
+  A lost copy's discard hands its slot to the rebuild only for the episode it began for, re-read from the device's
+  latest reconcile (`discardLostStore`); an entry moved on meanwhile gets a fresh device check instead
 - A rebuild's staging store opens through the same `BackendOpener` as a normal load (passed by
   `StoreRebuildFactory.createRebuild`). A first pass (no checkpoint) discards whatever staging holds and creates a
   fresh staging store atomically (`BackendOpener.create`); a resume only opens it, and one whose backend is lost

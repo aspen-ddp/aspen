@@ -1,11 +1,11 @@
 package org.aspen_ddp.aspen.server.host
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.Host
+import org.aspen_ddp.aspen.server.{Host, StorageDeviceConfig}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 
@@ -29,6 +29,13 @@ private class HeldRebuildFactory extends StoreRebuildFactory:
     val r = new HeldRebuild(storeId, episode)
     synchronized(created += r)
     r
+
+/** A device CRL whose first dropStore of each store waits for the test: a retire held up by a slow CRL */
+private class HeldDropCrl extends TestNetwork.TestCRL:
+  val drops: mutable.Map[StoreId, Promise[Unit]] = mutable.Map()
+
+  override def dropStore(storeId: StoreId): Future[Unit] = synchronized:
+    drops.getOrElseUpdate(storeId, Promise[Unit]()).future
 
 /** I3: at most one piece of host work (Create, Rebuild, TransferIn, TransferOut) per (device, store) at a time. Each
  *  test is a counterexample of the Stage 1 audit (store-copy state machine design, "COUNTEREXAMPLES TO I3") and checks
@@ -103,3 +110,35 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
         host.control.rebuilds.rebuildingStoreIds should not contain moving
         transfers.transfersIn.map(_._1) should be(Vector(moving))
         factory.created.size should be(1)
+
+  /** C2: a lost copy's discard (the retire) is held up by a slow CRL drop while the store is re-placed away and back
+   *  (Rebuilding under episode e2). The discard finishing must not start the rebuild it began for (e1): the rebuild
+   *  that starts is e2's, from the check the discard's end asks for. */
+  atest("a discard finishing after the entry moved on starts no rebuild (C2)"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = hostRoot / os.up / "injected-device"
+    os.makeDir.all(deviceDir)
+    val storePath = writeStoreConfig(deviceDir, moving)
+    os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+    val crl = new HeldDropCrl
+    val factory = new HeldRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+    val local = new LocalStorageDeviceState(deviceA, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl)
+    injectLoadedDevice(host, local)
+    val e1 = UUID.randomUUID()
+    val e2 = UUID.randomUUID()
+
+    for
+      _ <- check(host, deviceA, Map(moving -> rebuildingIn(e1)))
+      _ <- yieldUntil(crl.synchronized(crl.drops.contains(moving)))
+      discarding = host.control.rebuilds.isRebuilding(moving)
+      _ <- check(host, deviceA, Map(moving -> rebuildingIn(e2)))
+      next = recorded(host).armLookup(deviceA)
+      _ = next.success(deviceState(deviceA, Map(moving -> rebuildingIn(e2))))
+      _ = crl.synchronized(crl.drops(moving)).success(())
+      _ <- yieldUntil(factory.created.nonEmpty)
+    yield
+      discarding should be(true)
+      os.exists(storePath) should be(false)
+      factory.created.map(_.episode).toList should be(List(Some(e2)))

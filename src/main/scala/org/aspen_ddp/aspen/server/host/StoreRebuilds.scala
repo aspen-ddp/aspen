@@ -246,7 +246,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     if !rebuildingStores.contains(storeId) && !scheduledRebuildRetries.get(storeId).contains(held) &&
        rebuildingStores.size + droppingCrlState.size < ctx.maxConcurrentRebuilds &&
        ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId, episode) &&
-       discardLostStore(local, storeId, episode, acceptLoss) then
+       discardLostStore(local, storeId, episode) then
       val sr = ctx.storeRebuildFactory.createRebuild(
         ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends, episode)
 
@@ -845,11 +845,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  moved into pending-delete), and deleted once the store is Active on the device its pool names. The retire
    *  completes asynchronously: this returns false meanwhile, the store holding a rebuild slot (`droppingCrlState`).
    *  Once the copy is in pending-delete the rebuild is started at once, in the same callback, so the slot passes to
-   *  it with no gap in which another store's discard could take it. A failure frees the slot and leaves everything in
-   *  place for a later check.
+   *  it with no gap in which another store's discard could take it, but only while the device's latest reconcile still
+   *  read the entry Rebuilding under `episode`: otherwise the slot is freed and the device checked again. A failure
+   *  frees the slot and leaves everything in place for a later check.
    */
-  private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
-                               acceptLoss: Boolean): Boolean =
+  private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
     val storePath = local.devicePath / storeId.directoryName
     // A stat that fails is no absence (FileStat): the rebuild waits for a later check rather than start over the copy
     val marked = FileStat.existence(storePath / RebuildingStore.RebuildRequiredMarkerFile)
@@ -864,7 +864,17 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         ctx.copies.retire(local, storeId).foreach: clear =>
           droppingCrlState -= storeId
           if clear then
-            startRebuild(local, storeId, episode, acceptLoss)
+            // The retire may outlast the entry it began for (a slow CRL read or drop during a re-placement): the
+            // rebuild starts only for an entry the device's latest reconcile still read as Rebuilding under this
+            // episode. Otherwise the slot is released and the device checked again, which acts on the entry as it is
+            local.reconciledEntries.flatMap(_.get(storeId)).filter(entry =>
+              entry.status == StorageDeviceState.StoreStatus.Rebuilding && entry.rebuildEpisode == episode
+            ) match
+              case Some(entry) => startRebuild(local, storeId, episode, entry.acceptLoss)
+              case None =>
+                logger.info(s"Not rebuilding store $storeId on device ${local.storageDeviceId} after discarding its " +
+                            "lost copy: its entry there is no longer Rebuilding for this episode")
+                ctx.reconciler.checkStorageDevice(local.storageDeviceId)
       false
 
 object StoreRebuilds:

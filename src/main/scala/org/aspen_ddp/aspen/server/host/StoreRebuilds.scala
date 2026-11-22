@@ -712,14 +712,19 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  failed backend is (closed, moved to lost/ when its close ends, its CRL entries kept), and the Deleted Stores
    *  pass of the check that follows retires it to pending-delete. A store still opening is left for a later check. */
   def retireUnlistedServed(local: LocalStorageDeviceState, storeId: StoreId): Unit =
+    takeOutOfService(local, storeId, "is served from a copy its device's entry does not list")
+
+  /** Takes the copy of `storeId` served from `local` out of service as a failed backend is: a FailStop close, the copy
+   *  moved to lost/ when the close ends (P5), its CRL entries kept for its retire. `why` completes "store <id> ...".
+   *  Nothing is done for a store still opening, or one not served from this device's copy */
+  def takeOutOfService(local: LocalStorageDeviceState, storeId: StoreId, why: String): Unit =
     val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
     if !ctx.loader.isOpening(storeId) then
       ctx.router.entry(storeId) match
         case Some(entry) if entry.store.storageDeviceId == local.storageDeviceId &&
                             entry.store.backend.path == storePath =>
-          val err = new IllegalStateException(s"$storePath holds a copy of store $storeId that the entry of " +
-                                              s"device ${local.storageDeviceId} does not list")
-          backendFailed(storeId, Some(entry.store.backend), err, "is served from a copy its device's entry does not list")
+          val err = new IllegalStateException(s"$storePath holds a copy of store $storeId that $why")
+          backendFailed(storeId, Some(entry.store.backend), err, why)
         case _ => ()
 
   /** T10 for a closed copy of an attached device: moves the copy of `storeId` on `sds` into lost/, where it is never

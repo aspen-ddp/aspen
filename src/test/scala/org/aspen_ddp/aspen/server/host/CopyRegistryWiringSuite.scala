@@ -220,6 +220,35 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
     finally os.perms.set(closed, "rwx------")
 
+  // A copy placed after its device's load whose first stat fails is learned Unread by its load retry
+  // (HostCopies.awaitingRetry); the load that reads it cleanly refreshes the record (readAtLoad)
+  test("an Unread copy that later reads cleanly is refreshed at its load"):
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, deviceA)
+    val host = newHost(hostRoot, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    val dir = CopyLayout.path(dev, sid(0), None, Phase.Live)
+    org.aspen_ddp.aspen.server.store.backend.DefaultBackendOpener.createStore(
+      org.aspen_ddp.aspen.server.StoreConfig(sid(0), org.aspen_ddp.aspen.server.StoreConfig.RocksDB(None), None,
+        org.aspen_ddp.aspen.common.ida.Replication(3, 2)),
+      dir, dev / org.aspen_ddp.aspen.server.store.backend.StoreCreation.CreatingDirectory)
+    os.perms.set(dir, "rw-------")
+    val waiting =
+      try
+        // The fixture's tryLoadStore only records, so the loader's own is called, as a device scan's retry calls it
+        // No drain until the learn is taken: a strict drain fails on any copy a load had to learn
+        host.control.loader.tryLoadStore(local, dir)
+        host.control.loader.awaitingRetryWaitScans(sid(0))
+      finally os.perms.set(dir, "rwx------")
+    val learnedUnread = phases(host, deviceA)
+    host.control.copyRegistry.takeLearned().size should be(1)
+    host.control.loader.tryLoadStore(local, dir)
+    waiting should be(defined)
+    learnedUnread should be(Map(sid(0) -> Phase.Unread))
+    phases(host, deviceA) should be(Map(sid(0) -> Phase.Live))
+    consistent(host)
+
   test("a copy placed after its device's load is learned when a load offers it"):
     val hostRoot = newHostDir()
     val dev = device(hostRoot, deviceA)

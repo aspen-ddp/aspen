@@ -42,19 +42,25 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     @volatile var failing = false
     @volatile var stateLost = false
     @volatile var closeGate: Option[Future[Unit]] = None
+    @volatile var openGate: Option[Future[Unit]] = None
     @volatile var onFatals: List[Throwable => Unit] = Nil
     val opens = new AtomicInteger(0)
     override def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit): Future[Backend] =
       opens.incrementAndGet()
       onFatals = onFatal :: onFatals
-      if stateLost then
-        Future.failed(new BackendStateLost("injected: acknowledged state lost"))
-      else
+      def backend: Future[Backend] =
         Future.fromTry(Try(new RocksDBBackend(storePath, storeCfg.storeId, executionContext):
           override def hasFailed: Boolean = super.hasFailed || TestOpener.this.failing
           override def close(): Future[Unit] = closeGate match
             case None => super.close()
             case Some(gate) => gate.flatMap(_ => super.close())(using executionContext)))
+      if stateLost then
+        Future.failed(new BackendStateLost("injected: acknowledged state lost"))
+      else
+        // An open held by `openGate` completes once it does
+        openGate match
+          case None => backend
+          case Some(gate) => gate.flatMap(_ => backend)(using executionContext)
 
   /** A CRL whose next `failReads` reads of a store's state and next `failDrops` drops fail */
   private class FlakyCrl extends TestNetwork.TestCRL:
@@ -1008,6 +1014,13 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       _ = host.control.reconciler.checkAll()
     yield st.stores(moving).transferId.get
 
+  /** Gives a staged copy of `moving` its store config, as every shipped copy has: without one, an Active entry's
+   *  Missing Stores pass would rebuild the store */
+  private def configured(staged: os.Path): Unit =
+    os.makeDir.all(staged)
+    os.write.over(staged / StoreConfig.configFilename,
+      StoreConfig(moving, StoreConfig.RocksDB(None), None, ida).yamlConfig)
+
   /** Drains `host` until its transfer service has begun `n` transfers in */
   private def awaitBegun(host: Host, transfers: StagedTransferService, n: Int = 1): Future[Unit] =
     awaitLoudly(s"transfer in number $n to begin"):
@@ -1025,7 +1038,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       tid <- startMoving(host)
       _ <- awaitBegun(host, transfers)
       (_, attempt, staging) = transfers.transfersIn.head
-      _ = transfers.finishTransferIn(moving)
+      _ = transfers.finishTransferIn(moving, prepare = configured)
       _ <- awaitLoudly("the promotion"):
              host.testingOnlyHandleEvents()
              CopyFixtures.copyPath(dev, moving).isDefined
@@ -1088,7 +1101,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       for
         _ <- startMoving(host)
         _ <- awaitBegun(host, transfers)
-        _ = transfers.finishTransferIn(moving)
+        _ = transfers.finishTransferIn(moving, prepare = configured)
         _ <- awaitLoudly("the promotion"):
                host.testingOnlyHandleEvents()
                CopyFixtures.copyPath(dev, moving).isDefined
@@ -1132,31 +1145,119 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
         host.control.transfers.receiving.keySet should be(Set(moving))
         host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
-  atest("a transfer in waits while an earlier tenancy's Live copy is served, then retires it"):
+  atest("a transfer in retires an earlier tenancy's idle Live copy once a fresh read confirms it, then receives"):
     given ExecutionContext = executionContext
     val (hostRoot, dev) = receivingDevice(dev => CopyFixtures.placeCopy(dev, moving, Phase.Live): Unit)
     val transfers = new SnapshotTransfers(dev)
     val host = newHost(hostRoot, transferService = transfers)
     host.testingOnlyHandleEvents()
-    val local = loadedDevices(host)(net.secondDeviceId)
-    servedHere(host, local, moving)
     for
       _ <- startMoving(host)
-      _ <- pumpTx(host, transfers.transfersIn.nonEmpty, rounds = 5)
-      begunWhileServed = transfers.transfersIn.size
-      phaseWhileServed = CopyFixtures.phaseOf(dev, moving)
-      // Its serve ends, as a close leaves it
-      _ = host.control.copyRegistry.removedFromRouter(net.secondDeviceId, moving)
-      _ = host.control.copyRegistry.closeEnded(net.secondDeviceId, moving)
-      _ = host.control.reconciler.checkAll()
       _ <- awaitBegun(host, transfers)
     yield
-      begunWhileServed should be(0)
-      phaseWhileServed should be(Some(Phase.Live))
       transfers.atBegin.size should be(1)
       transfers.atBegin.head.map(_._2) should be(List(true))
       CopyFixtures.copyPath(dev, moving) should be(None)
       host.control.transfers.receiving.keySet should be(Set(moving))
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  // Review fix round 1: a reconcile whose tree read predates this transfer's pool update sees the entry TransferringIn
+  // over the Live copy recordTransferIn has just moved there. Its startIn must not take that copy for an earlier
+  // tenancy's: the fresh read of the device finds the entry Active
+  atest("a Live copy its own transfer moved live is not retired by a startIn read before the pool update"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = receivingDevice()
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(net.secondDeviceId)
+    for
+      tid <- startMoving(host)
+      _ <- awaitBegun(host, transfers)
+      _ = transfers.finishTransferIn(moving, prepare = configured)
+      _ <- pumpTx(host, recorded(host).transferOutcomes.contains(moving) &&
+                        !host.control.transfers.receiving.contains(moving))
+      liveAfterUpdate = recordOf(host, local, moving).map(r => (r.phase, r.activity))
+      // The stale pass: its snapshot read the entry TransferringIn for this transfer
+      _ = host.control.transfers.startIn(moving, host.hostId, StorageDeviceId.BootstrapStorageDeviceId,
+            net.secondDeviceId, Some(tid))
+      // Claimed at once, held across the fresh read; ended, with the device check it asks for, once the read is in
+      claimed = host.control.copyRegistry.copiesOf(local).flatMap(_.work.get(moving))
+      _ <- awaitLoudly("the stale startIn's fresh read and the check it asks for to end"):
+             host.testingOnlyHandleEvents()
+             host.control.copyRegistry.copiesOf(local).flatMap(_.work.get(moving)).isEmpty &&
+               host.control.reconciler.activeDeviceChecks.isEmpty
+      st <- client.getStorageDeviceState(net.secondDeviceId)
+    yield
+      recorded(host).transferOutcomes.get(moving) should be(Some(TransferOutcome.PoolRepointed))
+      liveAfterUpdate should be(Some((Phase.Live, Activity.Idle)))
+      claimed should be(Some(Work.TransferIn(None, TransferInStage.RetiringEarlierTenancy)))
+      st.stores(moving).status should be(StorageDeviceState.StoreStatus.Active)
+      CopyFixtures.phaseOf(dev, moving) should be(Some(Phase.Live))
+      CopyFixtures.copyPath(dev, moving) should be(Some(CopyLayout.path(dev, moving, None, Phase.Live)))
+      CopyFixtures.retiredCopies(dev, moving) should be(Nil)
+      inDir(dev, CopyLayout.LostDirectory) should be(Nil)
+      transfers.transfersIn.size should be(1)
+      host.control.copyRegistry.copiesOf(local).flatMap(_.work.get(moving)) should be(None)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("a transfer in takes an earlier tenancy's served Live copy out of service, then retires it and receives"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = receivingDevice(dev => rocksCopy(dev, moving): Unit)
+    val transfers = new SnapshotTransfers(dev)
+    val opener = new TestOpener
+    val host = realHost(hostRoot, opener, transfers = transfers)
+    host.testingOnlyHandleEvents()
+    val servedAtLoad = host.control.router.loaded.contains(moving)
+    @volatile var seen = Vector.empty[Phase]
+    @volatile var closings = Vector.empty[Activity]
+    host.control.copyRegistry.observer = (copies, sid) =>
+      if sid == moving && copies.deviceId == net.secondDeviceId then
+        copies.copies.get(sid).map(_.phase).foreach(p => if !seen.lastOption.contains(p) then seen :+= p)
+        copies.copies.get(sid).map(_.activity).collect { case c: Activity.Closing => c }.foreach: c =>
+          if !closings.lastOption.contains(c) then closings :+= c
+    for
+      _ <- startMoving(host)
+      // The checks that follow are the host's own: the close's end, then the retire's
+      _ <- awaitLoudly("the transfer in to begin"):
+             host.testingOnlyHandleEvents()
+             transfers.transfersIn.nonEmpty
+    yield
+      servedAtLoad should be(true)
+      host.control.router.loaded.contains(moving) should be(false)
+      // Closed FailStop, moved to lost/ once closed, then retired with its CRL state before the receive began
+      closings should be(Vector(Activity.Closing(ClosePurpose.FailStop)))
+      seen should be(Vector(Phase.Live, Phase.Lost, Phase.Retired))
+      transfers.atBegin.head.map(_._2) should be(List(true))
+      CopyFixtures.copyPath(dev, moving) should be(None)
+      host.control.transfers.receiving.keySet should be(Set(moving))
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("a transfer in waits while an earlier tenancy's Live copy is opening"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = receivingDevice(dev => rocksCopy(dev, moving): Unit)
+    val transfers = new SnapshotTransfers(dev)
+    val opener = new TestOpener
+    val gate = Promise[Unit]()
+    opener.openGate = Some(gate.future)
+    val host = realHost(hostRoot, opener, transfers = transfers)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(net.secondDeviceId)
+    for
+      _ <- startMoving(host)
+      _ <- pumpTx(host, transfers.transfersIn.nonEmpty, rounds = 10)
+      begunWhileOpening = transfers.transfersIn.size
+      whileOpening = recordOf(host, local, moving).map(r => (r.phase, r.activity.isInstanceOf[Activity.Opening]))
+      _ = gate.success(())
+      _ <- awaitLoudly("the transfer in to begin once the open ended"):
+             host.testingOnlyHandleEvents()
+             host.control.reconciler.checkAll()
+             transfers.transfersIn.nonEmpty
+    yield
+      begunWhileOpening should be(0)
+      whileOpening should be(Some((Phase.Live, true)))
+      transfers.atBegin.head.map(_._2) should be(List(true))
+      CopyFixtures.copyPath(dev, moving) should be(None)
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
   atest("a failed move to live keeps the arrived copy offline and the next check retries it"):
@@ -1171,7 +1272,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     for
       tid <- startMoving(host)
       _ <- awaitBegun(host, transfers)
-      _ = transfers.finishTransferIn(moving)
+      _ = transfers.finishTransferIn(moving, prepare = configured)
       _ <- pumpTx(host, recorded(host).transferOutcomes.contains(moving) &&
                         !host.control.transfers.receiving.contains(moving))
       phaseAfterFailure = CopyFixtures.phaseOf(dev, moving)
@@ -1224,7 +1325,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     for
       tid <- startMoving(host)
       _ <- awaitBegun(host, transfers)
-      _ = transfers.finishTransferIn(moving)
+      _ = transfers.finishTransferIn(moving, prepare = configured)
       _ <- pumpTx(host, host.control.router.loaded.contains(moving) ||
                         recorded(host).loadStoreByIdRequests.nonEmpty)
     yield

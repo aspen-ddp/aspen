@@ -205,8 +205,9 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ = crl.synchronized(crl.drops(moving)).failure(new Exception("CRL drop failed"))
       _ <- yieldUntil(!host.control.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(moving))
       retryScheduled = host.control.rebuilds.rebuildRetriesScheduled.contains(moving)
-      // The retry's check retires the copy as an earlier tenancy, and the check that follows starts the receive
-      _ = List(1, 2).foreach(_ =>
+      // The retry's check retires the copy as an earlier tenancy (once its fresh read of the device confirms the
+      // transfer), and the check that follows starts the receive
+      _ = List(1, 2, 3).foreach(_ =>
         recorded(host).armLookup(deviceA).success(deviceState(deviceA, Map(moving -> transferringIn))))
       _ = runRebuildRetries(host)
       _ <- pumpUntil(transfers.transfersIn.nonEmpty)

@@ -137,7 +137,11 @@
   record: none, receive; Unread, Retired or unsynced, wait; `Arrived(tid)` of this transfer with a valid save file,
   resume the pool update; Arrived of another transfer, or with an unusable save file, deleted rename-first (T13,
   `StoreCopies.delete`, the record removed) and received; any other phase, Live included, the earlier tenancy's,
-  retired (`retireEarlierTenancy`, below; the "store path already exists" refusal is gone). `startOut` refuses an
+  retired (`retireEarlierTenancy`, below; the "store path already exists" refusal is gone). The reconcile's tree
+  snapshot may predate this transfer's own pool update, after which `recordTransferIn` has moved the transfer's copy
+  Live, so `retireEarlierTenancy` claims its work (RetiringEarlierTenancy) and acts only once a fresh read of the
+  device's own state (`DeviceMetadata.lookupStorageDeviceState`) still shows the store TransferringIn for this
+  transfer id; anything else ends the work and checks the device again. `startOut` refuses an
   Arrived copy (P10). `discardArrivedTransferIn` (SourceRestored, Aborted) deletes the record's path
 - `CopyPhase` (`Phase`: Live, Arrived, Outbound, Rebuilt, Parked, Lost, Retired, and stage 1's Unread) names the
   phases. `CopyPhase.read` reads no marker: a flat copy is Live, and `Unread` no longer arises from a listing.
@@ -507,11 +511,14 @@
     Outbound or Lost) an earlier tenancy left on a device a store is transferring onto (re-placed away while the
     host was down, then transferred back; a store transferred back onto its old source; rebuild-process, P1). Its
     retire moves it to Lost first (T10, "stopped being the owner's"). It retires before asking for bytes, so the
-    earlier copy's device-CRL entries are saved before the new copy's first, save-file load drops them; it waits
-    while a rebuild of the store runs here, the store is opening, or the copy here is served, opening or closing
-    (not while the transfer's source is served from another device of this host: it closes only for the
-    StartStoreTransfer sent once the copy is retired), and checks the device again once it is retired, which
-    starts the transfer.
+    earlier copy's device-CRL entries are saved before the new copy's first, save-file load drops them, and only
+    after a fresh read of the device's state confirms the store is still TransferringIn for this transfer (above).
+    It waits while a rebuild of the store runs here, the store is opening, or the copy here is opening or closing.
+    A copy served from this device is not the owner's: it is taken out of service as a failed backend is
+    (`StoreRebuilds.takeOutOfService`, shared with `retireUnlistedServed`: FailStop close, moved to lost/ when the
+    close ends), and the check the close's end makes retires it. The transfer's source served from another device of
+    this host is left (it closes only for the StartStoreTransfer sent once the copy is retired). It checks the device
+    again once the copy is retired, which starts the transfer.
   - The Deleted Stores pass, for an offline store whose entry has left the device. The store stays offline until its
     path is clear, so a failed retire is retried.
     A store served from the device that its entry does not list (a copy put back by hand: `tryLoadStore` reads no

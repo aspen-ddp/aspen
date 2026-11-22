@@ -1,10 +1,12 @@
 package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
-import org.aspen_ddp.aspen.client.AspenClient
+import org.aspen_ddp.aspen.client.{AspenClient, TransactionOutcomeUnknown}
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.objects.KeyValueObjectPointer
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.TransactionDescription
 import org.aspen_ddp.aspen.server.{Host, StorageDeviceConfig}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
@@ -142,3 +144,60 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       discarding should be(true)
       os.exists(storePath) should be(false)
       factory.created.map(_.episode).toList should be(List(Some(e2)))
+
+  /** C4: a create's flip commits Active but is reported Unknown. Before its retry, a backend failure has the store
+   *  requested for rebuild and a check queues the rebuild (silenced). The create's work ended when its copy was
+   *  served, so the two never overlap; and while the flip is still pending a second create is not started. */
+  atest("a rebuild requested while a create's flip is pending does not overlap Create (C4)"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new HeldRebuildFactory
+    // No slot: the rebuild stays queued, its only work the silence
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 0)
+    val tclient = client.asInstanceOf[TestNetwork.TClient]
+    // A real pool, so the create gets as far as serving the store
+    val creating = StoreId(PoolId.BootstrapPoolId, 0)
+    @volatile var hooked = false
+    @volatile var createWorkAtRetry = true
+    @volatile var createWorkAfterSecondCreate = true
+    @volatile var createWorkWhileQueued = true
+    @volatile var queued = false
+
+    def touches(ptr: KeyValueObjectPointer)(txd: TransactionDescription): Boolean =
+      txd.allReferencedObjectsSet.exists(_.id == ptr.id)
+
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.setStoreEntry(creating, StorageDeviceState.StoreStatus.Initializing, None))
+      _ <- waitForTransactionsToComplete()
+      devPtr <- client.getStorageDevicePointer(deviceA)
+      _ = net.reportCommitAsUnknown(touches(devPtr))
+      _ = tclient.beforeRetry =
+        case _: TransactionOutcomeUnknown if !hooked =>
+          hooked = true
+          val local = loadedDevices(host)(deviceA)
+          createWorkAtRetry = host.control.rebuilds.isCreating(creating)
+          // A check that read the entry Initializing before the flip committed
+          host.control.rebuilds.createNewStore(local, creating)
+          createWorkAfterSecondCreate = host.control.rebuilds.isCreating(creating)
+          for
+            _ <- setDeviceState(deviceA)(_.setRebuilding(creating, UUID.randomUUID()))
+            _ = host.control.reconciler.checkStorageDevice(deviceA)
+            _ <- yieldUntil(host.control.rebuilds.silencedStores.contains(creating) &&
+                            !host.control.reconciler.activeDeviceChecks.contains(deviceA))
+          yield
+            queued = host.control.rebuilds.silencedStores.contains(creating)
+            createWorkWhileQueued = host.control.rebuilds.isCreating(creating)
+        case _ => Future.unit
+      _ = host.control.reconciler.checkStorageDevice(deviceA)
+      _ <- pumpUntil(hooked && !host.control.rebuilds.createFlipsPending.contains(creating), drain = Some(host))
+      _ = tclient.beforeRetry = _ => Future.unit
+    yield
+      hooked should be(true)
+      createWorkAtRetry should be(false)
+      createWorkAfterSecondCreate should be(false)
+      queued should be(true)
+      createWorkWhileQueued should be(false)
+      host.control.rebuilds.createFlipsPending should not contain creating
+      recorded(host).loadStoreRequests.toList should be(List((deviceA, creating)))

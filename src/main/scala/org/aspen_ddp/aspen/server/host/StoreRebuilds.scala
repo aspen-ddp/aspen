@@ -31,7 +31,11 @@ import scala.util.control.NonFatal
 class StoreRebuilds(ctx: DeviceControl) extends Logging:
   import ctx.given
 
+  // Create work (createNewStore): from the create's start until its copy is served, its open fails, or the create is
+  // skipped. The flip that follows touches no copy, so it is tracked apart (pendingCreateFlips): a store in either set
+  // is not created again, and only the first is work on the (device, store)
   private var creatingStores: Set[StoreId] = Set()
+  private var pendingCreateFlips: Set[StoreId] = Set()
 
   private var rebuildingStores: Map[StoreId, StoreRebuild] = Map()
   // The device each one in rebuildingStores runs on
@@ -80,6 +84,12 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private[host] def hasRebuildWork(storeId: StoreId, deviceId: StorageDeviceId): Boolean =
     silenced.get(storeId).contains(deviceId) || droppingCrlState.get(storeId).contains(deviceId) ||
       rebuildDevices.get(storeId).contains(deviceId)
+
+  /** Whether create work for the store runs here: its copy not yet served, nor its open failed (createNewStore) */
+  private[server] def isCreating(storeId: StoreId): Boolean = creatingStores.contains(storeId)
+
+  /** The created stores whose flip out of Initializing has not completed yet */
+  private[server] def createFlipsPending: Set[StoreId] = pendingCreateFlips
 
   /** Rebuilt stores whose rebuild-complete marker removal awaits a retry by the Completed Rebuilds pass */
   private[server] def markerRemovalsPending: Set[StoreId] = pendingMarkerRemovals
@@ -137,15 +147,22 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  create sees the shutdown.
    *
    *  Only a collision is retried. Any other failure -- the pool cannot be read, the directory
-   *  cannot be written -- is logged and releases creatingStores, so the next check tries again
+   *  cannot be written -- is logged and releases pendingCreateFlips, so the next check tries again
    *  rather than a silent retry loop running for the life of the process.
+   *
+   *  The create's work on the store (creatingStores) ends when its copy is served, its open fails, or the create is
+   *  skipped, not when the flip completes: once served, the copy is a store like any other, and a backend failure may
+   *  have it rebuilt (or an operator transfer it) as soon as the flip commits. pendingCreateFlips, which holds until
+   *  the flip completes, keeps a check meanwhile from creating it again (I3: one piece of work per (device, store)).
    */
   def createNewStore(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     val storePath = local.devicePath / storeId.directoryName
     val deviceId = local.storageDeviceId
 
-    if ! creatingStores.contains(storeId) && ! ctx.shutdown.isShuttingDown(deviceId) then
+    if ! creatingStores.contains(storeId) && ! pendingCreateFlips.contains(storeId) &&
+       ! ctx.shutdown.isShuttingDown(deviceId) then
       creatingStores += storeId
+      pendingCreateFlips += storeId
 
       // True when the store exists on disk (created here, or by an attempt that crashed before
       // its flip), false when the create was skipped for a shutdown. A stat that fails (FileStat) fails the flip, which
@@ -169,6 +186,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               val created = Promise[Unit]()
               ctx.loader.startOpen(local, storeConfig, storePath, create = true, Some(created))
               created.future.map(_ => true)
+
+      // The create's work ends here: served, failed, or skipped. Registered before the flip's callback, which runs
+      // only once fcreate has completed
+      fcreate.onComplete(_ => creatingStores -= storeId)
 
       // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
       // the control-context onComplete; the prepare closure's combinators run on the control thread
@@ -199,7 +220,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         result.failed.foreach: t =>
           logger.error(s"Failed to create store $storeId on device $deviceId. The next check of the " +
                        s"device will try again. Error: $t")
-        creatingStores -= storeId
+        // fcreate completed first, so creatingStores no longer holds it
+        pendingCreateFlips -= storeId
 
   /** Begins reconstruction of one store from the rest of its pool.
    *

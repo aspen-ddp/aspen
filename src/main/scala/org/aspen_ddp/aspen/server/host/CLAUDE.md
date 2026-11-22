@@ -49,7 +49,10 @@
 - Store creation is atomic (`BackendOpener.create`, `server.store.backend.StoreCreation`,
   systemic-loss-protection 4.1): `startOpen` with `create` (only `StoreRebuilds.createNewStore`) builds the
   store in `<device>/creating/` and renames it to its path before opening it, so a store directory exists only
-  complete and `open` never creates.
+  complete and `open` never creates. The create's work (`creatingStores`) ends when its copy is served, its open
+  fails or the create is skipped, not at the flip out of Initializing, which touches no copy: once the flip commits,
+  a rebuild or transfer out of the served store may start, and must not overlap the create (I3). The pending flip
+  is tracked apart (`pendingCreateFlips`), so a check meanwhile does not create the store again.
   A failed create, out of space included, leaves nothing at the path and is not put in `storesAwaitingRetry`: its
   entry stays Initializing and the next device check creates it again. Any other failed open but a lost state (out of
   space, an I/O, lock or resource error) leaves the store offline, unmarked, and in `storesAwaitingRetry`: each

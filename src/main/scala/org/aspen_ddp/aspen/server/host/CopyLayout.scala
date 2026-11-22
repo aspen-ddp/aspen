@@ -12,16 +12,19 @@ import scala.util.Try
  *  with the phase's parameter in the copy's own file for that phase, `phase-param.<phase directory>` (paramFile): a
  *  move writes only its target phase's file, and a location reads only its own, so a move that fails or a crash
  *  before its rename leaves the source's parameter as it was, and a stale file of an earlier phase is inert. A phase
- *  not converted yet is the flat path, `<device>/<storeId.directoryName>`, whose marker files say the phase
+ *  not converted yet (only Live, after Task 5) is the flat path, `<device>/<storeId.directoryName>`
  *  (CopyPhase). Code never builds a copy's path
  *  itself: it asks here, or the registry (HostCopies.pathOf).
  *
- *  Stage 2 converts the phases one task at a time; so far Outbound (`outbound/`, its transfer id in
- *  `phase-param.outbound`), Rebuilt (`rebuilt/`, its episode in `phase-param.rebuilt`), Parked (`parked/`), Lost
+ *  Stage 2 converts the phases one task at a time; so far Arrived (`arrived/`, its transfer id in
+ *  `phase-param.arrived`), Outbound (`outbound/`, its transfer id in `phase-param.outbound`), Rebuilt (`rebuilt/`, its episode in `phase-param.rebuilt`), Parked (`parked/`), Lost
  *  (`lost/`) and Retired (`pending-delete/`) are directories. */
 object CopyLayout:
   /** The directory of Lost copies: their CRL state is gone or unusable, and they await their retire */
   val LostDirectory = "lost"
+
+  /** The directory of Arrived copies: transferred in, awaiting their pool update (T8) */
+  val ArrivedDirectory = "arrived"
 
   /** The directory of Outbound copies: closed for a transfer out, their state in crl_save.log (T6) */
   val OutboundDirectory = "outbound"
@@ -35,6 +38,7 @@ object CopyLayout:
   /** The converted phase directories, by name, each with the phase of a child copy there (reading that phase's own
    *  parameter file, readParam, for a phase that carries one). Each task that converts a phase adds its row */
   private val phaseDirectories: List[(String, os.Path => Phase)] = List(
+    ArrivedDirectory -> (p => Phase.Arrived(readParam(p, Phase.Arrived("")))),
     OutboundDirectory -> (p => Phase.Outbound(readParam(p, Phase.Outbound("")))),
     RebuiltDirectory -> (p => Phase.Rebuilt(readParam(p, Phase.Rebuilt("")))),
     ParkedDirectory -> (_ => Phase.Parked),
@@ -44,8 +48,9 @@ object CopyLayout:
   /** Whether `name`, a child of a device root, is a phase directory (it holds copies; it is none itself) */
   def isPhaseDirectory(name: String): Boolean = phaseDirectories.exists(_._1 == name)
 
-  /** The directory of `phase` under the device root, None while the phase is still a flat marker copy */
+  /** The directory of `phase` under the device root, None for Live, still the flat path */
   def dirOf(phase: Phase): Option[String] = phase match
+    case Phase.Arrived(_) => Some(ArrivedDirectory)
     case Phase.Outbound(_) => Some(OutboundDirectory)
     case Phase.Rebuilt(_) => Some(RebuiltDirectory)
     case Phase.Parked => Some(ParkedDirectory)
@@ -54,7 +59,7 @@ object CopyLayout:
     case _ => None
 
   /** The phase a copy at `path` is in by its location: Some for a copy named as one (copyName) in a converted phase
-   *  directory, None for any other path (a flat copy, whose markers say its phase). Throws a failed read of the
+   *  directory, None for any other path (a flat copy, Live). Throws a failed read of the
    *  phase's parameter file */
   def phaseAt(path: os.Path): Option[Phase] =
     if parseName(path.last).isEmpty then
@@ -62,7 +67,7 @@ object CopyLayout:
     else
       phaseDirectories.collectFirst { case (name, phaseOf) if (path / os.up).last == name => phaseOf(path) }
 
-  /** The phase of the copy at `path`: by location in a phase directory (phaseAt), else what its markers read
+  /** The phase of the copy at `path`: by location in a phase directory (phaseAt), else the flat copy's (CopyPhase)
    *  (CopyPhase.known), None where they cannot be read */
   def knownPhase(path: os.Path): Option[Phase] =
     Try(phaseAt(path)).toOption.flatMap(byLocation => byLocation.orElse(CopyPhase.known(path)))
@@ -126,7 +131,7 @@ object CopyLayout:
    *  directory or device file ever does) and it is a directory, or its stat fails (it may be a store). One without a
    *  `config.yaml` is a copy that lost it, which the Missing Stores pass rebuilds and a retire takes; whoever needs a
    *  configured store (the CRL-lost decision, the drain's disk check) tests the config itself. Its phase is Unread
-   *  where its markers cannot be read: its load reads them again. A device path that is not a directory lists
+   *  where its phase cannot be read. A device path that is not a directory lists
    *  nothing */
   def list(devicePath: os.Path): Listing =
     if !FileStat.isDir(devicePath) then

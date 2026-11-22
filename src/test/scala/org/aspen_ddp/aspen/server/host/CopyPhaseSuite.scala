@@ -2,14 +2,12 @@ package org.aspen_ddp.aspen.server.host
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
+/** CopyPhase reads no marker any more (stage 2, Task 5): a flat copy is Live, whatever files it carries. Task 6 deletes
+ *  the reader */
 class CopyPhaseSuite extends AnyFunSuite with Matchers:
-
-  private val TI = StoreTransfer.TransferredInMarkerFile
-  private val RC = "rebuild-complete"
 
   private def withStore(markers: (String, String)*)(f: os.Path => Unit): Unit =
     val dir = os.temp.dir()
@@ -25,25 +23,14 @@ class CopyPhaseSuite extends AnyFunSuite with Matchers:
       CopyPhase.read(dir) should be(Phase.Live)
       CopyPhase.known(dir) should be(Some(Phase.Live))
 
-  test("the transferred-in marker maps to Arrived with its content"):
-    withStore(TI -> " t1\n")(dir => CopyPhase.read(dir) should be(Phase.Arrived("t1")))
-    withStore(TI -> "")(dir => CopyPhase.read(dir) should be(Phase.Arrived("")))
-
-  test("content is kept verbatim: garbage is distinct from empty"):
-    withStore(TI -> " xyz\n")(dir => CopyPhase.read(dir) should be(Phase.Arrived("xyz")))
+  test("parameters are kept verbatim: garbage is distinct from empty"):
     Phase.Arrived("xyz") should not be(Phase.Arrived(""))
     Phase.Rebuilt("xyz") should not be(Phase.Rebuilt(""))
     Phase.Outbound("xyz") should not be(Phase.Outbound(""))
 
-  test("Lost, Outbound, Rebuilt and Parked are never read from markers"):
+  test("no phase is read from a former marker file"):
     val u = UUID.randomUUID()
     withStore("rebuild-required" -> "")(dir => CopyPhase.read(dir) should be(Phase.Live))
     withStore("transferring-out" -> "t")(dir => CopyPhase.read(dir) should be(Phase.Live))
-    withStore(RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Live))
-    withStore(TI -> "t1", RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Arrived("t1")))
-
-  test("a failed stat throws and known answers None"):
-    withStore(TI -> ""): dir =>
-      os.perms.set(dir, "rw-------")
-      an[java.io.IOException] should be thrownBy CopyPhase.read(dir)
-      CopyPhase.known(dir) should be(None)
+    withStore("rebuild-complete" -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Live))
+    withStore("transferred-in" -> "t1")(dir => CopyPhase.read(dir) should be(Phase.Live))

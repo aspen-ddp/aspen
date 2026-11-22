@@ -90,7 +90,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     host.control.copyRegistry.device(deviceA).get.copies.values.map(_.activity).toSet should be(Set(Activity.Idle))
     host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
 
-  test("an unreadable copy registers Unread and stays silent"):
+  // No marker is read any more (Task 5): a flat copy that cannot be read is Live by its location, and its load's
+  // config read waits (StoreLoader.awaitUnreadRetry)
+  test("an unreadable copy registers Live and stays silent"):
     val hostRoot = newHostDir()
     val dev = device(hostRoot, deviceA)
     val dir = writeStoreConfig(dev, sid(0))
@@ -99,7 +101,8 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       val host = newHost(hostRoot, verifyCopyRegistry = true)
       // The drain's check skips what cannot be read: it neither throws nor reports
       host.testingOnlyHandleEvents()
-      phases(host, deviceA) should be(Map(sid(0) -> Phase.Unread))
+      phases(host, deviceA) should be(Map(sid(0) -> Phase.Live))
+      host.control.router.silentStores should contain(sid(0))
       host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
     finally os.perms.set(dir, "rwx------")
@@ -195,7 +198,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     host.control.transfersOut.startOut(StartStoreTransfer(host.hostId, client.clientId, source, shipped,
       HLCTimestamp.now, UUID.randomUUID())).transform(Success(_))
 
-  test("attach registers a child whose stat fails as Unread, and never throws"):
+  test("attach registers a child whose stat fails, and never throws"):
     val hostRoot = newHostDir()
     device(hostRoot, deviceA)
     val host = newHost(hostRoot, verifyCopyRegistry = true)
@@ -213,31 +216,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
         new org.aspen_ddp.aspen.TestNetwork.TestCRL)
       os.makeDir.all(other / "not-a-store")
       noException should be thrownBy host.control.copyRegistry.attach(sds, CopyLayout.list(other))
-      phases(host, deviceB) should be(Map(sid(0) -> Phase.Unread))
+      phases(host, deviceB) should be(Map(sid(0) -> Phase.Live))
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
     finally os.perms.set(closed, "rwx------")
-
-  test("an Unread copy that later reads cleanly is refreshed at its load"):
-    val hostRoot = newHostDir()
-    val dev = device(hostRoot, deviceA)
-    val dir = CopyFixtures.placeCopy(dev, sid(0), Phase.Arrived("ep"))
-    os.perms.set(dir, "rw-------")
-    val (host, waiting) =
-      try
-        val h = newHost(hostRoot, verifyCopyRegistry = true)
-        h.testingOnlyHandleEvents()
-        // The device loaded, and only this store waits for a retry: the fixture's tryLoadStore only records, so the
-        // loader's own is called, as a device scan's retry calls it
-        h.control.loader.tryLoadStore(loadedDevices(h)(deviceA), dir)
-        h.testingOnlyHandleEvents()
-        (h, h.control.loader.awaitingRetryWaitScans(sid(0)))
-      finally os.perms.set(dir, "rwx------")
-    val local = loadedDevices(host)(deviceA)
-    waiting should be(defined)
-    phases(host, deviceA) should be(Map(sid(0) -> Phase.Unread))
-    host.control.loader.tryLoadStore(local, dir)
-    phases(host, deviceA) should be(Map(sid(0) -> Phase.Arrived("ep")))
-    consistent(host)
 
   test("a copy placed after its device's load is learned when a load offers it"):
     val hostRoot = newHostDir()
@@ -245,10 +226,16 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
     val local = loadedDevices(host)(deviceA)
-    val dir = CopyFixtures.placeCopy(dev, sid(0), Phase.Arrived("t"))
+    // A flat copy, the only kind a load learns at its path (a copy in a phase directory is learned at its device's
+    // attach or rescan): a real store, whose open succeeds
+    val dir = CopyLayout.path(dev, sid(0), None, Phase.Live)
+    org.aspen_ddp.aspen.server.store.backend.DefaultBackendOpener.createStore(
+      org.aspen_ddp.aspen.server.StoreConfig(sid(0), org.aspen_ddp.aspen.server.StoreConfig.RocksDB(None), None,
+        org.aspen_ddp.aspen.common.ida.Replication(3, 2)),
+      dir, dev / org.aspen_ddp.aspen.server.store.backend.StoreCreation.CreatingDirectory)
     host.control.copyRegistry.verifyAgainstDisk().size should be(1)
     host.control.loader.tryLoadStore(local, dir)
-    phases(host, deviceA) should be(Map(sid(0) -> Phase.Arrived("t")))
+    phases(host, deviceA) should be(Map(sid(0) -> Phase.Live))
     host.control.copyRegistry.takeLearned().size should be(1)
     host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
     host.control.copyRegistry.takeRegistryErrors() should be(Vector())
@@ -936,12 +923,13 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       val copies = registry.copiesOf(local).get
       // Idle -> Closing is not in the table: applied anyway
       registry.removedFromRouter(deviceA, sid(0))
-      // Arrived(t) -> Arrived(u) is not in the table: the disk reads Live, so Live is recorded
-      copies.applyPhase(sid(1), Phase.Arrived("t"), Phase.Arrived("t"))
-      registry.placed("test", local, sid(1), Phase.Arrived("u"))
+      // A copy placed over a record of another (P2) is applied anyway: the placed copy is recorded
+      val placedId = java.util.UUID.randomUUID()
+      registry.placed("test", local, sid(1), Phase.Arrived("u"), placedId, unsynced = false)
       val errors = registry.takeRegistryErrors()
       copies.copies(sid(0)).activity should be(Activity.Closing(ClosePurpose.FailStop))
-      copies.copies(sid(1)).phase should be(Phase.Live)
+      copies.copies(sid(1)).phase should be(Phase.Arrived("u"))
+      copies.copies(sid(1)).copyId should be(Some(placedId))
       if strictMode then
         errors.size should be(2)
         errors.exists(_.contains("router remove")) should be(true)
@@ -1036,23 +1024,23 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     host.control.copyRegistry.silence(sid(3)) should be(Silence.Silent(Set(SilenceReason.CopyHere)))
     host.control.router.answersUnknown(sid(3)) should be(false)
 
-  // R6: marker durability is uniform, and the same for a move (Outbound's T7, into the flat path): a removal or move
-  // whose directory sync fails after it landed leaves the copy unsynced, and it is never loaded until a later device
-  // check forces the directory again, which loads it
-  for (name, phase) <- List(("TI", Phase.Arrived("x")), ("Outbound, moved to Live", Phase.Outbound("x")),
-                            ("RC", Phase.Rebuilt("x"))) do
-    atest(s"a failed sync after removing any marker leaves the copy unsynced and unloaded, and the next check loads it ($name)"):
+  // R6: a move into the flat path (Arrived's T9, Outbound's T7, Rebuilt's T3) whose directory sync fails after it
+  // landed leaves the copy unsynced, and it is never loaded until a later device check forces the directory again,
+  // which loads it
+  for (name, phase) <- List(("Arrived, moved to Live", Phase.Arrived("x")), ("Outbound, moved to Live", Phase.Outbound("x")),
+                            ("Rebuilt, moved to Live", Phase.Rebuilt("x"))) do
+    atest(s"a failed sync after a move to live leaves the copy unsynced and unloaded, and the next check loads it ($name)"):
       given ExecutionContext = executionContext
       val hostRoot = newHostDir()
       val dev = device(hostRoot, deviceA)
       val placed = CopyFixtures.placeCopy(dev, sid(0), phase)
-      // The directory whose sync fails: the copy's own for a marker, the one it leaves for a move
-      val failing = if CopyLayout.dirOf(phase).isDefined then placed / os.up else placed
+      // The directory whose sync fails: the one the move leaves
+      val failing = placed / os.up
       val dir = CopyLayout.path(dev, sid(0), None, Phase.Live)
       val host = newHost(hostRoot, verifyCopyRegistry = true)
       var failSync = true
       var syncs = List.empty[os.Path]
-      host.control.markers.syncDirectory = d =>
+      host.control.moves.syncDirectory = d =>
         syncs = d :: syncs
         if failSync && d == failing then throw new java.io.IOException("injected directory sync failure")
       host.testingOnlyHandleEvents()
@@ -1136,7 +1124,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       val dir = CopyLayout.path(dev, sid(0), None, Phase.Live)
       val host = newHost(hostRoot, verifyCopyRegistry = true)
       var failSync = true
-      host.control.markers.syncDirectory = d =>
+      host.control.moves.syncDirectory = d =>
         if failSync && d == placed / os.up then throw new java.io.IOException("injected directory sync failure")
       host.testingOnlyHandleEvents()
       def entry(status: StorageDeviceState.StoreStatus) =

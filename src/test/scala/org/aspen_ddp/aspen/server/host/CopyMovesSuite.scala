@@ -7,7 +7,6 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{DurableFiles, Host}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
-import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 
 import java.util.UUID
 import scala.concurrent.Future
@@ -80,21 +79,6 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     host.control.copyRegistry.pathOf(local, s) should be(Some(newPath))
     host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
-  test("a copy leaving a phase directory for the flat path is stripped of markers first, or not moved"):
-    val (host, _, _) = withDevice()
-    val tdir = scratch()
-    val copy = tdir / "a" / "copy"
-    os.makeDir.all(copy)
-    os.write(copy / StoreTransfer.TransferredInMarkerFile, "")
-    host.control.moves.syncDirectory = d => if d == copy then throw injected()
-    host.control.moves.relocate(copy, tdir / "flat", fromFlat = false, toFlat = true, Phase.Live) shouldBe
-      a[MoveResult.NotMoved]
-    os.isDir(copy) should be(true)
-    host.control.moves.syncDirectory = DurableFiles.syncDirectory
-    host.control.moves.relocate(copy, tdir / "flat", fromFlat = false, toFlat = true, Phase.Live) should be(
-      MoveResult.Durable)
-    os.list(tdir / "flat") should be(Nil)
-
   test("a sync that fails after the rename leaves the record unsynced and the next resync clears it"):
     val (host, local, dev) = withDevice()
     val target = dev / CopyLayout.dirOf(Phase.Retired).get
@@ -126,8 +110,7 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(tdir / "outbound")
     os.write(copy / CopyLayout.paramFile(Phase.Rebuilt("")).get, "episode-e")
     host.control.moves.rename = (_, _) => throw injected()
-    host.control.moves.relocate(copy, tdir / "outbound" / "copy", fromFlat = false, toFlat = false,
-      Phase.Outbound("transfer-t")) shouldBe a[MoveResult.NotMoved]
+    host.control.moves.relocate(copy, tdir / "outbound" / "copy", Phase.Outbound("transfer-t")) shouldBe a[MoveResult.NotMoved]
     host.testingOnlyHandleEvents()
     os.isDir(copy) should be(true)
     CopyLayout.readParam(copy, Phase.Rebuilt("")) should be("episode-e")

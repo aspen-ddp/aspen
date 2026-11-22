@@ -9,12 +9,8 @@ import java.util.UUID
 import scala.concurrent.{Future, Promise}
 
 object StoreTransfer:
-  /** Present in a store directory that has arrived and been moved into place, but whose pool
-   *  metadata has not yet been confirmed to name the receiving device; hosts do not load a store
-   *  carrying this marker. Removed only once the pool has been repointed. */
-  val TransferredInMarkerFile: String = "transferred-in"
-
-  /** Per-device directory that incoming stores are extracted into before being moved into place */
+  /** Per-device directory that incoming stores are extracted into before being moved into place: each receive attempt
+   *  stages under its own `transferring-in/<transferUUID>` (host.StoreTransfers.stagingOf) */
   val StagingDirectory: String = "transferring-in"
 
 /** Moves whole store directories between hosts. Each transfer attempt is identified by a

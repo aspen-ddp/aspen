@@ -461,7 +461,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val rebuilt = StoreId(PoolId.BootstrapPoolId, 0)
     var syncs = List.empty[os.Path]
     var failSync = true
-    host.control.markers.syncDirectory = dir =>
+    host.control.moves.syncDirectory = dir =>
       syncs = dir :: syncs
       if failSync then throw new java.io.IOException("injected directory sync failure")
 

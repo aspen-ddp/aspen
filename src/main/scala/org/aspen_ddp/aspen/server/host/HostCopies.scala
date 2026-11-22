@@ -56,10 +56,10 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   private var parkedRetries: Map[(StorageDeviceId, StoreId), LoadRetry] = Map()
   // Throws of the silence path (onChange), for the drain check
   private var silenceErrors: Vector[String] = Vector()
-  // Store paths whose marker change could not be synced before their device was attached (unsynced): its attach
+  // Store paths whose move could not be synced before their device was attached (unsynced): its attach
   // marks their records
   private var unsyncedPaths: Set[os.Path] = Set()
-  // Copies held back from loading for a marker change whose sync failed (unsynced), by device and store: held until
+  // Copies held back from loading for a move whose sync failed (unsynced), by device and store: held until
   // a load opens or installs them, or they leave their path or device, so every later device check that finds one
   // synced, free and Active loads it (DeviceReconciler.loadResynced), not only the check whose re-sync succeeded
   private var heldForSync: Set[(StorageDeviceId, StoreId)] = Set()
@@ -684,7 +684,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     pathOf(sds, storeId).getOrElse(CopyLayout.path(sds.devicePath, storeId, None, Phase.Live))
 
   /** A fact: CopyMoves moved the copy of `storeId` on `sds` to `to`, as `copyId`, durably unless `unsynced` (then held
-   *  for its load, as an unsynced marker change is; a copy unsynced before stays so). A move to Retired that leaves
+   *  for its load, as any unsynced copy is; a copy unsynced before stays so). A move to Retired that leaves
    *  the copy synced takes it out of the registry (P3); one that does not stays recorded, Retired and unsynced, until a
    *  resync forces it (synced). A move releases any hold of the copy for a failed move to Lost (CopyMoves) */
   def moved(site: String, sds: LocalStorageDeviceState, storeId: StoreId, to: Phase, copyId: java.util.UUID,
@@ -735,18 +735,9 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
             violation(site, s"record of $storeId is ${r.phase} as ${r.copyId}, its rebuild placed $phase as $copyId")
             copies.applyMove(storeId, phase, copyId, unsynced = false): Unit
 
-  /** A marker was written to or removed from the copy at `storePath` (CopyMarkers): its phase is what its markers
-   *  say now (CopyPhase), Unread where they cannot be read */
-  def markersChanged(site: String, storePath: os.Path): Unit =
-    fact(site):
-      copiesAt(storePath).foreach: (copies, storeId) =>
-        val now = CopyPhase.known(storePath).getOrElse(Phase.Unread)
-        if !copies.copies.get(storeId).exists(_.phase == now) then
-          copies.applyPhase(storeId, now, now).foreach(violation(site, _))
-
-  /** A marker write or removal at `storePath` reached the directory but its sync failed (CopyMarkers): its copy is
-   *  unsynced, never loaded, shipped or retired until a device check forces the directory again. A copy of a device
-   *  not attached yet (an adoption, a lost CRL's marks) is held here until its attach */
+  /** A move of the copy now at `storePath` landed but its sync failed (CopyMoves): its copy is unsynced, never
+   *  loaded, shipped or retired until a device check forces the directories again. A copy of a device not attached
+   *  yet (an adoption's or a lost CRL's moves) is held here until its attach */
   def unsynced(site: String, storePath: os.Path): Unit =
     fact(site):
       copiesAt(storePath) match
@@ -773,7 +764,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     unsyncedPaths.contains(storePath) ||
       copiesAt(storePath).exists((copies, storeId) => copies.copies.get(storeId).exists(_.unsynced))
 
-  /** The stores of `local`'s copies held back from loading for an unsynced marker change and not loaded since */
+  /** The stores of `local`'s copies held back from loading for an unsynced move and not loaded since */
   def heldForSyncOn(local: LocalStorageDeviceState): Set[StoreId] =
     copiesOf(local).map(c => heldForSync.collect { case (id, s) if id == c.deviceId => s }).getOrElse(Set())
 
@@ -786,15 +777,18 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     copiesOf(local).toList.flatMap(_.copies.values.filter(_.unsynced).map(_.storeId))
       .sortBy(s => (s.poolId.uuid, s.poolIndex))
 
-  /** A copy now at `storeId`'s path on `sds`, in `phase`: registered, or, where a record is there already, moved to
-   *  `phase`. A fact: the copy is at the path whatever the registry held */
-  def placed(site: String, sds: LocalStorageDeviceState, storeId: StoreId, phase: Phase): Unit =
+  /** A copy placed from a scratch area into `phase` on `sds` as `copyId` (CopyMoves.place: a transfer's promotion,
+   *  T8), durably unless `unsynced`: registered. A fact: the copy is there whatever the registry held, so a record of
+   *  another copy (a bug: P2 keeps one copy of a store per device) is recorded as a violation and takes this copy */
+  def placed(site: String, sds: LocalStorageDeviceState, storeId: StoreId, phase: Phase, copyId: java.util.UUID,
+             unsynced: Boolean): Unit =
     fact(site):
       copiesOf(sds).foreach: copies =>
         copies.copies.get(storeId) match
-          case Some(r) if r.phase == phase => ()
-          case Some(_) => phaseFact(site, copies, storeId, phase)
-          case None => copies.register(storeId, phase)
+          case None => copies.register(storeId, phase, Some(copyId), unsynced)
+          case Some(r) =>
+            violation(site, s"record of $storeId is ${r.phase} as ${r.copyId}, $site placed $phase as $copyId")
+            copies.applyMove(storeId, phase, copyId, unsynced): Unit
 
   /** The copy at `storeId`'s path on `sds` left it: retired into pending-delete, or deleted */
   def removed(site: String, sds: LocalStorageDeviceState, storeId: StoreId): Unit =

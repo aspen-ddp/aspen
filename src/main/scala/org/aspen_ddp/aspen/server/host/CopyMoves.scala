@@ -22,26 +22,19 @@ enum MoveResult:
  *  Every phase change of a copy between phase directories (spec "Uniform move and Unsynced"): the target phase's own
  *  parameter file (CopyLayout.paramFile) written durably first, when it carries one, then the rename through
  *  DurableFiles.move, which forces the directories that name the copy before and after. A rename that landed but was not forced leaves the copy
- *  unsynced (CopyRecord.unsynced, the one unsynced mechanism, which CopyMarkers' marker changes share): it is never
- *  loaded, shipped or released until a device check forces both directories again (`resync`, at the top of
- *  DeviceReconciler.reconcileDeviceState). A rename that failed changes nothing.
- *
- *  While flat marker copies remain (stage 2, Tasks 1-5), marker files inside a copy in a phase directory are inert:
- *  its location is its phase. A copy moved from the flat path into a phase directory is stripped of its markers once
- *  the move is durable (best effort, logged); one moved from a phase directory to the flat path is stripped first,
- *  durably, and a strip that fails is a NotMoved. A marker is never removed before the copy leaves the flat path: a
- *  crash would leave an unmarked flat copy, i.e. Live. */
+ *  unsynced (CopyRecord.unsynced, the one unsynced mechanism): it is never loaded, shipped or released until a device
+ *  check forces both directories again (`resync`, at the top of DeviceReconciler.reconcileDeviceState). A rename that
+ *  failed changes nothing. No copy carries a marker file any more (stage 2, Task 5): the flat path is Live. */
 final class CopyMoves(ctx: DeviceControl) extends Logging:
 
-  /** How a move, a marker site (CopyMarkers) and a resync force a directory. Replaced only by tests */
+  /** How a move and a resync force a directory. Replaced only by tests */
   private[server] var syncDirectory: os.Path => Unit = DurableFiles.syncDirectory
 
   /** How a move renames a copy. Replaced only by tests */
   private[server] var rename: (os.Path, os.Path) => Unit = DurableFiles.atomicRename
 
-  // Each unsynced move's copy, by its new path: the directories it still needs forced (its source's and target's),
-  // and whether it left the flat path, so its inert markers are stripped once the move is forced
-  private var unforced: Map[os.Path, (List[os.Path], Boolean)] = Map()
+  // Each unsynced move's copy, by its new path: the directories it still needs forced (its source's and target's)
+  private var unforced: Map[os.Path, List[os.Path]] = Map()
 
   // The copies whose move to Lost failed (StoreRebuilds.moveToLost), by device: held offline, never loaded, shipped
   // or retired, until a device check moves them (retryPendingLost). In memory only: a crash forgets the hold, and the
@@ -92,16 +85,28 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
         result match
           case MoveResult.NotMoved(_) => ()
           case _ =>
-            earlier.foreach: (dirs, leftFlat) =>
+            earlier.foreach: dirs =>
               unforced -= from
-              val (now, nowLeft) = unforced.getOrElse(target, (Nil, false))
-              unforced += target -> ((dirs ++ now).distinct, leftFlat || nowLeft)
+              unforced += target -> (dirs ++ unforced.getOrElse(target, Nil)).distinct
             ctx.copyRegistry.moved(site, sds, storeId, to, copyId,
               unsynced = result.isInstanceOf[MoveResult.Unsynced])
         result
 
+  /** Places the copy staged at `from`, in a scratch area (a transfer's staging, T8), into `to` on the attached `sds`
+   *  under a fresh copy id (P4), as one move: `to`'s parameter file written durably, then the rename forced. Recorded
+   *  as a fact (HostCopies.placed), unsynced for a rename that landed but was not forced. Returns the result */
+  def place(site: String, sds: LocalStorageDeviceState, storeId: StoreId, from: os.Path, to: Phase): MoveResult =
+    val copyId = UUID.randomUUID()
+    val target = CopyLayout.path(sds.devicePath, storeId, Some(copyId), to)
+    val result = relocateCopy(site, from, fromFlat = false, target, to)
+    result match
+      case MoveResult.NotMoved(_) => ()
+      case _ =>
+        ctx.copyRegistry.placed(site, sds, storeId, to, copyId, unsynced = result.isInstanceOf[MoveResult.Unsynced])
+    result
+
   /** As `move`, for a copy of a device being loaded (lost CRL, adoption), at `from` as `copyId` (None while flat):
-   *  returns the copy's new path, and an unsynced result is held for the device's attach, as an unsynced marker change
+   *  returns the copy's new path, and an unsynced result is held for the device's attach, as an unsynced move
    *  of such a device is (HostCopies.unsynced) */
   def moveUnattached(site: String, from: os.Path, storeId: StoreId, copyId: Option[UUID],
                      to: Phase): (MoveResult, os.Path) =
@@ -121,11 +126,8 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
     ctx.copyRegistry.unsyncedCopies(local).filter: storeId =>
       ctx.copyRegistry.pathOf(local, storeId).exists: path =>
         try
-          val (dirs, leftFlat) = unforced.getOrElse(path, (Nil, false))
-          (dirs :+ path).foreach(syncDirectory)
+          (unforced.getOrElse(path, Nil) :+ path).foreach(syncDirectory)
           unforced -= path
-          if leftFlat then
-            stripInert(path)
           ctx.copyRegistry.synced(path)
           true
         catch case NonFatal(t) =>
@@ -136,10 +138,10 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
   private def relocateCopy(site: String, from: os.Path, fromFlat: Boolean, target: os.Path, to: Phase): MoveResult =
     val toFlat = CopyLayout.dirOf(to).isEmpty
     if fromFlat && toFlat then
-      // Between two flat phases the markers move it (CopyMarkers), never a rename
+      // Only Live is flat: no move is between two flat phases
       MoveResult.NotMoved(IllegalArgumentException(s"$to is the flat path $from, where the copy already is"))
     else
-      val result = relocate(from, target, fromFlat, toFlat, to)
+      val result = relocate(from, target, to)
       result match
         case MoveResult.Durable => logger.info(s"Moved the copy at $from to $target ($site)")
         case MoveResult.Unsynced(t) =>
@@ -149,27 +151,22 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
           logger.error(s"Failed to move the copy at $from to $target ($site). It stays where it is. Error: $t")
       result
 
-  /** The steps of a move from `from` to `target`, into phase `to`: the target's directory made if absent, the
-   *  markers stripped when leaving a phase directory for the flat path, `to`'s own parameter file placed durably (the
-   *  source phase's file is never touched, so a failed move leaves the source reading what it read), the rename
-   *  forced, then the markers stripped when the copy left the flat path for a phase directory and the move is
-   *  durable. A move onto the copy's own path is no move: NotMoved */
-  private[host] def relocate(from: os.Path, target: os.Path, fromFlat: Boolean, toFlat: Boolean,
-                             to: Phase): MoveResult =
+  /** The steps of a move from `from` to `target`, into phase `to`: the target's directory made if absent, `to`'s own
+   *  parameter file placed durably (the source phase's file is never touched, so a failed move leaves the source
+   *  reading what it read), then the rename forced. A move onto the copy's own path is no move: NotMoved */
+  private[host] def relocate(from: os.Path, target: os.Path, to: Phase): MoveResult =
     if from == target then
       MoveResult.NotMoved(IllegalArgumentException(s"$to is the path $from, where the copy already is"))
     else
-      renameCopy(from, target, fromFlat, toFlat, to)
+      renameCopy(from, target, to)
 
-  private def renameCopy(from: os.Path, target: os.Path, fromFlat: Boolean, toFlat: Boolean, to: Phase): MoveResult =
+  private def renameCopy(from: os.Path, target: os.Path, to: Phase): MoveResult =
     val prepared =
       try
         val dir = target / os.up
         if !FileStat.exists(dir) then
           os.makeDir.all(dir)
           syncDirectory(dir / os.up)
-        if !fromFlat && toFlat && stripMarkers(from) then
-          syncDirectory(from)
         for
           file <- CopyLayout.paramFile(to)
           p <- CopyLayout.param(to)
@@ -179,20 +176,9 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
     prepared.getOrElse:
       try
         DurableFiles.move(from, target, syncDirectory, rename)
-        if fromFlat && !toFlat then
-          stripInert(target)
         MoveResult.Durable
       catch
         case t: DurableFiles.MoveNotForced =>
-          unforced += target -> (List(target / os.up, from / os.up).distinct, fromFlat && !toFlat)
+          unforced += target -> List(target / os.up, from / os.up).distinct
           MoveResult.Unsynced(t)
         case NonFatal(t) => MoveResult.NotMoved(t)
-
-  /** Strips the markers of a copy now durably in a phase directory, where they are inert: best effort, logged */
-  private def stripInert(path: os.Path): Unit =
-    try stripMarkers(path)
-    catch case NonFatal(t) => logger.warn(s"Failed to strip the inert markers of $path: $t")
-
-  /** Removes every marker file from the copy at `path`. Returns whether any was there */
-  private def stripMarkers(path: os.Path): Boolean =
-    StoreDirMarkers.Marker.values.toList.map(m => os.remove(path / m.fileName, checkExists = false)).exists(identity)

@@ -105,10 +105,10 @@ final class DeviceCopies(val deviceId: StorageDeviceId, val devicePath: os.Path,
     records.getOrElse(storeId, throw IllegalStateException(s"No copy record for $storeId"))
 
   /** A new record. Throws where one exists */
-  def register(storeId: StoreId, phase: Phase, copyId: Option[UUID] = None): Unit =
+  def register(storeId: StoreId, phase: Phase, copyId: Option[UUID] = None, unsynced: Boolean = false): Unit =
     if records.contains(storeId) then
       throw IllegalStateException(s"Copy record for $storeId already exists")
-    records += storeId -> CopyRecord(storeId, copyId, phase, false, Activity.Idle)
+    records += storeId -> CopyRecord(storeId, copyId, phase, unsynced, Activity.Idle)
     onChange(storeId)
 
   def setPhase(storeId: StoreId, to: Phase): Unit =

@@ -49,7 +49,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
    *
    *  The result is whether the store's path is clear: true once the copy is in pending-delete, or if there was none.
    *  False on a failure (logged, everything left for a later call), for a device unloaded meanwhile, while a retire
-   *  of the store is already running, while the copy is unsynced (a marker change or move a crash could undo; the
+   *  of the store is already running, while the copy is unsynced (a move a crash could undo; the
    *  next device check forces it), or while its move to lost/ awaits its retry (CopyMoves.pendingLost). */
   def retire(local: LocalStorageDeviceState, storeId: StoreId): Future[Boolean] =
     val storePath = ctx.copyRegistry.pathOrLive(local, storeId)

@@ -4,7 +4,6 @@ import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
-import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 
 import java.util.UUID
 
@@ -56,7 +55,6 @@ object CopyFixtures:
   /** The marker file and content a flat copy in `phase` carries */
   private def marker(phase: Phase): Option[(String, String)] = phase match
     case Phase.Live => None
-    case Phase.Arrived(t) => Some(StoreTransfer.TransferredInMarkerFile -> t)
     case p => throw IllegalArgumentException(s"No copy can be placed in $p")
 
   /** The copy id in the name of the copy at `path`, in a phase directory */

@@ -8,7 +8,6 @@ import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.TransferOutcome
-import org.aspen_ddp.aspen.server.{DurableFiles, FileStat}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -18,6 +17,7 @@ import java.util.UUID
 import scala.concurrent.duration.{Duration, SECONDS}
 import scala.concurrent.{Future, Promise}
 import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 
 object StoreTransfers:
   /** `toDeviceId` is the local device receiving the store, so a check of that device can tell
@@ -35,6 +35,16 @@ object StoreTransfers:
 
   /** How long a failed transfer in waits before it is restarted */
   val TransferInRetryDelay: Duration = Duration(30, SECONDS)
+
+  /** What startIn does for the copy of the store on the receiving device */
+  private[host] enum Next:
+    case Wait, Resume, Retire, Receive
+
+  /** The staging directory of receive attempt `transferUUID` on the device at `devicePath`,
+   *  `<device>/transferring-in/<transferUUID>` (P7): the service extracts the store into `<that>/<storeDir>`. Each attempt
+   *  has its own, removed whole with its attempt, so no attempt ever sees another's files */
+  def stagingOf(devicePath: os.Path, transferUUID: UUID): os.Path =
+    devicePath / StoreTransfer.StagingDirectory / transferUUID.toString
 
 import StoreTransfers.*
 
@@ -269,37 +279,43 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           pendingStartTransfers -= storeId
           transferInRetries -= storeId
           dropAttempt(storeId, Some(transferUUID))
-          // A retry waiting on a failed promotion still has the extracted copy in staging, which
-          // the service no longer owns. Nothing else can be receiving this store now.
-          if retry.nonEmpty then
-            ctx.devices.devices.get(toDeviceId).foreach: sds =>
-              val staged = sds.devicePath / StoreTransfer.StagingDirectory / storeId.directoryName
-              try os.remove.all(staged)
-              catch case t: Throwable =>
-                logger.error(s"Failed to remove the staged copy of store $storeId at $staged: $t")
+          // The attempt's staging directory goes with it (a retry's was removed when its attempt failed; this is
+          // only a safety net). It is the attempt's own, so nothing else can be using it
+          ctx.devices.devices.get(toDeviceId).foreach(sds => removeStaging(sds.devicePath, storeId, transferUUID))
           Some(transferUUID)
         case _ => None
     cancelled.foreach(ctx.storeTransferService.cancelTransferIn(storeId, _))
 
-  /** Removes the transferred-in marker from a promoted store, returning whether the store may now
-   *  be loaded. A store loaded with the marker still in place would be skipped by the next
-   *  restart's scan, so on failure it is left unloaded for reconcileDeviceState's
-   *  transferred-in pass to try again. The store's arrival (StoreLoader.ArrivedAtFile) is recorded
-   *  first, while the marker still keeps it from loading: it came from another host, whose clock
-   *  may lead this one's, and its load floor must cover that.
-   */
-  private[host] def clearTransferredInMarker(sds: LocalStorageDeviceState, storeId: StoreId): Boolean =
-    val storePath = ctx.copyRegistry.pathOrLive(sds, storeId)
-    try
-      StoreLoader.writeArrivedAt(storePath)
-      // A failed unlink keeps the marker, for the transferred-in pass; a failed sync after it leaves the copy unsynced,
-      // which the next check of the device forces and loads (CopyMarkers)
-      ctx.markers.remove(sds, storeId, StoreDirMarkers.Marker.TransferredIn)
-    catch
-      case t: Throwable =>
-        logger.error(s"Failed to record the arrival of store $storeId at $storePath before removing its " +
-                     s"transferred-in marker. The store stays offline. Error: $t")
-        false
+  /** Removes the staging directory of receive attempt `transferUUID` of `storeId` on the device at `devicePath`,
+   *  whole: logged, never thrown, as the device's next load sweeps `transferring-in/` anyway */
+  private def removeStaging(devicePath: os.Path, storeId: StoreId, transferUUID: UUID): Unit =
+    val staging = stagingOf(devicePath, transferUUID)
+    try os.remove.all(staging)
+    catch case NonFatal(t) =>
+      logger.error(s"Failed to remove the staging directory $staging of the transfer in of store $storeId: $t")
+
+  /** Moves the Arrived copy of `storeId` on `sds` to Live (T9), once its pool update has committed. Its arrival
+   *  (StoreLoader.ArrivedAtFile) is written durably first, while the copy is still Arrived and never loaded: it came
+   *  from another host, whose clock may lead this one's, and its load floor must cover that. A failed write or move
+   *  (NotMoved) leaves the copy Arrived and offline, for the Completed Transfers In pass to retry; an Unsynced move
+   *  leaves it Live and unsynced, which the next device check forces and loads (DeviceReconciler.loadResynced). A copy
+   *  with no Arrived record is not moved (NotMoved) */
+  private[host] def bringArrivedLive(sds: LocalStorageDeviceState, storeId: StoreId): MoveResult =
+    registry.copiesOf(sds).flatMap(_.copies.get(storeId)) match
+      case Some(r) if r.phase.isInstanceOf[Phase.Arrived] =>
+        val path = CopyLayout.path(sds.devicePath, storeId, r.copyId, r.phase)
+        try
+          StoreLoader.writeArrivedAt(path)
+          ctx.moves.move("arrived copy goes live", sds, storeId, Phase.Live)
+        catch case NonFatal(t) =>
+          logger.error(s"Failed to record the arrival of store $storeId at $path before moving it live. The store " +
+                       s"stays offline. Error: $t")
+          MoveResult.NotMoved(t)
+      case other =>
+        val t = IllegalStateException(s"The copy of store $storeId on device ${sds.storageDeviceId} is not Arrived " +
+                                      s"(${other.map(_.phase)})")
+        logger.info(s"Not moving store $storeId live: $t")
+        MoveResult.NotMoved(t)
 
   /** Runs the metadata step for a transferred store that has been promoted to its final path,
    *  then loads or discards the arrived copy according to the outcome. Reached both straight
@@ -346,17 +362,17 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           case Success(TransferOutcome.PoolRepointed) =>
             ctx.devices.devices.get(toDeviceid).foreach: sds =>
               // A shipped Rebuilt copy (an Unconfirmed flip's) arrives as any other: its phase-param files are inert
-              // here, and it goes Live with its transferred-in marker's removal (T9)
-              if clearTransferredInMarker(sds, storeId) then
+              // here, and it goes Live with the move out of arrived/ (T9)
+              if bringArrivedLive(sds, storeId) == MoveResult.Durable then
                 ctx.loadStoreById(toDeviceid, storeId)
-              // Otherwise its copy stays offline on its device, as a restart's scan would leave it, which is what
-              // the Completed Transfers In pass keys off
+              // Otherwise its copy stays offline on its device: Arrived, which the Completed Transfers In pass moves,
+              // or Live and unsynced, which the next check forces and loads
 
           case Success(TransferOutcome.PoolRepointedOffline) =>
-            // Left exactly as it arrived, behind its transferred-in marker, offline as a restart's scan
-            // would leave it. Once a restart or adoption makes the entry Active, the reconcile's
-            // completed-transfers-in pass clears the marker and loads it. Unlike the shutdown's own markers
-            // this needs no disk write, so it is the same whether or not the device is still loaded.
+            // Left exactly as it arrived, in arrived/, offline as a restart's scan would leave it. Once a
+            // restart or adoption makes the entry Active, the reconcile's completed-transfers-in pass moves it
+            // Live and loads it. This needs no disk write, so it is the same whether or not the device is
+            // still loaded.
             logger.info(s"Store $storeId has transferred onto device $toDeviceid, which is being " +
                         s"shut down. It stays offline")
 
@@ -372,10 +388,9 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
             // The only observer this Future has. Its onFail routes the permanent errors to
             // StopRetrying, which fails the promise -- and an unobserved failed Promise is not
             // reported by the ExecutionContext, so without this line a permanent give-up is
-            // exactly as silent as the infinite retry loop it replaced. The arrived copy keeps its
-            // transferred-in marker and the destination's entry stays TransferringIn, so the next
-            // device check resumes this step; until one succeeds the source's copy stays offline
-            // behind its own marker.
+            // exactly as silent as the infinite retry loop it replaced. The copy stays Arrived and the
+            // destination's entry TransferringIn, so the next device check resumes this step; until one
+            // succeeds the source's copy stays offline in its outbound/.
             logger.error(s"Failed to record the completed transfer of store $storeId " +
                          s"from device $fromDeviceId to device $toDeviceid. The store is " +
                          s"not loaded here and the pool still names the source", t)
@@ -409,94 +424,93 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     else if attemptOf(storeId).isEmpty && ! ctx.shutdown.isShuttingDown(toDeviceid) then
       ctx.devices.devices.get(toDeviceid).foreach: toDevice =>
         val devicePath = toDevice.devicePath
-        val finalPath = ctx.copyRegistry.pathOrLive(toDevice, storeId)
+        val record = registry.copiesOf(toDevice).flatMap(_.copies.get(storeId))
 
-        // The copy at the path has one phase (CopyPhase). An arrived (promoted) copy belongs to the transfer whose id
-        // its marker records. One left by an earlier transfer that was aborted or given up on predates whatever the
-        // source has accepted since, so resuming it would install stale data. One whose save file is no longer valid
-        // would be repointed onto, and the source's intact copy then released, as promotion refuses for a staged copy.
-        // Until the pool update commits the source still holds the state, so either is discarded and the transfer
-        // started over. One found lost since its promotion (in lost/) has the phase Lost, which is retired below like
-        // any copy of an earlier tenancy.
-        // A phase that cannot be read (CopyPhase.known), a save file that cannot be read
-        // (CrashRecoveryLog.isUnreadable), or a copy whose delete could not stat it (StoreCopies.delete answers not
-        // gone), says nothing of the copy: it is neither resumed nor discarded, and the next check reads it again.
-        val phase: Option[Phase] = CopyLayout.knownPhase(finalPath) match
-          case None =>
-            logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: the phase of the copy at " +
-                         s"$finalPath could not be read. Retrying at a later check")
-            None
-          case Some(Phase.Arrived(markerId)) =>
-            val unusable: Either[Throwable, Option[String]] =
-              try
-                if !transferId.exists(_.toString == markerId) then
-                  Right(Some(s"it belongs to transfer '$markerId', not to the current transfer $transferId"))
-                else
-                  CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(finalPath), storeId) match
-                    case Right(_) => Right(None)
-                    case Left(err) => Right(Some(s"its CRL save file is no longer usable: $err"))
-              catch case t: Throwable => Left(t)
-            unusable match
-              case Left(err) =>
-                logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: its arrived copy at " +
-                             s"$finalPath could not be checked. Retrying at a later check: $err")
-                None
-              case Right(None) => Some(Phase.Arrived(markerId))
-              case Right(Some(why)) =>
-                logger.warn(s"Discarding the arrived copy of store $storeId on device $toDeviceid: $why")
-                // Rename-first: a failure leaves the copy whole behind its marker. The source still owns the store
-                if StoreCopies.delete(devicePath, finalPath, s"an unusable arrived copy of store $storeId") then
-                  ctx.copyRegistry.removed("startIn unusable arrived copy", toDevice, storeId)
-                  Some(Phase.Live)
-                else
-                  logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: the unusable arrived " +
-                               s"copy at $finalPath could not be deleted. Retrying at a later check")
-                  None
-          case other => other
+        // The copy of the store on the device, by its record. An Arrived copy belongs to the transfer its record names
+        // (phase-param.arrived, read at the device's load or its promotion). One left by an earlier transfer that was
+        // aborted or given up on predates whatever the source has accepted since, so resuming it would install stale
+        // data. One whose save file is no longer valid would be repointed onto, and the source's intact copy then
+        // released, as promotion refuses for a staged copy. Until the pool update commits the source still holds the
+        // state, so either is deleted (T13) and the transfer started over. A save file that cannot be read
+        // (CrashRecoveryLog.isUnreadable), or a delete that could not stat the copy (StoreCopies.delete answers not
+        // gone), says nothing of the copy: it is neither resumed nor deleted, and the next check reads it again.
+        // A copy in any other phase is an earlier tenancy's, retired before the receive (retireEarlierTenancy).
+        val next: Next = record match
+          case None => Next.Receive
+          // A retired copy still recorded awaits the resync that forces its move (CopyMoves), as an unread one awaits
+          // a read
+          case Some(r) if r.phase == Phase.Unread || r.phase == Phase.Retired => Next.Wait
+          // A move a crash could undo (a promotion's included): the next device check forces it first
+          case Some(r) if r.unsynced =>
+            logger.info(s"Not transferring store $storeId onto device $toDeviceid yet: a move of its copy is not " +
+                        "durable. Retrying once a device check forces it")
+            Next.Wait
+          case Some(r) =>
+            r.phase match
+              case Phase.Arrived(arrivedId) =>
+                val path = CopyLayout.path(devicePath, storeId, r.copyId, r.phase)
+                val unusable: Either[Throwable, Option[String]] =
+                  try
+                    if !transferId.exists(_.toString == arrivedId) then
+                      Right(Some(s"it belongs to transfer '$arrivedId', not to the current transfer $transferId"))
+                    else
+                      CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(path), storeId) match
+                        case Right(_) => Right(None)
+                        case Left(err) => Right(Some(s"its CRL save file is no longer usable: $err"))
+                  catch case t: Throwable => Left(t)
+                unusable match
+                  case Left(err) =>
+                    logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: its arrived copy at " +
+                                 s"$path could not be checked. Retrying at a later check: $err")
+                    Next.Wait
+                  case Right(None) => Next.Resume
+                  case Right(Some(why)) =>
+                    logger.warn(s"Deleting the arrived copy of store $storeId on device $toDeviceid: $why")
+                    // Rename-first (T13): a failure leaves the copy whole in arrived/. The source still owns the store
+                    if StoreCopies.delete(devicePath, path, s"an unusable arrived copy of store $storeId") then
+                      ctx.copyRegistry.removed("startIn unusable arrived copy", toDevice, storeId)
+                      Next.Receive
+                    else
+                      logger.error(s"Not transferring store $storeId onto device $toDeviceid yet: the unusable " +
+                                   s"arrived copy at $path could not be deleted. Retrying at a later check")
+                      Next.Wait
+              case _ => Next.Retire
 
         // The attempt's id, fresh per attempt. The sender ignores a request whose timestamp is not newer than the last
         // one it acted on, and the service accepts a connection only for the UUID it is currently registered with, so
         // a retry after a failure needs both to be new.
         val transferUUID = UUID.randomUUID()
 
-        phase match
-          // A retired copy still recorded awaits the resync that forces its move (CopyMoves), as an unread one awaits
-          // a read
-          case None | Some(Phase.Unread) | Some(Phase.Retired) =>
+        next match
+          case Next.Wait =>
             ()
 
           // A copy promoted by an earlier attempt -- normally one that crashed before its metadata
           // step finished -- needs no bytes, only that step.
-          case Some(Phase.Arrived(_)) =>
+          case Next.Resume =>
             if claimWork(storeId, toDeviceid,
                          Work.TransferIn(transferId, TransferInStage.Receiving, Some(transferUUID))) then
               logger.info(s"Store $storeId has already arrived on device $toDeviceid. Resuming its " +
                           s"pool update")
               recordTransferIn(storeId, transferUUID, fromDeviceId, toDeviceid)
 
-          // A finished rebuild awaiting its flip, a parked copy, a lost copy, or an outbound copy, left by an earlier
-          // tenancy of the store on this device (rebuild-process; a store transferred back onto its old source): never
-          // the owner's, so retired, and the transfer starts at the check that follows
-          case Some(Phase.Lost | Phase.Rebuilt(_) | Phase.Parked | Phase.Outbound(_)) =>
+          // A Live, Outbound, Rebuilt, Parked or Lost copy left by an earlier tenancy of the store on this device
+          // (re-placed away while this host was down, then transferred back; a store transferred back onto its old
+          // source): never the owner's, so retired, and the transfer starts at the check that follows
+          case Next.Retire =>
             retireEarlierTenancy(toDevice, storeId)
 
-          // Promotion moves the arrived copy here and would fail on an existing directory, after
-          // the whole store had been shipped. Whatever is here is not ours to delete, so refuse
-          // before asking for any bytes. A stat that fails is no absence (FileStat): it refuses too, until a later
-          // check's stats answer.
-          case Some(Phase.Live) if !FileStat.existence(finalPath).contains(false) =>
-            logger.error(s"Cannot transfer store $storeId onto device $toDeviceid: store path " +
-                         s"already exists or cannot be stat'd. $finalPath")
-
-          case Some(Phase.Live) if !claimWork(storeId, toDeviceid,
-                                     Work.TransferIn(transferId, TransferInStage.Receiving, Some(transferUUID))) =>
+          case Next.Receive if !claimWork(storeId, toDeviceid,
+                                 Work.TransferIn(transferId, TransferInStage.Receiving, Some(transferUUID))) =>
             ()
 
-          case Some(Phase.Live) =>
+          case Next.Receive =>
             val timestamp = HLCTimestamp.now
+            val staging = stagingOf(devicePath, transferUUID)
+            // What the service extracts (StoreTransferService.beginTransferIn)
+            val stagedPath = staging / storeId.directoryName
 
-            val fcomplete = ctx.storeTransferService.beginTransferIn(
-              storeId, transferUUID, devicePath / StoreTransfer.StagingDirectory)
+            val fcomplete = ctx.storeTransferService.beginTransferIn(storeId, transferUUID, staging)
 
             // Retransmission stops on completion, success or failure, not on first data: the
             // sender needs the request until it has finished, and a failure restarts with a new
@@ -513,27 +527,16 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
               case Success(_) if ! isCurrent =>
                 // The bytes landed as the transfer was abandoned, or as its device's unload forgot the attempt
                 // (crlFailed cancels no transfer in, so no abandon will stop its retransmission). Nobody owns the
-                // staged copy now, and nothing can be receiving this store, since a new attempt needs the store to
-                // have no attempt, as dropping this one left it.
+                // staged copy now: the attempt's staging goes with it.
                 stopRetransmitting()
-                if attemptOf(storeId).isEmpty then
-                  val stagedPath = devicePath / StoreTransfer.StagingDirectory / storeId.directoryName
-                  try os.remove.all(stagedPath)
-                  catch case t: Throwable =>
-                    logger.error(s"Failed to remove the staged copy of store $storeId at $stagedPath: $t")
+                removeStaging(devicePath, storeId, transferUUID)
 
               case Failure(_) if ! isCurrent =>
                 stopRetransmitting()
+                removeStaging(devicePath, storeId, transferUUID)
 
               case Success(_) =>
                 stopRetransmitting()
-
-                // The source's copy carries its phase-param.outbound, inert here. The transferred-in
-                // marker is written before the move, so the copy reaches finalPath already marked.
-                // Unmarked, a crash before the metadata step finishes would have the restart load a
-                // copy the pool does not name, and the device check would then refuse the existing
-                // directory instead of resuming that step.
-                val stagedPath = devicePath / StoreTransfer.StagingDirectory / storeId.directoryName
 
                 // The copy's CRL save file is checked while the source still holds the state: once
                 // the pool update commits, the source deletes its copy and the file is the only one
@@ -547,42 +550,40 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                     case Left(err) =>
                       logger.error(s"The transferred copy of store $storeId has an unusable CRL save " +
                                    s"file. Restarting the transfer. Error: $err")
-                      try os.remove.all(stagedPath)
-                      catch case t: Throwable =>
-                        logger.error(s"Failed to remove the staged copy of store $storeId at $stagedPath: $t")
                       false
 
+                // Promotion (T8): one move of the staged copy into arrived/ under a fresh copy id, its transfer id
+                // written durably first as phase-param.arrived (the source's phase-param.outbound, shipped with it, is
+                // inert here). Arrived, a crash before the metadata step finishes leaves a copy no restart loads, and
+                // the device check resumes that step
                 val promoted =
                   if !crlValid then
-                    false
+                    MoveResult.NotMoved(IllegalStateException(s"unusable CRL save file at $stagedPath"))
                   else
-                    try
-                      // Durable, marker and move both: a copy that lands during a shutdown is
-                      // accepted by an adopter on the strength of this marker alone.
-                      DurableFiles.write(stagedPath / StoreTransfer.TransferredInMarkerFile,
-                                         transferId.map(_.toString).getOrElse(""))
-                      // The promotion's target: the arrived copy is not recorded until it is there
-                      DurableFiles.move(stagedPath, CopyLayout.path(devicePath, storeId, None, Phase.Live))
-                      // A fact: the copy is at its path now, whatever the registry held
-                      ctx.copyRegistry.placed("transfer-in promotion", toDevice, storeId,
-                        Phase.Arrived(transferId.map(_.toString).getOrElse("")))
-                      true
-                    catch
-                      case t: Throwable =>
-                        logger.error(s"Failed to move the transferred store $storeId from " +
-                                     s"$stagedPath to $finalPath. Restarting the transfer. Error: $t")
-                        false
+                    ctx.moves.place("transfer-in promotion", toDevice, storeId, stagedPath,
+                      Phase.Arrived(transferId.map(_.toString).getOrElse("")))
 
-                if ! promoted then
-                  // Nothing has been recorded yet, so the pool still names the source and this is
-                  // no different from a transfer that failed in flight. The restart's extraction
-                  // replaces the staged copy, and if the failure left a directory at finalPath the
-                  // restart refuses with an error rather than retrying forever.
-                  scheduleTransferInRetry(storeId, transferUUID, fromHostId, fromDeviceId, toDeviceid, transferId)
-                else
-                  recordTransferIn(storeId, transferUUID, fromDeviceId, toDeviceid)
+                promoted match
+                  case MoveResult.Durable =>
+                    removeStaging(devicePath, storeId, transferUUID)
+                    recordTransferIn(storeId, transferUUID, fromDeviceId, toDeviceid)
+                  case MoveResult.Unsynced(_) =>
+                    // Arrived, but a crash could undo the rename: no pool update until it is forced. The attempt ends
+                    // here, and the device check that follows forces the copy (its staging directory is one of the
+                    // directories it forces, so it stays until the device's next load sweeps it) and then resumes
+                    // the pool update
+                    dropAttempt(storeId, Some(transferUUID))
+                    ctx.reconciler.checkStorageDevice(toDeviceid)
+                  case MoveResult.NotMoved(_) =>
+                    // Nothing has been recorded yet, so the pool still names the source and this is
+                    // no different from a transfer that failed in flight. Its staging goes with the attempt, and the
+                    // restart receives into its own
+                    removeStaging(devicePath, storeId, transferUUID)
+                    scheduleTransferInRetry(storeId, transferUUID, fromHostId, fromDeviceId, toDeviceid, transferId)
               case Failure(_) =>
                 stopRetransmitting()
+                // The service removed what it extracted; the attempt's directory goes too
+                removeStaging(devicePath, storeId, transferUUID)
                 scheduleTransferInRetry(storeId, transferUUID, fromHostId, fromDeviceId, toDeviceid, transferId)
 
             val msg = StartStoreTransfer(
@@ -598,28 +599,35 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
 
             ctx.client.sendHostMessage(msg)
 
-  /** Clears the path of a store transferring onto `local` that holds a copy of an earlier tenancy of the store there:
-   *  a finished rebuild awaiting its flip (in `rebuilt/`), a parked or outbound copy, or a lost copy (in `lost/`), left when the
-   *  store was re-placed away (AspenClient.replaceRebuild) while this host was down. No other pass clears it while
-   *  the entry is TransferringIn. The copy is retired (StoreCopies.retire), not deleted: it is not the owner's, and
-   *  the source still is. Once the path is clear the device is checked again, which starts the transfer.
+  /** Retires the copy of an earlier tenancy of a store transferring onto `local`, in any phase but this transfer's
+   *  Arrived (P1): a Live copy, a finished rebuild awaiting its flip (in `rebuilt/`), a parked or outbound copy, or a
+   *  lost copy (in `lost/`), left when the store was re-placed away (AspenClient.replaceRebuild) while this host was
+   *  down, or a store transferred back onto its old source. No other pass retires it while the entry is TransferringIn.
+   *  The copy is retired (StoreCopies.retire: moved to Lost first, T10, "a copy that stopped being the owner's"), not
+   *  deleted: it is not the owner's, and the source still is. Once it is retired the device is checked again, which
+   *  starts the transfer.
    *
-   *  Retired before any bytes are asked for, so before the transfer's metadata step can make the entry Active:
-   *  a rebuild's flip finding an Active entry adopts it without an episode check (DeviceMetadata.markRebuiltStoreActive).
-   *  For the same reason it waits while a rebuild of the store runs here: the reconcile cancels one whose entry has
-   *  moved (StoreRebuilds.abandonUnlisted), and one past its latch could still move a copy into the path. A copy
-   *  served from this path, or a store still opening, waits too: whatever path took it out of service retires or
-   *  reloads it. The store served from another device of this host does not: that is the source of a transfer
-   *  between two devices of one host, closed only by the StartStoreTransfer sent once this path is clear. */
+   *  Retired before any bytes are asked for, so before the new copy's first load (a save-file load that drops the
+   *  store's device-CRL entries, StoreLoader.awaitCrlLoad) and before the transfer's metadata step can make the entry
+   *  Active: a rebuild's flip finding an Active entry adopts it without an episode check
+   *  (DeviceMetadata.markRebuiltStoreActive). For the same reason it waits while a rebuild of the store runs here: the
+   *  reconcile cancels one whose entry has moved (StoreRebuilds.abandonUnlisted), and one past its latch could still
+   *  place a copy. A copy served, opening or closing on this device, or a store still opening, waits too: whatever
+   *  took it out of service (or the open's end) leaves it closed for a later check to retire. The store served from
+   *  another device of this host does not: that is the source of a transfer between two devices of one host, closed
+   *  only by the StartStoreTransfer sent once this copy is retired. */
   private def retireEarlierTenancy(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
-    val servedHere = ctx.router.entry(storeId).exists(_.store.backend.path == storePath)
+    val servedHere = ctx.router.entry(storeId).exists(_.store.backend.path == storePath) ||
+      registry.copiesOf(local).flatMap(_.copies.get(storeId)).exists: r =>
+        r.activity == Activity.Served || r.activity.isInstanceOf[Activity.Opening] ||
+        r.activity.isInstanceOf[Activity.Closing]
     if registry.rebuilding(HostCopies.RebuildReads).contains(storeId) || servedHere || ctx.loader.isOpening(storeId) then
-      logger.info(s"Not transferring store $storeId onto device ${local.storageDeviceId} yet: its path holds a copy " +
-                  s"of an earlier tenancy, which waits for a rebuild, an open or a close of the store here to end")
+      logger.info(s"Not transferring store $storeId onto device ${local.storageDeviceId} yet: it holds a copy of an " +
+                  s"earlier tenancy, which waits for a rebuild, an open or a close of the store here to end")
     else if !ctx.copies.isRetiring(storeId) && inWork(storeId, local.storageDeviceId).isEmpty &&
             claimWork(storeId, local.storageDeviceId, Work.TransferIn(None, TransferInStage.RetiringEarlierTenancy)) then
-      logger.warn(s"Retiring the copy of an earlier tenancy of store $storeId at its path on device " +
+      logger.warn(s"Retiring the copy of an earlier tenancy of store $storeId at $storePath on device " +
                   s"${local.storageDeviceId} before transferring the store onto it")
       ctx.copies.retire(local, storeId).foreach: clear =>
         if inWork(storeId, local.storageDeviceId).exists(_.stage == TransferInStage.RetiringEarlierTenancy) then

@@ -131,7 +131,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
               case Phase.Arrived(_) =>
                 // Arrived, but the pool may still name the source. StoreTransfers.startIn resumes the
                 // metadata step for it, and reconcileDeviceState loads it if that step already committed.
-                logger.info("Skipping load of transferred-in store awaiting its pool update. " +
+                logger.info("Skipping load of arrived store awaiting its pool update. " +
                             s"StoreId $storeId. $potentialStoreFile")
               case Phase.Rebuilt(_) =>
                 // A finished rebuild whose flip may not have committed (a crash between the move and the flip,
@@ -147,9 +147,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             // Its move to lost/ failed: held offline until a check of its device moves it (StoreRebuilds.moveToLost)
             logger.info(s"Not loading store $storeId: its move to lost/ failed and is retried. $potentialStoreFile")
           else if ctx.copyRegistry.isUnsynced(sds, storeId) then
-            // A marker change a crash could undo (CopyMarkers): the next check of its device forces its directory
+            // A move a crash could undo (CopyMoves): the next check of its device forces its directories
             // and loads it (DeviceReconciler.loadResynced)
-            logger.info(s"Not loading store $storeId yet: a marker change to its copy is not durable. $potentialStoreFile")
+            logger.info(s"Not loading store $storeId yet: a move of its copy is not durable. $potentialStoreFile")
           else
             startOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)
         catch
@@ -941,7 +941,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
 object StoreLoader:
   /** In a store directory: this host's wall clock, in milliseconds, when the store arrived from another host, by a
-   *  transfer in (StoreTransfers.clearTransferredInMarker) or an adoption of its device (DeviceDiscovery). The store
+   *  transfer in (StoreTransfers.bringArrivedLive) or an adoption of its device (DeviceDiscovery). The store
    *  may have joined, and forgotten, a transaction there started up to MaxStartLead ahead of that host's clock, which
    *  may lead this one's: a load less than RebuildingStore.AcceptorSinceMargin after the arrival raises its forget floor
    *  by that margin (Frontend.arrivedAt). Durable and written before the store can load here, so a crash between the

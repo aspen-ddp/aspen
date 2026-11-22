@@ -452,7 +452,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       entryAfterUpdate.map(_.status) should be(Some(StoreStatus.Offline))
       pool.stores(movingStore.poolIndex).storageDeviceId should be(destId)
       recorded(host).loadStoreByIdRequests.toList should be(Nil)
-      // Kept as it arrived, behind its transferred-in marker, and not served.
+      // Kept as it arrived, in arrived/, and not served.
       CopyFixtures.phaseOf(deviceDir, movingStore).exists(_.isInstanceOf[Phase.Arrived]) should be(true)
       host.control.router.silentStores should contain(movingStore)
       st.stores(movingStore).status should be(StoreStatus.Offline)

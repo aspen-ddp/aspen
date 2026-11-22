@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.server.host.{AdoptionClass, CopyFixtures, Phase}
+import org.aspen_ddp.aspen.server.host.{AdoptionClass, CopyFixtures, CopyLayout, Phase}
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService, StoreLoader}
 import org.aspen_ddp.aspen.client.Transaction
@@ -346,15 +346,15 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       renames.filter(_._1 == d0) should be(Vector(d0 -> flat0))
       rebuilds.created.map(_.storeId).toList should be(List(s1))
 
-  // A transferred-in marker inside an outbound/ copy is inert (its location is its phase): it is Outbound, so its save
-  // file must be valid (it was adopted as Clean whatever its save file before CopyPhase)
-  atest("an outbound copy carrying a transferred-in marker with a truncated save file is adopted as Rebuilding"):
+  // An arrived phase-param inside an outbound/ copy is inert (its location is its phase): it is Outbound, so its save
+  // file must be valid (a transferred-in marker once had it adopted as Clean whatever its save file)
+  atest("an outbound copy carrying an arrived phase-param with a truncated save file is adopted as Rebuilding"):
     adoptWithLostStore: (dir, s) =>
       val outbound = markTransferringOut(dir / os.up, s)
-      os.write.over(outbound / StoreTransfer.TransferredInMarkerFile, "t1")
+      os.write.over(outbound / CopyLayout.paramFile(Phase.Arrived("")).get, "t1")
       os.write.over(Backend.crlSaveFile(outbound), "")
 
-  atest("an outbound copy carrying a transferred-in marker with a valid save file is adopted as Clean"):
+  atest("an outbound copy carrying an arrived phase-param with a valid save file is adopted as Clean"):
     given ExecutionContext = executionContext
     val rebuilds = new RecordingRebuildFactory
     for
@@ -363,7 +363,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       s0 = stores.head
       (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
       d0 = writeTransferringOutStore(deviceDir, s0)
-      _ = os.write.over(d0 / StoreTransfer.TransferredInMarkerFile, "t1")
+      _ = os.write.over(d0 / CopyLayout.paramFile(Phase.Arrived("")).get, "t1")
       host = newHost(hostRoot, storeRebuildFactory = rebuilds)
       _ <- resolve(host)
       st <- state(deviceA)
@@ -658,8 +658,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
   atest("a store that transferred in during the shutdown is adopted and then loaded"):
     given ExecutionContext = executionContext
     for
-      // PoolRepointedOffline: the arrived copy sits behind its transferred-in marker, with no
-      // transfer-out marker or CRL file of its own.
+      // PoolRepointedOffline: the arrived copy sits in arrived/, with no CRL file of its own.
       stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 2, registerOldHost = true): ss =>
                   Map(ss(0) -> offline, ss(1) -> offline)
       List(s0, s1) = stores: @unchecked
@@ -679,7 +678,11 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       st.status should be(DeviceStatus.Operational)
       st.stores(s1).status should be(StoreStatus.Active)
       CopyFixtures.phaseOf(deviceDir, s1) should be(Some(Phase.Live))
-      recorded(host).storeLoadAttempts.map(_._2).count(_ == d1) should be(2)
+      // Offered once in arrived/ at the device's load, and kept offline; loaded once, at its Live path, after its move
+      // there (T9)
+      recorded(host).storeLoadAttempts.map(_._2).count(_ == d1) should be(1)
+      recorded(host).storeLoadAttempts.map(_._2).count(_ == CopyLayout.path(deviceDir, s1, None, Phase.Live)) should be(1)
+      os.exists(CopyLayout.path(deviceDir, s1, None, Phase.Live) / StoreLoader.ArrivedAtFile) should be(true)
 
   atest("a store rebuilt after its device was shut down and unloaded is adopted"):
     given ExecutionContext = executionContext

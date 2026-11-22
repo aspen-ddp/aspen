@@ -6,7 +6,8 @@ import scala.util.control.NonFatal
 enum Phase:
   /** No marker: a copy that can be loaded and served */
   case Live
-  /** Arrived from another host (transferred-in) and awaiting its pool update; carries the transfer's id, trimmed */
+  /** In arrived/: transferred in and awaiting its pool update; carries the transfer's id (phase-param.arrived,
+   *  trimmed) */
   case Arrived(transferId: String)
   /** In outbound/: closed for a transfer out, its state in crl_save.log; carries the transfer id (phase-param.outbound,
    *  trimmed) */
@@ -23,18 +24,13 @@ enum Phase:
   /** Stage 1 only: never returned by `CopyPhase.read`. The registry's record of a copy whose read threw */
   case Unread
 
-/** The one reader of a flat store directory's markers. A copy in a phase
- *  directory has its phase by location (CopyLayout.phaseAt), never by markers. */
+/** The phase of a flat copy. A copy in a phase directory has its phase by location (CopyLayout.phaseAt). No marker
+ *  is written or read any more (stage 2, Task 5): the flat path is Live, its only remaining phase. Task 6 moves Live
+ *  into live/ and deletes this reader */
 object CopyPhase:
-  import StoreDirMarkers.Marker.*
 
-  /** The phase of the flat copy at `storePath`: Arrived with its transferred-in marker's content, else Live. Throws a
-   *  failed stat or read: a stat that fails is no absence. */
-  def read(storePath: os.Path): Phase =
-    if StoreDirMarkers.has(storePath, TransferredIn) then
-      Phase.Arrived(os.read(storePath / TransferredIn.fileName).trim)
-    else
-      Phase.Live
+  /** The phase of the flat copy at `storePath`: Live */
+  def read(storePath: os.Path): Phase = Phase.Live
 
   /** The phase of the copy at `storePath`, None where `read` throws, for a caller that waits for a later pass */
   def known(storePath: os.Path): Option[Phase] =

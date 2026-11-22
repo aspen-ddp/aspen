@@ -39,7 +39,7 @@ object DurableFiles extends Logging:
     syncDirectory(file / os.up)
 
   /** `write`'s first half: `file` replaced by `content`, forced and renamed into place, its directory not forced. For
-   *  a caller that forces the directory itself and must tell a failed sync from a failed write (host.CopyMarkers) */
+   *  a caller that forces the directory itself and must tell a failed sync from a failed write (host.CopyMoves) */
   def place(file: os.Path, content: String): Unit =
     placeWith(file)(_.write(content.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
 

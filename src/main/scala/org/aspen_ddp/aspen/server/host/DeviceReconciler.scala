@@ -146,7 +146,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   private def reconcileDeviceState(local: LocalStorageDeviceState,
                                    remote: StorageDeviceState): Unit =
     local.reconciledEntries = Some(remote.stores)
-    // Copies whose marker change or move was not durable (CopyMarkers, CopyMoves) are forced again first, so the passes
+    // Copies whose move was not durable (CopyMoves) are forced again first, so the passes
     // see them synced, and copies whose move to lost/ failed are moved (StoreRebuilds.moveToLost)
     ctx.moves.resync(local)
     ctx.rebuilds.retryPendingLost(local)
@@ -203,11 +203,6 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // Pending deletes
       // Retired copies whose store is Active on its owner device, and the remains of interrupted deletes
       ctx.copies.release(local, remote)
-
-  /** Whether the directory of `storeId` on `local` is known to carry `marker`. A stat that fails (FileStat) answers
-   *  false: the pass acting on the marker waits for a later reconcile, and the load it leads to stats it again */
-  private def hasMarker(local: LocalStorageDeviceState, storeId: StoreId, marker: StoreDirMarkers.Marker): Boolean =
-    StoreDirMarkers.knownPresent(ctx.copyRegistry.pathOrLive(local, storeId), marker)
 
   /** Retires the copies of stores whose entries have left this device (retireUnowned) */
   private def reconcileDeletedStores(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
@@ -329,24 +324,23 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     if stillSending.nonEmpty then
       scheduleDeviceRecheck(local.storageDeviceId)
 
-  /** Completes a transfer in whose pool update committed but whose marker was not removed, and loads the store. */
+  /** Completes a transfer in whose pool update committed but whose copy did not move Live, and loads the store (T9). */
   private def completeTransfersIn(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
-    // A crash between the pool update committing and the transferred-in marker's removal
-    // leaves an Active entry naming this device over a copy that tryLoadStore skips. The entry
-    // is no longer TransferringIn, so StoreTransfers.startIn never sees it, and nothing else
-    // removes the marker. Active is the tree's word that the pool now names this device, so
-    // the copy is ours to load. The store's receive attempt (on any device of the host) covers the window where this
-    // process's own metadata step has committed but has not yet removed the marker itself.
+    // A crash between the pool update committing and the copy's move out of arrived/ leaves an Active entry naming
+    // this device over a copy that tryLoadStore skips. The entry is no longer TransferringIn, so
+    // StoreTransfers.startIn never sees it. Active is the tree's word that the pool now names this device, so the copy
+    // is ours to load. A move that failed in recordTransferIn is retried here too; one not forced left the copy Live
+    // and unsynced, which loadResynced loads once forced. The store's receive attempt (on any device of the host)
+    // covers the window where this process's own metadata step has committed but has not yet moved the copy itself.
     ctx.copyRegistry.offlineCopies(local).filter(storeId =>
       !ctx.transfers.receiving.contains(storeId) &&
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
-      hasMarker(local, storeId, StoreDirMarkers.Marker.TransferredIn)
+      ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase.isInstanceOf[Phase.Arrived])
     ).foreach: storeId =>
-      val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
-      logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but still " +
-                  s"carries its transferred-in marker. Completing the transfer and loading the store")
-      if ctx.transfers.clearTransferredInMarker(local, storeId) then
-        ctx.tryLoadStore(local, storePath, None)
+      logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but its copy is still in arrived/. " +
+                  s"Completing the transfer and loading the store")
+      if ctx.transfers.bringArrivedLive(local, storeId) == MoveResult.Durable then
+        ctx.tryLoadStore(local, ctx.copyRegistry.pathOrLive(local, storeId), None)
 
   /** Completes a rebuild whose flip committed but whose copy did not move Live, and loads the store (T3). */
   private def completeRebuilds(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
@@ -365,7 +359,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       if ctx.rebuilds.bringRebuiltLive(local, storeId) == MoveResult.Durable then
         ctx.tryLoadStore(local, ctx.copyRegistry.pathOrLive(local, storeId), None)
 
-  /** Loads each copy held back from loading for a marker change whose sync failed (HostCopies.heldForSyncOn), once it
+  /** Loads each copy held back from loading for a move whose sync failed (HostCopies.heldForSyncOn), once it
    *  is synced again (CopyMoves.resync): the removal's own load was held back (an unsynced copy is never loaded),
    *  and the pass that made it keys off the marker it removed. Only a Live copy still offline and free of work, whose
    *  entry is Active; one that is not yet stays held, for every later check, until a load opens it or it leaves its

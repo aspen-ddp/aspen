@@ -21,7 +21,7 @@ class CopyLayoutSuite extends FileBasedTests:
     // Each task that converts a phase flips its row to Some
     val table = List(
       (Phase.Live, "live", false),
-      (Phase.Arrived("t"), "arrived", false),
+      (Phase.Arrived("t"), "arrived", true),
       (Phase.Outbound("t"), "outbound", true),
       (Phase.Rebuilt("e"), "rebuilt", true),
       (Phase.Parked, "parked", true),
@@ -36,6 +36,7 @@ class CopyLayoutSuite extends FileBasedTests:
     CopyLayout.path(tdir, s, Some(u), Phase.Outbound("t")) should be(tdir / "outbound" / CopyLayout.copyName(s, u))
     CopyLayout.path(tdir, s, Some(u), Phase.Rebuilt("e")) should be(tdir / "rebuilt" / CopyLayout.copyName(s, u))
     CopyLayout.path(tdir, s, Some(u), Phase.Parked) should be(tdir / "parked" / CopyLayout.copyName(s, u))
+    CopyLayout.path(tdir, s, Some(u), Phase.Arrived("t")) should be(tdir / "arrived" / CopyLayout.copyName(s, u))
     CopyLayout.path(tdir, s, Some(u), Phase.Live) should be(tdir / s.directoryName)
 
   test("param is the phase's parameter"):

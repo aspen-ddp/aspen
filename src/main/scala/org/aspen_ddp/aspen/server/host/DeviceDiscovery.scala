@@ -305,7 +305,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *    adopting it would drop whatever it held: Unclean, and the device is refused.
    *  - In lost/: CrlLost. Its host moved it there because its state cannot be trusted (a backend that failed while
    *    closing, a lost CRL).
-   *  - `transferred-in`: Clean. A transfer in that landed during the shutdown (PoolRepointedOffline);
+   *  - In arrived/: Clean. A transfer in that landed during the shutdown (PoolRepointedOffline);
    *    it was never opened on this device, so it has no CRL state to carry.
    *  - In outbound/: a network transfer out had taken its state out of the device CRL into
    *    crl_save.log. Clean with a valid save file. Without one the state is gone -- a disk pulled
@@ -453,9 +453,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *     keepRebuiltStoreOffline, T5) is moved to Live (CopyMoves.moveUnattached) for every store now Active,
    *     except one whose entry still names a transfer or that this process is sending: there it
    *     belongs to a transfer. Offline entries -- none are expected -- keep theirs and stay
-   *     unloaded. The shutdown itself leaves none. A transferred-in marker is left alone: the
-   *     reconcile's completed-transfers-in pass clears it and loads the store, as it would after any
-   *     crash.
+   *     unloaded. The shutdown itself leaves none. An arrived/ copy is left alone: the
+   *     reconcile's completed-transfers-in pass writes its arrival, moves it Live and loads the store, as it
+   *     would after any crash.
    *  3. shutdown.state is removed.
    *  4. The device is loaded through tryLoadDevice and checked at once, so its Rebuilding and
    *     TransferringIn work resumes now rather than at the next periodic check.

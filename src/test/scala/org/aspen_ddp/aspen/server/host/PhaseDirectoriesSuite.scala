@@ -973,3 +973,274 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     CopyFixtures.phaseOf(dev, s1) should be(Some(Phase.Parked))
     CopyFixtures.phaseOf(dev, s2) should be(Some(Phase.Lost))
     Future.successful(succeed)
+
+  // ---- Task 5: Arrived is arrived/, and staging is per attempt ----
+
+  // A store of the bootstrap pool, transferred onto the second device
+  private val moving = StoreId(PoolId.BootstrapPoolId, 1)
+
+  /** A StagedTransferService that, at each beginTransferIn, snapshots what the receiving device `dev` holds of
+   *  `moving`: its retired copies, and whether each holds its lost-crl-state.log */
+  private class SnapshotTransfers(dev: => os.Path) extends StagedTransferService:
+    @volatile var atBegin: Vector[List[(os.Path, Boolean)]] = Vector()
+    override def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path): Future[Unit] =
+      atBegin :+= CopyFixtures.retiredCopies(dev, moving).map(p => p -> os.exists(p / RebuildingStore.LostCrlStateFile))
+      super.beginTransferIn(storeId, transferUUID, destinationDirectory)
+
+  /** A host root with the second device, its CRL directory present, after `place` has put what it likes there */
+  private def receivingDevice(place: os.Path => Unit = _ => ()): (os.Path, os.Path) =
+    val hostRoot = newHostDir()
+    val dev = writeDevice(hostRoot, "dev0", net.secondDeviceId)
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(dev))
+    place(dev)
+    (hostRoot, dev)
+
+  /** Starts the transfer of `moving` onto the second device in the tree and checks `host`'s devices: yields the
+   *  transfer's id */
+  private def startMoving(host: Host): Future[UUID] =
+    given ExecutionContext = executionContext
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(moving, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      st <- client.getStorageDeviceState(net.secondDeviceId)
+      _ = host.control.reconciler.checkAll()
+    yield st.stores(moving).transferId.get
+
+  /** Drains `host` until its transfer service has begun `n` transfers in */
+  private def awaitBegun(host: Host, transfers: StagedTransferService, n: Int = 1): Future[Unit] =
+    awaitLoudly(s"transfer in number $n to begin"):
+      host.testingOnlyHandleEvents()
+      transfers.transfersIn.size >= n
+
+  atest("a received copy is staged under its attempt and promoted into arrived with its transfer id"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = receivingDevice()
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
+    host.testingOnlyHandleEvents()
+    recorded(host).holdTransferOutcomes()
+    for
+      tid <- startMoving(host)
+      _ <- awaitBegun(host, transfers)
+      (_, attempt, staging) = transfers.transfersIn.head
+      _ = transfers.finishTransferIn(moving)
+      _ <- awaitLoudly("the promotion"):
+             host.testingOnlyHandleEvents()
+             CopyFixtures.copyPath(dev, moving).isDefined
+    yield
+      staging should be(dev / "transferring-in" / attempt.toString)
+      CopyFixtures.phaseOf(dev, moving) should be(Some(Phase.Arrived(tid.toString)))
+      val arrived = CopyFixtures.copyPath(dev, moving).get
+      arrived / os.up should be(dev / CopyLayout.ArrivedDirectory)
+      CopyLayout.readParam(arrived, Phase.Arrived("")) should be(tid.toString)
+      // The attempt's staging went with it
+      os.exists(staging) should be(false)
+      recordOf(host, loadedDevices(host)(net.secondDeviceId), moving).flatMap(_.copyId) should be(
+        Some(CopyFixtures.copyIdOf(arrived)))
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("a committed pool update writes arrived-at, then moves the copy live and serves it"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = receivingDevice()
+    val transfers = new StagedTransferService
+    val opener = new TestOpener
+    val host = realHost(hostRoot, opener, transfers = transfers)
+    host.testingOnlyHandleEvents()
+    // Each rename, and whether its source held arrived-at as it was renamed
+    @volatile var renames = Vector.empty[(os.Path, os.Path, Boolean)]
+    host.control.moves.rename = (from, to) =>
+      renames :+= (from, to, os.exists(from / StoreLoader.ArrivedAtFile))
+      DurableFiles.atomicRename(from, to)
+    for
+      _ <- startMoving(host)
+      _ <- awaitBegun(host, transfers)
+      pstate <- client.getStoragePoolState(moving.poolId)
+      _ = transfers.finishTransferIn(moving, prepare = staged =>
+            DefaultBackendOpener.createStore(StoreConfig.forPool(moving, pstate), staged,
+              staged / os.up / StoreCreation.CreatingDirectory))
+      _ <- pumpTx(host, host.control.router.loaded.contains(moving))
+    yield
+      recorded(host).transferOutcomes.get(moving) should be(Some(TransferOutcome.PoolRepointed))
+      val flat = CopyLayout.path(dev, moving, None, Phase.Live)
+      renames.map((from, to, withArrival) => ((from / os.up).last, to, withArrival)).last should be(
+        (CopyLayout.ArrivedDirectory, flat, true))
+      CopyFixtures.phaseOf(dev, moving) should be(Some(Phase.Live))
+      os.exists(flat / StoreLoader.ArrivedAtFile) should be(true)
+      inDir(dev, CopyLayout.ArrivedDirectory) should be(Nil)
+      host.control.router.loaded.contains(moving) should be(true)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  for (what, spoil) <- List[(String, os.Path => Unit)](
+        "of another transfer" -> (copy =>
+          os.write.over(copy / CopyLayout.paramFile(Phase.Arrived("")).get, UUID.randomUUID().toString)),
+        "with an unusable save file" -> (copy => os.write.over(Backend.crlSaveFile(copy), Array[Byte](1, 2, 3))))
+  do
+    atest(s"an arrived copy $what is deleted and the transfer restarted"):
+      given ExecutionContext = executionContext
+      val (hostRoot, dev) = receivingDevice()
+      val transfers = new StagedTransferService
+      val host = newHost(hostRoot, transferService = transfers)
+      host.testingOnlyHandleEvents()
+      // Held, the first host stops where a crash after promotion would: Arrived, the pool still naming the source
+      recorded(host).holdTransferOutcomes()
+      for
+        _ <- startMoving(host)
+        _ <- awaitBegun(host, transfers)
+        _ = transfers.finishTransferIn(moving)
+        _ <- awaitLoudly("the promotion"):
+               host.testingOnlyHandleEvents()
+               CopyFixtures.copyPath(dev, moving).isDefined
+        _ = spoil(CopyFixtures.copyPath(dev, moving).get)
+        transfers2 = new StagedTransferService
+        host2 = newHost(hostRoot, transferService = transfers2)
+        _ = host2.control.reconciler.checkAll()
+        _ <- awaitBegun(host2, transfers2)
+      yield
+        transfers2.transfersIn.size should be(1)
+        // Deleted rename-first (T13): nothing in arrived/, nothing retired, deleting/ emptied
+        CopyFixtures.copyPath(dev, moving) should be(None)
+        inDir(dev, CopyLayout.ArrivedDirectory) should be(Nil)
+        CopyFixtures.retiredCopies(dev, moving) should be(Nil)
+        os.list(dev / StoreCopies.DeletingDirectory) should be(Nil)
+        recorded(host2).transferOutcomes.get(moving) should be(None)
+        recordOf(host2, loadedDevices(host2)(net.secondDeviceId), moving) should be(None)
+        host2.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  // Review Focus 2: an earlier tenancy's copy, in any phase but this transfer's Arrived, is retired before the receive:
+  // never stuck behind a path, and never received while its CRL entries are unsaved
+  for phase <- List(Phase.Lost, Phase.Outbound("old"), Phase.Rebuilt("old"), Phase.Parked) do
+    atest(s"a transfer in retires an earlier tenancy's copy in each non-Live phase, then receives ($phase)"):
+      given ExecutionContext = executionContext
+      val (hostRoot, dev) = receivingDevice(dev => CopyFixtures.placeCopy(dev, moving, phase): Unit)
+      val transfers = new SnapshotTransfers(dev)
+      val host = newHost(hostRoot, transferService = transfers)
+      host.testingOnlyHandleEvents()
+      val atLoad = CopyFixtures.phaseOf(dev, moving)
+      for
+        _ <- startMoving(host)
+        _ <- awaitBegun(host, transfers)
+      yield
+        atLoad should be(Some(phase))
+        // Retired, with its CRL state saved, before beginTransferIn was called
+        transfers.atBegin.size should be(1)
+        transfers.atBegin.head.size should be(1)
+        transfers.atBegin.head.head._2 should be(true)
+        CopyFixtures.copyPath(dev, moving) should be(None)
+        CopyFixtures.retiredCopies(dev, moving) should be(transfers.atBegin.head.map(_._1))
+        host.control.transfers.receiving.keySet should be(Set(moving))
+        host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("a transfer in waits while an earlier tenancy's Live copy is served, then retires it"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = receivingDevice(dev => CopyFixtures.placeCopy(dev, moving, Phase.Live): Unit)
+    val transfers = new SnapshotTransfers(dev)
+    val host = newHost(hostRoot, transferService = transfers)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(net.secondDeviceId)
+    servedHere(host, local, moving)
+    for
+      _ <- startMoving(host)
+      _ <- pumpTx(host, transfers.transfersIn.nonEmpty, rounds = 5)
+      begunWhileServed = transfers.transfersIn.size
+      phaseWhileServed = CopyFixtures.phaseOf(dev, moving)
+      // Its serve ends, as a close leaves it
+      _ = host.control.copyRegistry.removedFromRouter(net.secondDeviceId, moving)
+      _ = host.control.copyRegistry.closeEnded(net.secondDeviceId, moving)
+      _ = host.control.reconciler.checkAll()
+      _ <- awaitBegun(host, transfers)
+    yield
+      begunWhileServed should be(0)
+      phaseWhileServed should be(Some(Phase.Live))
+      transfers.atBegin.size should be(1)
+      transfers.atBegin.head.map(_._2) should be(List(true))
+      CopyFixtures.copyPath(dev, moving) should be(None)
+      host.control.transfers.receiving.keySet should be(Set(moving))
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("a failed move to live keeps the arrived copy offline and the next check retries it"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = receivingDevice()
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
+    host.testingOnlyHandleEvents()
+    @volatile var failing = true
+    val renames = recordRenames(host, fail = (from, _) => failing && (from / os.up).last == CopyLayout.ArrivedDirectory)
+    val local = loadedDevices(host)(net.secondDeviceId)
+    for
+      tid <- startMoving(host)
+      _ <- awaitBegun(host, transfers)
+      _ = transfers.finishTransferIn(moving)
+      _ <- pumpTx(host, recorded(host).transferOutcomes.contains(moving) &&
+                        !host.control.transfers.receiving.contains(moving))
+      phaseAfterFailure = CopyFixtures.phaseOf(dev, moving)
+      recordAfterFailure = recordOf(host, local, moving).map(r => (r.phase, r.activity))
+      loadsAfterFailure = recorded(host).loadStoreByIdRequests.toList
+      offlineAfterFailure = offlineCopies(host, local).contains(moving)
+      arrivedAtWritten = CopyFixtures.copyPath(dev, moving).exists(p => os.exists(p / StoreLoader.ArrivedAtFile))
+      _ = { failing = false }
+      before = recorded(host).storeLoadAttempts.size
+      st <- client.getStorageDeviceState(net.secondDeviceId)
+      _ <- check2(host, st)
+    yield
+      recorded(host).transferOutcomes.get(moving) should be(Some(TransferOutcome.PoolRepointed))
+      phaseAfterFailure should be(Some(Phase.Arrived(tid.toString)))
+      recordAfterFailure should be(Some((Phase.Arrived(tid.toString), Activity.Idle)))
+      loadsAfterFailure should be(Nil)
+      offlineAfterFailure should be(true)
+      arrivedAtWritten should be(true)
+      st.stores(moving).status should be(StorageDeviceState.StoreStatus.Active)
+      // The Completed Transfers In pass moved it and offered it to the loader at its Live path
+      val flat = CopyLayout.path(dev, moving, None, Phase.Live)
+      CopyFixtures.phaseOf(dev, moving) should be(Some(Phase.Live))
+      renames().count((from, to) => to == flat) should be(2)
+      recorded(host).storeLoadAttempts.toList.drop(before) should be(List((net.secondDeviceId, flat)))
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("a promotion whose sync fails starts no pool update until a device check forces it"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = receivingDevice()
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
+    host.testingOnlyHandleEvents()
+    val arrivedDir = dev / CopyLayout.ArrivedDirectory
+    @volatile var failSyncs = 1
+    host.control.moves.syncDirectory = d =>
+      if d == arrivedDir && failSyncs > 0 then
+        failSyncs -= 1
+        throw new java.io.IOException("injected sync")
+      DurableFiles.syncDirectory(d)
+    // Each (phase, unsynced) the record takes, and whether the record was unsynced whenever the pool update ran
+    @volatile var seen = Vector.empty[(Phase, Boolean)]
+    @volatile var recordingUnsynced = Vector.empty[Boolean]
+    host.control.copyRegistry.observer = (copies, sid) =>
+      if sid == moving && copies.deviceId == net.secondDeviceId then
+        copies.copies.get(sid).map(r => (r.phase, r.unsynced)).foreach(p => if !seen.lastOption.contains(p) then seen :+= p)
+        copies.work.get(sid).foreach:
+          case w: Work.TransferIn if w.stage == TransferInStage.Recording =>
+            recordingUnsynced :+= copies.copies.get(sid).exists(_.unsynced)
+          case _ => ()
+    for
+      tid <- startMoving(host)
+      _ <- awaitBegun(host, transfers)
+      _ = transfers.finishTransferIn(moving)
+      _ <- pumpTx(host, host.control.router.loaded.contains(moving) ||
+                        recorded(host).loadStoreByIdRequests.nonEmpty)
+    yield
+      failSyncs should be(0)
+      val arrived = Phase.Arrived(tid.toString)
+      seen.take(2) should be(Vector((arrived, true), (arrived, false)))
+      seen.last should be((Phase.Live, false))
+      recordingUnsynced should not be empty
+      recordingUnsynced.forall(!_) should be(true)
+      recorded(host).transferOutcomes.get(moving) should be(Some(TransferOutcome.PoolRepointed))
+      transfers.transfersIn.size should be(1)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  /** A device check of the second device reading `state` */
+  private def check2(host: Host, state: StorageDeviceState): Future[Unit] =
+    val armed = recorded(host).armLookup(net.secondDeviceId)
+    host.control.reconciler.checkStorageDevice(net.secondDeviceId)
+    armed.success(state)
+    pump(host, host.control.reconciler.activeDeviceChecks.isEmpty)

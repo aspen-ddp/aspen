@@ -525,8 +525,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, failFirstStoreLoad = true, ec = recordingEc)
 
     // A device outside storage-devices, so no rescan can load it, holding a store that still
-    // carries its transferred-in marker. Against the Active entry armed below,
-    // reconcileDeviceState's completed-transfers-in pass removes the marker and calls
+    // is in arrived/. Against the Active entry armed below,
+    // reconcileDeviceState's completed-transfers-in pass moves it live and calls
     // tryLoadStore with no try/catch around it, and the owed failure throws out of the reconcile.
     // Its copy, registered at the injection and offline, is what makes the pass iterate at all.
     val devDir = hostRoot / "injected-device"
@@ -1178,14 +1178,14 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     net.takeCapturedHostMessages().collect:
       case m: StartStoreTransfer if m.storeId == sid => m
 
-  atest("transfer in stages under the transferring-in directory"):
+  atest("transfer in stages under the transferring-in directory, in its attempt's own directory"):
     given ExecutionContext = executionContext
 
     startTransferIn().map: t =>
       t.transfers.transfersIn.map(_._3) should be(
-        Vector(t.deviceDir / "transferring-in"))
+        t.transfers.transfersIn.map(a => t.deviceDir / "transferring-in" / a._2.toString))
 
-  atest("successful transfer in promotes the staged store and drops the marker"):
+  atest("successful transfer in promotes the staged store into arrived and moves it live"):
     given ExecutionContext = executionContext
 
     for
@@ -1315,7 +1315,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(recorded(t.host).transferOutcomes.contains(t.movingStore) &&
                      !t.host.control.transfers.receiving.keySet.contains(t.movingStore))
     yield
-      os.exists(promoted) should be(true)
+      promoted / os.up should be(t.deviceDir / CopyLayout.ArrivedDirectory)
+      CopyFixtures.phaseOf(t.deviceDir, t.movingStore) should be(Some(Phase.Live))
       heldTransferringIn should contain(t.movingStore)
       attemptsWhileHeld should be(1)
       recorded(t.host).transferOutcomes.get(t.movingStore) should be(Some(DeviceMetadata.TransferOutcome.PoolRepointed))
@@ -1391,7 +1392,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     yield
       startTransferSent(transfers, store, 2) should be(true)
       transfers.cancelledTransfersIn.map(_._1) should be(Vector(store))
-      transfers.transfersIn.last._3 should be(deviceDirB / "transferring-in")
+      transfers.transfersIn.last._3 should be(deviceDirB / "transferring-in" / transfers.transfersIn.last._2.toString)
 
   atest("an abandon during the retry delay cancels the retry and the staged copy"):
     given ExecutionContext = executionContext
@@ -1400,8 +1401,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       t <- startTransferIn()
       _ = t.transfers.failTransferIn(t.movingStore)
       _ <- pumpUntil(t.host.control.transfers.transferInRetries.keySet.contains(t.movingStore))
-      // What a failed promotion leaves behind for the retry to replace.
-      staged = t.deviceDir / StoreTransfer.StagingDirectory / t.movingStore.directoryName
+      // The failed attempt's staging, as if its removal had failed: the abandon removes it with the attempt
+      staged = StoreTransfers.stagingOf(t.deviceDir, t.transfers.transfersIn.last._2) / t.movingStore.directoryName
       _ = os.makeDir.all(staged)
 
       _ <- tombstoneDevice(StorageDeviceId.BootstrapStorageDeviceId)
@@ -1473,8 +1474,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       t <- startTransferIn()
       _ = t.transfers.failTransferIn(t.movingStore)
       _ <- pumpUntil(t.host.control.transfers.transferInRetries.keySet.contains(t.movingStore))
-      // What a failed promotion leaves behind for the retry to replace.
-      staged = t.deviceDir / StoreTransfer.StagingDirectory / t.movingStore.directoryName
+      // The failed attempt's staging, as if its removal had failed: the abort removes it with the attempt
+      staged = StoreTransfers.stagingOf(t.deviceDir, t.transfers.transfersIn.last._2) / t.movingStore.directoryName
       _ = os.makeDir.all(staged)
 
       _ <- client.abortStoreTransfer(t.movingStore)
@@ -1767,7 +1768,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       recorded(host2).loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
       CopyFixtures.phaseOf(t.deviceDir, t.movingStore).exists(_.isInstanceOf[Phase.Arrived]) should be(false)
       // It came from another host, whose clock may lead this one's: its load floor takes the cross-host margin
-      os.exists(promoted / StoreLoader.ArrivedAtFile) should be(true)
+      promoted / os.up should be(t.deviceDir / CopyLayout.ArrivedDirectory)
+      os.exists(CopyFixtures.copyPath(t.deviceDir, t.movingStore).get / StoreLoader.ArrivedAtFile) should be(true)
 
   atest("a promoted copy left by a different transfer is discarded and the store shipped again"):
     given ExecutionContext = executionContext
@@ -1791,7 +1793,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       CopyFixtures.copyPath(t.deviceDir, t.movingStore) should be(None)
       recorded(host2).transferOutcomes.get(t.movingStore) should be(None)
 
-  atest("a promoted copy whose marker cannot be read is neither discarded nor resumed until it reads (SL-W24)"):
+  // SL-W24, under P6: an arrived copy's phase-param.arrived names the transfer it belongs to. One that cannot be read
+  // leaves its device unloaded (nothing discarded, resumed or shipped) until a scan can read it
+  atest("a promoted copy whose phase-param cannot be read leaves its device unloaded until it reads (SL-W24)"):
     given ExecutionContext = executionContext
 
     for
@@ -1800,22 +1804,24 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ = t.transfers.finishTransferIn(t.movingStore)
       _ <- pumpUntil(CopyFixtures.copyPath(t.deviceDir, t.movingStore).isDefined)
       promoted = CopyFixtures.copyPath(t.deviceDir, t.movingStore).get
-      // Raw: the fault is in the marker file itself
-      marker = promoted / StoreTransfer.TransferredInMarkerFile
-      // The marker's stat succeeds and its read fails (EACCES): it says nothing of which transfer the copy belongs to
-      _ = os.perms.set(marker, "---------")
+      param = promoted / CopyLayout.paramFile(Phase.Arrived("")).get
+      // The parameter's stat succeeds and its read fails (EACCES): it says nothing of which transfer the copy belongs to
+      _ = os.perms.set(param, "---------")
 
       transfers2 = new StagedTransferService
       host2 = newHost(t.hostRoot, transferService = transfers2)
       _ = host2.control.reconciler.checkAll()
       _ <- pumpUntil(false, rounds = 5)
-      keptWhileUnreadable = CopyFixtures.copyPath(t.deviceDir, t.movingStore).isDefined
+      loadedWhileUnreadable = loadedDevices(host2).contains(net.secondDeviceId)
+      keptWhileUnreadable = os.isDir(promoted)
       shippedWhileUnreadable = transfers2.transfersIn.nonEmpty
       outcomeWhileUnreadable = recorded(host2).transferOutcomes.get(t.movingStore)
-      _ = os.perms.set(marker, "rw-------")
+      _ = os.perms.set(param, "rw-------")
+      _ = host2.control.discovery.checkForNewDevices()
       _ = host2.control.reconciler.checkAll()
       _ <- pumpUntil(recorded(host2).transferOutcomes.contains(t.movingStore))
     yield
+      loadedWhileUnreadable should be(false)
       keptWhileUnreadable should be(true)
       shippedWhileUnreadable should be(false)
       outcomeWhileUnreadable should be(None)
@@ -1851,7 +1857,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         recorded(host2).transferOutcomes.get(t.movingStore) should be(None)
         poolState.stores(t.movingStore.poolIndex).storageDeviceId should not be net.secondDeviceId
 
-  // An arrived copy found lost (moved to lost/, its transferred-in marker inert there) is retired like any lost copy,
+  // An arrived copy found lost (moved to lost/ from arrived/) is retired like any lost copy,
   // not deleted.
   for (what, mark) <- List[(String, (os.Path, StoreId, os.Path) => Unit)](
         "in lost/" -> ((dev, s, _) => CopyFixtures.markCopy(dev, s, Phase.Lost): Unit))
@@ -1879,7 +1885,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         CopyFixtures.retiredCopies(t.deviceDir, t.movingStore) should have size 1
 
   // A promoted copy moved to outbound/ (a store transferred back onto its old source before that device's Deleted
-  // Stores pass ran; its transferred-in marker inert there): its entry is still TransferringIn, so nothing else clears
+  // Stores pass ran): its entry is still TransferringIn, so nothing else clears
   // it. It was refused forever as "store path already exists"; now it is retired and the store shipped again
   atest("an outbound copy at a transfer in's path is retired on resume and the store shipped again"):
     given ExecutionContext = executionContext
@@ -1982,7 +1988,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         host.control.router.isOffline(movingStore) should be(false)
         host.control.currentView.repairable should contain(movingStore)
 
-  atest("a store carrying the transferred-in marker is not loaded at startup"):
+  atest("a store in arrived/ is not loaded at startup"):
     // A real Host rather than one with the recording tryLoadStore seam, which records every
     // candidate and honours no marker.
     val hostRoot = newHostDir()
@@ -1991,8 +1997,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val storeDir = CopyLayout.path(deviceDir, storeId, Some(UUID.randomUUID()), Phase.Live)
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
       storeDir / os.up / StoreCreation.CreatingDirectory)
-    CopyFixtures.markCopy(deviceDir, storeId, Phase.Arrived(""))
-    val filesBefore = os.list(storeDir).toSet
+    val arrivedDir = CopyFixtures.markCopy(deviceDir, storeId, Phase.Arrived(""))
+    val filesBefore = os.list(arrivedDir).toSet
 
     val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
@@ -2003,7 +2009,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       host.control.router.silentStores should contain(storeId)
       host.getStoreIds should not contain storeId
       // Nothing was opened in the copy's directory.
-      os.list(storeDir).toSet should be(filesBefore)
+      os.list(arrivedDir).toSet should be(filesBefore)
 
   atest("a rebuilt store in rebuilt/ is not loaded at startup"):
     // rebuild-process 10: a crash between the rebuild's move into place and its flip. The tree still says Rebuilding,
@@ -2066,7 +2072,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       host.control.copyRegistry.rebuilding(org.aspen_ddp.aspen.server.host.HostCopies.RebuildReads) should contain(storeIdB)
       CopyFixtures.phaseOf(deviceDir, storeIdB).contains(Phase.Lost) should be(false)
 
-  atest("an Active store still carrying the transferred-in marker is loaded; a TransferringIn one is not"):
+  atest("an Active store whose copy is still in arrived/ is moved live and loaded; a TransferringIn one is not"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newHost(hostRoot)
@@ -2081,7 +2087,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val armed = recorded(host).armLookup(deviceA)
     host.control.reconciler.checkAll()
 
-    // Active: the pool update committed and the destination crashed before removing the marker.
+    // Active: the pool update committed and the destination crashed before moving the copy out of arrived/.
     // TransferringIn with no source named keeps the other out of startStoreTransferIn, so it
     // isolates the guard: the pool update for it has not committed.
     armed.success(deviceState(
@@ -2094,7 +2100,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       CopyFixtures.phaseOf(deviceDir, storeId) should be(Some(Phase.Live))
       CopyFixtures.phaseOf(deviceDir, storeIdB) should be(Some(Phase.Arrived("")))
-      os.exists(activeDir / StoreLoader.ArrivedAtFile) should be(true)
+      os.exists(CopyLayout.path(deviceDir, storeId, None, Phase.Live) / StoreLoader.ArrivedAtFile) should be(true)
       os.exists(pendingDir / StoreLoader.ArrivedAtFile) should be(false)
       recorded(host).storeLoadAttempts.toList.drop(before) should be(
         List((deviceA, CopyLayout.path(deviceDir, storeId, None, Phase.Live))))

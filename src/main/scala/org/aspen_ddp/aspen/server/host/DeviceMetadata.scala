@@ -65,7 +65,7 @@ object DeviceMetadata:
 
     /** As PoolRepointed, but the destination is shutting down or shut down, so its entry was
      *  written Offline rather than Active. The arrived copy is ours but must not be served: it
-     *  stays unloaded behind its transferred-in marker until a restart or adoption makes the
+     *  stays unloaded in arrived/ until a restart or adoption makes the
      *  entry Active, when the reconcile's completed-transfers-in pass loads it. */
     case PoolRepointedOffline
 
@@ -83,7 +83,7 @@ object DeviceMetadata:
 
     /** The destination device now names another host: it was shut down and adopted while this
      *  host's pool update was still in flight. Nothing was written. The arrived copy is left as
-     *  it is, behind its transferred-in marker, for the owner's reconcile to finish: its
+     *  it is, in arrived/, for the owner's reconcile to finish: its
      *  TransferringIn pass finds the promoted copy and runs this update itself. */
     case NotOwned
 
@@ -292,7 +292,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
         // The destination was shut down and adopted by another host while this update was
         // pending. Only its owner may write its entries or announce where the store lives, so
         // nothing is written here; that host's reconcile resumes this update from the arrived
-        // copy, which stays behind its transferred-in marker.
+        // copy, which stays in arrived/.
         else if toDev.hostId != hostId then
           logger.info(s"Transfer of store $storeId onto device $toDeviceid finished after the " +
                       s"device moved to host ${toDev.hostId}. Leaving the pool update to that host")

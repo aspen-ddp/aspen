@@ -175,8 +175,13 @@ class CopyCrashSuite extends IntegrationTestSuite with CopyHostFixture:
         _ <- check(host)
         beforeCrash = onlyCopy(dev, s)
         stateBeforeCrash = os.exists(beforeCrash.path / RebuildingStore.LostCrlStateFile)
-        stateBytes = if stateBeforeCrash then Some(os.read.bytes(beforeCrash.path / RebuildingStore.LostCrlStateFile).toList)
-                     else None
+        // The state the crashed retire saved, made distinct from anything a retire could save again: the CRLs here
+        // hold no state, so a re-save over it would otherwise write the same bytes. After a real dropStore a re-save
+        // would replace the saved entries with an empty state
+        sentinel = s"saved before the crash: ${UUID.randomUUID()}"
+        _ = if stateBeforeCrash then
+              os.write.over(beforeCrash.path / RebuildingStore.LostCrlStateFile, sentinel)
+        stateBytes = Option.when(stateBeforeCrash)(sentinel)
         restarted = newHost(hostRoot)
         _ = restarted.testingOnlyHandleEvents()
         atRestart = onlyCopy(dev, s)
@@ -201,7 +206,7 @@ class CopyCrashSuite extends IntegrationTestSuite with CopyHostFixture:
         retired.path / os.up should be(pendingDir)
         retired.copyId should be(copyId)
         os.exists(retired.path / RebuildingStore.LostCrlStateFile) should be(true)
-        stateBytes.foreach(b => os.read.bytes(retired.path / RebuildingStore.LostCrlStateFile).toList should be(b))
+        stateBytes.foreach(b => os.read(retired.path / RebuildingStore.LostCrlStateFile) should be(b))
         os.exists(retired.path / StoreConfig.configFilename) should be(true)
         recordOf(restarted, loadedDevices(restarted)(deviceA), s) should be(None)
         restarted.control.copyRegistry.takeRegistryErrors() should be(Vector())

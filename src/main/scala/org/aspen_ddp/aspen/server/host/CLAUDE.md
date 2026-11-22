@@ -67,7 +67,12 @@
   is Opening or Closing (its LoadStore or its close's end retires it); a foreign copy `retireForeignCopy` finds
   closed, and retire step 1. A crash between a FailStop close and its move leaves the copy where it was, and the
   restart loads it as after any crash (its CRL holds what the backend had not applied; a backend still broken fails
-  again). `ClosePurpose.Reload` (a failed CRL load, `handleUnloadFailed`; a failed save-file removal,
+  again). Every unload of a device (a shutdown's `closeThenUnload`, a relinquish or a Failed retirement's
+  `stopServing`, `crlFailed`) waits for the closes on it whose end may move a copy to lost/
+  (`StoreRebuilds.closeStarted`/`closeDone`: `handleClose`, `closeUnloaded`, `retireUnserved`, a failed unserved
+  backend's close in `handleBackendOpened`) through `DeviceShutdown.unloadOnceClosed`, so every such move is made on
+  the attached device and an adopter never reads a fail-stopped copy as clean. A close that ends after its device's
+  unload is a bug: logged at error, and its copy moved with `moveUnattached` all the same. `ClosePurpose.Reload` (a failed CRL load, `handleUnloadFailed`; a failed save-file removal,
   `handleSaveFileRemovalFailed`) leaves the copy where it is, to load again. A move that fails is logged at error and
   the copy held offline in `CopyMoves.pendingLost(local)` (in memory, per device, dropped at detach): never loaded
   (`tryLoadStore`), shipped (`startOut`, `closedForTransfer`: treated as Lost), retired (`StoreCopies.retire` answers

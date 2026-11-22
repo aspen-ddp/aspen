@@ -270,13 +270,12 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
             _ <- closeStoresToRelinquish(local)
           yield ()
         catch case t: Throwable => Future.failed(t)
-      frelinquish.onComplete: result =>
+      frelinquish.flatMap(_ => unloadOnceClosed(local)).onComplete: result =>
         relinquishingDevices -= deviceId
         result match
-          case Success(_) =>
-            if ctx.devices.isLoaded(local) then
-              unloadDevice(deviceId)
-              logger.info(s"Storage device $deviceId, $unloadedAs, is unloaded")
+          case Success(true) =>
+            logger.info(s"Storage device $deviceId, $unloadedAs, is unloaded")
+          case Success(false) => ()
           case Failure(t) =>
             logger.warn(s"Failed to unload storage device $deviceId, $unloadedAs. The next " +
                         s"check of the device will try again. Error: $t")
@@ -303,12 +302,13 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
           closeStoresToRelinquish(local, (storeId: StoreId) =>
             ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now)))
         catch case t: Throwable => Future.failed(t)
-      closed.onComplete: result =>
-        relinquishingDevices -= deviceId
+      closed.transformWith: result =>
         result.failed.foreach(t => logger.error(s"Failed to close the stores of storage device $deviceId, whose CRL " +
                                                 s"has failed. Unloading it anyway: $t"))
-        if ctx.devices.isLoaded(local) then
-          unloadDevice(deviceId)
+        unloadOnceClosed(local)
+      .onComplete: result =>
+        relinquishingDevices -= deviceId
+        if result.toOption.contains(true) then
           logger.info(s"Storage device $deviceId, whose CRL has failed, is unloaded")
 
   /** Closes every store open on a relinquished device, one at a time, until none is left: one loaded meanwhile is
@@ -376,10 +376,28 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    */
   private def closeThenUnload(local: LocalStorageDeviceState): Future[Unit] =
     if storesToClose(local).isEmpty then
-      unloadDevice(local.storageDeviceId)
-      Future.unit
+      unloadOnceClosed(local, untilOpen = true).flatMap: _ =>
+        // A store loaded while the closes ended is closed by another round
+        if ctx.devices.isLoaded(local) then closeThenUnload(local) else Future.unit
     else
       closeStoresForShutdown(local).flatMap(_ => closeThenUnload(local))
+
+  /** Unloads `local` once every close on it whose end may move its copy to lost/ has ended
+   *  (StoreRebuilds.closeStarted: a FailStop close, a failed close, an unserved failed backend's), so each such move is
+   *  made on the attached device: unloaded first, the copy would stay where it was, and a load or an adoption would
+   *  take it for a clean one. The check and the unload run in one control task. False if it was not loaded, or, when
+   *  `untilOpen` (a shutdown), a store is open on it again (the caller's next round closes it); a relinquish or a CRL
+   *  failure unloads whatever is open, as it always has */
+  private def unloadOnceClosed(local: LocalStorageDeviceState, untilOpen: Boolean = false): Future[Boolean] =
+    val deviceId = local.storageDeviceId
+    if !ctx.devices.isLoaded(local) || (untilOpen && storesToClose(local).nonEmpty) then
+      Future.successful(false)
+    else if ctx.rebuilds.closesRunning(deviceId) then
+      logger.info(s"Unloading storage device $deviceId once the closes still running on it have ended")
+      ctx.rebuilds.closesEnded(deviceId).flatMap(_ => unloadOnceClosed(local, untilOpen))
+    else
+      unloadDevice(deviceId)
+      Future.successful(true)
 
   /** Forgets a device that has been shut down. Its stores stay silent (the copy registry's unloaded entries), so
    *  messages for them are dropped rather than answered with UnknownStore, and it stays in this host's

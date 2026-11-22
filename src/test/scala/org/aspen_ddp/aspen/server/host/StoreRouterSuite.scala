@@ -262,8 +262,10 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
 
   private def await[T](f: Future[T]): T = Await.result(f, Duration(Bound, SECONDS))
 
-  private def bootstrappedBackend(storeId: StoreId): TrackingBackend =
-    val backend = new TrackingBackend(storeId, os.temp.dir())
+  /** A store's backend in `dir` (a fresh temp directory by default, a bare directory no device holds) */
+  private def bootstrappedBackend(storeId: StoreId, dir: os.Path = os.temp.dir()): TrackingBackend =
+    os.makeDir.all(dir)
+    val backend = new TrackingBackend(storeId, dir)
     backend.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
       DataBuffer(Array[Byte](7)))
     backend
@@ -277,7 +279,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
   private def assertAbandoned(fx: Fixture, s0: StoreId, sds: LocalStorageDeviceState, backend: TrackingBackend): Unit =
     val (entry, offline, loaded, offlineInDevice) = fx.onControl:
       (fx.ctx.router.entry(s0), fx.ctx.router.isOffline(s0), fx.ctx.copyRegistry.openCopies(sds).contains(s0),
-        fx.ctx.copyRegistry.heldOffline(sds, s0))
+        fx.ctx.copyRegistry.offlineCopies(sds).contains(s0))
     entry should be(None)
     offline should be(true)
     loaded should be(false)
@@ -556,13 +558,21 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       second.closed should be(false)
 
   /** A device over `crl` counting with `admission`, onto which `storeId` is loaded */
-  /** Whether the load retired the copy of `s0` on `sds` unserved (StoreRebuilds.retireUnserved): its copy moved to
-   *  lost/, or, its backend in a bare directory with nothing at its record's path, held for that move to retry
-   *  (CopyMoves.pendingLost). The move runs in a control task once the backend's close completes, queued before the
-   *  load's promise fails */
+  /** Whether the load retired the copy of `s0` on `sds` unserved (StoreRebuilds.retireUnserved): any move to lost/
+   *  made or attempted, its copy's record Lost or held for the move's retry (CopyMoves.pendingLost). The move runs in
+   *  a control task once the backend's close completes, queued before the load's promise fails */
   private def retiredLost(fx: Fixture, sds: LocalStorageDeviceState, s0: StoreId): Boolean = fx.onControl:
     fx.ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(s0)).exists(_.phase == Phase.Lost) ||
       fx.ctx.moves.isPendingLost(sds, s0)
+
+  /** Whether the copy of `s0` on `sds` is in lost/, on disk and in its record, nothing left at its flat path, and not
+   *  held for a move's retry */
+  private def inLost(fx: Fixture, sds: LocalStorageDeviceState, s0: StoreId): Boolean = fx.onControl:
+    fx.ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(s0)).exists(_.phase == Phase.Lost) &&
+      !fx.ctx.moves.isPendingLost(sds, s0) &&
+      CopyFixtures.phaseOf(sds.devicePath, s0).contains(Phase.Lost) &&
+      CopyFixtures.copyPath(sds.devicePath, s0).exists(_ / os.up == sds.devicePath / CopyLayout.LostDirectory) &&
+      !os.exists(CopyLayout.path(sds.devicePath, s0, None, Phase.Live))
 
   private def addCountingDevice(fx: Fixture, storeId: StoreId, crl: CrashRecoveryLog,
                                 admission: CrlAdmission): LocalStorageDeviceState = fx.onControl:
@@ -721,12 +731,13 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       val admission = new CrlAdmission(if what.contains("limit") then 100 else Long.MaxValue)
       withRouter(crl): fx =>
         val sds = addCountingDevice(fx, s0, crl, admission)
-        val backend = bootstrappedBackend(s0)
+        // At its flat path on the device, so its retire moves it into lost/
+        val backend = bootstrappedBackend(s0, CopyLayout.path(sds.devicePath, s0, None, Phase.Live))
         CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(states(s0)), backend.crlSaveFile)
         intercept[Exception](await(fx.load(backend)))
         assertAbandoned(fx, s0, sds, backend)
         admission.admittedBytes should be(0)
-        retiredLost(fx, sds, s0) should be(true)
+        inLost(fx, sds, s0) should be(true)
         crl.getFullRecoveryState(s0) should be(empty)
         fx.onControl(fx.ctx.loader.awaitingRetryHasCallback(s0)) should be(None)
 

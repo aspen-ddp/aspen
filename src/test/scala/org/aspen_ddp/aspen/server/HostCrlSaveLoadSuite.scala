@@ -13,9 +13,11 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription,
   TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlClosed, CrlFailed, StoreRecoveryState,
-  TransactionRecoveryState}
-import org.aspen_ddp.aspen.server.host.{Activity, ClosePurpose, ControlFixture, LockstepThreading, StoreLoader}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlClosed, CrlFailed,
+  StoreRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.StorageDeviceConfig
+import org.aspen_ddp.aspen.server.host.{Activity, ClosePurpose, ControlFixture, CopyFixtures, CopyLayout, LockstepThreading, Phase,
+  StoreLoader}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.{Frontend, Store, StoreIncarnationFile}
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
@@ -38,10 +40,11 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
   private val deviceId = StorageDeviceId(new UUID(7, 5))
 
   /** Writes a crl_save.log holding txid's commit vote on an overwrite of the object, and returns the store's backend */
-  private def storeWithSaveFile(): MapBackend =
-    val root = os.temp.dir()
-    tempRoots += root
-    val storeDir = root / "store"
+  private def storeWithSaveFile(at: Option[os.Path] = None): MapBackend =
+    val storeDir = at.getOrElse:
+      val root = os.temp.dir()
+      tempRoots += root
+      root / "store"
     os.makeDir.all(storeDir)
     // Every store directory has its incarnation file from its creation
     StoreIncarnationFile.writeFresh(storeDir)
@@ -239,10 +242,11 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       if failing then Future.unit else super.dropStore(storeId)
 
   /** The store's backend holding the object, in a directory of its own, with no crl_save.log */
-  private def storeInDir(): (MapBackend, os.Path) =
-    val root = os.temp.dir()
-    tempRoots += root
-    val storeDir = root / "store"
+  private def storeInDir(at: Option[os.Path] = None): (MapBackend, os.Path) =
+    val storeDir = at.getOrElse:
+      val root = os.temp.dir()
+      tempRoots += root
+      root / "store"
     os.makeDir.all(storeDir)
     // Every store directory has its incarnation file from its creation
     StoreIncarnationFile.writeFresh(storeDir)
@@ -261,35 +265,60 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
         case _ => ()
     () => seen.toList
 
-  /** The store is not served, and was closed as a fail-stop: the close that moves an attached device's copy to lost/
-   *  when it ends (this one's device is not loaded, so nothing on disk changes) */
-  private def assertRetired(host: Host, loaded: Future[Unit], storeDir: os.Path): Future[compatible.Assertion] =
+  /** A host with device A loaded, its CRL `crl`, and the device's path: a store loaded onto it at its flat path
+   *  (copyAt) is a copy of the device, which a fail-stop moves to lost/ */
+  private def deviceCrlHost(crl: CrashRecoveryLog): (Host, os.Path) =
+    val hostRoot = newHostDir()
+    val dev = writeDevice(hostRoot, "dev0", deviceA)
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(dev))
+    val factory = new CrashRecoveryLogFactory:
+      def openCRL(devicePath: os.Path, config: StorageDeviceConfig, holdsStores: Boolean): CrashRecoveryLog = crl
+      def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit = ()
+    val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+      new LockstepThreading(executionContext), net.objectCacheFactory, net,
+      BackgroundTaskManager.NoBackgroundTaskManager, factory,
+      net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
+      seams = compared())
+    host.testingOnlyHandleEvents()
+    (host, dev)
+
+  /** Where device A's copy of the suite's store lives while Live */
+  private def copyAt(dev: os.Path): Option[os.Path] = Some(CopyLayout.path(dev, crlStoreId, None, Phase.Live))
+
+  /** The store, loaded onto device A at `dev`, is not served, was closed as a fail-stop, and its copy is in lost/ once
+   *  that close has ended, nothing left at its flat path */
+  private def assertRetired(host: Host, loaded: Future[Unit], dev: os.Path): Future[compatible.Assertion] =
     given ExecutionContext = executionContext
     val closes = closesSeen(host)
     def retired: Boolean =
       host.testingOnlyHandleEvents()
-      loaded.isCompleted && storeOf(host).isEmpty
+      loaded.isCompleted && storeOf(host).isEmpty && CopyFixtures.phaseOf(dev, crlStoreId).contains(Phase.Lost)
     for
       _ <- yieldUntil(retired)
     yield
       withClue("a store that failed to recover part of its transactions is not served: "):
         storeOf(host) should be (None)
       closes() should be (List(ClosePurpose.FailStop))
+      CopyFixtures.phaseOf(dev, crlStoreId) should be (Some(Phase.Lost))
+      CopyFixtures.copyPath(dev, crlStoreId).map(_ / os.up) should be (Some(dev / CopyLayout.LostDirectory))
+      os.exists(copyAt(dev).get) should be (false)
 
-  atest("a store whose device-CRL recovery throws is not served, and is closed as a fail-stop"):
+  atest("a store whose device-CRL recovery throws is not served, and is moved to lost/"):
     val crl = new ThrowingCRL
     crl.save(txid, commitVote(), () => ())
     crl.failing = true
-    val (backend, storeDir) = storeInDir()
-    val host = newCrlHost(crl)
-    assertRetired(host, host.loadStore(deviceId, backend, None), storeDir)
+    val (host, dev) = deviceCrlHost(crl)
+    val (backend, _) = storeInDir(copyAt(dev))
+    host.testingOnlyRescan(deviceA)
+    assertRetired(host, host.loadStore(deviceA, backend, None), dev)
 
-  atest("a store whose recovery from its crl_save.log throws is not served, and is closed as a fail-stop"):
+  atest("a store whose recovery from its crl_save.log throws is not served, and is moved to lost/"):
     val crl = new ThrowingCRL
     crl.failing = true
-    val backend = storeWithSaveFile()
-    val host = newCrlHost(crl)
-    assertRetired(host, host.loadStore(deviceId, backend, None), backend.path)
+    val (host, dev) = deviceCrlHost(crl)
+    val backend = storeWithSaveFile(copyAt(dev))
+    host.testingOnlyRescan(deviceA)
+    assertRetired(host, host.loadStore(deviceA, backend, None), dev)
 
   /** The device's CRL fails `crl`'s outstanding recovery read with `err`: the store is left installed, unmarked and
    *  holding its messages, for the device's unload (DeviceShutdown.crlFailed) or the shutdown to close (CRL-W12) */
@@ -331,14 +360,15 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
       val backend = storeWithSaveFile()
       assertReadFailureLeavesStore(new SlowReadCRL, backend, backend.path, err())
 
-  atest("a store whose device-CRL recovery read fails otherwise is not served, and is closed as a fail-stop"):
+  atest("a store whose device-CRL recovery read fails otherwise is not served, and is moved to lost/"):
     val crl = new SlowReadCRL
     crl.save(txid, commitVote(), () => ())
-    val (backend, storeDir) = storeInDir()
-    val host = newCrlHost(crl)
-    val loaded = host.loadStore(deviceId, backend, None)
+    val (host, dev) = deviceCrlHost(crl)
+    val (backend, _) = storeInDir(copyAt(dev))
+    host.testingOnlyRescan(deviceA)
+    val loaded = host.loadStore(deviceA, backend, None)
     crl.answer.failure(new IllegalStateException("injected read failure"))
-    assertRetired(host, loaded, storeDir)
+    assertRetired(host, loaded, dev)
 
   atest("a prepare that arrives while the crl_save.log loads is handled after the recovered transactions lock"):
     given ExecutionContext = executionContext

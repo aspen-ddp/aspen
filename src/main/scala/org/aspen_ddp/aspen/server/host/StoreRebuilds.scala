@@ -747,17 +747,49 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     ctx.moves.pendingLost(local).toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
       moveToLost("retry move to lost", local, storeId): Unit
 
-  /** The copy of `storeId` on device `deviceId`, if it is loaded here: moved to lost/ (moveToLost), then its device
-   *  checked so the reconcile flips its entry to Rebuilding */
-  private def moveClosedToLost(site: String, deviceId: StorageDeviceId, storeId: StoreId): Unit =
+  // The closes on each device whose end may move their copy to lost/ (closeStarted): a store's close (handleClose,
+  // closeUnloaded) and an unserved backend's (retireUnserved, handleBackendOpened). Every unload of a device waits for
+  // them (DeviceShutdown.unloadOnceClosed), so their move is made on the attached device
+  private var lostCloses: Map[StorageDeviceId, Set[Promise[Unit]]] = Map()
+
+  /** A close on device `deviceId` whose end may move its copy to lost/ begins: the device is not unloaded until the
+   *  returned promise is given back to closeDone, after that move */
+  private[host] def closeStarted(deviceId: StorageDeviceId): Promise[Unit] =
+    val p = Promise[Unit]()
+    lostCloses += deviceId -> (lostCloses.getOrElse(deviceId, Set()) + p)
+    p
+
+  /** The close `p` (closeStarted) on device `deviceId` has ended, its copy moved to lost/ if it was to be */
+  private[host] def closeDone(deviceId: StorageDeviceId, p: Promise[Unit]): Unit =
+    val left = lostCloses.getOrElse(deviceId, Set()) - p
+    lostCloses = if left.isEmpty then lostCloses - deviceId else lostCloses + (deviceId -> left)
+    p.trySuccess(())
+
+  /** Whether a close on device `deviceId` whose end may move its copy to lost/ is still running */
+  private[host] def closesRunning(deviceId: StorageDeviceId): Boolean = lostCloses.contains(deviceId)
+
+  /** Completes once every close on device `deviceId` running now (closeStarted) has ended */
+  private[host] def closesEnded(deviceId: StorageDeviceId): Future[Unit] =
+    Future.sequence(lostCloses.getOrElse(deviceId, Set()).toList.map(_.future)).map(_ => ())
+
+  /** The closed copy of `storeId` at `path` on device `deviceId`: moved to lost/ (moveToLost), then its device checked
+   *  so the reconcile flips its entry to Rebuilding. Every unload waits for the close that leads here
+   *  (closeStarted), so a device not loaded is a bug: logged at error, and the copy moved all the same, unattached
+   *  (CopyMoves.moveUnattached), so that no later load or adoption takes it for a clean copy */
+  private def moveClosedToLost(site: String, deviceId: StorageDeviceId, storeId: StoreId, path: os.Path): Unit =
     ctx.devices.devices.get(deviceId) match
       case Some(sds) =>
         moveToLost(site, sds, storeId): Unit
         ctx.reconciler.checkStorageDevice(deviceId)
       case None =>
-        // Its device was unloaded meanwhile: its next load finds the copy where it is, and a backend still broken
-        // fails its open again (P5)
-        logger.warn(s"Not moving the copy of store $storeId to lost/ ($site): its device $deviceId is not loaded")
+        logger.error(s"The copy of store $storeId at $path closed after its device $deviceId was unloaded ($site), " +
+                     "a bug: an unload waits for its closes. Moving it to lost/ unattached")
+        val flat = CopyLayout.parseName(path.last).isEmpty
+        if flat && Try(FileStat.isDir(path)).getOrElse(true) then
+          ctx.moves.moveUnattached(site, path, storeId, None, Phase.Lost)._1 match
+            case MoveResult.NotMoved(t) =>
+              logger.error(s"Failed to move the copy of store $storeId at $path to lost/: $t")
+            case _ => ()
 
   /** The LoadStore handler found `backend`'s CRL save file unusable. The file sits in the store's
    *  own directory, so it is the only copy of that state: the store is permanently failed. It
@@ -780,12 +812,15 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  at the next start and lands here again. */
   def retireUnserved(storageDeviceId: StorageDeviceId, backend: Backend): Unit =
     val storeId = backend.storeId
+    val tracked = closeStarted(storageDeviceId)
     val closed =
       try backend.close()
       catch case NonFatal(t) => Future.failed(t)
     closed.onComplete: result =>
-      result.failed.foreach(t => logger.warn(s"Failed to close the unserved backend of store $storeId: $t"))
-      moveClosedToLost("retireUnserved", storageDeviceId, storeId)
+      try
+        result.failed.foreach(t => logger.warn(s"Failed to close the unserved backend of store $storeId: $t"))
+        moveClosedToLost("retireUnserved", storageDeviceId, storeId, backend.path)
+      finally closeDone(storageDeviceId, tracked)
 
   /** A store closed by ShutdownStore whose backend failed-stop meanwhile: its page-cache state can't be trusted, so
    *  it is rebuilt rather than treated as cleanly closed. Its copy, closed (Idle), is moved to lost/, where nothing
@@ -796,13 +831,13 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     val storeId = store.storeId
     logger.error(s"Store $storeId failed on an I/O error while closing. Moving it to lost/ instead of closing it " +
                  s"cleanly. ${store.backend.path}")
-    moveClosedToLost("failedOnClose", store.storageDeviceId, storeId)
+    moveClosedToLost("failedOnClose", store.storageDeviceId, storeId, store.backend.path)
 
   /** The FailStop close of `storeId` on device `deviceId` ended (StoreLoader.closeUnloaded): the copy is moved to
    *  lost/ now it is closed (P5). A crash between the close and the move leaves it where it was, and the restart loads
    *  it as after any crash */
-  def failStopClosed(deviceId: StorageDeviceId, storeId: StoreId): Unit =
-    moveClosedToLost("fail-stop close ended", deviceId, storeId)
+  def failStopClosed(deviceId: StorageDeviceId, storeId: StoreId, path: os.Path): Unit =
+    moveClosedToLost("fail-stop close ended", deviceId, storeId, path)
 
   /** A backend failed-stop: its state can no longer be trusted, so the store is rebuilt. If it is
    *  served, it is unloaded, its CRL state left for the rebuild's discard to save and drop, and closed with purpose

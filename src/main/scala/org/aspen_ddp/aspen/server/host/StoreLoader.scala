@@ -297,17 +297,23 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         logger.warn(s"Not serving store $storeId opened at $storePath: its device was unloaded or another " +
                     s"backend serves it meanwhile. Closing it")
         val failed = backend.hasFailed
+        // Its device's unload waits for the close (StoreRebuilds.closeStarted), so the move below is made on it
+        val tracked = Option.when(failed && registered)(ctx.rebuilds.closeStarted(sds.storageDeviceId))
         val closed =
           try backend.close()
           catch case NonFatal(t) => Future.failed(t)
         created.foreach(_.tryFailure(new IllegalStateException(s"store $storeId was opened but not served")))
         openEnded()
         if failed then
-          // Moved to lost/ once its backend has closed: never a move of an open backend's directory (P5)
+          // Moved to lost/ once its backend has closed: never a move of an open backend's directory (P5). A device
+          // unloaded before this open ended is left as its unload left it: the copy is where it was, and a backend
+          // still broken fails its next open again
           closed.onComplete: _ =>
-            if ctx.devices.isLoaded(sds) then
-              ctx.rebuilds.moveToLost("failed unserved backend", sds, storeId): Unit
-              ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
+            try
+              if ctx.devices.isLoaded(sds) then
+                ctx.rebuilds.moveToLost("failed unserved backend", sds, storeId): Unit
+                ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
+            finally tracked.foreach(ctx.rebuilds.closeDone(sds.storageDeviceId, _))
       case Success(backend) =>
         if create then
           newStores += storeId
@@ -798,6 +804,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  ends (StoreRebuilds.failStopClosed, P5); any other leaves it where it is */
   private[host] def closeUnloaded(entry: StoreRouter.Entry, dropDurably: Boolean, purpose: ClosePurpose): Unit =
     val store = entry.store
+    // Its device's unload waits for the close's end (StoreRebuilds.closeStarted)
+    val tracked = ctx.rebuilds.closeStarted(store.storageDeviceId)
     startClose(entry):
       store.objectCache.clear()
       if dropDurably then
@@ -813,10 +821,12 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         ctx.copyRegistry.closeEnded(store.storageDeviceId, store.storeId)
         // The reconcile's passes leave a closing copy to its close (HostCopies.offlineCopies): its end checks the
         // device again, so a fail-stopped or unloaded copy is retired or rebuilt without waiting for the periodic check
-        if purpose == ClosePurpose.FailStop then
-          ctx.rebuilds.failStopClosed(store.storageDeviceId, store.storeId)
-        else if ctx.devices.devices.contains(store.storageDeviceId) then
-          ctx.reconciler.checkStorageDevice(store.storageDeviceId)
+        try
+          if purpose == ClosePurpose.FailStop then
+            ctx.rebuilds.failStopClosed(store.storageDeviceId, store.storeId, store.backend.path)
+          else if ctx.devices.devices.contains(store.storageDeviceId) then
+            ctx.reconciler.checkStorageDevice(store.storageDeviceId)
+        finally ctx.rebuilds.closeDone(store.storageDeviceId, tracked)
 
   /** The first step of a close, on the executor of `entry`, whose store the router no longer holds. Every task
    *  queued ahead of it has run against the open store. It then sets `closing`, so I/O completions posted from now on
@@ -868,6 +878,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       case None => completion.success(())
       case Some(entry) =>
         val store = entry.store
+        // Its device's unload waits for the close's end, failedOnClose's move included (StoreRebuilds.closeStarted)
+        val tracked = ctx.rebuilds.closeStarted(store.storageDeviceId)
         // isWriteFrozen may be read from any thread
         if store.backend.isWriteFrozen then
           // The close abandons the held writes as a crash would: they were never
@@ -910,7 +922,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           // The close has ended: the backend and directory belong to the control side again
           ctx.threading.release(storeId)
           ctx.copyRegistry.closeEnded(store.storageDeviceId, storeId)
-          result match
+          try result match
             case Success(_) =>
               // An FSIF close completes even after a fail-stop during it, and this store is no
               // longer served, so its BackendFailed (if any) would find nothing to act on.
@@ -922,6 +934,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             case Failure(t) =>
               logger.error(s"Failed to close store $storeId: $t")
               completion.failure(t)
+          finally ctx.rebuilds.closeDone(store.storageDeviceId, tracked)
 
 object StoreLoader:
   /** In a store directory: this host's wall clock, in milliseconds, when the store arrived from another host, by a

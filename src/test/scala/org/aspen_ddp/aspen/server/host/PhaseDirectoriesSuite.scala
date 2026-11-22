@@ -139,6 +139,91 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       inLost(dev, s, flat)
       host.control.router.loaded.contains(s) should be(false)
 
+  /** As pump, also letting the client's transactions complete each round */
+  private def pumpTx(host: Host, condition: => Boolean, rounds: Int = -1): Future[Unit] =
+    given ExecutionContext = executionContext
+    val deadline = System.nanoTime() + Duration(10, SECONDS).toNanos
+    def loop(done: Int): Future[Unit] =
+      host.testingOnlyHandleEvents()
+      if condition || rounds == done || (rounds < 0 && System.nanoTime() - deadline > 0) then
+        Future.unit
+      else
+        waitForTransactionsToComplete().flatMap(_ => loop(done + 1))
+    loop(0)
+
+  /** A real host serving a RocksDB copy of `s` on device A, whose backend has failed with its FailStop close held by
+   *  the returned gate: the copy is Closing, still Live at its flat path */
+  private def heldFailStop(hostRoot: os.Path, dev: os.Path): Future[(Host, os.Path, Promise[Unit])] =
+    given ExecutionContext = executionContext
+    val flat = rocksCopy(dev, s)
+    val opener = new TestOpener
+    val host = realHost(hostRoot, opener)
+    val gate = Promise[Unit]()
+    for
+      _ <- pump(host, host.control.router.loaded.contains(s))
+      _ = opener.closeGate = Some(gate.future)
+      _ = opener.onFatals.head(new java.io.IOException("injected"))
+      _ <- pump(host, !host.control.router.loaded.contains(s))
+    yield (host, flat, gate)
+
+  private def closingFailStop(host: Host): Boolean =
+    host.control.copyRegistry.copiesOf(loadedDevices(host)(deviceA)).flatMap(_.copies.get(s)).map(_.activity)
+      .contains(Activity.Closing(ClosePurpose.FailStop))
+
+  atest("a shutdown waits for a fail-stop close to end, and its copy is moved to lost before the unload"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val active = org.aspen_ddp.aspen.common.metadata.StorageDeviceState.StoreEntry(
+      org.aspen_ddp.aspen.common.metadata.StorageDeviceState.StoreStatus.Active, None)
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.copy(stores = Map(s -> active)))
+      _ <- waitForTransactionsToComplete()
+      (host, flat, gate) <- heldFailStop(hostRoot, dev)
+      _ <- client.shutdownStorageDevice(deviceA)
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpTx(host, recorded(host).shutdownOutcomes.nonEmpty)
+      _ <- pumpTx(host, false, rounds = 10)
+      // Shut down in the tree, but not unloaded while the close runs: the copy is still Live where it was
+      outcomes = recorded(host).shutdownOutcomes.toList
+      loadedWhileHeld = loadedDevices(host).contains(deviceA)
+      closingWhileHeld = closingFailStop(host)
+      phaseWhileHeld = CopyFixtures.phaseOf(dev, s)
+      _ = gate.success(())
+      _ <- pumpTx(host, !loadedDevices(host).contains(deviceA))
+    yield
+      outcomes should be(List(DeviceMetadata.ShutdownOutcome.Completed))
+      loadedWhileHeld should be(true)
+      closingWhileHeld should be(true)
+      phaseWhileHeld should be(Some(Phase.Live))
+      loadedDevices(host).contains(deviceA) should be(false)
+      // What an adopting host reads: CrlLost, never a clean copy
+      inLost(dev, s, flat)
+
+  atest("a relinquish waits for a fail-stop close to end, and its copy is moved to lost before the unload"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val other = org.aspen_ddp.aspen.common.metadata.HostId(new java.util.UUID(9, 9))
+    for
+      (host, flat, gate) <- heldFailStop(hostRoot, dev)
+      // The tree names another owner: the device is relinquished
+      armed = recorded(host).armLookup(deviceA)
+      _ = host.control.reconciler.checkStorageDevice(deviceA)
+      _ = armed.success(deviceState(deviceA).copy(hostId = other))
+      _ <- pump(host, false, rounds = 20)
+      loadedWhileHeld = loadedDevices(host).contains(deviceA)
+      closingWhileHeld = closingFailStop(host)
+      phaseWhileHeld = CopyFixtures.phaseOf(dev, s)
+      _ = gate.success(())
+      _ <- pump(host, !loadedDevices(host).contains(deviceA))
+    yield
+      loadedWhileHeld should be(true)
+      closingWhileHeld should be(true)
+      phaseWhileHeld should be(Some(Phase.Live))
+      loadedDevices(host).contains(deviceA) should be(false)
+      inLost(dev, s, flat)
+
   atest("a crash after a fail-stop close and before its move reloads the copy from live"):
     given ExecutionContext = executionContext
     val (hostRoot, dev) = device()

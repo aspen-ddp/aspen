@@ -87,11 +87,11 @@
   (queued, discarding its lost copy, running, or cancelled and not yet released), a transfer in of that store onto
   the device waits (`StoreRebuilds.hasRebuildWork`, checked by `StoreTransfers.startIn`; `server/host/CLAUDE.md`).
   A lost copy's discard hands its slot to the rebuild only for the episode it began for, re-read from the device's
-  latest reconcile (`discardLostStore`); an entry moved on meanwhile gets a fresh device check instead
+  latest reconcile (`discardLostStore`); an entry moved on meanwhile gets a fresh device check instead, and a failed one the backoff re-check of a failed pass.
   A new store's create work ends once its copy is served, before its flip commits, so a rebuild of a store whose
-  backend failed right after its create never overlaps the create (`StoreRebuilds.createNewStore`)
+  backend failed right after its create never overlaps the create (`StoreRebuilds.createNewStore`).
   A rebuild is neither requested (Lost CRL pass) nor started (`startRebuild`) while a send of the store is still
-  registered (`isTransferringOut`): its discard would move the directory being shipped. A device re-check follows
+  registered (`isTransferringOut`, host-wide by store): its discard would move the directory being shipped. A device re-check follows
 - A rebuild's staging store opens through the same `BackendOpener` as a normal load (passed by
   `StoreRebuildFactory.createRebuild`). A first pass (no checkpoint) discards whatever staging holds and creates a
   fresh staging store atomically (`BackendOpener.create`); a resume only opens it, and one whose backend is lost

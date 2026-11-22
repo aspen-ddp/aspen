@@ -261,9 +261,11 @@
     `droppingCrlState`), and the slot passes straight to the rebuild in the same callback, so one reconcile cannot
     retire every marked store at once. The handoff re-reads `reconciledEntries`: the rebuild starts only if the entry
     is still Rebuilding under the episode the discard began for; otherwise the slot is released and the device checked
-    again (a retire held up by a slow CRL can outlast a re-placement). Neither the Lost CRL pass
+    again (a retire held up by a slow CRL can outlast a re-placement). A failed retire is a failed pass: it re-checks
+    the other devices and schedules this device's backoff re-check (`scheduleRebuildRetry`), which also starts a
+    transfer in the discard held back. Neither the Lost CRL pass
     (`DeviceReconciler.flipLostCrlStores`) nor `startRebuild` acts on a store while
-    `storeTransferService.isTransferringOut` holds it (a transfer aborted while its send runs, its copy then marked):
+    `storeTransferService.isTransferringOut` (host-wide, by store id) holds it (a transfer aborted while its send runs, its copy then marked):
     the discard would move the directory the send may still read. Each schedules a device re-check instead, as the
     Abandoned Transfers Out pass does.
   - `StoreTransfers.startIn`, for a `rebuild-complete` or `rebuild-required` copy an earlier tenancy left at the

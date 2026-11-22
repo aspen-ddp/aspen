@@ -32,12 +32,15 @@ private class HeldRebuildFactory extends StoreRebuildFactory:
     synchronized(created += r)
     r
 
-/** A device CRL whose first dropStore of each store waits for the test: a retire held up by a slow CRL */
+/** A device CRL whose first dropStore of each store waits for the test (a retire held up by a slow CRL); later ones
+ *  complete at once */
 private class HeldDropCrl extends TestNetwork.TestCRL:
   val drops: mutable.Map[StoreId, Promise[Unit]] = mutable.Map()
 
   override def dropStore(storeId: StoreId): Future[Unit] = synchronized:
-    drops.getOrElseUpdate(storeId, Promise[Unit]()).future
+    drops.get(storeId) match
+      case Some(p) if p.isCompleted => Future.unit
+      case _ => drops.getOrElseUpdate(storeId, Promise[Unit]()).future
 
 /** I3: at most one piece of host work (Create, Rebuild, TransferIn, TransferOut) per (device, store) at a time. Each
  *  test is a counterexample of the Stage 1 audit (store-copy state machine design, "COUNTEREXAMPLES TO I3") and checks
@@ -144,6 +147,43 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       discarding should be(true)
       os.exists(storePath) should be(false)
       factory.created.map(_.episode).toList should be(List(Some(e2)))
+
+  /** C1, review Minor 1: a lost copy's discard fails (its CRL drop) after the store was re-placed away and transferred
+   *  back. The transfer in held back while the discard ran is not left for the periodic check: the failed discard
+   *  schedules its device's backoff re-check, as a failed rebuild pass does, and that check starts the transfer. */
+  atest("a failed discard re-checks its device so a held transfer in proceeds (C1)"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = hostRoot / os.up / "injected-device"
+    os.makeDir.all(deviceDir)
+    val storePath = writeStoreConfig(deviceDir, moving)
+    os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+    val crl = new HeldDropCrl
+    val factory = new HeldRebuildFactory
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers, storeRebuildFactory = factory)
+    val local = new LocalStorageDeviceState(deviceA, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl)
+    injectLoadedDevice(host, local)
+
+    for
+      _ <- check(host, deviceA, Map(moving -> rebuildingIn(UUID.randomUUID())))
+      _ <- yieldUntil(crl.synchronized(crl.drops.contains(moving)))
+      _ <- check(host, deviceA, Map(moving -> transferringIn))
+      _ <- pumpUntil(recorded(host).transferSourceReads.nonEmpty)
+      heldBack = transfers.transfersIn.isEmpty
+      _ = crl.synchronized(crl.drops(moving)).failure(new Exception("CRL drop failed"))
+      _ <- yieldUntil(!host.control.rebuilds.isRebuilding(moving))
+      retryScheduled = host.control.rebuilds.rebuildRetriesScheduled.contains(moving)
+      // The retry's check retires the copy as an earlier tenancy, and the check that follows starts the receive
+      _ = List(1, 2).foreach(_ =>
+        recorded(host).armLookup(deviceA).success(deviceState(deviceA, Map(moving -> transferringIn))))
+      _ = runRebuildRetries(host)
+      _ <- pumpUntil(transfers.transfersIn.nonEmpty)
+    yield
+      heldBack should be(true)
+      retryScheduled should be(true)
+      transfers.transfersIn.map(_._1) should be(Vector(moving))
+      factory.created should be(empty)
 
   /** C4: a create's flip commits Active but is reported Unknown. Before its retry, a backend failure has the store
    *  requested for rebuild and a check queues the rebuild (silenced). The create's work ended when its copy was

@@ -220,7 +220,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         result.failed.foreach: t =>
           logger.error(s"Failed to create store $storeId on device $deviceId. The next check of the " +
                        s"device will try again. Error: $t")
-        // fcreate completed first, so creatingStores no longer holds it
+        // Normally after fcreate's callback has released creatingStores; a flip failing before its prepare ran
+        // leaves creatingStores to fcreate, which still blocks a second create until it ends
         pendingCreateFlips -= storeId
 
   /** Begins reconstruction of one store from the rest of its pool.
@@ -276,7 +277,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     if !shipping && !rebuildingStores.contains(storeId) && !scheduledRebuildRetries.get(storeId).contains(held) &&
        rebuildingStores.size + droppingCrlState.size < ctx.maxConcurrentRebuilds &&
        ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId, episode) &&
-       discardLostStore(local, storeId, episode) then
+       discardLostStore(local, storeId, episode, held) then
       val sr = ctx.storeRebuildFactory.createRebuild(
         ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends, episode)
 
@@ -877,9 +878,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  Once the copy is in pending-delete the rebuild is started at once, in the same callback, so the slot passes to
    *  it with no gap in which another store's discard could take it, but only while the device's latest reconcile still
    *  read the entry Rebuilding under `episode`: otherwise the slot is freed and the device checked again. A failure
-   *  frees the slot and leaves everything in place for a later check.
+   *  frees the slot, leaves everything in place, and schedules the device's backoff re-check as a failed pass does.
    */
-  private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
+  private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
+                               held: StoreRebuilds.HeldRebuild): Boolean =
     val storePath = local.devicePath / storeId.directoryName
     // A stat that fails is no absence (FileStat): the rebuild waits for a later check rather than start over the copy
     val marked = FileStat.existence(storePath / RebuildingStore.RebuildRequiredMarkerFile)
@@ -905,6 +907,12 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 logger.info(s"Not rebuilding store $storeId on device ${local.storageDeviceId} after discarding its " +
                             "lost copy: its entry there is no longer Rebuilding for this episode")
                 ctx.reconciler.checkStorageDevice(local.storageDeviceId)
+          else
+            // A failed retire is a failed pass (rebuild-process 5.7): the freed slot re-checks the other devices, and
+            // this device is checked after a backoff, not at once (a CRL that keeps failing would spin). That check
+            // also starts whatever the discard held back here, a transfer in of the store re-placed away and back
+            ctx.devices.devices.keys.filter(_ != local.storageDeviceId).foreach(ctx.reconciler.checkStorageDevice)
+            scheduleRebuildRetry(storeId, held)
       false
 
 object StoreRebuilds:

@@ -14,6 +14,8 @@ enum Phase:
   case Rebuilt(episode: String)
   /** Rebuild-required: its CRL state is gone */
   case Lost
+  /** In pending-delete/: a move target only (CopyMoves, from Lost). Never recorded once its move is durable */
+  case Retired
   /** Stage 1 only: never returned by `CopyPhase.read`. The registry's record of a copy whose read threw */
   case Unread
 

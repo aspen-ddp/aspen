@@ -342,7 +342,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
   def reloadClosedStores(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     val deviceId = local.storageDeviceId
     closedForShutdown.get(deviceId).foreach: closed =>
-      def storePath(storeId: StoreId): os.Path = local.devicePath / storeId.directoryName
+      def storePath(storeId: StoreId): os.Path = ctx.copyRegistry.pathOrLive(local, storeId)
       // One loaded by something else since (served or opening), or gone, is dropped. One still closing, retiring or
       // held by other work on the device is left to it (I3) and kept, for a later reconcile once that has ended
       val free = ctx.copyRegistry.offlineCopies(local)

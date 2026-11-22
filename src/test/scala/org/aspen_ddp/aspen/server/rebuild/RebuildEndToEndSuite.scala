@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.rebuild
 
+import org.aspen_ddp.aspen.server.host.{CopyFixtures, Phase}
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker
@@ -72,7 +73,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       fullEntry <- fullPool.errorTree.get(MissedUpdateMarker.errorKey(storeId, ids(1)))
       fullLostEntry <- fullPool.errorTree.get(MissedUpdateMarker.errorKey(storeId, ids.head))
       fullLeft = RebuildState.load(staging).map(_.failedObjects.toSet)
-      fullPlaced = os.exists(dev / storeId.directoryName)
+      fullPlaced = CopyFixtures.copyPath(dev, storeId).isDefined
 
       accepted <- rebuild(Set(doomed), episode).complete.transform(Success(_))
 
@@ -97,7 +98,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       fullLeft should be(Some(Set(ids.head, ids(1))))
       // With it the rebuild finishes, and the lost object, only that one, is recorded for repair
       accepted should be(Success(()))
-      os.exists(dev / storeId.directoryName / StoreConfig.configFilename) should be(true)
+      CopyFixtures.copyPath(dev, storeId).exists(p => os.exists(p / StoreConfig.configFilename)) should be(true)
       lostEntry should be(defined)
       restoredEntry should be(None)
 
@@ -193,7 +194,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       // Every object restored again, none taken from the earlier episode's copy
       val restored = resumed.testingOnlyRestoredKeys.map(_.bytes.toList).toSet
       ids.map(id => Key(id.toBytes).bytes.toList).toSet.subsetOf(restored) should be(true)
-      os.read(dev / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile) should be(current.get.toString)
+      CopyFixtures.phaseOf(dev, storeId) should be(Some(Phase.Rebuilt(current.get.toString)))
 
   atest("a failed device's stores are reconstructed on a live device"):
     given ExecutionContext = executionContext
@@ -266,8 +267,8 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       // directory under rebuilding/ is gone. Each bootstrap store also holds flushed object data
       // (not just scaffolding); the initial metadata pool's stores are empty, so have none.
       expectedStores.foreach: sid =>
-        val finalPath = deviceDir / sid.directoryName
-        os.exists(finalPath) should be(true)
+        CopyFixtures.copyPath(deviceDir, sid) should be(defined)
+        val finalPath = CopyFixtures.copyPath(deviceDir, sid).get
         StoreConfig.loadStoreConfig(finalPath / StoreConfig.configFilename).storeId should
           be(sid)
 

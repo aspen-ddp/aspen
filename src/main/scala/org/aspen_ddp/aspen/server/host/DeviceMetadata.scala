@@ -598,7 +598,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
               crlLost.foreach: storeId =>
                 logger.warn(s"Store $storeId on storage device $storageDeviceId has lost its CRL state. " +
                             s"Adopting it as Rebuilding")
-                markRebuildRequired(devicePath / storeId.directoryName)
+                markRebuildRequired(CopyLayout.path(devicePath, storeId, None, Phase.Live))
               val reactivated = state.withOfflineStoresActive.copy(hostId = hostId, status = DeviceStatus.Operational)
               val newState = crlLost.foldLeft(reactivated): (st, storeId) =>
                 st.setRebuilding(storeId, UUID.randomUUID())

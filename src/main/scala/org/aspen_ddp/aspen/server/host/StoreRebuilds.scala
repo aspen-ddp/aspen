@@ -156,7 +156,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  the flip completes, keeps a check meanwhile from creating it again (I3: one piece of work per (device, store)).
    */
   def createNewStore(local: LocalStorageDeviceState, storeId: StoreId): Unit =
-    val storePath = local.devicePath / storeId.directoryName
+    // The create's target: the copy has no record yet
+    val storePath = CopyLayout.path(local.devicePath, storeId, None, Phase.Live)
     val deviceId = local.storageDeviceId
 
     // The create claims its work first (I3): refused (other work holds the copy, recorded), nothing starts, and the
@@ -459,7 +460,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 // device before the retry
                 logger.error(s"Failed to record the completed rebuild of store $storeId on " +
                              s"device ${local.storageDeviceId}. The store is on disk in " +
-                             s"${local.devicePath / storeId.directoryName} but is not " +
+                             s"${ctx.copyRegistry.pathOrLive(local, storeId)} but is not " +
                              s"loaded, and the device entry still says Rebuilding. Retrying with a backoff", t)
               finally
                 release()
@@ -596,7 +597,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  again, the same as any other store whose close did not finish.
    */
   private def keepRebuiltStoreOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit =
-    val storePath = local.devicePath / storeId.directoryName
+    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
     try
       ctx.markers.write(local, storeId, StoreDirMarkers.Marker.TransferOut, "")
       // After the pair: the transfer-out marker now keeps it offline, and its reinstatement loads it. A failed
@@ -635,7 +636,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  first removed durably, making the next pass a first pass (dropStagingCheckpoint). No rebuild of the store runs
    *  here when this is called. Returns whether the rebuild may go on now. */
   private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
-    val storePath = local.devicePath / storeId.directoryName
+    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
     // Some(None): nothing at the path or this episode's finished copy; Some(Some(marked)): another copy, rebuild-required
     // or not
     val found =
@@ -700,7 +701,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  failed backend is (marked rebuild-required, closed, left offline, its CRL entries kept), and the Deleted Stores
    *  pass of the check that follows retires it to pending-delete. A store still opening is left for a later check. */
   def retireUnlistedServed(local: LocalStorageDeviceState, storeId: StoreId): Unit =
-    val storePath = local.devicePath / storeId.directoryName
+    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
     if !ctx.loader.isOpening(storeId) then
       ctx.router.entry(storeId) match
         case Some(entry) if entry.store.storageDeviceId == local.storageDeviceId &&
@@ -880,7 +881,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    */
   private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
                                held: StoreRebuilds.HeldRebuild): Boolean =
-    val storePath = local.devicePath / storeId.directoryName
+    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
     // A stat that fails is no absence (FileStat): the rebuild waits for a later check rather than start over the copy
     val marked = FileStat.existence(storePath / RebuildingStore.RebuildRequiredMarkerFile)
     if marked.contains(false) then

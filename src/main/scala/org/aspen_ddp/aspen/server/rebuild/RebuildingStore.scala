@@ -12,6 +12,7 @@ import org.aspen_ddp.aspen.common.network.PendingAllocation
 import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId}
 import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
+import org.aspen_ddp.aspen.server.host.{CopyLayout, Phase}
 import org.aspen_ddp.aspen.server.store.{Frontend, StoreIncarnationFile}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, StoreCreation}
 import scribe.Logging
@@ -241,7 +242,8 @@ class RebuildingStore(client: AspenClient,
   private val reader = client.withReadTimeout(objectReadTimeout)
 
   private val stagingPath = devicePath / RebuildDirectory / storeId.directoryName
-  private val finalPath = devicePath / storeId.directoryName
+  // The rebuilt copy's final path: it is not recorded until its completion's handler runs
+  private val finalPath = CopyLayout.path(devicePath, storeId, None, Phase.Live)
 
   private val completionPromise: Promise[Unit] = Promise()
   def complete: Future[Unit] = completionPromise.future

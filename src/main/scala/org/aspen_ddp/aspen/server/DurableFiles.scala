@@ -6,6 +6,8 @@ import java.nio.file.StandardOpenOption
 import java.util.concurrent.atomic.AtomicBoolean
 import scribe.Logging
 
+import scala.util.control.NonFatal
+
 /** Small files that must survive a power cut or a pulled disk the moment their write returns:
  *  the device markers, the per-store transfer-out marker and CRL save file that a network transfer
  *  or a rebuild leaves behind, and anything else a "safe to remove" decision depends on.
@@ -68,14 +70,28 @@ object DurableFiles extends Logging:
     if os.remove(file, checkExists = false) then
       syncDirectory(file / os.up)
 
+  /** The rename of `source` to `target` landed, but a sync of a directory naming it failed (`cause`): a crash could
+   *  undo it. Any other failure of `move` means nothing moved */
+  final class MoveNotForced(val source: os.Path, val target: os.Path, cause: Throwable)
+    extends java.io.IOException(s"Moved $source to $target, but could not force the move: $cause", cause)
+
   /** Renames `source` (a file or a directory) to `target` atomically, then forces the directory that now names it and,
    *  if different, the one that named it, so that after a crash exactly one of the two paths exists. Both must be on
-   *  one file system. Every rename of a store copy, a store's CRL state or a device CRL goes through here. */
-  def move(source: os.Path, target: os.Path): Unit =
-    os.move(source, target, atomicMove = true)
-    syncDirectory(target / os.up)
-    if source / os.up != target / os.up then
-      syncDirectory(source / os.up)
+   *  one file system. Every rename of a store copy, a store's CRL state or a device CRL goes through here. A sync that
+   *  fails after the rename throws MoveNotForced; any other throw means nothing moved. `rename` and `sync` are the
+   *  rename and the directory sync (host.CopyMoves passes its test seams) */
+  def move(source: os.Path, target: os.Path,
+           sync: os.Path => Unit = syncDirectory,
+           rename: (os.Path, os.Path) => Unit = atomicRename): Unit =
+    rename(source, target)
+    try
+      sync(target / os.up)
+      if source / os.up != target / os.up then
+        sync(source / os.up)
+    catch case NonFatal(t) => throw new MoveNotForced(source, target, t)
+
+  /** os-lib's atomic rename: `move`'s default */
+  def atomicRename(source: os.Path, target: os.Path): Unit = os.move(source, target, atomicMove = true)
 
   /** Forces every regular file and directory under `root`, `root` included, to stable storage: files first, then
    *  each directory below its entries. For a freshly written tree before it is renamed into place. An entry whose stat

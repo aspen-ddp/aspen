@@ -51,7 +51,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
    *  of the store is already running, or while the copy is unsynced (CopyMarkers: a marker change a crash could undo;
    *  the next device check forces it). */
   def retire(local: LocalStorageDeviceState, storeId: StoreId): Future[Boolean] =
-    val storePath = local.devicePath / storeId.directoryName
+    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
     if isRetiring(storeId) then
       Future.successful(false)
     else if ctx.copyRegistry.isUnsynced(local, storeId) then
@@ -110,7 +110,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
 
   /** Step 4 of retire. Returns whether the path is clear. */
   private def moveToPendingDelete(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
-    val storePath = local.devicePath / storeId.directoryName
+    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
     try
       if FileStat.exists(storePath) then
         val pendingDir = StoreCopies.ensureDirectory(local.devicePath, RebuildingStore.PendingDeleteDirectory)
@@ -145,7 +145,8 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
     def delete(copy: os.Path, why: String): Unit =
       StoreCopies.delete(local.devicePath, copy, why)
 
-    copies.filterNot(releaseLookups.contains).foreach: copy =>
+    // A copy whose move here is not forced yet (CopyMoves) could come back at its path after a crash: never released
+    copies.filterNot(c => releaseLookups.contains(c) || ctx.copyRegistry.isUnsyncedAt(c)).foreach: copy =>
       StoreCopies.pendingDeleteStore(copy.last) match
         case None =>
           ctx.warn(copy, s"Keeping $copy: its name does not identify a store copy")

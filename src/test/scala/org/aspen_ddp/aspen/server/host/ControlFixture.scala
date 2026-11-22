@@ -311,8 +311,9 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
       shutdownCloses += storeId
     val closed =
       if failingShutdownCloses.get.contains(storeId) then
-        attached.control.devices.devices.valuesIterator.map(_.devicePath / storeId.directoryName).filter(os.isDir)
-          .foreach(dir => os.write.over(dir / RebuildingStore.RebuildRequiredMarkerFile, ""))
+        attached.control.devices.devices.valuesIterator.map(_.devicePath)
+          .filter(CopyFixtures.copyPath(_, storeId).isDefined)
+          .foreach(CopyFixtures.markCopy(_, storeId, Phase.Lost))
         Future.failed(Host.StoreFailedOnClose(storeId))
       else
         shutdownCloseGate.get match
@@ -497,11 +498,7 @@ trait ControlFixture:
    *  tryLoadStore loads nothing, so an Active entry over a directory without a config is taken for a lost store by
    *  the reconcile's Missing Stores pass and rebuilt. */
   protected def writeStoreConfig(deviceDir: os.Path, storeId: StoreId): os.Path =
-    val dir = deviceDir / storeId.directoryName
-    os.makeDir.all(dir)
-    os.write.over(dir / StoreConfig.configFilename,
-      StoreConfig(storeId, StoreConfig.RocksDB(None), None, Replication(3, 2)).yamlConfig)
-    dir
+    CopyFixtures.placeCopy(deviceDir, storeId, Phase.Live)
 
   private final class Rig(val seams: RecordingSeams, val scheduler: ManualControlScheduler)
 
@@ -598,7 +595,7 @@ trait ControlFixture:
   protected def placedCopies(host: Host, sds: LocalStorageDeviceState, storeIds: StoreId*): Unit =
     storeIds.foreach: storeId =>
       host.control.copyRegistry.registered("placed after load", sds, storeId,
-        CopyPhase.read(sds.devicePath / storeId.directoryName))
+        CopyFixtures.phaseOf(sds.devicePath, storeId).get)
 
   /** Records `storeIds` as served from `sds` without loading them, as the recording seams load nothing: their copies
    *  (registered if placed after the load) Served. The recording shutdown close ends that */

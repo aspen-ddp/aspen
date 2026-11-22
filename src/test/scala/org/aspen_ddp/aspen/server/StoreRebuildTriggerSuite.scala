@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.host.{CopyFixtures, Phase}
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
@@ -32,12 +33,7 @@ private class RecordedRebuild(val storeId: StoreId,
   /** Completes it as RebuildingStore.finish does: its copy placed at the store's path first, a store config and the
    *  rebuild-complete marker of its episode */
   def placeAndComplete(): Unit =
-    val dir = devicePath.get / storeId.directoryName
-    os.makeDir.all(dir)
-    os.write.over(dir / StoreConfig.configFilename,
-      StoreConfig(storeId, StoreConfig.RocksDB(None), None,
-        org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
-    os.write.over(dir / RebuildingStore.RebuildCompleteMarkerFile, RebuildingStore.rebuildCompleteContent(episode))
+    CopyFixtures.placeCopy(devicePath.get, storeId, Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)))
     promise.success(())
 
 private class RecordingRebuildFactory extends StoreRebuildFactory:
@@ -367,9 +363,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = armed.success(readState)
       _ <- yieldUntil(factory.created.nonEmpty)
       // As finish leaves the copy: in place, carrying its rebuild-complete marker
-      storeDir = deviceDir / rebuilt.directoryName
-      _ = os.makeDir.all(storeDir)
-      _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, "")
+      _ = CopyFixtures.placeCopy(deviceDir, rebuilt, Phase.Rebuilt(""), configured = false)
       _ = factory.created.head.promise.success(())
       _ <- waitForTransactionsToComplete()
       _ <- yieldUntil(recorded(host).loadStoreByIdRequests.contains((realDeviceId, rebuilt)))
@@ -383,7 +377,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     yield
       recorded(host).loadStoreByIdRequests should contain((realDeviceId, rebuilt))
       // Removed once the flip committed, so the load serves it
-      os.exists(deviceDir / rebuilt.directoryName / RebuildingStore.RebuildCompleteMarkerFile) should be(false)
+      CopyFixtures.phaseOf(deviceDir, rebuilt).exists(_.isInstanceOf[Phase.Rebuilt]) should be(false)
       finalState.stores.get(rebuilt).map(_.status) should be(
         Some(StorageDeviceState.StoreStatus.Active))
       // The pool's current host for the store, as of the pool config's timestamp, and online
@@ -457,8 +451,6 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
     val rebuilt = StoreId(PoolId.BootstrapPoolId, 0)
-    val storeDir = deviceDir / rebuilt.directoryName
-    val marker = storeDir / RebuildingStore.RebuildCompleteMarkerFile
     var syncs = List.empty[os.Path]
     var failSync = true
     host.control.markers.syncDirectory = dir =>
@@ -485,15 +477,14 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = host.control.reconciler.checkAll()
       _ = armed.success(deviceState(realDeviceId, Map(rebuilding(rebuilt))))
       _ <- yieldUntil(factory.created.nonEmpty)
-      _ = os.makeDir.all(storeDir)
-      _ = os.write.over(marker, "")
+      storeDir = CopyFixtures.placeCopy(deviceDir, rebuilt, Phase.Rebuilt(""), configured = false)
       _ = factory.created.head.promise.success(())
       _ <- waitForTransactionsToComplete()
       _ <- yieldUntil(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
       _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(realDeviceId))
       _ = recorded(host).rebuildOutcomes((realDeviceId, rebuilt)) should be(RebuildOutcome.Adopt)
       // Unlinked, but not durably: kept offline, its removal pending
-      _ = os.exists(marker) should be(false)
+      _ = CopyFixtures.phaseOf(deviceDir, rebuilt) should be(Some(Phase.Live))
       _ = recorded(host).loadStoreByIdRequests should not contain ((realDeviceId, rebuilt))
       _ = offlineCopies(host, local) should contain(rebuilt)
       _ = host.control.copyRegistry.isUnsynced(local, rebuilt) should be(true)
@@ -514,7 +505,6 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
     val lost = storeN(0)
-    val storeDir = deviceDir / lost.directoryName
 
     for
       deviceSetId <- client.createStorageDeviceSet("test-set", 0, None)
@@ -530,8 +520,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
             List(Insert(StorageDeviceState.StateKey, newState.encode())))
       _ <- waitForTransactionsToComplete()
       // As crlSaveFileLost leaves it: marked, and offline (its copy registered Lost at the device's load)
-      _ = os.makeDir.all(storeDir)
-      _ = os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
+      _ = CopyFixtures.placeCopy(deviceDir, lost, Phase.Lost, configured = false)
       local = new LocalStorageDeviceState(
         realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL())
       _ = injectLoadedDevice(host, local)
@@ -541,7 +530,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     yield
       finalState.stores.get(lost).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
       factory.created.map(_.storeId).toList should be(List(lost))
-      os.exists(storeDir) should be(false)
+      CopyFixtures.copyPath(deviceDir, lost) should be(None)
 
   atest("a directory no rebuild produced at a Rebuilding store's path is retired before the rebuild starts"):
     // rebuild-process 4.1 (T12): a leftover of an earlier tenancy of the store on this device, with neither marker. It
@@ -551,8 +540,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
     val stale = storeN(0)
-    val storeDir = deviceDir / stale.directoryName
-    os.makeDir.all(storeDir)
+    val storeDir = CopyFixtures.placeCopy(deviceDir, stale, configured = false)
     os.write.over(storeDir / "data", "stale")
 
     val armed = recorded(host).armLookup(deviceA)
@@ -565,7 +553,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
 
     yieldUntil(factory.created.nonEmpty).map: _ =>
       factory.created.map(_.storeId).toList should be(List(stale))
-      os.exists(storeDir) should be(false)
+      CopyFixtures.copyPath(deviceDir, stale) should be(None)
       pending should have size 1
       os.exists(pending.head / "data") should be(true)
       os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
@@ -586,8 +574,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
     val back = storeN(0)
-    val storeDir = deviceDir / back.directoryName
-    os.makeDir.all(storeDir)
+    val storeDir = CopyFixtures.placeCopy(deviceDir, back, configured = false)
     os.write.over(storeDir / "data", "served")
     val staging = writeCheckpoint(deviceDir, back)
 
@@ -597,7 +584,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
 
     yieldUntil(factory.created.nonEmpty).map: _ =>
       factory.created.map(_.storeId).toList should be(List(back))
-      os.exists(storeDir) should be(false)
+      CopyFixtures.copyPath(deviceDir, back) should be(None)
       os.exists(staging) should be(false)
 
   atest("a served copy at a Rebuilding store's path discards the staging checkpoint before it is fail-stopped (RB-W21)"):
@@ -608,8 +595,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
     val back = storeN(0)
-    val storeDir = deviceDir / back.directoryName
-    os.makeDir.all(storeDir)
+    val storeDir = CopyFixtures.placeCopy(deviceDir, back, configured = false)
     StoreIncarnationFile.writeFresh(storeDir)
     host.testingOnlyRescan(deviceA)
     val backend = new MapBackend(back):
@@ -637,7 +623,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       served should be(false)
       stagingWhenUnserved should be(Some(false))
       os.exists(staging) should be(false)
-      os.exists(storeDir) should be(false)
+      CopyFixtures.copyPath(deviceDir, back) should be(None)
 
   atest("a served store its device's entry does not list is taken out of service and retired (RB-W5)"):
     // A copy put back at a store path by hand, loaded at startup without reading the tree. The reconcile takes it out
@@ -648,8 +634,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val unlisted = storeN(0)
     val listed = storeN(1)
     def backendAt(s: StoreId): MapBackend =
-      val dir = deviceDir / s.directoryName
-      os.makeDir.all(dir)
+      val dir = CopyFixtures.placeCopy(deviceDir, s, configured = false)
       StoreIncarnationFile.writeFresh(dir)
       new MapBackend(s):
         override def path: os.Path = dir
@@ -668,7 +653,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
         recorded(host).armLookup(deviceA).success(deviceState(deviceA, Map(listed -> active)))
         host.control.reconciler.checkStorageDevice(deviceA)
         host.testingOnlyHandleEvents()
-      !os.exists(deviceDir / unlisted.directoryName)
+      CopyFixtures.copyPath(deviceDir, unlisted).isEmpty
 
     for
       _ <- yieldUntil({ host.testingOnlyHandleEvents(); loads.forall(_.isCompleted) && served(unlisted) && served(listed) })
@@ -677,10 +662,10 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       served(unlisted) should be(false)
       host.control.copyRegistry.openCopies(loadedDevices(host)(deviceA)) should not contain unlisted
       pending should have size 1
-      pending.head.last should startWith(unlisted.directoryName)
+      pending should be(CopyFixtures.retiredCopies(deviceDir, unlisted))
       os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
       served(listed) should be(true)
-      os.exists(deviceDir / listed.directoryName / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      CopyFixtures.phaseOf(deviceDir, listed).contains(Phase.Lost) should be(false)
 
   private def rebuildingIn(storeId: StoreId, episode: UUID): (StoreId, StorageDeviceState.StoreEntry) =
     storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None, Some(episode))
@@ -766,10 +751,8 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 2)
     val current = UUID.randomUUID()
-    def storeDir(n: Int): os.Path = deviceDir / storeN(n).directoryName
-    List(0, 1).foreach(n => os.makeDir.all(storeDir(n)))
-    os.write.over(storeDir(0) / RebuildingStore.RebuildCompleteMarkerFile, UUID.randomUUID().toString)
-    os.write.over(storeDir(1) / RebuildingStore.RebuildCompleteMarkerFile, current.toString)
+    CopyFixtures.placeCopy(deviceDir, storeN(0), Phase.Rebuilt(UUID.randomUUID().toString), configured = false)
+    CopyFixtures.placeCopy(deviceDir, storeN(1), Phase.Rebuilt(current.toString), configured = false)
 
     val armed = recorded(host).armLookup(deviceA)
     host.control.reconciler.checkAll()
@@ -781,10 +764,10 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
 
     yieldUntil(factory.created.size == 2).map: _ =>
       factory.created.map(_.storeId).toSet should be(Set(storeN(0), storeN(1)))
-      os.exists(storeDir(0)) should be(false)
+      CopyFixtures.copyPath(deviceDir, storeN(0)) should be(None)
       pending should have size 1
       os.exists(pending.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
-      os.read(storeDir(1) / RebuildingStore.RebuildCompleteMarkerFile) should be(current.toString)
+      CopyFixtures.phaseOf(deviceDir, storeN(1)) should be(Some(Phase.Rebuilt(current.toString)))
 
   atest("a finished copy whose rebuild-complete marker cannot be read is kept, and its rebuild waits (RB-W22)"):
     // Taken for a foreign copy it would be retired, and the store rebuilt from scratch
@@ -853,9 +836,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ <- yieldUntil(factory.created.nonEmpty)
       // Re-placed away and back before any check of this device saw it
       _ <- setEntry(realDeviceId, current)
-      storeDir = deviceDir / rebuilt.directoryName
-      _ = os.makeDir.all(storeDir)
-      _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, earlier.toString)
+      _ = CopyFixtures.placeCopy(deviceDir, rebuilt, Phase.Rebuilt(earlier.toString), configured = false)
       _ = factory.created.head.promise.success(())
       _ <- waitForTransactionsToComplete()
       _ <- yieldUntil(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
@@ -865,7 +846,9 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).loadStoreByIdRequests should not contain((realDeviceId, rebuilt))
       finalState.stores(rebuilt).rebuildEpisode should be(Some(current))
       // Left for the current episode's rebuild to retire, and silent meanwhile
-      os.read(storeDir / RebuildingStore.RebuildCompleteMarkerFile) should be(earlier.toString)
+      // Raw: the copy may carry rebuild-required beside it by now (the current episode's retire), which outranks it
+      os.read(CopyFixtures.copyPath(deviceDir, rebuilt).get / RebuildingStore.RebuildCompleteMarkerFile) should be(
+        earlier.toString)
       hasRebuildWork(host, rebuilt) should be(true)
 
   atest("a superseded copy whose entry then leaves the device is retired by the Deleted Stores pass (RB-W9)"):
@@ -906,9 +889,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = armed.success(deviceState(realDeviceId, Map(rebuildingIn(rebuilt, earlier))))
       _ <- yieldUntil(factory.created.nonEmpty)
       _ <- setEntry(realDeviceId, current)
-      storeDir = deviceDir / rebuilt.directoryName
-      _ = os.makeDir.all(storeDir)
-      _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, earlier.toString)
+      _ = CopyFixtures.placeCopy(deviceDir, rebuilt, Phase.Rebuilt(earlier.toString), configured = false)
       // The check the Superseded outcome asks for finds the entry re-placed to another device, before the current
       // episode's rebuild could start here
       _ = recorded(host).armLookup(realDeviceId).success(deviceState(realDeviceId, Map()))
@@ -916,7 +897,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- awaitLoudly("the flip's outcome")(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
       // Retired into pending-delete, its record gone with it
-      _ <- awaitLoudly("the retire of the superseded copy")(!os.exists(storeDir) &&
+      _ <- awaitLoudly("the retire of the superseded copy")(CopyFixtures.copyPath(deviceDir, rebuilt).isEmpty &&
              !host.control.copyRegistry.device(realDeviceId).exists(_.copies.contains(rebuilt)))
     yield
       recorded(host).rebuildOutcomes((realDeviceId, rebuilt)) should be(RebuildOutcome.Superseded)
@@ -936,8 +917,6 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(deviceDir)
     injectLoadedDevice(host, new LocalStorageDeviceState(
       synthetic, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL()))
-    val storeDir = deviceDir / storeN(0).directoryName
-
     def pending: List[os.Path] =
       val dir = deviceDir / RebuildingStore.PendingDeleteDirectory
       if os.exists(dir) then os.list(dir).toList else Nil
@@ -948,8 +927,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
 
     for
       _ <- awaitLoudly("the rebuild to start")(factory.created.size == 1)
-      _ = os.makeDir.all(storeDir)
-      _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, "")
+      _ = CopyFixtures.placeCopy(deviceDir, storeN(0), Phase.Rebuilt(""), configured = false)
       _ = factory.created.head.promise.success(())
       _ <- awaitLoudly("the flip's failure and its backoff")(
              scheduler(host).pending.contains(Host.RebuildRetryInitialDelay))
@@ -957,7 +935,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = recorded(host).armLookup(synthetic).success(deviceState(synthetic, Map()))
       _ = runRebuildRetries(host)
       // Retired into pending-delete, its record gone with it
-      _ <- awaitLoudly("the retire of the unpromoted copy")(!os.exists(storeDir) &&
+      _ <- awaitLoudly("the retire of the unpromoted copy")(CopyFixtures.copyPath(deviceDir, storeN(0)).isEmpty &&
              !host.control.copyRegistry.device(synthetic).exists(_.copies.contains(storeN(0))))
     yield
       factory.created should have size 1
@@ -979,7 +957,6 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(deviceDir)
     val local = new LocalStorageDeviceState(synthetic, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL())
     injectLoadedDevice(host, local)
-    val storeDir = deviceDir / storeN(0).directoryName
 
     val first = recorded(host).armLookup(synthetic)
     host.control.reconciler.checkAll()
@@ -988,8 +965,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     for
       _ <- awaitLoudly("the rebuild to start")(factory.created.size == 1)
       _ = installServedElsewhere(host, storeN(0))
-      _ = os.makeDir.all(storeDir)
-      _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, "")
+      _ = CopyFixtures.placeCopy(deviceDir, storeN(0), Phase.Rebuilt(""), configured = false)
       _ = factory.created.head.promise.success(())
       // The finished copy registered, its flip failed for good and its backoff scheduled
       _ <- awaitLoudly("the flip's failure and its backoff")(
@@ -1089,10 +1065,8 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
           tx.update(ptr, None, None, reqs, ops)
       _ <- waitForTransactionsToComplete()
       // Create the store directory that the rebuild would have placed
-      storePath = deviceDir / storeN(0).directoryName
-      _ = os.makeDir.all(storePath)
+      storePath = CopyFixtures.placeCopy(deviceDir, storeN(0), Phase.Rebuilt(""), configured = false)
       _ = os.write(storePath / "marker.txt", "rebuilt store")
-      _ = os.write(storePath / RebuildingStore.RebuildCompleteMarkerFile, "")
       // Inject device and trigger rebuild
       _ = injectLoadedDevice(host, new LocalStorageDeviceState(
         realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL()))
@@ -1103,12 +1077,12 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ <- yieldUntil(factory.created.nonEmpty)
       _ = factory.created.head.promise.success(())
       _ <- waitForTransactionsToComplete()
-      _ <- yieldUntil(!os.exists(storePath), 200)
+      _ <- yieldUntil(CopyFixtures.copyPath(deviceDir, storeN(0)).isEmpty, 200)
     yield
       // Store should NOT be loaded (no loadStoreById call for the real device)
       recorded(host).loadStoreByIdRequests.exists(_._1 == realDeviceId) should be(false)
       // Store directory should be discarded
-      os.exists(storePath) should be(false)
+      CopyFixtures.copyPath(deviceDir, storeN(0)) should be(None)
       // Nothing puts the store here any more, so its offline mark is gone
       host.control.router.silentStores should not contain storeN(0)
       hasRebuildWork(host, storeN(0)) should be(false)

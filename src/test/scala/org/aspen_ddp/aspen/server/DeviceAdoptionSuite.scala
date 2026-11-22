@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.host.{CopyFixtures, Phase}
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService, StoreLoader}
 import org.aspen_ddp.aspen.client.Transaction
@@ -111,12 +112,13 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
 
   /** A store directory as a network transfer out leaves it: a transfer-out marker and a CRL save file. */
   private def writeTransferringOutStore(deviceDir: os.Path, storeId: StoreId): os.Path =
-    val dir = writeClosedStore(deviceDir, storeId)
-    os.write.over(dir / StoreTransfer.TransferOutMarkerFile, "")
+    val dir = CopyFixtures.placeCopy(deviceDir, storeId, Phase.Outbound(""))
     CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, Backend.crlSaveFile(dir))
     dir
 
-  private def marker(dir: os.Path): os.Path = dir / StoreTransfer.TransferOutMarkerFile
+  /** Whether the copy of `storeId` on the device at `deviceDir` is Outbound (its transfer-out marker) */
+  private def outbound(deviceDir: os.Path, storeId: StoreId): Boolean =
+    CopyFixtures.phaseOf(deviceDir, storeId).exists(_.isInstanceOf[Phase.Outbound])
 
   private def storeMoves(): List[StoreMoved] = net.takeCapturedGossip().collect { case g: StoreMoved => g }
 
@@ -194,8 +196,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       List(e0, e1, e2).map(_.storageDeviceId).toSet should be(Set(deviceA))
       DeviceMarkers.readOwningHost(deviceDir) should be(Some(HostId.BootstrapHostId))
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
-      os.exists(marker(d0)) should be(false)
-      os.exists(marker(d2)) should be(true)
+      outbound(deviceDir, s0) should be(false)
+      outbound(deviceDir, s2) should be(true)
       // Adopted from another host, whose clock may lead this one's: their load floors take the cross-host margin
       List(d0, d2).foreach(d => os.exists(d / StoreLoader.ArrivedAtFile) should be(true))
       loadedDevices(host).contains(deviceA) should be(true)
@@ -280,7 +282,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
   // Marked by the host that closed it (a backend that failed during its close, StoreRebuilds.failedOnClose): its
   // state cannot be trusted whatever else its directory holds.
   atest("a store marked rebuild-required is adopted as Rebuilding"):
-    adoptWithLostStore((dir, _) => os.write.over(dir / RebuildingStore.RebuildRequiredMarkerFile, ""))
+    adoptWithLostStore((dir, s) => CopyFixtures.markCopy(dir / os.up, s, Phase.Lost))
 
   // A network transfer out extracted the store's state from the device CRL into its save file. A save file missing
   // or unusable now (a disk pulled before it reached the platter, or a file copied from another store) leaves no
@@ -319,7 +321,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
     yield
       st.hostId should be(HostId.BootstrapHostId)
       st.stores(s0).status should not be(StoreStatus.Rebuilding)
-      os.exists(d0 / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      CopyFixtures.phaseOf(deviceDir, s0).contains(Phase.Lost) should be(false)
       rebuilds.created should be(empty)
 
   atest("a transferring-out store whose save file cannot be read fails the adoption for a later scan (SL-W18)"):
@@ -336,7 +338,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       host = newHost(hostRoot, storeRebuildFactory = rebuilds)
       _ <- resolve(host)
       whileUnreadable <- state(deviceA)
-      markedWhileUnreadable = os.exists(d0 / RebuildingStore.RebuildRequiredMarkerFile)
+      markedWhileUnreadable = CopyFixtures.phaseOf(deviceDir, s0).contains(Phase.Lost)
       _ = os.perms.set(Backend.crlSaveFile(d0), "rw-------")
       _ <- scanAndResolve(host)
       st <- state(deviceA)
@@ -345,7 +347,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       markedWhileUnreadable should be(false)
       st.hostId should be(HostId.BootstrapHostId)
       st.stores(s0).status should not be(StoreStatus.Rebuilding)
-      os.exists(d0 / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      CopyFixtures.phaseOf(deviceDir, s0).contains(Phase.Lost) should be(false)
       rebuilds.created should be(empty)
 
   /** The device directory as pulled from its host without a shutdown: `owning-host` naming `owningHost`, and no
@@ -387,7 +389,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       entries.map(_.hostId).toSet should be(Set(HostId.BootstrapHostId))
       DeviceMarkers.readOwningHost(deviceDir) should be(Some(HostId.BootstrapHostId))
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
-      os.exists(marker(d2)) should be(true)
+      outbound(deviceDir, s2) should be(true)
       loadedDevices(host).contains(deviceA) should be(true)
       recorded(host).storeLoadAttempts.map(_._2) should contain(d0)
       storeMoves().map(_.storeId) should be(List(s0))
@@ -530,7 +532,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       loadedDevices(host).contains(deviceA) should be(true)
       DeviceMarkers.readOwningHost(deviceDir) should be(Some(HostId.BootstrapHostId))
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
-      os.exists(marker(d0)) should be(false)
+      outbound(deviceDir, s0) should be(false)
       recorded(host).storeLoadAttempts.map(_._2) should contain(d0)
       storeMoves().map(_.storeId) should be(List(s0))
 
@@ -578,7 +580,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       loadedDevices(host).contains(deviceA) should be(true)
       st.status should be(DeviceStatus.Operational)
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
-      os.exists(marker(d0)) should be(false)
+      outbound(deviceDir, s0) should be(false)
       // Back on the host that shut it down, one clock: the load floor takes only MaxStartLead
       os.exists(d0 / StoreLoader.ArrivedAtFile) should be(false)
       recorded(host).storeLoadAttempts.map(_._2) should contain(d0)
@@ -614,22 +616,20 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       List(s0, s1) = stores: @unchecked
       (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
       _ = writeClosedStore(deviceDir, s0)
-      d1 = deviceDir / s1.directoryName
-      _ = writeStoreConfig(deviceDir, s1)
-      _ = os.write.over(d1 / StoreTransfer.TransferredInMarkerFile, "")
+      d1 = CopyFixtures.placeCopy(deviceDir, s1, Phase.Arrived(""))
       host = newHost(hostRoot)
       _ <- resolve(host)
       st <- state(deviceA)
       // Its copy, registered Arrived at the device's load, is offline there, so the completed-transfers-in pass of
       // the adoption's own reconcile, or of the check below, completes it
       _ = host.control.reconciler.checkAll()
-      _ <- pumpUntil(!os.exists(d1 / StoreTransfer.TransferredInMarkerFile) &&
+      _ <- pumpUntil(CopyFixtures.phaseOf(deviceDir, s1).contains(Phase.Live) &&
                      host.control.reconciler.activeDeviceChecks.isEmpty)
     yield
       recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
       st.status should be(DeviceStatus.Operational)
       st.stores(s1).status should be(StoreStatus.Active)
-      os.exists(d1 / StoreTransfer.TransferredInMarkerFile) should be(false)
+      CopyFixtures.phaseOf(deviceDir, s1) should be(Some(Phase.Live))
       recorded(host).storeLoadAttempts.map(_._2).count(_ == d1) should be(2)
 
   atest("a store rebuilt after its device was shut down and unloaded is adopted"):
@@ -657,9 +657,9 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       d0Old = writeStoreConfig(oldDir, s0)
       _ = RebuildingStore.writeEmptyCrlState(d0Old, s0)
       _ = rebuilds.created.head.promise.success(())
-      _ <- pumpUntil(os.exists(d0Old / StoreTransfer.TransferOutMarkerFile))
+      _ <- pumpUntil(outbound(oldDir, s0))
       entryAfterRebuild <- state(deviceA).map(_.stores(s0))
-      markerWritten = os.exists(marker(d0Old))
+      markerWritten = outbound(oldDir, s0)
       crlWritten = os.exists(Backend.crlSaveFile(d0Old))
       // Carried to the new host.
       newRoot = newHostDir()
@@ -676,8 +676,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       st.status should be(DeviceStatus.Operational)
       st.hostId should be(HostId.BootstrapHostId)
       st.stores(s0).status should be(StoreStatus.Active)
-      os.exists(marker(newDir / s0.directoryName)) should be(false)
-      recorded(host).storeLoadAttempts.map(_._2) should contain(newDir / s0.directoryName)
+      outbound(newDir, s0) should be(false)
+      recorded(host).storeLoadAttempts.map(_._2) should contain(CopyFixtures.copyPath(newDir, s0).get)
 
   private val destHostId = HostId(UUID.fromString("0a0a0a0a-0000-0000-0000-000000000002"))
 
@@ -810,7 +810,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       st.status should be(DeviceStatus.Operational)
       st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Active))
       loadedDevices(host).contains(deviceA) should be(true)
-      stores.map(s => os.exists(marker(deviceDir / s.directoryName))) should be(List(false, false))
+      stores.map(outbound(deviceDir, _)) should be(List(false, false))
       storeMoves().map(_.storeId).toSet should be(stores.toSet)
 
   atest("adopting a device holding bootstrap-pool stores rewrites the bootstrap config for them only"):

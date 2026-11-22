@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen
 
+import org.aspen_ddp.aspen.server.host.{CopyFixtures, Phase}
 import org.aspen_ddp.aspen.client.{AppendPosition, AspenClient, RangedWrite, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.ida.{IDA, RandomAccessReedSolomon}
@@ -104,7 +105,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
 
   private def storeIds: List[StoreId] = (0 until ida.width).toList.map(i => StoreId(poolId, i.toByte))
 
-  private def storeDir(storeId: StoreId): os.Path = deviceDir / storeId.directoryName
+  private def storeDir(storeId: StoreId): os.Path = CopyFixtures.copyPath(deviceDir, storeId).get
 
   // ---- Polling ----------------------------------------------------------------------------------------------
 
@@ -511,7 +512,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
     yield
       sawRebuilding should be(true)
       storesShouldBeFsifOnDisk()
-      os.exists(lostDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      CopyFixtures.phaseOf(deviceDir, storeIds(lost)).contains(Phase.Lost) should be(false)
       os.exists(deviceDir / RebuildingStore.RebuildDirectory / storeIds(lost).directoryName) should be(false)
       succeed
 

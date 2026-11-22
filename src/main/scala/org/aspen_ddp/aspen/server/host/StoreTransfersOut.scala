@@ -92,13 +92,13 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   private def extractUnloaded(storeId: StoreId, sds: LocalStorageDeviceState): Future[Unit] =
     // A stat that fails says nothing (FileStat): taken for an absence, the CRL's entries would be written over a save
     // file, or nothing extracted from a directory that ships
-    Try(FileStat.isDir(sds.devicePath / storeId.directoryName)) match
+    Try(FileStat.isDir(ctx.copyRegistry.pathOrLive(sds, storeId))) match
       case Failure(err) => Future.failed(err)
       case Success(false) => Future.unit
       case Success(true) => extractFromDirectory(storeId, sds)
 
   private def extractFromDirectory(storeId: StoreId, sds: LocalStorageDeviceState): Future[Unit] =
-    val saveFile = Backend.crlSaveFile(sds.devicePath / storeId.directoryName)
+    val saveFile = Backend.crlSaveFile(ctx.copyRegistry.pathOrLive(sds, storeId))
     // Read before anything is, so the release below covers only the entries the extraction takes
     val charge = sds.admission.retainedCharge(storeId)
     def released(): Future[Unit] =
@@ -210,7 +210,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
       // delays
       if ctx.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(m.storeId) then
         refuse(s"Not starting the transfer out of store ${m.storeId} yet: a rebuild of it is still registered")
-      val markedPath = sourceDs.devicePath / m.storeId.directoryName
+      val markedPath = ctx.copyRegistry.pathOrLive(sourceDs, m.storeId)
       // A stat that fails throws (FileStat), failing the request: a marked copy never ships
       if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut &&
          FileStat.exists(markedPath / RebuildingStore.RebuildRequiredMarkerFile) then
@@ -258,7 +258,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
                     s"its close failed. Error: $t")
 
     result.foreach: _ =>
-      val storePath = sourceDs.devicePath / m.storeId.directoryName
+      val storePath = ctx.copyRegistry.pathOrLive(sourceDs, m.storeId)
       lazy val markedNow = FileStat.existence(storePath / RebuildingStore.RebuildRequiredMarkerFile)
       // Checked again now the close is done: a shutdown that began during it has already
       // run stopDeviceWork, which found no send to cancel, so a send begun here would run
@@ -345,7 +345,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
    */
   def reinstateAbandonedOut(local: LocalStorageDeviceState,
                             storeId: StoreId): Unit =
-    val storePath = local.devicePath / storeId.directoryName
+    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
 
     logger.warn(s"Store $storeId on device ${local.storageDeviceId} is offline behind a " +
                 s"transfer-out marker, but the storage-devices tree records it as Active with " +

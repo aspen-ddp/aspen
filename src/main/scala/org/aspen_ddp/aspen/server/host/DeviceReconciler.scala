@@ -105,7 +105,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       case Success(stores) =>
         def leftover(storeId: StoreId): Boolean =
           !remote.stores.contains(storeId) && !ctx.copyRegistry.openCopies(local).contains(storeId) &&
-            FileStat.existence(local.devicePath / storeId.directoryName).contains(false) &&
+            FileStat.existence(ctx.copyRegistry.pathOrLive(local, storeId)).contains(false) &&
             !crlDropsRunning.contains(storeId) &&
             !ctx.copies.isRetiring(storeId)
         // Only while the device is still loaded: an unloaded one's CRL is shut down
@@ -146,8 +146,9 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   private def reconcileDeviceState(local: LocalStorageDeviceState,
                                    remote: StorageDeviceState): Unit =
     local.reconciledEntries = Some(remote.stores)
-    // Copies whose marker change was not durable (CopyMarkers) are forced again first, so the passes see them synced
-    ctx.markers.resync(local)
+    // Copies whose marker change or move was not durable (CopyMarkers, CopyMoves) are forced again first, so the passes
+    // see them synced
+    ctx.moves.resync(local)
     if remote.isFailed then
       // An operator has declared this device dead. Its directory can still mount -- a dead
       // controller rather than a dead platter -- and its zeroed host id must not be mistaken for
@@ -205,7 +206,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   /** Whether the directory of `storeId` on `local` is known to carry `marker`. A stat that fails (FileStat) answers
    *  false: the pass acting on the marker waits for a later reconcile, and the load it leads to stats it again */
   private def hasMarker(local: LocalStorageDeviceState, storeId: StoreId, marker: StoreDirMarkers.Marker): Boolean =
-    StoreDirMarkers.knownPresent(local.devicePath / storeId.directoryName, marker)
+    StoreDirMarkers.knownPresent(ctx.copyRegistry.pathOrLive(local, storeId), marker)
 
   /** Retires the copies of stores whose entries have left this device (retireUnowned) */
   private def reconcileDeletedStores(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
@@ -254,14 +255,14 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     val missing = remote.stores.collect {
       case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Active &&
           !local.declaredMissing.contains(storeId) &&
-          FileStat.existence(local.devicePath / storeId.directoryName / StoreConfig.configFilename)
+          FileStat.existence(ctx.copyRegistry.pathOrLive(local, storeId) / StoreConfig.configFilename)
             .contains(false) &&
           unserved(storeId) =>
         storeId
     }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
     missing.foreach: storeId =>
       logger.error(s"Store $storeId is Active on storage device ${local.storageDeviceId}, but " +
-                   s"${local.devicePath / storeId.directoryName} holds no store. Rebuilding it")
+                   s"${ctx.copyRegistry.pathOrLive(local, storeId)} holds no store. Rebuilding it")
       local.declaredMissing += storeId
       ctx.copyRegistry.missingIs(local)
     local.declaredMissing.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
@@ -338,7 +339,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
       hasMarker(local, storeId, StoreDirMarkers.Marker.TransferredIn)
     ).foreach: storeId =>
-      val storePath = local.devicePath / storeId.directoryName
+      val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
       logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but still " +
                   s"carries its transferred-in marker. Completing the transfer and loading the store")
       if ctx.transfers.clearTransferredInMarker(local, storeId) then
@@ -356,14 +357,14 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
       hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildComplete)
     ).foreach: storeId =>
-      val storePath = local.devicePath / storeId.directoryName
+      val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
       logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but its rebuild-complete marker " +
                   s"is not durably removed. Completing the rebuild and loading the store")
       if ctx.rebuilds.clearRebuildCompleteMarker(local, storeId) then
         ctx.tryLoadStore(local, storePath, None)
 
   /** Loads each copy held back from loading for a marker change whose sync failed (HostCopies.heldForSyncOn), once it
-   *  is synced again (CopyMarkers.resync): the removal's own load was held back (an unsynced copy is never loaded),
+   *  is synced again (CopyMoves.resync): the removal's own load was held back (an unsynced copy is never loaded),
    *  and the pass that made it keys off the marker it removed. Only a Live copy still offline and free of work, whose
    *  entry is Active; one that is not yet stays held, for every later check, until a load opens it or it leaves its
    *  path or device. Its online gossip goes with the load, as a reinstated transfer out's does */
@@ -375,7 +376,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active)
     ).foreach: storeId =>
       logger.info(s"Loading store $storeId on device ${local.storageDeviceId}: its marker removal is durable now")
-      ctx.tryLoadStore(local, local.devicePath / storeId.directoryName, Some(() => ctx.gossipStoreOnline(storeId)))
+      ctx.tryLoadStore(local, ctx.copyRegistry.pathOrLive(local, storeId), Some(() => ctx.gossipStoreOnline(storeId)))
 
   /** Drops the transfers in this host is still tracking that the tree no longer records. */
   private def dropAbortedTransfersIn(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
@@ -462,7 +463,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  so it is released without waiting for the periodic check. A record whose directory is known gone (removed by
    *  hand) goes at once. */
   private def retireUnowned(local: LocalStorageDeviceState, storeId: StoreId): Unit =
-    val present = FileStat.existence(local.devicePath / storeId.directoryName)
+    val present = FileStat.existence(ctx.copyRegistry.pathOrLive(local, storeId))
     if present.contains(false) then
       ctx.copyRegistry.removed("retireUnowned: no directory", local, storeId)
     else if present.isDefined && !ctx.copies.isRetiring(storeId) then

@@ -145,8 +145,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val hostRoot = newHostDir()
     val deviceDir = hostRoot / os.up / "injected-device"
     os.makeDir.all(deviceDir)
-    val storePath = writeStoreConfig(deviceDir, moving)
-    os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+    CopyFixtures.placeCopy(deviceDir, moving, Phase.Lost)
     val crl = new HeldDropCrl
     val factory = new HeldRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
@@ -166,7 +165,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ <- yieldUntil(factory.created.nonEmpty)
     yield
       discarding should be(true)
-      os.exists(storePath) should be(false)
+      CopyFixtures.copyPath(deviceDir, moving) should be(None)
       factory.created.map(_.episode).toList should be(List(Some(e2)))
 
   /** C1, review Minor 1: a lost copy's discard fails (its CRL drop) after the store was re-placed away and transferred
@@ -177,8 +176,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val hostRoot = newHostDir()
     val deviceDir = hostRoot / os.up / "injected-device"
     os.makeDir.all(deviceDir)
-    val storePath = writeStoreConfig(deviceDir, moving)
-    os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+    CopyFixtures.placeCopy(deviceDir, moving, Phase.Lost)
     val crl = new HeldDropCrl
     val factory = new HeldRebuildFactory
     val transfers = new StagedTransferService
@@ -273,8 +271,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    val storePath = writeStoreConfig(deviceDir, moving)
-    os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+    val storePath = CopyFixtures.placeCopy(deviceDir, moving, Phase.Lost)
     val sends = new StagedSendService
     val factory = new HeldRebuildFactory
     val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
@@ -291,7 +288,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ = host.control.reconciler.checkStorageDevice(deviceA)
       _ <- pumpUntil(false, rounds = 3)
       whileShipping <- entry()
-      keptWhileShipping = os.exists(storePath)
+      keptWhileShipping = CopyFixtures.copyPath(deviceDir, moving).isDefined
       _ = sends.endTransferOut(moving)
       _ = runDeviceRechecks(host)
       _ <- pumpUntil(factory.created.nonEmpty)
@@ -300,7 +297,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       whileShipping should be(Some(StorageDeviceState.StoreStatus.Active))
       keptWhileShipping should be(true)
       afterShip should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
-      os.exists(storePath) should be(false)
+      CopyFixtures.copyPath(deviceDir, moving) should be(None)
       factory.created.map(_.storeId).toList should be(List(moving))
 
   /** Ship x discard, the entry already Rebuilding: its rebuild does not discard the copy while the ship runs */
@@ -308,8 +305,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    val storePath = writeStoreConfig(deviceDir, moving)
-    os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+    val storePath = CopyFixtures.placeCopy(deviceDir, moving, Phase.Lost)
     val sends = new StagedSendService
     val factory = new HeldRebuildFactory
     val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
@@ -320,8 +316,8 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     for
       _ <- check(host, deviceA, rebuilding)
       // Long enough for a discard to have moved the copy
-      _ <- yieldUntil(!os.exists(storePath))
-      keptWhileShipping = os.exists(storePath)
+      _ <- yieldUntil(CopyFixtures.copyPath(deviceDir, moving).isEmpty)
+      keptWhileShipping = CopyFixtures.copyPath(deviceDir, moving).isDefined
       discardingWhileShipping = host.control.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(moving)
       _ = sends.endTransferOut(moving)
       _ = recorded(host).armLookup(deviceA).success(deviceState(deviceA, rebuilding))
@@ -330,7 +326,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     yield
       keptWhileShipping should be(true)
       discardingWhileShipping should be(false)
-      os.exists(storePath) should be(false)
+      CopyFixtures.copyPath(deviceDir, moving) should be(None)
       factory.created.map(_.storeId).toList should be(List(moving))
 
   // A store of the bootstrap pool, whose pool entry names the bootstrap device: startOut reads both fresh
@@ -410,7 +406,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
           readsWhileFirstRuns should be(1)
         second.isFailure should be(true)
         sends.transfersOut.map(_._1) should be(Vector(shipped))
-        FileStat.exists(storePath / StoreTransfer.TransferOutMarkerFile) should be(true)
+        CopyFixtures.phaseOf(deviceDir, shipped).exists(_.isInstanceOf[Phase.Outbound]) should be(true)
         hasTransferOutWork(host, shipped) should be(false)
 
   /** C3: a rebuild's flip commits Active but is reported Unknown. Before its retry reads the entry, an operator's
@@ -444,9 +440,8 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ <- check(host, source, rebuilding)
       _ <- yieldUntil(factory.created.nonEmpty)
       // Where the rebuild placed its copy, with the rebuild-complete marker of its episode as finish places it
-      storePath = writeStoreConfig(deviceDir, shipped)
-      _ = os.write.over(storePath / RebuildingStore.RebuildCompleteMarkerFile,
-                        RebuildingStore.rebuildCompleteContent(Some(episode)))
+      _ = CopyFixtures.placeCopy(deviceDir, shipped,
+        Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(Some(episode))))
       devPtr <- client.getStorageDevicePointer(source)
       _ = net.reportCommitAsUnknown(touches(devPtr))
       _ = tclient.beforeRetry =
@@ -480,7 +475,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       retransmit.isSuccess should be(true)
       recorded(host).transferOutCloses.toList should be(List(shipped))
       sends.transfersOut.map(_._1) should be(Vector(shipped))
-      FileStat.exists(storePath / StoreTransfer.TransferOutMarkerFile) should be(true)
+      CopyFixtures.phaseOf(deviceDir, shipped).exists(_.isInstanceOf[Phase.Outbound]) should be(true)
 
   /** Double open (audit Step 4): a store's backend has opened and its LoadStore is queued, not yet handled. A second
    *  load offer meanwhile (a duplicate LoadStoreById, say) finds the store still opening (its copy Opening) and starts
@@ -492,7 +487,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newHost(hostRoot)
     val local = loadedDevices(host)(deviceA)
-    val storePath = deviceDir / moving.directoryName
+    val storePath = CopyLayout.path(deviceDir, moving, Some(UUID.randomUUID()), Phase.Live)
     DefaultBackendOpener.createStore(StoreConfig(moving, StoreConfig.RocksDB(None), None, Replication(3, 2)),
       storePath, deviceDir / StoreCreation.CreatingDirectory)
     host.testingOnlyRescan(deviceA)
@@ -551,13 +546,13 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(hasTransferOutWork(host, shipped))
       closingAtCheck = hasTransferOutWork(host, shipped)
       // Its backend failed while it closed (StoreRebuilds.failedOnClose), and the store is requested for rebuild
-      _ = os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+      _ = CopyFixtures.markCopy(deviceDir, shipped, Phase.Lost)
       _ = host.control.copyRegistry.markedLost("failedOnClose", storePath)
       _ <- check(host, source, rebuilding)
       startedWhileClosing = factory.created.nonEmpty || host.control.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(shipped)
       // Not even queued (silenced): the close's TransferOut work holds the (device, store) (I3)
       queuedWhileClosing = host.control.rebuilds.hasRebuildWork(shipped, source)
-      keptWhileClosing = FileStat.exists(storePath)
+      keptWhileClosing = CopyFixtures.copyPath(deviceDir, shipped).isDefined
       // The close fails (an extraction I/O error): nothing else then checks the device, so it is the close's end that
       // re-checks it, reading the entry still Rebuilding
       _ = recorded(host).armLookup(source).success(deviceState(source, rebuilding))
@@ -586,7 +581,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
       val host = newHost(hostRoot)
       val local = loadedDevices(host)(deviceA)
-      val storePath = deviceDir / moving.directoryName
+      val storePath = CopyLayout.path(deviceDir, moving, Some(UUID.randomUUID()), Phase.Live)
       DefaultBackendOpener.createStore(StoreConfig(moving, StoreConfig.RocksDB(None), None, Replication(3, 2)),
         storePath, deviceDir / StoreCreation.CreatingDirectory)
       host.testingOnlyRescan(deviceA)

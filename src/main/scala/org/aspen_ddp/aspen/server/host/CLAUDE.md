@@ -14,11 +14,12 @@
 - `CopyMarkers` (`DeviceControl.markers`) makes every marker write and removal at a store path (R6): the marker is
   placed (`DurableFiles.place`; rebuild-required through the `writeRebuildRequiredMarker` seam, which only places it)
   or unlinked, the copy's phase recorded (`markedLost` / `markersChanged`), then the store directory forced
-  (`CopyMarkers.syncDirectory`, a test seam). A write or unlink that lands but whose sync fails sets the record's
-  `unsynced` (`HostCopies.unsynced`; a copy of a device not attached yet, an adoption's or a lost CRL's marks, is held
-  in `unsyncedPaths` until its attach): a write then throws, a removal returns false. An unsynced copy is never loaded
+  (`CopyMarkers.syncDirectory`, which is `CopyMoves.syncDirectory`: one seam). A write or unlink that lands but
+  whose sync fails sets the record's `unsynced` (`HostCopies.unsynced`; a copy of a device not attached yet, an
+  adoption's or a lost CRL's marks, is held in `unsyncedPaths` until its attach): a write then throws, a removal
+  returns false. An unsynced copy is never loaded
   (`tryLoadStore`), shipped (`startOut` refuses) or retired (`StoreCopies.retire` answers false). Each device check
-  first forces every unsynced copy again (`CopyMarkers.resync`, at the top of `reconcileDeviceState`). A copy marked
+  first forces every unsynced copy again (`CopyMoves.resync`, at the top of `reconcileDeviceState`). A copy marked
   unsynced stays held for its load (`HostCopies.heldForSyncOn`) until a load opens or installs it, or it leaves its
   path or device, and every operational check loads each held copy that is synced, Live, offline, free of work and
   Active (`DeviceReconciler.loadResynced`, with its online gossip): the pass that removed its marker keys off that
@@ -28,8 +29,30 @@
   transfer-out removal, `keepRebuiltStoreOffline`, `closedForTransfer`'s transfer-out marker, `markRebuildRequired`
   and `StoreCopies.retire`'s rebuild-required marker. Markers in staging (a transfer's, a rebuild's) travel with the
   move that places the copy, which `DurableFiles.move` forces
-- `CopyPhase` (`Phase`: Live, Arrived, Outbound, Rebuilt, Lost) is the one reader of a copy's markers and the one
-  place that ranks them: RR > TO > TI > RC, first present wins (`read` throws a failed stat or read, `known`
+- Copy layout (store copy state machine, stage 2; spec "Device layout"): `CopyLayout` says where each copy lives.
+  A converted phase is a directory under the device root holding copies named `<storeId.directoryName>.<copyId>`
+  (`copyName`/`parseName`; the store id comes from the name only), its parameter in the copy's `phase-param`
+  (`param`, `readParam`: "" when known absent, a failed stat throws). So far only Retired (`pending-delete/`) is a
+  directory (`dirOf`); every other phase is the flat path `<device>/<storeId.directoryName>`, whose markers say it.
+  `CopyLayout.list` is the one listing of a device's copies (device load and its CRL-lost decision, `storesIn`,
+  `HostCopies.attach`/`rescan`/`verifyAgainstDisk`): flat store-named directories (config or not; a failed stat
+  counts) and each converted directory's children; a child that is no copy name is a stray, logged at warn at the
+  device's load and never touched. Code never builds a copy's path: it asks `HostCopies.pathOf` (the record's,
+  `CopyLayout.path` over its `copyId` and phase), `pathOrLive` where the copy may have no record, or
+  `CopyLayout.path(..., None, Phase.Live)` for a copy not recorded yet (a create's target, a rebuild's final path, a
+  transfer's promotion). `CopyRecord.copyId` is None for a flat copy. Every phase change into or out of a phase
+  directory is one `CopyMoves.move` (`DeviceControl.moves`; `moveUnattached` for a device being loaded): the target's
+  `phase-param` written durably, then `DurableFiles.move` through the `rename` and `syncDirectory` seams, recorded as
+  a fact (`HostCopies.moved`, a fresh `copyId` on a copy's first move). `DurableFiles.move` throws
+  `DurableFiles.MoveNotForced` for a rename that landed but was not forced: `MoveResult.Unsynced`, the record takes
+  the phase with `unsynced` (the same flag a marker change sets) and `resync` forces both directories again; any
+  other failure is `NotMoved`, nothing changed. A durable move to Retired unregisters the record (P3); an unsynced one
+  stays recorded, Retired, out of `offlineCopies`, and `StoreCopies.release` skips it, until the resync. Markers in
+  a phase directory are inert: a copy leaving the flat path is stripped of them once its move is durable, one going
+  back to it first (a failed strip is NotMoved). Tests place, find and read copies only through `CopyFixtures`
+  (`placeCopy`, `markCopy`, `copyPath`, `phaseOf`, `retiredCopies`)
+- `CopyPhase` (`Phase`: Live, Arrived, Outbound, Rebuilt, Lost, Retired) is the one reader of a copy's markers and
+  the one place that ranks them: RR > TO > TI > RC, first present wins (`read` throws a failed stat or read, `known`
   answers None for a pass that waits). `tryLoadStore`, `adoptionClass` (Outbound needs a valid save file, else
   CrlLost), `holdsOwnState` (Rebuilt), `reloadClosedStores` (offers Live, and a copy whose phase cannot be read) and
   `startIn` (Arrived: stale check; Lost, Rebuilt and Outbound: `retireEarlierTenancy`; Live: refuse or receive; None:

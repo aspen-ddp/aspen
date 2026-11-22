@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.rebuild
 
+import org.aspen_ddp.aspen.server.host.{CopyFixtures, Phase}
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.scalatest.compatible
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, Transaction}
@@ -95,7 +96,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- rebuild.complete
 
       // Reopen the rebuilt store and verify the objects are actually retrievable.
-      db = new BufferedConsistentRocksDB(dev / storeId.directoryName)
+      db = new BufferedConsistentRocksDB(CopyFixtures.copyPath(dev, storeId).get)
       // Hand-rolled key encoding: RocksDBBackend.tokey is private and the backend's read path
       // (RocksDBBackend.read) requires a CompletionHandler, which is heavyweight for this check.
       // This couples to the encoding but is the simplest accessible read path. If
@@ -109,13 +110,13 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       readResults <- Future.sequence(ids.map(id => db.get(tokey(id))))
       _ <- db.close()
     yield
-      val finalPath = dev / storeId.directoryName
-      os.exists(finalPath) should be(true)
+      CopyFixtures.copyPath(dev, storeId) should be(defined)
+      val finalPath = CopyFixtures.copyPath(dev, storeId).get
       // The staging directory and its checkpoint are gone once the store is whole.
       os.exists(dev / RebuildingStore.RebuildDirectory / storeId.directoryName) should be(false)
       os.exists(finalPath / RebuildState.stateFilename) should be(false)
       // Moved in carrying the marker that keeps it offline until its flip commits (rebuild-process 2.2)
-      os.exists(finalPath / RebuildingStore.RebuildCompleteMarkerFile) should be(true)
+      CopyFixtures.phaseOf(dev, storeId).exists(_.isInstanceOf[Phase.Rebuilt]) should be(true)
       // Its whole transaction state, empty, so its first load drops what the device CRL holds for it (rebuild-process 5.6)
       CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(finalPath), storeId) should be(Right(StoreRecoveryState.Empty))
       // A StoreConfig is written up front, so the moved directory is loadable.
@@ -208,7 +209,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
         allocations.filter(_.pointers.exists(_.id == held.id)).map(_.committed) should be(List(true))
       after.values.flatten.exists(_.pointers.exists(_.id == held.id)) should be(false)
       rebuild.testingOnlyRestoredKeys.map(_.bytes.toList) should contain(held.id.toBytes.toList)
-      os.exists(dev / storeId.directoryName) should be(true)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(true)
 
   /** The stores' votes on `txid`, or None for a store not holding it */
   private def votes(txid: TransactionId): List[Option[TransactionDisposition.Value]] =
@@ -298,7 +299,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     yield
       withClue("the rebuild finishes: ")(outcome should be(Some(scala.util.Success(()))))
       withClue("the unsettled allocation is recorded for repair: ")(entry should be(defined))
-      os.exists(dev / storeId.directoryName) should be(true)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(true)
 
   atest("a listed allocation whose transaction finalizes before the sweep is restored from a read"):
     given ExecutionContext = executionContext
@@ -345,7 +346,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
       listed.flatMap(_.pointers).map(_.id) should contain(held.id)
       resumed.testingOnlyRestoredKeys.map(_.bytes.toList) should contain(held.id.toBytes.toList)
-      os.exists(dev / storeId.directoryName) should be(true)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(true)
 
   atest("a listed allocation deleted before its transaction finalizes is settled by a read proving the deletion"):
     given ExecutionContext = executionContext
@@ -365,7 +366,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- rebuild.complete
     yield
       rebuild.testingOnlyRestoredKeys.map(_.bytes.toList) should not contain(held.id.toBytes.toList)
-      os.exists(dev / storeId.directoryName) should be(true)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(true)
 
   atest("a rebuild does not complete until a quorum of its peers has listed their pending allocations"):
     given ExecutionContext = executionContext
@@ -383,7 +384,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- rebuild.complete
     yield
       stalled should be(None)
-      os.exists(dev / storeId.directoryName) should be(true)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(true)
 
   // A pool short of live peers fails the pass into the host's backoff retry instead of holding its slot
   atest("a peer query without its quorum within its timeout fails the pass"):
@@ -402,7 +403,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     yield
       net.dropClientResponse = _ => false
       outcome.failed.get shouldBe a[RebuildingStore.PeerQueryTimedOut]
-      os.exists(dev / storeId.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
 
   atest("a cancel while waiting for the peers' quorum fails the rebuild"):
     given ExecutionContext = executionContext
@@ -421,7 +422,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       net.dropClientResponse = _ => false
       stalled should be(None)
       outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
-      os.exists(dev / storeId.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
 
   atest("a rebuilt store records that its acceptor covers only transactions started after its rebuild"):
     given ExecutionContext = executionContext
@@ -434,7 +435,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- rebuild.complete
       after = HLCTimestamp.now
     yield
-      val since = RebuildingStore.readAcceptorSince(dev / storeId.directoryName)
+      val since = RebuildingStore.readAcceptorSince(CopyFixtures.copyPath(dev, storeId).get)
       since.isDefined should be(true)
       // At least the margin past the start of the rebuild, and no more than the margin past its end
       (since.get - before) should be >= RebuildingStore.AcceptorSinceMargin.asInstanceOf[scala.concurrent.duration.Duration]
@@ -453,7 +454,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- rebuild.complete
       after = System.currentTimeMillis()
     yield
-      val gate = RebuildingStore.readInheritedVotes(dev / storeId.directoryName, horizon)
+      val gate = RebuildingStore.readInheritedVotes(CopyFixtures.copyPath(dev, storeId).get, horizon)
       val lead = horizon.toMillis + 2 * RebuildingStore.AcceptorSinceMargin.toMillis
       gate.isDefined should be(true)
       // The pass started between the two readings
@@ -472,7 +473,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends)
       _ <- rebuild.complete
     yield
-      val written = os.read(dev / storeId.directoryName / StoreIncarnationFile.FileName).trim
+      val written = os.read(CopyFixtures.copyPath(dev, storeId).get / StoreIncarnationFile.FileName).trim
       written should not be seeded
       Try(UUID.fromString(written)).isSuccess should be(true)
 
@@ -493,8 +494,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     val dev = deviceDir()
     // rebuild-process 4.1 (T12): a leftover of an earlier tenancy, no rebuild-complete marker. StoreRebuilds retires
     // such a directory before starting a rebuild; the rebuild itself must not take it for a finished one.
-    val leftover = dev / storeId.directoryName
-    os.makeDir.all(leftover)
+    val leftover = CopyFixtures.placeCopy(dev, storeId, configured = false)
     os.write.over(leftover / "data", "stale")
     for
       _ <- populate(3)
@@ -529,8 +529,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     val dev = deviceDir()
     // A crash between the move and the flip leaves the store in place, with its marker. The rebuild must not
     // start over, and must not fail.
-    os.makeDir.all(dev / storeId.directoryName)
-    os.write.over(dev / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile, "")
+    CopyFixtures.placeCopy(dev, storeId, Phase.Rebuilt(""), configured = false)
     // Staged as a crash just before the move would have left it: the move is not atomic with
     // the flip, so a staging directory carrying a checkpoint can outlive the final directory
     // appearing. Pre-created so that asserting on its removal is an assertion about
@@ -576,7 +575,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       val allocatedBytes = ids.map(id => Key(id.toBytes).bytes.toList).toSet
       // From the beginning: every object, not the tail of some range the torn file half-named.
       (allocatedBytes subsetOf restoredBytes) should be(true)
-      os.exists(dev / storeId.directoryName) should be(true)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(true)
 
   atest("an empty checkpoint restarts the walk from the beginning"):
     tornCheckpointRestartsTheWalk("")
@@ -638,7 +637,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       (rebuild.testingOnlyRestoredKeys.map(_.bytes.toList).toSet intersect allocated,
        sorted.drop(9).map(_.bytes.toList).toSet,
        allocated,
-       os.read(dev / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile))
+       CopyFixtures.phaseOf(dev, storeId).collect { case Phase.Rebuilt(e) => e }.getOrElse(""))
 
   atest("a resume continues a checkpoint of its own Rebuilding episode"):
     given ExecutionContext = executionContext
@@ -661,8 +660,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     val dev = deviceDir()
     val earlier = UUID.randomUUID()
-    os.makeDir.all(dev / storeId.directoryName)
-    os.write.over(dev / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile, earlier.toString)
+    CopyFixtures.placeCopy(dev, storeId, Phase.Rebuilt(earlier.toString), configured = false)
     for
       _ <- populate(5)
       _ <- net.waitForTransactionsToComplete()
@@ -676,7 +674,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // Not promoted, not overwritten: StoreRebuilds retires such a copy before a rebuild starts
       refused.failed.get shouldBe an[IllegalStateException]
       later.testingOnlyRestoredKeys should be(Nil)
-      os.read(dev / storeId.directoryName / RebuildingStore.RebuildCompleteMarkerFile) should be(earlier.toString)
+      CopyFixtures.phaseOf(dev, storeId) should be(Some(Phase.Rebuilt(earlier.toString)))
       // The episode that finished it takes it for done
       taken should be(scala.util.Success(()))
       own.testingOnlyRestoredKeys should be(Nil)
@@ -716,7 +714,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       outcome.isFailure should be(true)
       // The staging directory and its checkpoint survive, so the next device check resumes.
       val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
-      os.exists(dev / storeId.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       val saved = RebuildState.load(staging).get
       saved.failedObjects should be(List(ids.head))
       // The checkpoint advanced past it: one unreadable object cannot wedge the walk forever.
@@ -739,7 +737,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
         within(10.seconds, "the rebuild")(rebuild.complete.transform(scala.util.Success.apply))
     yield
       outcome.isFailure should be(true)
-      os.exists(dev / storeId.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       val saved = RebuildState.load(dev / RebuildingStore.RebuildDirectory / storeId.directoryName).get
       saved.failedObjects should be(List(ids.head))
       saved.lastRestoredKey should not be None
@@ -758,7 +756,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
         within(10.seconds, "the rebuild")(rebuild.complete.transform(scala.util.Success.apply))
     yield
       outcome.failed.get.getMessage should include("1 object reads in a row timed out")
-      os.exists(dev / storeId.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       // Aborted at the first timeout: the rest of the walk was skipped, and the checkpoint survives for the next pass
       val saved = RebuildState.load(dev / RebuildingStore.RebuildDirectory / storeId.directoryName).get
       saved.failedObjects.size should be(1)
@@ -802,7 +800,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ = net.observeRead = _ => ()
     yield
       outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
-      os.exists(dev / storeId.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
 
   atest("MaxFailedObjects cap prevents the store from moving into place"):
     given ExecutionContext = executionContext
@@ -823,7 +821,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // The staging directory and its checkpoint survive, so the next device check resumes
       val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
       os.exists(staging) should be(true)
-      os.exists(dev / storeId.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       // The checkpoint was written when the cap was hit
       val saved = RebuildState.load(staging).get
       saved.lastRestoredKey should not be None
@@ -872,7 +870,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // is short an object into place.
       settled.get.isFailure should be(true)
       val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
-      os.exists(dev / storeId.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       // Recorded as one more failed object, subject to the existing cap and retry machinery.
       RebuildState.load(staging).get.failedObjects should be(List(bogusId))
 
@@ -896,14 +894,14 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
       // What the cancelled pass left behind, before a new one resumes from it
       checkpointed = RebuildState.load(staging).isDefined
-      placed = os.exists(dev / storeId.directoryName)
+      placed = CopyFixtures.copyPath(dev, storeId).isDefined
       resumed = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends)
       _ <- resumed.complete
     yield
       outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
       checkpointed should be(true)
       placed should be(false)
-      os.exists(dev / storeId.directoryName) should be(true)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(true)
 
   atest("an abort latched while finish closes the backend keeps the staging copy out of place"):
     given ExecutionContext = executionContext
@@ -921,7 +919,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
     yield
       outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
-      os.exists(dev / storeId.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       os.exists(staging) should be(true)
       RebuildState.load(staging).isDefined should be(true)
 
@@ -972,7 +970,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // The staging directory and its checkpoint survive
       val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
       os.exists(staging) should be(true)
-      os.exists(dev / storeId.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       // failedObjects is EMPTY -- proving the latch alone failed the pass, not retryFailures()
       val saved = RebuildState.load(staging).get
       saved.failedObjects should be(Nil)
@@ -994,7 +992,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       opener.opens.map((cfg, path) => (cfg.storeId, cfg.backend, path)) should be(expected)
       os.exists(dev / StoreCreation.CreatingDirectory) && os.list(dev / StoreCreation.CreatingDirectory).nonEmpty should
         be(false)
-      os.exists(dev / storeId.directoryName) should be(true)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(true)
 
   atest("a staging store whose state is lost is discarded, checkpoint and all, and the next rebuild starts over"):
     given ExecutionContext = executionContext
@@ -1022,7 +1020,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // From the beginning: every allocated object, not only those after the discarded checkpoint
       val restoredBytes = rebuild.testingOnlyRestoredKeys.map(_.bytes.toList).toSet
       (restoredBytes intersect sorted.map(_.bytes.toList).toSet) should be(sorted.map(_.bytes.toList).toSet)
-      os.exists(dev / storeId.directoryName) should be(true)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(true)
 
   atest("a fail-stop of the staging store fails the pass and leaves its checkpoint for the next one"):
     given ExecutionContext = executionContext
@@ -1042,7 +1040,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
     yield
       outcome.failed.get should be(failure)
-      os.exists(dev / storeId.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       RebuildState.load(staging).isDefined should be(true)
 
   /** Opens through the default opener, wrapping the backend so its rebuildFlush throws an out-of-space error while
@@ -1103,7 +1101,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       result.map: outcome =>
         Backend.isOutOfSpace(outcome.failed.get) should be(true)
         alerts.toArray(Array.empty[scribe.Level]).toList should be(List(scribe.Level.Error))
-        os.exists(dev / storeId.directoryName) should be(false)
+        CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
         RebuildState.load(staging).isDefined should be(true)
 
   atest("a failed completion-file write in finish keeps the checkpoint for the next pass (RB-W10)"):
@@ -1121,5 +1119,5 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
     yield
       outcome.isFailure should be(true)
-      os.exists(dev / storeId.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       RebuildState.load(staging).isDefined should be(true)

@@ -32,7 +32,7 @@ class DerivedSilenceSuite extends IntegrationTestSuite with ControlFixture:
 
   /** A complete RocksDB store at its path on `dev`, as a create leaves it */
   private def realStore(dev: os.Path, storeId: StoreId): os.Path =
-    val storePath = dev / storeId.directoryName
+    val storePath = CopyLayout.path(dev, storeId, Some(UUID.randomUUID()), Phase.Live)
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, Replication(3, 2)),
       storePath, dev / StoreCreation.CreatingDirectory)
     storePath
@@ -76,7 +76,7 @@ class DerivedSilenceSuite extends IntegrationTestSuite with ControlFixture:
     val devB = device(hostRoot, "dev1", deviceB)
     val storePath = realStore(devA, s)
     // Device B holds a lost copy of the store
-    os.write(writeStoreConfig(devB, s) / RebuildingStore.RebuildRequiredMarkerFile, "")
+    CopyFixtures.placeCopy(devB, s, Phase.Lost)
     val host = newHost(hostRoot)
     host.testingOnlyHandleEvents()
     host.control.loader.tryLoadStore(loadedDevices(host)(deviceA), storePath)
@@ -200,10 +200,10 @@ class DerivedSilenceSuite extends IntegrationTestSuite with ControlFixture:
   // I3: the reconcile's passes select from the device's offline copies, which leave a copy whose store has work on
   // the device to that work. Its entry gone from the device (an abort, a re-placement), the Deleted Stores pass would
   // otherwise retire the copy under the work, which then discards or promotes the same path
-  for (what, marker, work) <- List(
-        ("an arrived copy while its transfer in's pool update is in flight", StoreTransfer.TransferredInMarkerFile,
+  for (what, phase, work) <- List(
+        ("an arrived copy while its transfer in's pool update is in flight", Phase.Arrived(""),
          Work.TransferIn(None, TransferInStage.Recording)),
-        ("a rebuilt copy while its rebuild's flip is in flight", RebuildingStore.RebuildCompleteMarkerFile,
+        ("a rebuilt copy while its rebuild's flip is in flight", Phase.Rebuilt(""),
          Work.Rebuild(None, RebuildStage.Running)))
   do
     atest(s"the Deleted Stores pass leaves $what to its work"):
@@ -215,8 +215,7 @@ class DerivedSilenceSuite extends IntegrationTestSuite with ControlFixture:
       // Injected, so no device load's own check is in flight
       val dev = hostRoot / os.up / "injected-device"
       os.makeDir.all(dev)
-      val dir = writeStoreConfig(dev, s)
-      os.write.over(dir / marker, "")
+      CopyFixtures.placeCopy(dev, s, phase)
       val local = new LocalStorageDeviceState(deviceA, dev, dev / "dummy.file", new org.aspen_ddp.aspen.TestNetwork.TestCRL())
       injectLoadedDevice(host, local)
       host.control.copyRegistry.work("test", deviceA, s, w => w.ordinal == work.ordinal, Some(work))
@@ -226,11 +225,12 @@ class DerivedSilenceSuite extends IntegrationTestSuite with ControlFixture:
       armed.success(deviceState(deviceA))
       for
         // The check ends, or a retire it started moves the copy away (and checks the device again)
-        _ <- pumpUntil(host, !host.control.reconciler.activeDeviceChecks.contains(deviceA) || !os.exists(dir))
+        _ <- pumpUntil(host, !host.control.reconciler.activeDeviceChecks.contains(deviceA) ||
+                             CopyFixtures.copyPath(dev, s).isEmpty)
         // A retire, had one started, completes within these rounds (its CRL calls answer at once)
-        _ <- pumpUntil(host, !os.exists(dir), rounds = 5)
+        _ <- pumpUntil(host, CopyFixtures.copyPath(dev, s).isEmpty, rounds = 5)
       yield
         offlineCopies(host, local) should not contain s
-        os.exists(dir / marker) should be(true)
+        CopyFixtures.phaseOf(dev, s) should be(Some(phase))
         host.control.copyRegistry.device(deviceA).flatMap(_.copies.get(s)) should not be empty
 

@@ -836,7 +836,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   def handleLoadById(e: LoadStoreById): Unit =
     ctx.devices.devices.get(e.sstorageDeviceId).foreach: sds =>
-      ctx.tryLoadStore(sds, sds.devicePath / e.toreId.directoryName, None)
+      ctx.tryLoadStore(sds, ctx.copyRegistry.pathOrLive(sds, e.toreId), None)
 
   /** Closes a store (spec section 5): removes it from the router, which marks it offline so new traffic gets the
    *  offline handling, then runs the close on its executor, behind any tasks already queued for it: the object cache

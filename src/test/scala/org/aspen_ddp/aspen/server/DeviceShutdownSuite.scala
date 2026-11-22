@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.host.{CopyFixtures, Phase}
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, RebuildStage, StagedSendService, StagedTransferService, TransferInStage, Work}
@@ -105,7 +106,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newHost(hostRoot, transferService = transfers, storeRebuildFactory = rebuilds)
-    loaded.foreach(s => os.makeDir.all(deviceDir / s.directoryName))
+    loaded.foreach(s => bareCopy(deviceDir, s))
     servedHere(host, loadedDevices(host)(deviceA), loaded.toSeq*)
     for
       _ <- net.createDevice(deviceA)
@@ -123,9 +124,21 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
     yield ()
 
-  /** Neither of the files a network transfer leaves: a shutdown leaves a store's state in its device's CRL */
-  private def noMoveFiles(storeDir: os.Path): Boolean =
-    !os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) && !os.exists(Backend.crlSaveFile(storeDir))
+  /** Neither of the things a network transfer leaves on the copy of `s`: its Outbound phase and its save file. A
+   *  shutdown leaves a store's state in its device's CRL */
+  private def noMoveFiles(deviceDir: os.Path, s: StoreId): Boolean =
+    !outbound(deviceDir, s) && CopyFixtures.copyPath(deviceDir, s).forall(dir => !os.exists(Backend.crlSaveFile(dir)))
+
+  /** Whether the copy of `s` is Outbound (its transfer-out marker) */
+  private def outbound(deviceDir: os.Path, s: StoreId): Boolean =
+    CopyFixtures.phaseOf(deviceDir, s).exists(_.isInstanceOf[Phase.Outbound])
+
+  /** A copy of `s` holding nothing, not even its config */
+  private def bareCopy(deviceDir: os.Path, s: StoreId): os.Path =
+    CopyFixtures.placeCopy(deviceDir, s, configured = false)
+
+  /** The path of the copy of `s` */
+  private def copyAt(deviceDir: os.Path, s: StoreId): os.Path = CopyFixtures.copyPath(deviceDir, s).get
 
   atest("a ShuttingDown device has its stores closed and announced, then is Shutdown"):
     given ExecutionContext = executionContext
@@ -139,8 +152,8 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     yield
       recorded(host).shutdownCloses.toSet should be(Set(s0, s1))
       recorded(host).shutdownCloses.size should be(2)
-      noMoveFiles(deviceDir / s0.directoryName) should be(true)
-      noMoveFiles(deviceDir / s1.directoryName) should be(true)
+      noMoveFiles(deviceDir, s0) should be(true)
+      noMoveFiles(deviceDir, s1) should be(true)
       DeviceMarkers.readShutdownState(deviceDir) should be(Some(HostId.BootstrapHostId))
       st.status should be(DeviceStatus.Shutdown)
       st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Offline))
@@ -161,10 +174,10 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     yield
       recorded(host).shutdownCloses.toSet should be(Set(s0, s1))
       // The failed store is marked for rebuild, which is what an adopter reads; the clean one is plain
-      os.exists(deviceDir / s0.directoryName / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
-      os.exists(deviceDir / s1.directoryName / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
-      noMoveFiles(deviceDir / s0.directoryName) should be(true)
-      noMoveFiles(deviceDir / s1.directoryName) should be(true)
+      CopyFixtures.phaseOf(deviceDir, s0).contains(Phase.Lost) should be(true)
+      CopyFixtures.phaseOf(deviceDir, s1).contains(Phase.Lost) should be(false)
+      noMoveFiles(deviceDir, s0) should be(true)
+      noMoveFiles(deviceDir, s1) should be(true)
       st.stores(s0).status should be(StoreStatus.Offline)
       st.stores(s1).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
@@ -218,7 +231,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       // Between the stores closing and the Shutdown commit, a late rebuild completion flips s1 to
       // Active and loads it.
       _ = recorded(host).beforeNextShutdownCommit: () =>
-            os.makeDir.all(deviceDir / s1.directoryName)
+            bareCopy(deviceDir, s1)
             servedHere(host, loadedDevices(host)(deviceA), s1)
             setDeviceState(deviceA)(_.setStoreEntry(s1, StoreStatus.Active, None))
       _ <- shutDown(host)
@@ -226,7 +239,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     yield
       recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.StoresReactivated, ShutdownOutcome.Completed))
       recorded(host).shutdownCloses.toList should be(List(s0, s1))
-      noMoveFiles(deviceDir / s1.directoryName) should be(true)
+      noMoveFiles(deviceDir, s1) should be(true)
       st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Offline))
       st.status should be(DeviceStatus.Shutdown)
 
@@ -263,7 +276,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.restartStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       _ = gate.success(())
-      paths = List(s0, s1).map(s => deviceDir / s.directoryName)
+      paths = List(s0, s1).map(copyAt(deviceDir, _))
       _ <- pumpUntil(recorded(host).shutdownOutcomes.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty &&
                      paths.forall(recorded(host).storeLoadAttempts.map(_._2).contains))
       st <- state(deviceA)
@@ -274,9 +287,9 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
       loadedDevices(host).contains(deviceA) should be(true)
       // The reconcile brought both stores back: there were no markers to remove
-      paths.forall(noMoveFiles) should be(true)
-      recorded(host).storeLoadAttempts.map(_._2).toSet should contain allOf(deviceDir / s0.directoryName,
-                                                                  deviceDir / s1.directoryName)
+      List(s0, s1).forall(noMoveFiles(deviceDir, _)) should be(true)
+      recorded(host).storeLoadAttempts.map(_._2).toSet should contain allOf(copyAt(deviceDir, s0),
+                                                                  copyAt(deviceDir, s1))
 
   // A closed copy that other work holds when the cancelled shutdown's reconcile runs is left to that work (I3), and
   // kept among the closed stores, so a later reconcile loads it once the work has ended rather than dropping it. The
@@ -296,7 +309,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ = host.control.copyRegistry.work("test", deviceA, s1, _.isInstanceOf[Work.TransferIn], heldWork)
       _ = gate.success(())
-      paths = List(s0, s1).map(s => deviceDir / s.directoryName)
+      paths = List(s0, s1).map(copyAt(deviceDir, _))
       attempts = () => recorded(host).storeLoadAttempts.map(_._2).toList
       _ <- awaitLoudly("the cancelled shutdown to reload s0")(recorded(host).shutdownOutcomes.nonEmpty &&
              host.control.reconciler.activeDeviceChecks.isEmpty && attempts().contains(paths(0)))
@@ -321,18 +334,18 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       // Its stats now fail (EACCES): CopyPhase.known answers None
-      unreadable = deviceDir / s0.directoryName
+      unreadable = copyAt(deviceDir, s0)
       _ = os.perms.set(unreadable, "rw-------")
       _ <- client.restartStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       _ = gate.success(())
-      paths = List(s0, s1).map(s => deviceDir / s.directoryName)
+      paths = List(s0, s1).map(copyAt(deviceDir, _))
       _ <- pumpUntil(recorded(host).shutdownOutcomes.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty &&
                      paths.forall(recorded(host).storeLoadAttempts.map(_._2).contains))
       _ = os.perms.set(unreadable, "rwx------")
     yield
       recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Cancelled))
-      recorded(host).storeLoadAttempts.map(_._2).toSet should contain allOf(unreadable, deviceDir / s1.directoryName)
+      recorded(host).storeLoadAttempts.map(_._2).toSet should contain allOf(unreadable, copyAt(deviceDir, s1))
 
   atest("an Initializing store is not created while the device is ShuttingDown"):
     given ExecutionContext = executionContext
@@ -344,7 +357,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- shutDown(host)
       st <- state(deviceA)
     yield
-      os.exists(deviceDir / creating.directoryName) should be(false)
+      CopyFixtures.copyPath(deviceDir, creating) should be(None)
       st.stores(creating) should be(initializing)
       st.status should be(DeviceStatus.Shutdown)
 
@@ -356,7 +369,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val sends = new StagedSendService
     val host = newHost(hostRoot, transferService = sends)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
-    os.makeDir.all(deviceDir / movingStore.directoryName)
+    bareCopy(deviceDir, movingStore)
 
     for
       _ <- net.createSecondDevice()
@@ -370,7 +383,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     yield
       refused.getMessage should include("ShuttingDown")
       sends.transfersOut should be(Vector())
-      os.exists(deviceDir / movingStore.directoryName / StoreTransfer.TransferOutMarkerFile) should be(false)
+      outbound(deviceDir, movingStore) should be(false)
 
   atest("a transfer in from a Shutdown source is not started"):
     given ExecutionContext = executionContext
@@ -403,7 +416,6 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val transfers = new StagedTransferService
     val host = newHost(hostRoot, transferService = transfers)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
-    val arrived = deviceDir / movingStore.directoryName
 
     for
       _ <- net.createSecondDevice()
@@ -415,7 +427,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       // Hold the pool update between promotion and its transaction, then request the shutdown.
       gate = recorded(host).holdTransferOutcomes()
       _ = transfers.finishTransferIn(movingStore)
-      _ <- pumpUntil(os.exists(arrived / StoreTransfer.TransferredInMarkerFile))
+      _ <- pumpUntil(CopyFixtures.phaseOf(deviceDir, movingStore).exists(_.isInstanceOf[Phase.Arrived]))
       _ <- client.shutdownStorageDevice(destId)
       _ <- waitForTransactionsToComplete()
       _ = gate.success(())
@@ -431,7 +443,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       pool.stores(movingStore.poolIndex).storageDeviceId should be(destId)
       recorded(host).loadStoreByIdRequests.toList should be(Nil)
       // Kept as it arrived, behind its transferred-in marker, and not served.
-      os.exists(arrived / StoreTransfer.TransferredInMarkerFile) should be(true)
+      CopyFixtures.phaseOf(deviceDir, movingStore).exists(_.isInstanceOf[Phase.Arrived]) should be(true)
       host.control.router.silentStores should contain(movingStore)
       st.stores(movingStore).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
@@ -447,8 +459,8 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       // The rebuilt store lands at its final path, with the empty save file finish writes.
-      _ = os.makeDir.all(deviceDir / s0.directoryName)
-      _ = RebuildingStore.writeEmptyCrlState(deviceDir / s0.directoryName, s0)
+      _ = bareCopy(deviceDir, s0)
+      _ = RebuildingStore.writeEmptyCrlState(copyAt(deviceDir, s0), s0)
       _ = rebuilds.created.head.promise.success(())
       _ <- pumpUntil(recorded(host).rebuildFlipSeq.contains((deviceA, s0)))
       entryAfterFlip <- state(deviceA).map(_.stores.get(s0))
@@ -458,9 +470,9 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     yield
       entryAfterFlip.map(_.status) should be(Some(StoreStatus.Offline))
       recorded(host).loadStoreByIdRequests.toList should be(Nil)
-      os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      outbound(deviceDir, s0) should be(true)
       // Kept beside the marker, so an adopter accepts it.
-      os.exists(Backend.crlSaveFile(deviceDir / s0.directoryName)) should be(true)
+      os.exists(Backend.crlSaveFile(copyAt(deviceDir, s0))) should be(true)
       host.control.router.silentStores should contain(s0)
       st.stores(s0).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
@@ -488,7 +500,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).loadStoreRequests.toList should be(List((deviceA, creating)))
       entryAfterFlip.map(_.status) should be(Some(StoreStatus.Offline))
       recorded(host).shutdownCloses.toList should be(List(creating))
-      noMoveFiles(deviceDir / creating.directoryName) should be(true)
+      noMoveFiles(deviceDir, creating) should be(true)
       st.stores(creating).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
 
@@ -549,7 +561,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(rebuilds.created.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- setDeviceState(deviceA)(_.copy(hostId = otherHostId))
-      _ = os.makeDir.all(deviceDir / s0.directoryName)
+      _ = bareCopy(deviceDir, s0)
       _ = rebuilds.created.head.promise.success(())
       _ <- pumpUntil(recorded(host).rebuildOutcomes.contains((deviceA, s0)))
       st <- state(deviceA)
@@ -559,8 +571,8 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       st.hostId should be(otherHostId)
       recorded(host).loadStoreByIdRequests.toList should be(Nil)
       // Left for the owner, whose rebuild finds the store in place and only flips it.
-      os.exists(deviceDir / s0.directoryName) should be(true)
-      os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(false)
+      CopyFixtures.copyPath(deviceDir, s0) should be(defined)
+      outbound(deviceDir, s0) should be(false)
 
   /** setUp with s0 Rebuilding under a RecordedRebuild, which ignores cancel() as a rebuild whose
    *  walk is still reading does, and s1 Active and open. The shutdown is requested and checked,
@@ -585,7 +597,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       closesWhileWaiting = recorded(host).shutdownCloses.toList
       outcomesWhileWaiting = recorded(host).shutdownOutcomes.toList
       // The walk ends and the rebuilt store lands, after the shutdown request.
-      _ = os.makeDir.all(deviceDir / s0.directoryName)
+      _ = bareCopy(deviceDir, s0)
       _ = rebuilds.created.head.promise.success(())
       _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
       st <- state(deviceA)
@@ -597,7 +609,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).shutdownCloses.toList should be(List(s1))
       recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
       // Kept offline as the shutdown's own closes are, before Shutdown committed.
-      os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      outbound(deviceDir, s0) should be(true)
       st.stores(s0).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
 
@@ -636,7 +648,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
       gate = recorded(host).holdTransferOutcomes()
       _ = transfers.finishTransferIn(movingStore)
-      _ <- pumpUntil(os.exists(deviceDir / movingStore.directoryName / StoreTransfer.TransferredInMarkerFile))
+      _ <- pumpUntil(CopyFixtures.phaseOf(deviceDir, movingStore).exists(_.isInstanceOf[Phase.Arrived]))
       _ <- client.shutdownStorageDevice(destId)
       _ <- waitForTransactionsToComplete()
       _ = host.control.reconciler.checkAll()
@@ -661,8 +673,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val rebuilds = new RecordingRebuildFactory
     val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = rebuilds)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
-    val storeDir = deviceDir / movingStore.directoryName
-    os.makeDir.all(storeDir)
+    bareCopy(deviceDir, movingStore)
     def ask() = host.control.transfersOut.startOut(StartStoreTransfer(host.hostId, client.clientId,
       sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
 
@@ -677,7 +688,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       // The close fails as ShutdownStore's does for a backend that failed-stop: marked, offline, unloaded
       _ = recorded(host).failNextTransferOutClose.set(Some(() =>
-            os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")))
+            CopyFixtures.markCopy(deviceDir, movingStore, Phase.Lost): Unit))
       _ <- ask()
       _ <- pumpUntil(recorded(host).lostTransferAborts.nonEmpty)
       // A retransmit meanwhile is refused before anything is closed, written or sent
@@ -691,7 +702,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       retransmit.getMessage should include("rebuild-required")
       sends.transfersOut should be(Vector())
       recorded(host).transferOutCloses.toList should be(List(movingStore))
-      os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
+      outbound(deviceDir, movingStore) should be(false)
       st.stores(movingStore).status should be(StoreStatus.Rebuilding)
       dest.stores.get(movingStore) should be(None)
       rebuilds.created.map(_.storeId).toList should be(List(movingStore))
@@ -704,7 +715,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val sends = new StagedSendService
     val host = newHost(hostRoot, transferService = sends)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
-    os.makeDir.all(deviceDir / movingStore.directoryName)
+    bareCopy(deviceDir, movingStore)
 
     for
       _ <- net.createSecondDevice()
@@ -735,6 +746,6 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       sendsWhileShuttingDown should be(Vector())
       sends.transfersOut should be(Vector())
       // Not marked: the transfer never began, and the shutdown marks no store it closes
-      os.exists(deviceDir / movingStore.directoryName / StoreTransfer.TransferOutMarkerFile) should be(false)
+      outbound(deviceDir, movingStore) should be(false)
       st.stores(movingStore).status should be(StoreStatus.TransferringOut)
       st.status should be(DeviceStatus.Shutdown)

@@ -290,7 +290,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  may lead this one's, and its load floor must cover that.
    */
   private[host] def clearTransferredInMarker(sds: LocalStorageDeviceState, storeId: StoreId): Boolean =
-    val storePath = sds.devicePath / storeId.directoryName
+    val storePath = ctx.copyRegistry.pathOrLive(sds, storeId)
     try
       StoreLoader.writeArrivedAt(storePath)
       // A failed unlink keeps the marker, for the transferred-in pass; a failed sync after it leaves the copy unsynced,
@@ -346,7 +346,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         outcome match
           case Success(TransferOutcome.PoolRepointed) =>
             ctx.devices.devices.get(toDeviceid).foreach: sds =>
-              val storePath = sds.devicePath / storeId.directoryName
+              val storePath = ctx.copyRegistry.pathOrLive(sds, storeId)
               if clearTransferredInMarker(sds, storeId) then
                 // A rebuilt copy whose flip was Unconfirmed ships with its rebuild-complete marker
                 // (rebuild-process 5.7). The flip committed before the source's entry could become
@@ -418,7 +418,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     else if attemptOf(storeId).isEmpty && ! ctx.shutdown.isShuttingDown(toDeviceid) then
       ctx.devices.devices.get(toDeviceid).foreach: toDevice =>
         val devicePath = toDevice.devicePath
-        val finalPath = devicePath / storeId.directoryName
+        val finalPath = ctx.copyRegistry.pathOrLive(toDevice, storeId)
 
         // The copy at the path has one phase (CopyPhase). An arrived (promoted) copy belongs to the transfer whose id
         // its marker records. One left by an earlier transfer that was aborted or given up on predates whatever the
@@ -469,7 +469,9 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         val transferUUID = UUID.randomUUID()
 
         phase match
-          case None | Some(Phase.Unread) =>
+          // A retired copy still recorded awaits the resync that forces its move (CopyMoves), as an unread one awaits
+          // a read
+          case None | Some(Phase.Unread) | Some(Phase.Retired) =>
             ()
 
           // A copy promoted by an earlier attempt -- normally one that crashed before its metadata
@@ -570,7 +572,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                       // accepted by an adopter on the strength of this marker alone.
                       DurableFiles.write(stagedPath / StoreTransfer.TransferredInMarkerFile,
                                          transferId.map(_.toString).getOrElse(""))
-                      DurableFiles.move(stagedPath, finalPath)
+                      // The promotion's target: the arrived copy is not recorded until it is there
+                      DurableFiles.move(stagedPath, CopyLayout.path(devicePath, storeId, None, Phase.Live))
                       // A fact: the copy is at its path now, whatever the registry held
                       ctx.copyRegistry.placed("transfer-in promotion", toDevice, storeId,
                         Phase.Arrived(transferId.map(_.toString).getOrElse("")))
@@ -620,7 +623,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  reloads it. The store served from another device of this host does not: that is the source of a transfer
    *  between two devices of one host, closed only by the StartStoreTransfer sent once this path is clear. */
   private def retireEarlierTenancy(local: LocalStorageDeviceState, storeId: StoreId): Unit =
-    val storePath = local.devicePath / storeId.directoryName
+    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
     val servedHere = ctx.router.entry(storeId).exists(_.store.backend.path == storePath)
     if registry.rebuilding(HostCopies.RebuildReads).contains(storeId) || servedHere || ctx.loader.isOpening(storeId) then
       logger.info(s"Not transferring store $storeId onto device ${local.storageDeviceId} yet: its path holds a copy " +

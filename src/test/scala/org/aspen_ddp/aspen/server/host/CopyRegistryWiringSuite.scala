@@ -29,8 +29,8 @@ private class PlacingRebuildFactory(writeConfig: (os.Path, StoreId) => os.Path)(
     val id = storeId
     // Placed off the control thread, as finish's move is, and completed right after it
     val placed = Future:
-      val dir = writeConfig(devicePath, id)
-      os.write.over(dir / RebuildingStore.RebuildCompleteMarkerFile, RebuildingStore.rebuildCompleteContent(episode))
+      writeConfig(devicePath, id)
+      CopyFixtures.markCopy(devicePath, id, Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)))
       ()
     new StoreRebuild:
       val storeId: StoreId = id
@@ -69,10 +69,10 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val hostRoot = newHostDir()
     val dev = device(hostRoot, deviceA)
     writeStoreConfig(dev, sid(0))
-    os.write(writeStoreConfig(dev, sid(1)) / RebuildingStore.RebuildRequiredMarkerFile, "")
-    os.write(writeStoreConfig(dev, sid(2)) / StoreTransfer.TransferOutMarkerFile, "t-out\n")
-    os.write(writeStoreConfig(dev, sid(3)) / StoreTransfer.TransferredInMarkerFile, "t-in")
-    os.write(writeStoreConfig(dev, sid(4)) / RebuildingStore.RebuildCompleteMarkerFile, "ep")
+    CopyFixtures.placeCopy(dev, sid(1), Phase.Lost)
+    CopyFixtures.placeCopy(dev, sid(2), Phase.Outbound("t-out"))
+    CopyFixtures.placeCopy(dev, sid(3), Phase.Arrived("t-in"))
+    CopyFixtures.placeCopy(dev, sid(4), Phase.Rebuilt("ep"))
     // Not store directories: a scratch area and a directory whose name is no store's
     os.makeDir.all(dev / "creating")
     os.makeDir.all(dev / "not-a-store")
@@ -113,8 +113,8 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val dev = device(hostRoot, source)
     writeStoreConfig(dev, shipped)
     writeStoreConfig(dev, sid(0))
-    os.write(writeStoreConfig(dev, sid(1)) / StoreTransfer.TransferredInMarkerFile, "t-in")
-    os.write(writeStoreConfig(dev, sid(2)) / RebuildingStore.RebuildCompleteMarkerFile, "kept")
+    CopyFixtures.placeCopy(dev, sid(1), Phase.Arrived("t-in"))
+    CopyFixtures.placeCopy(dev, sid(2), Phase.Rebuilt("kept"))
     val sends = new StagedSendService
     val host = newHost(hostRoot, transferService = sends,
                        storeRebuildFactory = new PlacingRebuildFactory(writeStoreConfig)(using executionContext),
@@ -210,7 +210,8 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     try
       val sds = new LocalStorageDeviceState(deviceB, other, other / StorageDeviceConfig.configFilename,
         new org.aspen_ddp.aspen.TestNetwork.TestCRL)
-      noException should be thrownBy host.control.copyRegistry.attach(sds, List(child, other / "not-a-store"))
+      os.makeDir.all(other / "not-a-store")
+      noException should be thrownBy host.control.copyRegistry.attach(sds, CopyLayout.list(other))
       phases(host, deviceB) should be(Map(sid(0) -> Phase.Unread))
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
     finally os.perms.set(closed, "rwx------")
@@ -218,8 +219,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
   test("an Unread copy that later reads cleanly is refreshed at its load"):
     val hostRoot = newHostDir()
     val dev = device(hostRoot, deviceA)
-    val dir = writeStoreConfig(dev, sid(0))
-    os.write(dir / RebuildingStore.RebuildCompleteMarkerFile, "ep")
+    val dir = CopyFixtures.placeCopy(dev, sid(0), Phase.Rebuilt("ep"))
     os.perms.set(dir, "rw-------")
     val (host, waiting) =
       try
@@ -244,8 +244,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
     val local = loadedDevices(host)(deviceA)
-    val dir = writeStoreConfig(dev, sid(0))
-    os.write(dir / StoreTransfer.TransferOutMarkerFile, "t")
+    val dir = CopyFixtures.placeCopy(dev, sid(0), Phase.Outbound("t"))
     host.control.copyRegistry.verifyAgainstDisk().size should be(1)
     host.control.loader.tryLoadStore(local, dir)
     phases(host, deviceA) should be(Map(sid(0) -> Phase.Outbound("t")))
@@ -321,7 +320,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       yield
         outcome.toString should be(variant)
         after should be(Map(sid(0) -> expected))
-        CopyPhase.read(local.devicePath / sid(0).directoryName) should be(expected)
+        CopyFixtures.phaseOf(local.devicePath, sid(0)) should be(Some(expected))
         consistent(host)
 
   atest("a rebuild whose flip discards its copy unregisters it"):
@@ -339,7 +338,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     yield
       recorded(host).rebuildOutcomes((source, sid(7))) should be(RebuildOutcome.Discard)
       phases(host, source) should be(Map())
-      os.exists(local.devicePath / sid(7).directoryName) should be(false)
+      CopyFixtures.copyPath(local.devicePath, sid(7)) should be(None)
       consistent(host)
 
   atest("a rebuild over a foreign copy marks it Lost, retires it to pending-delete, and adopts its own"):
@@ -394,7 +393,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     // No crl/ beside its stores: the device's CRL is lost
     val dev = writeDevice(hostRoot, "dev0", deviceA)
     writeStoreConfig(dev, sid(0))
-    os.write(writeStoreConfig(dev, sid(1)) / RebuildingStore.RebuildCompleteMarkerFile, "ep")
+    CopyFixtures.placeCopy(dev, sid(1), Phase.Rebuilt("ep"))
     val host = newHost(hostRoot, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
     phases(host, deviceA) should be(Map(sid(0) -> Phase.Lost, sid(1) -> Phase.Rebuilt("ep")))
@@ -405,9 +404,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       given ExecutionContext = executionContext
       val hostRoot = newHostDir()
       val dev = device(hostRoot, source)
-      val dir = writeStoreConfig(dev, shipped)
-      if rebuilt then
-        os.write(dir / RebuildingStore.RebuildCompleteMarkerFile, "ep")
+      CopyFixtures.placeCopy(dev, shipped, if rebuilt then Phase.Rebuilt("ep") else Phase.Live)
       val sends = new StagedSendService
       val host = newHost(hostRoot, transferService = sends, verifyCopyRegistry = true)
       host.testingOnlyHandleEvents()
@@ -466,7 +463,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()
     val dev = device(hostRoot, net.secondDeviceId)
-    os.write(writeStoreConfig(dev, shipped) / StoreTransfer.TransferredInMarkerFile, "another-transfer")
+    CopyFixtures.placeCopy(dev, shipped, Phase.Arrived("another-transfer"))
     val transfers = new StagedTransferService
     val host = newHost(hostRoot, transferService = transfers, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
@@ -534,7 +531,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
 
   /** A complete RocksDB store at its path on `dev`, as a create leaves it */
   private def realStore(dev: os.Path, storeId: StoreId): os.Path =
-    val storePath = dev / storeId.directoryName
+    val storePath = CopyLayout.path(dev, storeId, Some(UUID.randomUUID()), Phase.Live)
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, Replication(3, 2)),
       storePath, dev / StoreCreation.CreatingDirectory)
     storePath
@@ -786,7 +783,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       _ = host.testingOnlyHandleEvents()
     yield
       host.control.router.isOffline(created) should be(true)
-      os.exists(dev / created.directoryName) should be(false)
+      CopyFixtures.copyPath(dev, created) should be(None)
       host.control.copyRegistry.silence(created) should be(Silence.Silent(Set(SilenceReason.Opening)))
       consistent(host)
 
@@ -1029,7 +1026,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val dev = device(hostRoot, deviceA)
     val other = secondDevice(hostRoot, deviceB)
     // Its config lost on device A; a whole copy on device B
-    os.makeDir.all(dev / sid(3).directoryName)
+    os.remove(CopyFixtures.placeCopy(dev, sid(3)) / StoreConfig.configFilename)
     writeStoreConfig(other, sid(3))
     val host = newHost(hostRoot, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
@@ -1038,14 +1035,12 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
 
   // R6: marker durability is uniform. A removal whose directory sync fails after the unlink leaves the copy unsynced,
   // and it is never loaded until a later device check forces the directory again, which loads it
-  for (name, marker) <- List(("TI", StoreTransfer.TransferredInMarkerFile), ("TO", StoreTransfer.TransferOutMarkerFile),
-                             ("RC", RebuildingStore.RebuildCompleteMarkerFile)) do
+  for (name, phase) <- List(("TI", Phase.Arrived("x")), ("TO", Phase.Outbound("x")), ("RC", Phase.Rebuilt("x"))) do
     atest(s"a failed sync after removing any marker leaves the copy unsynced and unloaded, and the next check loads it ($name)"):
       given ExecutionContext = executionContext
       val hostRoot = newHostDir()
       val dev = device(hostRoot, deviceA)
-      val dir = writeStoreConfig(dev, sid(0))
-      os.write(dir / marker, "x")
+      val dir = CopyFixtures.placeCopy(dev, sid(0), phase)
       val host = newHost(hostRoot, verifyCopyRegistry = true)
       var failSync = true
       var syncs = List.empty[os.Path]
@@ -1068,7 +1063,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       val loadedAtStart = loads
       for
         _ <- check()
-        removed = !os.exists(dir / marker)
+        removed = CopyFixtures.phaseOf(dev, sid(0)).contains(Phase.Live)
         unsynced = record(host, deviceA, sid(0)).map(_.unsynced)
         loadsAfterFailure = loads
         _ = failSync = false
@@ -1128,8 +1123,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       given ExecutionContext = executionContext
       val hostRoot = newHostDir()
       val dev = device(hostRoot, deviceA)
-      val dir = writeStoreConfig(dev, sid(0))
-      os.write(dir / StoreTransfer.TransferOutMarkerFile, "x")
+      val dir = CopyFixtures.placeCopy(dev, sid(0), Phase.Outbound("x"))
       val host = newHost(hostRoot, verifyCopyRegistry = true)
       var failSync = true
       host.control.markers.syncDirectory = d =>
@@ -1197,14 +1191,11 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       // another episode. Neither is the rebuild's own, so both are reported (checked without draining)
       wrong = writeStoreConfig(dev, sid(0))
       liveCopy = mismatches()
-      _ = os.write.over(wrong / RebuildingStore.RebuildCompleteMarkerFile,
-                        RebuildingStore.rebuildCompleteContent(Some(UUID.randomUUID())))
+      _ = CopyFixtures.markCopy(dev, sid(0), Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(Some(UUID.randomUUID()))))
       otherEpisode = mismatches()
       _ = os.remove.all(wrong)
       // Where finish places the copy, before its future completes
-      placed = writeStoreConfig(dev, sid(0))
-      _ = os.write.over(placed / RebuildingStore.RebuildCompleteMarkerFile,
-                        RebuildingStore.rebuildCompleteContent(Some(episode)))
+      _ = CopyFixtures.placeCopy(dev, sid(0), Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(Some(episode))))
       placingPhase = host.control.rebuilds.finishPlacing(deviceA, sid(0))
       // The draining check passes: the copy is exempt
       _ = host.testingOnlyHandleEvents()

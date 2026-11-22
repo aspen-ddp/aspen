@@ -7,7 +7,8 @@
   executor, so they take no locks. The exception is `Store.transactionDrivers`, a `@volatile` immutable Map so
   `hasTransactions`/`logTransactionStatus` may read it from any thread; `TransactionDriver`s keep their own locks for
   their timer threads. Details: `host/CLAUDE.md`
-- `server.DurableFiles` forces files and their directories so markers and moves survive a pulled disk. That
+- `server.DurableFiles` forces files and their directories so markers and moves survive a pulled disk (a move whose
+  rename landed but whose sync failed throws `DurableFiles.MoveNotForced`; any other failure moved nothing). That
   durability holds on Linux only, the supported host platform: directory fsync is a no-op on Windows and a plain fsync
   on macOS, each logging one warning
 - Every existence test under `server/` is `server.FileStat`'s, never os-lib's `os.exists`/`os.isDir`/`os.isFile`,

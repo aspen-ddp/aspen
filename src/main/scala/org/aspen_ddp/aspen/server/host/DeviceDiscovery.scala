@@ -285,14 +285,12 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     finally
       releaseMarks(path, marked)
 
-  /** The stores whose directories are under the device directory `path`, by their store configs. A listing or a
-   *  config stat that fails throws (FileStat): a store it cannot see is never taken for none, so the caller leaves
-   *  the device to the next scan */
+  /** The stores with a configured copy on the device directory `path` outside pending-delete/, by their copies'
+   *  names (CopyLayout.list). A listing or a config stat that fails throws (FileStat): a store it cannot see is never
+   *  taken for none, so the caller leaves the device to the next scan */
   private def storesIn(path: os.Path): Set[StoreId] =
-    os.list(path).iterator.flatMap: dir =>
-      val cfgPath = dir / StoreConfig.configFilename
-      if FileStat.isFile(cfgPath) then Try(StoreConfig.loadStoreConfig(cfgPath).storeId).toOption else None
-    .toSet
+    CopyLayout.list(path).copies.filter(f =>
+      f.phase != Phase.Retired && FileStat.isFile(f.path / StoreConfig.configFilename)).map(_.storeId).toSet
 
   /** Clears the awaiting-device marks of `stores`, unless an adoption of `path` has taken them over */
   private def releaseMarks(path: os.Path, stores: Set[StoreId]): Unit =
@@ -405,7 +403,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     state.stores.collect {
       case (storeId, entry) if (entry.status == StorageDeviceState.StoreStatus.Offline ||
                                 entry.status == StorageDeviceState.StoreStatus.Active) &&
-                               adoptionClass(storeId, path / storeId.directoryName) == cls => storeId
+                               adoptionClass(storeId, CopyLayout.path(path, storeId, None, Phase.Live)) == cls =>
+        storeId
     }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
 
   /** The Offline and Active entries of `state` whose directories under `path` are missing. */
@@ -454,7 +453,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       // Each store arrives from another host, whose clock may lead this one's: its load floor must cover that. Before
       // the owner is rewritten, so that a crash between the two finds the adoption still to finish. A directory
       // stat that fails throws (FileStat), leaving the owner unwritten and the adoption to the next scan
-      state.stores.keys.map(storeId => path / storeId.directoryName).filter(FileStat.isDir(_))
+      state.stores.keys.map(storeId => CopyLayout.path(path, storeId, None, Phase.Live)).filter(FileStat.isDir(_))
         .foreach(StoreLoader.writeArrivedAt)
       DeviceMarkers.writeOwningHost(path, ctx.hostId)
 
@@ -466,7 +465,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         // A marker that cannot be removed keeps the store offline as a present one does, until a later check of its
         // device; one removed whose directory could not be forced leaves the copy unsynced, which its attach takes
         // and the device's check forces and loads (CopyMarkers, logged there)
-        ctx.markers.removeAt(path / storeId.directoryName, StoreDirMarkers.Marker.TransferOut): Unit
+        ctx.markers.removeAt(CopyLayout.path(path, storeId, None, Phase.Live), StoreDirMarkers.Marker.TransferOut): Unit
 
     announceOnLoad += path -> active.keySet
     DeviceMarkers.removeShutdownState(path)
@@ -563,13 +562,14 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  A device without stores simply gets its CRL created. */
   private def openDeviceCrl(devicePath: os.Path,
                             sdCfg: StorageDeviceConfig,
-                            children: Seq[os.Path]): CrashRecoveryLog =
+                            listing: CopyLayout.Listing): CrashRecoveryLog =
     val crlDir = CrashRecoveryLog.deviceCrlDir(devicePath)
-    // Stats that fail are no absence (FileStat). A child directory whose config cannot be stat'd may be a store, so it
-    // counts as one: missing it could take an emptied crl/ for a new CRL. A failed stat of a child or of crl/ itself
-    // throws, leaving the device unloaded for the next scan, rather than declare a crl/ that is there lost
-    val storeDirs = children.filter(dir =>
-      FileStat.isDir(dir) && FileStat.existence(dir / StoreConfig.configFilename).forall(identity))
+    // Stats that fail are no absence (FileStat). A copy whose config cannot be stat'd may be a store, so it counts as
+    // one (CopyLayout.list): missing it could take an emptied crl/ for a new CRL. A failed stat of crl/ itself throws,
+    // leaving the device unloaded for the next scan, rather than declare a crl/ that is there lost. Retired copies
+    // keep their CRL state in their own files
+    val storeDirs = listing.copies.filter(_.phase != Phase.Retired).map(_.path)
+      .filter(dir => FileStat.existence(dir / StoreConfig.configFilename).forall(identity))
     val lost =
       if storeDirs.nonEmpty && ! FileStat.exists(crlDir) then
         logger.error(s"Storage device $devicePath holds stores but has no CRL directory. Its stores must be rebuilt")
@@ -720,7 +720,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         try os.remove.all(replacementCrl)
         catch case t: Throwable =>
           logger.warn(s"Failed to remove the unfinished replacement CRL directory $replacementCrl: $t")
-        Try(os.list(storageDevicePath)) match
+        Try((os.list(storageDevicePath), CopyLayout.list(storageDevicePath))) match
           case Failure(t) =>
             // Same hazard as the scan in checkForNewDevices: listing can fail with an IO
             // error even when isDir just succeeded. The catch in tryLoadDevice would absorb
@@ -729,10 +729,10 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             warnOnce(storageDevicePath, s"Failed to list storage device directory $storageDevicePath. " +
                                         s"Will retry on the next scan. Error: $t")
             None
-          case Success(storeFiles) =>
+          case Success((children, listing)) =>
             // Opened before any store is offered, so each store recovers from it. Recovery blocks the control
             // thread. A throw leaves the device unloaded.
-            val crl = openDeviceCrl(storageDevicePath, sdCfg, storeFiles)
+            val crl = openDeviceCrl(storageDevicePath, sdCfg, listing)
             val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath, crl,
               new CrlAdmission(crl.admissionLimitBytes))
             // A growth raises the limit the stores admit against; registered before any store loads
@@ -746,8 +746,13 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
             try
               // Its copies registered before any store is offered (HostCopies)
-              ctx.copyRegistry.attach(sds, storeFiles)
-              storeFiles.foreach: potentialStoreFile =>
+              // Listed again: a lost CRL's open marked copies since the listing above
+              val copies = CopyLayout.list(storageDevicePath)
+              ctx.copyRegistry.attach(sds, copies)
+              // Every child of the device root is offered, as tryLoadStore decides what is a store; then each copy in
+              // a phase directory but pending-delete/
+              val inPhases = copies.copies.filter(f => f.phase != Phase.Retired && f.copyId.isDefined).map(_.path)
+              (children ++ inPhases).foreach: potentialStoreFile =>
                 ctx.tryLoadStore(sds, potentialStoreFile, None)
             catch
               case t: Throwable =>

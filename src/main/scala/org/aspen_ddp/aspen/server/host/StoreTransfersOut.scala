@@ -120,6 +120,10 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
     def err(msg: String): Nothing =
       logger.info(msg)
       throw new Exception(msg)
+    // A refusal the receiver's retransmit resolves: the request is retried as it is, once the work it waits on ends
+    def refuse(msg: String): Nothing =
+      logger.debug(msg)
+      throw new Exception(msg)
 
     // Any failure here, including a destination HostState that cannot be read, drops this
     // request; the receiver's retransmit is what tries again. Retransmits and superseded
@@ -181,6 +185,13 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
       if ctx.shutdown.isShuttingDown(sourceDs.storageDeviceId) then
         err(s"Source device ${sourceDs.storageDeviceId} for transfer of store ${m.storeId} is " +
             s"being shut down")
+      // Single flight per store (I3: one piece of work per (device, store)). A retransmit or readdressed request that
+      // arrives while an earlier one is closing the store, or extracting its CRL state (extractUnloaded), does
+      // nothing: a second close would find the store gone and write the marker and begin the send while the first
+      // is still extracting, and its end would clear closingForTransfer under the first. If the first fails, the
+      // receiver's next retransmit tries again
+      if closingForTransfer.contains(m.storeId) then
+        refuse(s"Not starting the transfer out of store ${m.storeId} again: an earlier request is still closing it")
       val markedPath = sourceDs.devicePath / m.storeId.directoryName
       // A stat that fails throws (FileStat), failing the request: a marked copy never ships
       if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut &&

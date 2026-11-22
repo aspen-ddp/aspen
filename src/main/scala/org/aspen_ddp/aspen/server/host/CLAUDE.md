@@ -310,7 +310,9 @@
   answers) fails the extraction, and a load of the save file queues its saves behind the extraction's final deletions
   (its empty `dropStore` is a CRL barrier, `server/crl/CLAUDE.md`), so they create records rather than being skipped, and `startOut` re-checks loaded / opening / `opensStarted` in the
   control task that writes the marker. The extraction releases only the charge retained when it began
-  (`releaseRetained(storeId, charge)`).
+  (`releaseRetained(storeId, charge)`). `startOut` is single flight per store (I3): a request (a retransmit, a
+  readdress) that arrives while `closingForTransfer` holds the store, its close or `extractUnloaded` still running,
+  does nothing (logged at debug); the receiver's retransmit tries again if the first fails (`WorkOverlapSuite`).
   `DeviceReconciler.dropLeftoverCrlState` drops the entries of a store with no entry on the device, no directory
   (a stat that answers absent) and no retire running, as a safety net for a directory removed by hand; a store its
   entry names keeps them, even one the Missing Stores pass is rebuilding. It releases only the admission charge

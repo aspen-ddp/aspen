@@ -7,13 +7,18 @@ import org.aspen_ddp.aspen.common.objects.KeyValueObjectPointer
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
-import org.aspen_ddp.aspen.server.{Host, StorageDeviceConfig}
+import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.common.network.StartStoreTransfer
+import org.aspen_ddp.aspen.server.{FileStat, Host, StorageDeviceConfig}
+import org.aspen_ddp.aspen.server.crl.StoreRecoveryState
+import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.util.{Success, Try}
 
 /** A rebuild that does nothing until the test resolves it, and ignores its cancel: a rebuild winding down, or one past
  *  finish's latch re-check */
@@ -41,6 +46,19 @@ private class HeldDropCrl extends TestNetwork.TestCRL:
     drops.get(storeId) match
       case Some(p) if p.isCompleted => Future.unit
       case _ => drops.getOrElseUpdate(storeId, Promise[Unit]()).future
+
+/** A device CRL whose first readStoreState of each store waits for the test (an extraction held up by a slow CRL);
+ *  later ones answer at once. Counts every read */
+private class HeldReadCrl extends TestNetwork.TestCRL:
+  val reads: mutable.Map[StoreId, Promise[Unit]] = mutable.Map()
+  val readCount: mutable.Map[StoreId, Int] = mutable.Map()
+
+  override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] = synchronized:
+    readCount(storeId) = readCount.getOrElse(storeId, 0) + 1
+    val first = !reads.contains(storeId)
+    val p = reads.getOrElseUpdate(storeId, Promise[Unit]())
+    val answer = super.readStoreState(storeId)
+    if first then p.future.flatMap(_ => answer)(using ExecutionContext.parasitic) else answer
 
 /** I3: at most one piece of host work (Create, Rebuild, TransferIn, TransferOut) per (device, store) at a time. Each
  *  test is a counterexample of the Stage 1 audit (store-copy state machine design, "COUNTEREXAMPLES TO I3") and checks
@@ -308,3 +326,84 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       discardingWhileShipping should be(false)
       os.exists(storePath) should be(false)
       factory.created.map(_.storeId).toList should be(List(moving))
+
+  // A store of the bootstrap pool, whose pool entry names the bootstrap device: startOut reads both fresh
+  private val shipped = StoreId(PoolId.BootstrapPoolId, 1)
+
+  private def ask(host: Host): Future[Try[Unit]] =
+    given ExecutionContext = executionContext
+    host.control.transfersOut.startOut(StartStoreTransfer(host.hostId, client.clientId, source, shipped,
+      HLCTimestamp.now, UUID.randomUUID())).transform(Success(_))
+
+  private def queuedCloses(host: Host): List[Runnable] = host.threading match
+    case t: LockstepThreading => t.queuedItems.filter:
+      case e: Host.EventTask => e.event.isInstanceOf[Host.ShutdownStore]
+      case _ => false
+    case _ => Nil
+
+  /** C5: a retransmitted StartStoreTransfer arrives while the first request's close (and CRL extraction) of the store
+   *  is still running. It does nothing: the store is closed and extracted once, and its send begun once. Loaded: the
+   *  close is the store's ShutdownStore, still queued. Unloaded: the extraction's read of the device CRL is held */
+  for loaded <- List(true, false) do
+    atest(s"two StartStoreTransfer requests close and extract once (${if loaded then "loaded" else "unloaded"}, C5)"):
+      given ExecutionContext = executionContext
+      val hostRoot = newHostDir()
+      val deviceDir = hostRoot / os.up / "injected-device"
+      os.makeDir.all(deviceDir)
+      val storePath = writeStoreConfig(deviceDir, shipped)
+      val crl = new HeldReadCrl
+      val sends = new StagedSendService
+      val host = newHost(hostRoot, transferService = sends)
+      val local = new LocalStorageDeviceState(source, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl)
+      injectLoadedDevice(host, local)
+      if loaded then
+        installServedElsewhere(host, shipped)
+      else
+        local.offlineStores += shipped
+
+      // The first close, completed by hand once the second request is refused
+      def finishFirstClose(): Unit =
+        if loaded then
+          host.threading match
+            case t: LockstepThreading =>
+              t.removeQueued:
+                case e: Host.EventTask => e.event.isInstanceOf[Host.ShutdownStore]
+                case _ => false
+              .foreach:
+                case e: Host.EventTask => e.event match
+                  case Host.ShutdownStore(storeId, _, completion) =>
+                    host.control.router.remove(storeId)
+                    completion.success(())
+                  case _ => ()
+                case _ => ()
+            case _ => ()
+        else
+          crl.synchronized(crl.reads(shipped)).success(())
+
+      def firstCloseRunning: Boolean =
+        if loaded then queuedCloses(host).nonEmpty else crl.synchronized(crl.reads.contains(shipped))
+
+      for
+        _ <- net.createSecondDevice()
+        _ <- waitForTransactionsToComplete()
+        _ <- client.transferStore(shipped, net.secondDeviceId)
+        _ <- waitForTransactionsToComplete()
+        first = ask(host)
+        _ <- yieldUntil(firstCloseRunning)
+        second <- ask(host)
+        closesWhileFirstRuns = recorded(host).transferOutCloses.toList
+        queuedWhileFirstRuns = queuedCloses(host).size
+        readsWhileFirstRuns = crl.synchronized(crl.readCount.getOrElse(shipped, 0))
+        _ = finishFirstClose()
+        _ <- yieldUntil(sends.isTransferringOut(shipped))
+        _ <- first
+      yield
+        closesWhileFirstRuns should be(List(shipped))
+        if loaded then
+          queuedWhileFirstRuns should be(1)
+        else
+          readsWhileFirstRuns should be(1)
+        second.isFailure should be(true)
+        sends.transfersOut.map(_._1) should be(Vector(shipped))
+        FileStat.exists(storePath / StoreTransfer.TransferOutMarkerFile) should be(true)
+        host.control.transfersOut.isClosingForTransfer(shipped) should be(false)

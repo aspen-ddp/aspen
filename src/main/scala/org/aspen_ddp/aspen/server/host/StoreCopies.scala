@@ -54,27 +54,31 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
   def retire(local: LocalStorageDeviceState, storeId: StoreId): Future[Boolean] =
     // A store with no record has no copy on the device: its path is clear
     val recorded = ctx.copyRegistry.pathOf(local, storeId)
-    val storePath = recorded.getOrElse(local.devicePath)
+    def at = recorded.fold("")(p => s" at $p")
     if isRetiring(storeId) then
       Future.successful(false)
     else if ctx.copyRegistry.isUnsynced(local, storeId) then
-      logger.info(s"Not retiring the copy of store $storeId at $storePath yet: a change to it is not durable")
+      logger.info(s"Not retiring the copy of store $storeId$at yet: a change to it is not durable")
       Future.successful(false)
     else if ctx.moves.isPendingLost(local, storeId) then
-      logger.info(s"Not retiring the copy of store $storeId at $storePath yet: its move to lost/ is still to retry")
+      logger.info(s"Not retiring the copy of store $storeId$at yet: its move to lost/ is still to retry")
       Future.successful(false)
     else
-      // A stat that fails is no absence (FileStat): the retire fails, to be retried, rather than report a clear path
-      val present =
-        try Success(recorded.isDefined && FileStat.exists(storePath))
-        catch case NonFatal(t) => Failure(t)
-      present match
-        case Failure(t) =>
-          logger.error(s"Failed to tell whether a copy of store $storeId is at $storePath. Retrying at a later " +
-                       s"check. Error: $t")
-          Future.successful(false)
-        case Success(false) => Future.successful(true)
-        case Success(true) => retirePresent(local, storeId, storePath)
+      recorded match
+        case None => Future.successful(true)
+        case Some(storePath) =>
+          // A stat that fails is no absence (FileStat): the retire fails, to be retried, rather than report a clear
+          // path
+          val present =
+            try Success(FileStat.exists(storePath))
+            catch case NonFatal(t) => Failure(t)
+          present match
+            case Failure(t) =>
+              logger.error(s"Failed to tell whether a copy of store $storeId is at $storePath. Retrying at a later " +
+                           s"check. Error: $t")
+              Future.successful(false)
+            case Success(false) => Future.successful(true)
+            case Success(true) => retirePresent(local, storeId, storePath)
 
   /** retire's steps for a copy known to be at `at` */
   private def retirePresent(local: LocalStorageDeviceState, storeId: StoreId, at: os.Path): Future[Boolean] =
@@ -127,8 +131,8 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
    *  the copy left the registry (P3). One not forced stays recorded, Retired and unsynced, until a device check
    *  forces it; one that failed leaves the copy in lost/ for the next retire */
   private def moveToPendingDelete(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
-    val storePath = ctx.copyRegistry.pathOf(local, storeId).getOrElse(local.devicePath)
-    logger.warn(s"Retiring the copy of store $storeId at $storePath to pending-delete. It is deleted once the store " +
+    val at = ctx.copyRegistry.pathOf(local, storeId).fold("")(p => s" at $p")
+    logger.warn(s"Retiring the copy of store $storeId$at to pending-delete. It is deleted once the store " +
                 s"is Active on the device its pool names")
     ctx.moves.move("moveToPendingDelete", local, storeId, Phase.Retired) == MoveResult.Durable
 

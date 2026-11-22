@@ -60,7 +60,7 @@ object Host:
   /** The close of a store (ShutdownStore) found its backend failed-stop: the store is moved to lost/
    *  rather than closed cleanly, so a caller must not take it as cleanly closed (move it to outbound/) or ship it. */
   final case class StoreFailedOnClose(storeId: StoreId)
-    extends Exception(s"Store $storeId failed on an I/O error while closing; it is marked for rebuild")
+    extends Exception(s"Store $storeId failed on an I/O error while closing; it is moved to lost/ and rebuilt")
 
   /** A store whose load failed with its data intact (out of space, a CRL that cannot admit its save file now, an
    *  unreadable config, an executor slot an earlier close still holds, or any other open failure but a lost state):

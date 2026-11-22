@@ -308,7 +308,7 @@ brings it up to date.
    has flipped Active, or been re-placed (rebuild-process 4.2, R4), means a rebuilt copy may have joined
    transactions. Two incarnations' states are then both live, and the old one must never return.
 2. **The data copy is whole.** It is the copy that was declared, from its path or from
-   `pending-delete/<store-dir>-<uuid>`, untouched since. Its `incarnation` file must be the copy's own.
+   `pending-delete/<copy>` (its copy name), untouched since. Its `incarnation` file must be the copy's own.
 3. **Its complete CRL state is in hand**, and the software that will load it can read it (the fixed release, when the
    declaration came from a bug):
    - D1/D2 (CRL lost): the store's entries are only in `crl.lost-<uuid>`. The fresh CRL holds none, so the retire's
@@ -336,14 +336,17 @@ brings it up to date.
 4. **The cause is gone.** The fixed release is running, or the transient condition (a mount, a restore) is corrected.
    Otherwise the store is declared again at load, which is harmless but pointless.
 
-**Steps.** With the device's host stopped (crash-only: killing it is fine), so no reconcile acts in between:
+**Steps.** These steps are unexercised: no test or tool runs them, so follow them with care and check each result.
+With the device's host stopped (crash-only: killing it is fine), so no reconcile acts in between:
 
 1. Write the device's tree entry back to Active, as a transaction that requires the entry to be unchanged (still
    Rebuilding under the declaration's episode). If it fails, precondition 1 may no longer hold: start over.
    Once the entry is not Rebuilding, the reconcile abandons the rebuild (`StoreRebuilds.abandonUnlisted`) and
    deletes its `rebuilding/<id>` staging copy.
 2. On the device, remove a finished rebuild's copy (one in `rebuilt/`). It never served, so it is
-   derived, and no copy of the store may remain in `live/`.
+   derived. No other copy of the store may remain outside `pending-delete/`: none in `live/`, `arrived/`, `outbound/`,
+   `parked/` or `lost/` but the declared copy itself. A second copy would make the device load retire both and rebuild
+   the store (P2: at most one copy of a store per device outside `pending-delete/`).
 3. Put the declared copy in `live/`. Write its complete CRL state (precondition 3) as the copy's `crl_save.log`, in the
    save-file format `CrashRecoveryLog.saveStoreState` writes (`lost-crl-state.log` already is one), remove
    `lost-crl-state.log` and `lost-crl-entries.log`, and last move the copy, under its copy name, from `pending-delete/`

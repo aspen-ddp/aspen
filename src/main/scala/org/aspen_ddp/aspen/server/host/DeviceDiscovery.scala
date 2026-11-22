@@ -700,7 +700,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  for it and loads the file (StoreLoader.awaitCrlLoad). A directory whose config cannot be read, or whose file is
    *  missing, cut short or another store's, does not hold its state that way; one whose config or save file could
    *  not be read (CrashRecoveryLog.isUnreadable) is not known either way, so the read's error is thrown, leaving the
-   *  device unloaded for the next scan before any store is marked. Or it is in rebuilt/: a
+   *  device unloaded for the next scan before any copy is moved to lost/. Or it is in rebuilt/: a
    *  finished rebuild awaiting its flip, which has never served (StoreLoader.tryLoadStore leaves it offline), so its
    *  transaction state is empty. Its rebuild or the reconcile's Completed Rebuilds pass flips and loads it as it
    *  would have over the old CRL; one finished for an earlier episode is retired by retireForeignCopy as before. A

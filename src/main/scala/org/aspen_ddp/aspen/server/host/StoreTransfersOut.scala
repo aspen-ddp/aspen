@@ -32,8 +32,8 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   private var rebuildsAwaitingClose: Set[StoreId] = Set()
 
   /** Claims the store's TransferOut work on `sds` at `stage` before a transfer out's close or abort starts (I3): false
-   *  if other work holds the (device, store), and then nothing starts. An abort claimed during the close (a copy marked
-   *  while it closed) takes the close's work over */
+   *  if other work holds the (device, store), and then nothing starts. An abort claimed during the close (a copy found
+   *  lost while it closed) takes the close's work over */
   private def claimWork(storeId: StoreId, sds: LocalStorageDeviceState, transferId: Option[UUID],
                         stage: TransferOutStage): Boolean =
     ctx.copyRegistry.work("transfer out", sds.storageDeviceId, storeId, _.isInstanceOf[Work.TransferOut],

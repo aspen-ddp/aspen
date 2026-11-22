@@ -212,7 +212,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // a completed transfer that is already so, and the check the retire asks for deletes it.
     //
     // A served store whose entry is absent is a copy put at the store path by hand: every path that serves a store
-    // has its entry first. It is taken out of service (marked, closed, offline), and the check that follows
+    // has its entry first. It is taken out of service (closed, moved to lost/, offline), and the check that follows
     // retires it here like any other offline one.
     ctx.router.loaded.collect {
       case (storeId, store) if store.storageDeviceId == local.storageDeviceId && !remote.stores.contains(storeId) =>

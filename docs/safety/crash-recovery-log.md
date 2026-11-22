@@ -1241,7 +1241,7 @@ lists, commits an ownership transaction, then loads the device, which recovers t
 keeps a second process on the same host or file system out. A running old host relinquishes the device when it sees
 the tree name another owner (`DeviceShutdown.relinquishDevice`); on shared storage it may write until then (not
 defended, by decision). A store whose copy is in `outbound/` with no valid `crl_save.log` is adopted as lost
-(`DeviceDiscovery.adoptionClass`); one whose copy is in `lost/` is adopted Rebuilding. A listing or `phase-param` read
+(`DeviceDiscovery.adoptionClass`); one whose copy is in `lost/` is adopted Rebuilding. A listing or parameter file (`phase-param.*`) read
 that fails, or a save file that cannot be read (`CrashRecoveryLog.isUnreadable`), fails the adoption for a later scan
 to retry.
 

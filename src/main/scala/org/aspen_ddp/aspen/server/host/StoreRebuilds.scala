@@ -138,7 +138,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *
    *  The flip writes serviceStatus: Active normally, Offline when the device has been asked to
    *  shut down since the create began. The store is loaded either way, its copy Opening then Served, so the
-   *  shutdown closes and marks it like the device's other open stores.
+   *  shutdown closes it like the device's other open stores.
    *
    *  A create that has not started its local work by the time this device's shutdown begins (or
    *  its unload) does none: nothing is created or loaded, and the entry stays Initializing for a
@@ -262,7 +262,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *
    *  A slot is taken from the start of a lost store's discard (its work DiscardingLost), not only once its walk runs,
    *  and passes straight from the discard to the rebuild (`handoff`: the work goes DiscardingLost -> Running, the
-   *  discard's own slot not counted against it): otherwise one pass would discard every marked store on the device at
+   *  discard's own slot not counted against it): otherwise one pass would discard every lost store on the device at
    *  once (systemic-loss-protection.md).
    *
    *  `episode` is the Rebuilding entry's episode (StoreEntry.rebuildEpisode). The rebuild resumes only a checkpoint,
@@ -673,7 +673,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  next pass a first pass (dropStagingCheckpoint). No rebuild of the store runs here when this is called. Returns
    *  whether the rebuild may go on now. */
   private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
-    val storePath = ctx.copyRegistry.pathOf(local, storeId).getOrElse(local.devicePath)
+    val storePath = ctx.copyRegistry.pathOf(local, storeId)
     // Some(None): no copy or this episode's finished copy; Some(Some(lost)): another copy, Lost (in lost/) or not
     val found: Option[Option[Boolean]] =
       registry.copiesOf(local).flatMap(_.copies.get(storeId)).map(_.phase) match
@@ -695,10 +695,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     else if ctx.loader.isOpening(storeId) then
       false
     else
-      val err = new IllegalStateException(s"$storePath holds a copy of store $storeId that no rebuild produced, " +
-                                          "while the store is Rebuilding on this device")
+      val err = new IllegalStateException(s"The copy of store $storeId${storePath.fold("")(p => s" at $p")} is " +
+                                          "one no rebuild produced, while the store is Rebuilding on this device")
       ctx.router.entry(storeId) match
-        case Some(entry) if entry.store.backend.path == storePath =>
+        case Some(entry) if storePath.contains(entry.store.backend.path) =>
           backendFailed(storeId, Some(entry.store.backend), err, "is served from a copy no rebuild produced")
           false
         case _ =>

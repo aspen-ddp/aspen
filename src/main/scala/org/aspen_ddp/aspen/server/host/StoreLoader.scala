@@ -43,7 +43,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // LoadRetryCap; one waiting for CRL room is retried at every scan, as its CRL frees room as transactions conclude.
   // Each retry opens the store through startOpen, never blocking the control thread. An open takes the retry (Opening);
   // a retry that fails the same way records it again with a doubled wait, read from the retry the open took. Never
-  // marked for rebuild: nothing says its data is gone. Without the retry a store whose entry is Active would stay
+  // moved to lost/: nothing says its data is gone. Without the retry a store whose entry is Active would stay
   // unserved for the life of the process while its previous copy is released.
   //
   // An open is its copy's Opening activity, from startOpen until the open fails or, for one opened, until the

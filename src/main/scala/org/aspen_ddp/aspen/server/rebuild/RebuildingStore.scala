@@ -34,11 +34,10 @@ object RebuildingStore:
    *  down. That is what keeps a half-rebuilt store from being loaded and answering reads. */
   val RebuildDirectory = "rebuilding"
 
-  /** Device-root directory a marked store directory is renamed into before its rebuild starts, which clears the
-   *  store's path (a rebuild takes a directory there for a store already in place). The copy is kept, with its former
-   *  device-CRL entries in LostCrlStateFile, until the store is Active again wherever it was rebuilt: a rebuild that
-   *  cannot finish destroys nothing. The device's reconcile then deletes it (DeviceReconciler). Invisible to
-   *  Host.tryLoadStore for the same reason as RebuildDirectory. */
+  /** Device-root directory a retired copy is moved into from lost/ (T11, StoreCopies.retire step 4), whole and under
+   *  its copy name, with its former device-CRL entries in LostCrlStateFile. It is kept until the store is Active again
+   *  on its owner device (StoreCopies.release): a rebuild that cannot finish destroys nothing. Never loaded: the
+   *  loader is offered only live/ copies. */
   val PendingDeleteDirectory = "pending-delete"
 
   /** Writes the rebuilt store's whole transaction state, which is empty, as the crl_save.log of the store directory

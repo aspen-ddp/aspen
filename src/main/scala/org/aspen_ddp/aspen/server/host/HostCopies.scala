@@ -58,7 +58,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   // Throws of the silence path (onChange), for the drain check
   private var silenceErrors: Vector[String] = Vector()
   // Store paths whose move could not be synced before their device was attached (unsynced): its attach
-  // marks their records
+  // sets their records unsynced
   private var unsyncedPaths: Set[os.Path] = Set()
   // Copies held back from loading for a move whose sync failed (unsynced), by device and store: held until
   // a load opens or installs them, or they leave their path or device, so every later device check that finds one
@@ -432,7 +432,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
           activityFact("close ended", copies, storeId, Activity.Idle)
           takeParked("close ended", copies, storeId)
 
-  /** StoreCopies.retire took the copy at `storeId`'s path on `local`, marked Lost, as its own. A retry the copy awaited
+  /** StoreCopies.retire took the copy at `storeId`'s path on `local`, in lost/, as its own. A retry the copy awaited
    *  is dropped: a retired copy never loads */
   def retiring(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     fact("retire"):

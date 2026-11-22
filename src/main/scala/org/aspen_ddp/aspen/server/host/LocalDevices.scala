@@ -83,12 +83,12 @@ class LocalDevices extends Logging:
       case Some(sds) =>
         // No record: no copy of the store on the device. A stat that fails is no absence (FileStat): the delete is
         // attempted, and fails rather than report it gone
-        val storePath = sds.copies.pathOf(storeId).getOrElse(sds.devicePath)
-        if sds.copies.pathOf(storeId).isDefined && !FileStat.existence(storePath).contains(false) then
-          logger.warn(s"Discarding the copy of store $storeId on device $deviceId. " +
-                      s"$reason: $storePath")
-          // Rename-first: a failure leaves the copy whole where it is, so a restart never loads it.
-          // The store is not loaded, so nothing serves it now
-          if StoreCopies.delete(sds.devicePath, storePath, reason) then Some(sds) else None
-        else
-          None
+        sds.copies.pathOf(storeId) match
+          case Some(storePath) if !FileStat.existence(storePath).contains(false) =>
+            logger.warn(s"Discarding the copy of store $storeId on device $deviceId. " +
+                        s"$reason: $storePath")
+            // Rename-first: a failure leaves the copy whole where it is, so a restart never loads it.
+            // The store is not loaded, so nothing serves it now
+            if StoreCopies.delete(sds.devicePath, storePath, reason) then Some(sds) else None
+          case _ =>
+            None

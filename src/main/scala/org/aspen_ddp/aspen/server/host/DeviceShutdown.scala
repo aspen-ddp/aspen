@@ -31,7 +31,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
   // Devices whose shutDownDevice sequence is running. One at a time per device: every check of a
   // ShuttingDown device calls shutDownDevice, and the sequence spans several asynchronous steps,
   // so without this a nudge or the hourly check arriving mid-shutdown would close stores, write
-  // markers and transact the device state a second time in parallel with the first.
+  // shutdown.state and transact the device state a second time in parallel with the first.
   private var shuttingDownDevices: Set[StorageDeviceId] = Set()
 
   // Devices whose relinquishDevice sequence is running. One at a time per device, for the same reason.
@@ -163,7 +163,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
       val (ins, recording) =
         ctx.transfers.inFlightFor(deviceId, entriesIn(StorageDeviceState.StoreStatus.TransferringIn))
 
-      // The store is already closed and marked by its transfer. Cancelling the send leaves it so.
+      // The store is already closed and in outbound/ for its transfer. Cancelling the send leaves it so.
       entriesIn(StorageDeviceState.StoreStatus.TransferringOut)
         .filter(ctx.storeTransferService.isTransferringOut)
         .foreach: storeId =>

@@ -961,7 +961,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       // The queued rebuild on this device does not stop the served store's repair scans (R20)
       host.control.currentView.repairable should contain(storeN(0))
       // Nothing the registry's updates threw was swallowed
-      host.control.copyRegistry.takeShadowErrors() should be(Vector())
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
   atest("a rebuilding store stays silent when another device here retires its old copy (RB-W23)"):
     // replaceRebuild moved the store's rebuild between two devices of this host. The destination never held the store,

@@ -78,7 +78,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   /** Records `retry` for `storeId`: its copy is AwaitingRetry (HostCopies.awaitingRetry) */
   private def awaitRetry(site: String, storeId: StoreId, retry: LoadRetry): Unit =
-    ctx.copyRegistry.awaitingRetry(site, storeId, retry)
+    ctx.copyRegistry.awaitingRetry(site, storeId, retry): Unit
 
   /** Drops the retry of `storeId`: its copy is Idle */
   private def dropRetry(storeId: StoreId, wait: LoadRetry): Unit =
@@ -213,25 +213,37 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  Meanwhile its copy is Opening, so a shutdown waits for it, no second open starts, and the store is silent rather
    *  than answered as not here.
    *
-   *  Refused while the store has TransferOut work on the device (R12): the transfer's close and extraction need the
-   *  store closed until its transferring-out marker is written. The refusal is logged at debug and opens nothing; the
-   *  copy stays as it was (Idle, or AwaitingRetry, which the device scans offer again once the work ends). */
+   *  The copy's Opening is a claim (HostCopies.opening), and a refused one opens nothing (I1). It is refused while the
+   *  store has TransferOut work on the device (R12: the transfer's close and extraction need the store closed until
+   *  its transferring-out marker is written; asked first, and logged at debug), and for any move the table refuses (a
+   *  copy Closing, Retiring or not Live; recorded as a violation). A refused open records a load retry (R23), with
+   *  the waiting load's onServed and the usual backoff, so the device scans offer it again once whatever held the
+   *  copy has ended; a refused create does not, as its entry, still Initializing, has the next check create again. */
   private[host] def startOpen(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                               create: Boolean, created: Option[Promise[Unit]],
                               onServed: Option[() => Unit] = None): Unit =
     val storeId = storeCfg.storeId
-    ctx.copyRegistry.transferOutWork(sds, storeId) match
-      case Some(work) =>
-        logger.debug(s"Not opening store $storeId on device ${sds.storageDeviceId}: it has $work there, which keeps " +
-                     "it closed until its transferring-out marker is written")
-        created.foreach(_.tryFailure(new IllegalStateException(s"store $storeId is transferring out")))
-      case None =>
-        // A load that failed with its data intact handed its callback to this open, which now runs it, once, if it
-        // serves the store. The open takes the retry: its copy goes AwaitingRetry -> Opening
-        val previous = ctx.copyRegistry.retryOn(sds, storeId)
-        val servedCallback = composeServed(previous.flatMap(_.onServed), onServed)
-        lastOpenId += 1
-        ctx.copyRegistry.opening(sds, storeId, lastOpenId, create)
+    // A load that failed with its data intact handed its callback to this open, which now runs it, once, if it
+    // serves the store. The open takes the retry: its copy goes AwaitingRetry -> Opening
+    val previous = ctx.copyRegistry.retryOn(sds, storeId)
+    val servedCallback = composeServed(previous.flatMap(_.onServed), onServed)
+    def refused(why: String): Unit =
+      created.foreach(_.tryFailure(new IllegalStateException(s"the open of store $storeId was refused: $why")))
+      if !create then
+        val waitScans = nextWait(previous)
+        awaitRetry("refused open", storeId, LoadRetry(sds, storePath, waitScans, waitScans, servedCallback))
+    val transferOut = ctx.copyRegistry.transferOutWork(sds, storeId)
+    if transferOut.isDefined then
+      logger.debug(s"Not opening store $storeId on device ${sds.storageDeviceId}: it has ${transferOut.get} there, " +
+                   "which keeps it closed until its transferring-out marker is written. Retrying at the device scans")
+      refused(s"it has ${transferOut.get}")
+    else
+      lastOpenId += 1
+      if !ctx.copyRegistry.opening(sds, storeId, lastOpenId, create) then
+        logger.error(s"Not opening store $storeId on device ${sds.storageDeviceId}: the copy registry refused its " +
+                     "Opening. Retrying at the device scans")
+        refused("the copy registry refused its Opening")
+      else
         val fopen =
           try openBackend(storeCfg, storePath, create, sds.devicePath / StoreCreation.CreatingDirectory)
           catch case NonFatal(t) => Future.failed(t)
@@ -340,6 +352,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         awaitRetry("failed open", storeId, LoadRetry(sds, storePath, waitScans, waitScans, onServed))
         created.foreach(_.tryFailure(e))
     if !installing then
+      // Whatever ended it, the open is over: a retry whose claim was refused leaves no copy Opening for good
+      openEnded()
       putDeferredCloses(storeId)
 
   /** The next wait, in device scans, after `previous`: doubled, up to the cap, or 1 for a first failure */
@@ -649,7 +663,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                     ctx.copyRegistry.retryDropped("LoadStore", _, storeId))
                 router.install(entry)
                 awaitCrlLoad(entry.store, trs, p)
-    // The open that queued this LoadStore ended unserved: its copy is Opening no more (shadow). Installed, it is Served
+    // The open that queued this LoadStore ended unserved: its copy is Opening no more. Installed, it is Served
     if fromOpen && router.entry(backend.storeId).forall(_.store.backend ne backend) then
       ctx.devices.devices.get(storageDeviceId).foreach(ctx.copyRegistry.openEnded("load ended", _, backend.storeId))
 
@@ -865,7 +879,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
               CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile)))
             store.close().flatMap(_ => Future.fromTry(saved))(using ExecutionContext.parasitic)
           .flatMap: _ =>
-            // The store is closed: its copy's close ends here (shadow), before the extraction's deletion, so an open
+            // The store is closed: its copy's close ends here, before the extraction's deletion, so an open
             // that installs during the deletion finds the copy Idle
             ctx.copyRegistry.closeEnded(store.storageDeviceId, storeId)
             val extracted = extractedTry.get

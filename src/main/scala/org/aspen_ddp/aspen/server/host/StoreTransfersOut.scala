@@ -36,7 +36,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   // device again, which starts it
   private var rebuildsAwaitingClose: Set[StoreId] = Set()
 
-  /** The store's TransferOut work on `sds` (shadow): from startOut's close until its marker task has run, and while
+  /** The store's TransferOut work on `sds`: from startOut's close until its marker task has run, and while
    *  returnLostTransferToRebuild aborts its transfer */
   private def syncWork(storeId: StoreId, sds: LocalStorageDeviceState, transferId: Option[UUID]): Unit =
     val desired =
@@ -44,7 +44,13 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
         Some(Work.TransferOut(transferId))
       else
         None
-    ctx.copyRegistry.work("transfer out", sds.storageDeviceId, storeId, _.isInstanceOf[Work.TransferOut], desired)
+    ctx.copyRegistry.work("transfer out", sds.storageDeviceId, storeId, _.isInstanceOf[Work.TransferOut], desired): Unit
+
+  /** Claims the store's TransferOut work on `sds` before a transfer out's close or abort starts (I3): false if other
+   *  work holds the (device, store), and then nothing starts */
+  private def claimWork(storeId: StoreId, sds: LocalStorageDeviceState, transferId: Option[UUID]): Boolean =
+    ctx.copyRegistry.work("transfer out", sds.storageDeviceId, storeId, _.isInstanceOf[Work.TransferOut],
+      Some(Work.TransferOut(transferId)))
 
   /** Whether a rebuild of the store must wait for its close for a transfer out (I3: a discard of its copy would move
    *  the directory the close is extracting from). When it must, the close's end checks the source device again */
@@ -222,7 +228,10 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
         // A retransmitted request finds the store already closed, and its going offline already gossiped
         val wasLoaded = ctx.router.loaded.contains(m.storeId)
         // The store stays closed between its close and the marker below, written in a later control task: its
-        // TransferOut work, started here before the close, refuses every open of the copy until then (R12)
+        // TransferOut work, started here before the close, refuses every open of the copy until then (R12). A claim
+        // refused (other work holds the copy, recorded) starts nothing: the receiver's retransmit asks again
+        if !claimWork(m.storeId, sourceDs, devEntry.transferId) then
+          refuse(s"Not starting the transfer out of store ${m.storeId} yet: the copy registry refused its work")
         closingForTransfer += m.storeId
         syncWork(m.storeId, sourceDs, devEntry.transferId)
         val fclosed =
@@ -306,7 +315,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
    *  flips the now Active entry to Rebuilding. One abort at a time per store: retransmits arriving meanwhile do nothing
    *  more. */
   private def returnLostTransferToRebuild(storeId: StoreId, sds: LocalStorageDeviceState): Unit =
-    if ! abortingLostTransfers.contains(storeId) then
+    if ! abortingLostTransfers.contains(storeId) && claimWork(storeId, sds, None) then
       abortingLostTransfers += storeId
       syncWork(storeId, sds, None)
       logger.warn(s"Aborting the transfer out of store $storeId, which is marked rebuild-required, so it is rebuilt")

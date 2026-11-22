@@ -103,6 +103,30 @@ final class DeviceCopies(val deviceId: StorageDeviceId, val devicePath: os.Path,
     records += storeId -> r.copy(activity = to)
     onChange(storeId)
 
+  /** A fact (HostCopies.fact): the activity move already happened, so it is applied whatever the table says. Returns
+   *  the description of a move the table does not allow, for the caller to record */
+  def applyActivity(storeId: StoreId, to: Activity): Option[String] =
+    val r = record(storeId)
+    val illegal = Option.when(!Transitions.activityLegal(r.phase, r.activity, to))(
+      s"Illegal activity move for $storeId at ${r.phase}: ${r.activity} -> $to, applied as a fact")
+    records += storeId -> r.copy(activity = to)
+    onChange(storeId)
+    illegal
+
+  /** A fact: the copy's markers moved it to `to`. A move the table does not allow sets what its directory reads now
+   *  (`onDisk`) instead, and returns its description, for the caller to record */
+  def applyPhase(storeId: StoreId, to: Phase, onDisk: => Phase): Option[String] =
+    val r = record(storeId)
+    if Transitions.phaseLegal(r.phase, to) then
+      records += storeId -> r.copy(phase = to)
+      onChange(storeId)
+      None
+    else
+      val disk = onDisk
+      records += storeId -> r.copy(phase = disk)
+      onChange(storeId)
+      Some(s"Illegal phase move for $storeId: ${r.phase} -> $to; recorded $disk, as its directory reads")
+
   def setUnsynced(storeId: StoreId, unsynced: Boolean): Unit =
     records += storeId -> record(storeId).copy(unsynced = unsynced)
     onChange(storeId)

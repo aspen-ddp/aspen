@@ -22,27 +22,38 @@
   (before any store is offered; `ControlFixture.injectLoadedDevice` too) registers every store directory, by name,
   with its `CopyPhase` (`Unread` where it cannot be read); `detach` at unload. Every disk mutation site of a store
   path (create, rebuild finish's handler, transfer-in promotion, the four markers' writes and removals, retire into
-  pending-delete, discards) updates it right after its durable step, through `HostCopies.shadow`, which logs and
-  records a throw instead of failing production. Activity is the one home of the loader's opens and load retries:
+  pending-delete, discards) updates it right after its durable step. Every update is one of two kinds (R22):
+  a **fact** (`HostCopies.fact`: something that already happened, i.e. an install, a router removal, the end of a
+  close, an open, a retire or a retry, a retire's start, a phase a marker site reached, a copy leaving its path) is
+  applied even where the transition table refuses it (`DeviceCopies.applyActivity`/`applyPhase`; a refused phase is
+  set to what the directory reads, `CopyPhase.known`), and the violation recorded. A **claim** (`HostCopies.claim`:
+  Opening, AwaitingRetry, a work's start or update, a new record) that the table refuses is refused, recorded and
+  returned `false`, and its caller backs off: `startOpen` opens nothing; `createNewStore`, `startRebuild`'s queuing,
+  `startOut`, `returnLostTransferToRebuild` and `startIn`'s receive, earlier-tenancy retire and abandon start nothing
+  (each claims its work before touching its own sets). Production logs each violation at error; tests fail on it
+  (below). Activity is the one home of the loader's opens and load retries:
   `startOpen` sets Opening (a create's record is registered Live there, before its create places the copy, and
   unregistered if the create fails leaving nothing; the disk check skips a record under Create work that has no
   directory yet), an open's unserved end Idle, each load retry AwaitingRetry (`HostCopies.awaitingRetry`, holding the
-  `LoadRetry`) and a dropped retry Idle; `StoreRouter.install` Served (Served -> Served for a reload; a LoadStore no
-  open queued first drops the copy's retry) and `remove` Closing, its purpose from `closingFor` (DeviceShutdown:
+  `LoadRetry`: parked while the copy is Closing or Retiring, `parkedRetries`, and taken once it is Idle again;
+  refused for a Served copy) and a dropped retry Idle (as is one whose copy a retire takes); `StoreRouter.install`
+  Served (Served -> Served for a reload; a LoadStore no open queued first drops the copy's retry) and `remove` Closing, its purpose from `closingFor` (DeviceShutdown:
   Shutdown / Relinquish; `handleClose` with `extractCrl`: TransferOut; else FailStop), until
-  `handleClose`/`closeUnloaded` end it (Idle, or AwaitingRetry when a retry was recorded while it closed:
-  `retriesAfterClose`; a transfer-out close ends once the store is closed, before the extraction's deletion);
+  `handleClose`/`closeUnloaded` end it (Idle, or AwaitingRetry when a retry was parked while it closed; a
+  transfer-out close ends once the store is closed, before the extraction's deletion);
   `StoreCopies.retire` Retiring. Work is
   synced from each owner's sets at every write: Create (`creatingStores`), Rebuild (`StoreRebuilds.heldWork` Queued,
   from the first reconcile that sees the Rebuilding entry until its outcome or the entry's leaving ends it;
   `droppingCrlState` DiscardingLost; `rebuildDevices` Running / Abandoned), TransferIn (`transferringIn` Receiving,
   `recordingTransfersIn` Recording, `abandoningTransferIns` Abandoning, `retireEarlierTenancy`
   RetiringEarlierTenancy), TransferOut (`closingForTransfer`, `abortingLostTransfers`); a second Work for a (device,
-  store) is a shadow error (I3), so `startRebuild` does not even queue a store a transfer out is closing.
+  store) is a refused claim (I3), so `startRebuild` does not even queue a store a transfer out is closing.
   `declaredMissing` is mirrored as `missing`. An open of a copy with TransferOut work on its device is refused (R12):
   `DeviceCopies.setActivity` throws on the move to Opening, and `StoreLoader.startOpen` asks first
-  (`HostCopies.transferOutWork`), logs at debug and opens nothing, the copy left Idle (or AwaitingRetry, which the
-  device scans offer again once the work ends). An install on a loaded device with no record learns the
+  (`HostCopies.transferOutWork`), logs at debug and opens nothing. Any refused open (that, or an Opening claim the
+  table refuses, I1) records a load retry with the waiting load's `onServed` and the usual backoff (R23), so the
+  device scans serve the store once whatever held the copy has ended; a refused create records none (its entry,
+  still Initializing, has the next check create it again). An install on a loaded device with no record learns the
   copy (`learned`), as `readAtLoad` does, and so do a LoadStore and a load retry that find none (copies put at a path
   after the device's load). Stores loaded onto a device this host has not loaded, through
   `Host.Seams.unloadedDeviceCrl` (TestNetwork), get an untracked record (Live) at install, Served there and Closing
@@ -66,9 +77,10 @@
   a later reconcile. A throw of the
   silence path is a bug: in production it is logged at error and the store left silent (clients retransmit); with
   `HostCopies.strict` (`Host.Seams.strictCopyRegistry`, every ControlFixture host; implied by `verifyCopyRegistry`)
-  it propagates as `SilenceFailure`, which `shadow` never swallows. Every lockstep drain of a strict host fails on
-  any throw the registry recorded, a `shadow` site's included (R21); production keeps logging those at error and
-  swallowing them. With `verifyCopyRegistry` (TestNetwork; ControlFixture's `newHost(verifyCopyRegistry = ...)`)
+  it propagates as `SilenceFailure`, which `fact` and `claim` never swallow. Every lockstep drain of a strict host
+  fails on any violation the registry recorded, a fact's or a refused claim's (R21, R22); production logs them at
+  error, applies the fact, and backs off the claim. With `verifyCopyRegistry` (TestNetwork; ControlFixture's
+  `newHost(verifyCopyRegistry = ...)`)
   each drain also throws on any `verifyAgainstDisk` mismatch (phase, unrecorded config'd directory, record without
   directory). A copy put back at its path after its device's load (a restore finishing late) is learned where it is
   marked rebuild-required (`markedLost`). The drain check can land between an off-thread step and its

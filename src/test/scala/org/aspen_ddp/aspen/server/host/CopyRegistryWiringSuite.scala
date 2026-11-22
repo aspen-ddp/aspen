@@ -100,7 +100,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       host.testingOnlyHandleEvents()
       phases(host, deviceA) should be(Map(sid(0) -> Phase.Unread))
       host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
-      host.control.copyRegistry.takeShadowErrors() should be(Vector())
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
     finally os.perms.set(dir, "rwx------")
 
   atest("a restart rebuilds the same phases"):
@@ -186,7 +186,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
   private def consistent(host: Host): org.scalatest.Assertion =
     host.testingOnlyHandleEvents()
     host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
-    host.control.copyRegistry.takeShadowErrors() should be(Vector())
+    host.control.copyRegistry.takeRegistryErrors() should be(Vector())
     host.control.copyRegistry.learned should be(Vector())
 
   private def ask(host: Host): Future[Try[Unit]] =
@@ -212,7 +212,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
         new org.aspen_ddp.aspen.TestNetwork.TestCRL)
       noException should be thrownBy host.control.copyRegistry.attach(sds, List(child, other / "not-a-store"))
       phases(host, deviceB) should be(Map(sid(0) -> Phase.Unread))
-      host.control.copyRegistry.takeShadowErrors() should be(Vector())
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
     finally os.perms.set(closed, "rwx------")
 
   test("an Unread copy that later reads cleanly is refreshed at its load"):
@@ -251,7 +251,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     phases(host, deviceA) should be(Map(sid(0) -> Phase.Outbound("t")))
     host.control.copyRegistry.learned.size should be(1)
     host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
-    host.control.copyRegistry.takeShadowErrors() should be(Vector())
+    host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
   atest("a store served from an unloaded device has an untracked record, Idle once the router removes it"):
     given ExecutionContext = executionContext
@@ -730,7 +730,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       after = host.control.copyRegistry.device(source).get.work.get(shipped)
     yield
       work.get should be(a[Work.TransferOut])
-      refused should be(Some(Activity.Idle))
+      refused.get should be(a[Activity.AwaitingRetry])
       loaded should be(false)
       repairableDuringClose should be(false)
       started should be(Success(()))
@@ -806,17 +806,115 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       started <- request
       _ <- awaitLoudly("the transfer out of the extracted store to begin")(sends.isTransferringOut(shipped))
       _ = host.testingOnlyHandleEvents()
-      errors = host.control.copyRegistry.takeShadowErrors()
+      errors = host.control.copyRegistry.takeRegistryErrors()
     yield
       work.get should be(a[Work.TransferOut])
       direct.failed.get should be(an[IllegalStateException])
-      refusedOpen should be(Some(Activity.Idle))
+      refusedOpen.get should be(a[Activity.AwaitingRetry])
       openingAfter should be(false)
       loadedAfter should be(false)
       started should be(Success(()))
       sends.isTransferringOut(shipped) should be(true)
       record(host, source, shipped).map(_.phase).get should be(a[Phase.Outbound])
       errors should be(Vector())
+
+  // ---- Fix round 1 of Task 7: claims refuse and the caller backs off (I1, R23); facts apply (R22) ----
+
+  // I1: the Opening claim is refused for a reason other than TransferOut work (here a record whose phase is not Live,
+  // so Idle -> Opening is illegal). The open backs off: no backend opens, and the copy awaits a load retry (R23)
+  atest("an Opening claim refused for a non-TransferOut reason opens no backend and leaves an AwaitingRetry"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, deviceA)
+    val storePath = realStore(dev, sid(0))
+    val host = newHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    val copies = host.control.copyRegistry.copiesOf(local).get
+    // The record disagrees with the disk (Lost, the disk Live): its Opening is illegal
+    copies.setPhase(sid(0), Phase.Lost)
+    val cfg = StoreConfig.loadStoreConfig(storePath / StoreConfig.configFilename)
+    var served = false
+    host.control.loader.startOpen(local, cfg, storePath, create = false, None, Some(() => served = true))
+    val errors = host.control.copyRegistry.takeRegistryErrors()
+    val activity = copies.copies.get(sid(0)).map(_.activity)
+    host.testingOnlyHandleEvents()
+    Future:
+      errors.size should be(1)
+      errors.head should include("startOpen")
+      recorded(host).loadStoreRequests should be(empty)
+      host.control.loader.isOpening(sid(0)) should be(false)
+      activity.get should be(a[Activity.AwaitingRetry])
+      host.control.loader.awaitingRetryHasCallback(sid(0)) should be(Some(true))
+      served should be(false)
+
+  // R23: an open refused while the store has TransferOut work records a retry carrying its onServed. Once the
+  // transfer's close fails (the work ends, nothing shipped), the device scan's retry serves the store and runs it
+  atest("an open refused during TransferOut is retried and served once the transfer ends, with its onServed run"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, source)
+    val storePath = realStore(dev, shipped)
+    val sends = new StagedSendService
+    val host = newHost(hostRoot, transferService = sends, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(source)
+    var served = false
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(shipped, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      gate = recorded(host).holdTransferOutCloses()
+      request = ask(host)
+      _ <- awaitLoudly("the transfer out's close to begin")(hasTransferOutWork(host, shipped))
+      _ = host.control.loader.tryLoadStore(local, storePath, Some(() => served = true))
+      _ = host.testingOnlyHandleEvents()
+      refused = record(host, source, shipped).map(_.activity)
+      _ = gate.failure(new java.io.IOException("Simulated extraction failure"))
+      _ <- request
+      _ = host.testingOnlyHandleEvents()
+      workAfter = hasTransferOutWork(host, shipped)
+      attemptsBefore = recorded(host).storeLoadAttempts.size
+      _ = host.control.loader.retryFailedLoads()
+      retried = recorded(host).storeLoadAttempts.drop(attemptsBefore).toList
+      // What the recording tryLoadStore seam stands in for
+      _ = host.control.loader.tryLoadStore(local, storePath)
+      _ <- awaitLoudly("the retried load to serve the store and run its onServed")(
+             { host.testingOnlyHandleEvents(); host.control.router.loaded.contains(shipped) && served })
+      _ <- close(host, shipped)
+    yield
+      refused.get should be(a[Activity.AwaitingRetry])
+      workAfter should be(false)
+      retried should be(List((source, storePath)))
+      served should be(true)
+      sends.transfersOut should be(empty)
+      consistent(host)
+
+  // R22: a fact (here a router removal of a copy the registry holds Idle, and a phase the registry holds against what
+  // the disk reads) is applied whatever the table says, and recorded; a phase is set to what the disk reads
+  test("an illegal fact is applied in production mode and recorded"):
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, deviceA)
+    writeStoreConfig(dev, sid(0))
+    writeStoreConfig(dev, sid(1))
+    val host = newHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val registry = host.control.copyRegistry
+    registry.strict = false
+    val local = loadedDevices(host)(deviceA)
+    val copies = registry.copiesOf(local).get
+    // Idle -> Closing is not in the table: applied anyway
+    registry.removedFromRouter(deviceA, sid(0))
+    // Lost -> Live is not in the table: the disk reads Live, so Live is recorded
+    copies.setPhase(sid(1), Phase.Lost)
+    registry.moved("test", local, sid(1), Phase.Live)
+    val errors = registry.takeRegistryErrors()
+    copies.copies(sid(0)).activity should be(Activity.Closing(ClosePurpose.FailStop))
+    copies.copies(sid(1)).phase should be(Phase.Live)
+    errors.size should be(2)
+    errors.exists(_.contains("router remove")) should be(true)
+    errors.exists(_.contains("test")) should be(true)
 
   // ---- The states of D1, D4, D5 and D6 of the old marks (spec, Stage 1 audit findings, Step 3 addenda), derived ----
 

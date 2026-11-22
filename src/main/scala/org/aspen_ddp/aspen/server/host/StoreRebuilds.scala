@@ -89,7 +89,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       else
         None
     val ep = (if running then rebuildEpisodes.get(storeId).flatten else None).orElse(episode)
-    ctx.copyRegistry.work("rebuild", deviceId, storeId, _.isInstanceOf[Work.Rebuild], stage.map(Work.Rebuild(ep, _)))
+    ctx.copyRegistry.work("rebuild", deviceId, storeId, _.isInstanceOf[Work.Rebuild], stage.map(Work.Rebuild(ep, _))): Unit
 
   /** Whether a rebuild of the store runs here, or its lost copy is being discarded for one (discardLostStore) */
   private[host] def isRebuilding(storeId: StoreId): Boolean =
@@ -175,11 +175,13 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     val storePath = local.devicePath / storeId.directoryName
     val deviceId = local.storageDeviceId
 
+    // The create claims its work first (I3): refused (other work holds the copy, recorded), nothing starts, and the
+    // next check tries again
     if ! creatingStores.contains(storeId) && ! pendingCreateFlips.contains(storeId) &&
-       ! ctx.shutdown.isShuttingDown(deviceId) then
+       ! ctx.shutdown.isShuttingDown(deviceId) &&
+       ctx.copyRegistry.work("create", deviceId, storeId, _ == Work.Create, Some(Work.Create)) then
       creatingStores += storeId
       pendingCreateFlips += storeId
-      ctx.copyRegistry.work("create", deviceId, storeId, _ == Work.Create, Some(Work.Create))
 
       // True when the store exists on disk (created here, or by an attempt that crashed before
       // its flip), false when the create was skipped for a shutdown. A stat that fails (FileStat) fails the flip, which
@@ -284,8 +286,16 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     if closing then
       logger.debug(s"Not rebuilding store $storeId on device ${local.storageDeviceId} yet: a transfer out is still " +
                    "closing it")
-    // Silent from the first reconcile that sees the entry, a store queued for a slot included (rebuild-process 6.2)
-    if !closing && !heldWork.contains(storeId) then
+    // Silent from the first reconcile that sees the entry, a store queued for a slot included (rebuild-process 6.2).
+    // Queuing claims the work (I3): refused (other work holds the copy, recorded), nothing is queued or started, and a
+    // later reconcile asks again
+    val refused = !closing && !heldWork.contains(storeId) && !rebuildingStores.contains(storeId) &&
+      !ctx.copyRegistry.work("rebuild", local.storageDeviceId, storeId, _.isInstanceOf[Work.Rebuild],
+        Some(Work.Rebuild(episode, RebuildStage.Queued)))
+    if refused then
+      logger.error(s"Not rebuilding store $storeId on device ${local.storageDeviceId} yet: the copy registry refused " +
+                   "its work")
+    if !closing && !refused && !heldWork.contains(storeId) then
       heldWork += storeId -> local.storageDeviceId
     syncRebuildWork(storeId, local.storageDeviceId, episode)
     // A store inside its backoff (scheduleRebuildRetry) waits for that re-check, which clears the mark before it
@@ -297,13 +307,13 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     // abandoned-transfers-out pass make the same check. Not asked while a rebuild of the store is registered: nothing
     // starts then anyway, and the rebuild's end checks the device again (a send cannot begin meanwhile, since startOut
     // refuses while the rebuild is registered), so a re-check would only repeat at every reconcile
-    val shipping = !closing && !rebuildingStores.contains(storeId) &&
+    val shipping = !closing && !refused && !rebuildingStores.contains(storeId) &&
       ctx.storeTransferService.isTransferringOut(storeId)
     if shipping then
       logger.debug(s"Not rebuilding store $storeId on device ${local.storageDeviceId} yet: a transfer out of it is " +
                    "still sending")
       ctx.reconciler.scheduleDeviceRecheck(local.storageDeviceId)
-    if !closing && !shipping && !rebuildingStores.contains(storeId) && !scheduledRebuildRetries.get(storeId).contains(held) &&
+    if !closing && !refused && !shipping && !rebuildingStores.contains(storeId) && !scheduledRebuildRetries.get(storeId).contains(held) &&
        rebuildingStores.size + droppingCrlState.size < ctx.maxConcurrentRebuilds &&
        ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId, episode) &&
        discardLostStore(local, storeId, episode, held) then

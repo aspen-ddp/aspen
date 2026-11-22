@@ -178,12 +178,12 @@ object Host:
                          /** How far past the start lead each renewal sets the join ceiling (JoinCeiling.Step) */
                          joinCeilingStep: FiniteDuration = JoinCeiling.Step,
                          /** Lockstep only: each testingOnlyHandleEvents checks the copy registry once drained, failing
-                          *  on a throw its shadow updates swallowed, a throw of its silence path or a disagreement
+                          *  on a violation its facts or claims recorded, a throw of its silence path or a disagreement
                           *  with the disk (HostCopies.verifyAgainstDisk). Implies strictCopyRegistry */
                          verifyCopyRegistry: Boolean = false,
                          /** A throw of the copy registry's silence path (HostCopies.onChange) propagates rather than
                           *  leaving the store silent, and each lockstep testingOnlyHandleEvents fails on any throw
-                          *  the registry recorded, its silence path's or one `shadow` swallowed */
+                          *  the registry recorded, its silence path's or a fact's or refused claim's violation */
                          strictCopyRegistry: Boolean = false)
 
   object Seams:
@@ -548,7 +548,7 @@ class Host(val client: AspenClient,
       t.drain()
       if seams.verifyCopyRegistry then
         val registry = deviceControl.copyRegistry
-        val problems = registry.takeShadowErrors().toList ++ registry.takeSilenceErrors() ++
+        val problems = registry.takeRegistryErrors().toList ++ registry.takeSilenceErrors() ++
           registry.verifyAgainstDisk()
         // A copy a load learned of is reported, not failed on: a test may place a copy after its device's load
         if problems.nonEmpty then
@@ -557,7 +557,7 @@ class Host(val client: AspenClient,
                                           (problems ++ learned).mkString("\n  "))
       else if seams.strictCopyRegistry then
         val registry = deviceControl.copyRegistry
-        val problems = registry.takeShadowErrors().toList ++ registry.takeSilenceErrors()
+        val problems = registry.takeRegistryErrors().toList ++ registry.takeSilenceErrors()
         if problems.nonEmpty then
           throw new IllegalStateException(s"Copy registry of host $hostId after a drain, its updates threw:\n  " +
                                           problems.mkString("\n  "))

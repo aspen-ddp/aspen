@@ -68,7 +68,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
   private var abandonDevices: Map[StoreId, StorageDeviceId] = Map()
   private var retiringEarlier: Map[StoreId, StorageDeviceId] = Map()
 
-  /** The store's TransferIn work on `deviceId` (shadow), staged as the sets above and recordingTransfersIn say */
+  /** The store's TransferIn work on `deviceId`, staged as the sets above and recordingTransfersIn say */
   private def syncWork(storeId: StoreId, deviceId: StorageDeviceId, transferId: Option[UUID] = None): Unit =
     val stage =
       if recordingTransfersIn.get(storeId).exists(_._1 == deviceId) then
@@ -82,7 +82,17 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
       else
         None
     ctx.copyRegistry.work("transfer in", deviceId, storeId, _.isInstanceOf[Work.TransferIn],
-      stage.map(Work.TransferIn(transferId, _)))
+      stage.map(Work.TransferIn(transferId, _))): Unit
+
+  /** Claims the store's TransferIn work on `deviceId` at `stage` before a transfer in's step starts (I3): false if
+   *  other work holds the (device, store) (recorded), and then nothing starts; a later check asks again */
+  private def claimWork(storeId: StoreId, deviceId: StorageDeviceId, stage: TransferInStage,
+                        transferId: Option[UUID] = None): Boolean =
+    val claimed = ctx.copyRegistry.work("transfer in", deviceId, storeId, _.isInstanceOf[Work.TransferIn],
+      Some(Work.TransferIn(transferId, stage)))
+    if !claimed then
+      logger.error(s"Not transferring store $storeId onto device $deviceId yet: the copy registry refused its work")
+    claimed
 
   /** The transfer-in work on `deviceId` that a shutdown of it must stop or wait for. `ingStores` are the stores
    *  the device's tree entry records as TransferringIn.
@@ -436,6 +446,9 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
 
           // A copy promoted by an earlier attempt -- normally one that crashed before its metadata
           // step finished -- needs no bytes, only that step.
+          case Some(Phase.Arrived(_)) if !claimWork(storeId, toDeviceid, TransferInStage.Receiving, transferId) =>
+            ()
+
           case Some(Phase.Arrived(_)) =>
             logger.info(s"Store $storeId has already arrived on device $toDeviceid. Resuming its " +
                         s"pool update")
@@ -458,6 +471,9 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           case Some(Phase.Live) if !FileStat.existence(finalPath).contains(false) =>
             logger.error(s"Cannot transfer store $storeId onto device $toDeviceid: store path " +
                          s"already exists or cannot be stat'd. $finalPath")
+
+          case Some(Phase.Live) if !claimWork(storeId, toDeviceid, TransferInStage.Receiving, transferId) =>
+            ()
 
           case Some(Phase.Live) =>
             // Fresh per attempt. The sender ignores a request whose timestamp is not newer than the
@@ -590,7 +606,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     if ctx.rebuilds.rebuildingStoreIds.contains(storeId) || servedHere || ctx.loader.isOpening(storeId) then
       logger.info(s"Not transferring store $storeId onto device ${local.storageDeviceId} yet: its path holds a copy " +
                   s"of an earlier tenancy, which waits for a rebuild, an open or a close of the store here to end")
-    else if !ctx.copies.isRetiring(storeId) then
+    else if !ctx.copies.isRetiring(storeId) &&
+            claimWork(storeId, local.storageDeviceId, TransferInStage.RetiringEarlierTenancy) then
       logger.warn(s"Retiring the copy of an earlier tenancy of store $storeId at its path on device " +
                   s"${local.storageDeviceId} before transferring the store onto it")
       retiringEarlier += storeId -> local.storageDeviceId
@@ -620,7 +637,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     // in the meantime calls here again. Without the guard each one starts its own retry loop,
     // all writing the same key and losing to each other on KeyRevision. Same shape as
     // createNewStore's creatingStores and startIn's transferringIn.
-    if ! abandoningTransferIns.contains(storeId) then
+    if ! abandoningTransferIns.contains(storeId) && claimWork(storeId, toDeviceId, TransferInStage.Abandoning) then
       abandoningTransferIns += storeId
       abandonDevices += storeId -> toDeviceId
       syncWork(storeId, toDeviceId)

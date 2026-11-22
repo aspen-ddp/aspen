@@ -545,6 +545,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       closingAtCheck = host.control.transfersOut.isClosingForTransfer(shipped)
       // Its backend failed while it closed (StoreRebuilds.failedOnClose), and the store is requested for rebuild
       _ = os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+      _ = host.control.copyRegistry.markedLost("failedOnClose", storePath)
       _ <- check(host, source, rebuilding)
       startedWhileClosing = factory.created.nonEmpty || host.control.rebuilds.isRebuilding(shipped)
       // Not even queued (silenced): the close's TransferOut work holds the (device, store) (I3)

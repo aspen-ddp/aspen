@@ -529,10 +529,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           syncRebuildWork(storeId, deviceId)
           sr.cancel()
 
-    // A store queued for a slot whose entry left before its rebuild started (rebuild-process 6.2)
-    heldWork.foreach: (storeId, deviceId) =>
-      if deviceId == local.storageDeviceId && !listed(storeId) && !rebuildingStores.contains(storeId) then
-        endRebuildWork(storeId)
+    endUnlistedWork(local, remote)
 
     val stagingRoot = local.devicePath / RebuildingStore.RebuildDirectory
     val staged =
@@ -549,6 +546,16 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                       s"device ${local.storageDeviceId}")
           try os.remove.all(dir)
           catch case t: Throwable => logger.warn(s"Failed to delete $dir. Retrying at a later check. Error: $t")
+
+  /** Ends the queued Rebuild work on `local` of each store whose entry there is no longer Rebuilding and whose rebuild
+   *  does not run (rebuild-process 6.2): a queued store whose entry left before it started, or the kept work of a
+   *  superseded or permanently failed flip. Run first in the reconcile, so the passes that leave a copy to its work
+   *  (HostCopies.offlineCopies) see the copy as no work's any more */
+  def endUnlistedWork(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    heldWork.foreach: (storeId, deviceId) =>
+      if deviceId == local.storageDeviceId && !rebuildingStores.contains(storeId) &&
+         !remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Rebuilding) then
+        endRebuildWork(storeId)
 
   /** Ends the Rebuild work this host holds for `storeId` (rebuild-process 6.2), once its slot is released if it runs.
    *  Whatever else names the store here (its copy, an unloaded device's entry) keeps it silent; nothing else does */

@@ -84,7 +84,10 @@
   re-placement only removes that device's copy). `Adopt`, `AdoptOffline`, `Discard`, `Unconfirmed`, `NotOwned`, a
   cancel for an entry that left the device and `abandonUnlisted` for a queued one end the work; whatever else names
   the store (the finished copy, until its load serves it; an unloaded device's entry) keeps it silent. Other outcomes
-  (Superseded, a failed flip, pass or a shutdown's cancel) keep the work, queued, for the retry
+  (Superseded, a failed flip, pass or a shutdown's cancel) keep the work, queued, for the retry, until the entry
+  leaves Rebuilding: each reconcile first ends such work (`endUnlistedWork`), so its passes find the copy free (a
+  copy with work on its device is left to that work). A queued rebuild never makes a store served elsewhere here
+  unrepairable; only a running one does (R20)
 - One piece of host work per (device, store) at a time (I3): while a rebuild of a store is registered on a device
   (queued, discarding its lost copy, running, or cancelled and not yet released), a transfer in of that store onto
   the device waits (`StoreRebuilds.hasRebuildWork`, checked by `StoreTransfers.startIn`; `server/host/CLAUDE.md`).

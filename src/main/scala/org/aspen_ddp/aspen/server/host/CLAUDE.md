@@ -54,21 +54,30 @@
   device here. A reloaded device keeps its unloaded listing until its first reconcile writes `reconciledEntries`
   (`LocalStorageDeviceState.onReconciled`). `StoreRouter.remove` marks the store silent before it leaves the map;
   `answersUnknown` is `ready`, not installed, not silent. The view's `repairable` is `HostCopies.repairable`
-  (Served, not Closing, no Rebuild or TransferOut work on any device, not being sent). A throw of the silence path is
-  a bug: in production it is logged at error and the store left silent (clients retransmit); with
-  `HostCopies.strict` (`Host.Seams.strictCopyRegistry`, every ControlFixture host; implied by
-  `verifyCopyRegistry`) it propagates as `SilenceFailure`, which `shadow` never swallows, and the next lockstep drain
-  fails on it too. With `verifyCopyRegistry` (TestNetwork; ControlFixture's `newHost(verifyCopyRegistry = ...)`) each
-  lockstep drain also throws on a recorded shadow throw and on any `verifyAgainstDisk` mismatch (phase, unrecorded
-  config'd directory, record without directory). The drain check can land between an off-thread step and its
+  (Served, not Closing, no Rebuild work Running and no TransferOut work on any device, not being sent: R20, a queued,
+  discarding or abandoned rebuild reads nothing, and a flip that keeps failing keeps its work queued). A throw of the
+  silence path is a bug: in production it is logged at error and the store left silent (clients retransmit); with
+  `HostCopies.strict` (`Host.Seams.strictCopyRegistry`, every ControlFixture host; implied by `verifyCopyRegistry`)
+  it propagates as `SilenceFailure`, which `shadow` never swallows. Every lockstep drain of a strict host fails on
+  any throw the registry recorded, a `shadow` site's included (R21); production keeps logging those at error and
+  swallowing them. With `verifyCopyRegistry` (TestNetwork; ControlFixture's `newHost(verifyCopyRegistry = ...)`)
+  each drain also throws on any `verifyAgainstDisk` mismatch (phase, unrecorded config'd directory, record without
+  directory). A copy put back at its path after its device's load (a restore finishing late) is learned where it is
+  marked rebuild-required (`markedLost`). The drain check can land between an off-thread step and its
   control-thread handler (a rebuild's copy placed before its completion callback runs), so a test does not drain
   while such a step is in flight
-- The reconcile passes select from the device's offline copies (`HostCopies.offlineCopies`: records whose activity is
-  not Served or Opening): the Deleted Stores, Lost CRL, Abandoned Transfers Out, Completed Transfers In and
-  Completed Rebuilds passes, `reloadClosedStores` and `retryFailedLoads`. A shutdown or relinquish closes the device's
+- The reconcile passes select from the device's offline copies (`HostCopies.offlineCopies`: records Idle or awaiting
+  a load retry, with no work on the device): the Deleted Stores, Lost CRL, Abandoned Transfers Out, Completed
+  Transfers In and Completed Rebuilds passes and `reloadClosedStores`. A copy that a transfer in, rebuild, create or
+  transfer out owns, or that is closing or retiring, is left to that work (I3), whose end checks the device again:
+  `closeUnloaded` (fail-stop, failed CRL load, failed save-file removal) checks it once the close ends, and the
+  reconcile first ends the queued Rebuild work of stores no longer Rebuilding there (`StoreRebuilds.endUnlistedWork`).
+  `retryFailedLoads` keeps a retry while its copy is neither served nor opening, whatever work holds it
+  (`heldOffline`). A shutdown or relinquish closes the device's
   copies that are Served or Opening (`openCopies`, plus a create's open, whose copy has no record yet;
   `DeviceShutdown.storesToClose`). Tests place copies after a device's load with `ControlFixture.placedCopies`, and
-  fake a served copy with `servedHere` (the recording shutdown close ends it). `LocalDevices.isLoaded(sds)` says
+  fake a served copy with `servedHere` (the recording shutdown close ends it); `ControlFixture.awaitLoudly` waits on
+  work that crosses real-time hops and fails, naming what it waited for, when its time runs out. `LocalDevices.isLoaded(sds)` says
   whether a device state is still the loaded one
 
 ### Host threading model

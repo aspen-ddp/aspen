@@ -167,6 +167,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // itself does nothing then, as the guard is held.
       ctx.shutdown.shutDownDevice(local, remote)
     else
+      // Queued rebuild work of stores no longer Rebuilding here ends first, so the passes below see its copy free
+      ctx.rebuilds.endUnlistedWork(local, remote)
       reconcileDeletedStores(local, remote)
       requestMissingStoresRebuild(local, remote)
       // Any entries a store transferred away left in the device CRL go too

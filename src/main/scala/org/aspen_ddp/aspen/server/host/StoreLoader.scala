@@ -384,7 +384,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       val deviceId = wait.sds.storageDeviceId
       val entry = wait.sds.reconciledEntries.map(_.get(storeId))
       if ! ctx.devices.isLoaded(wait.sds) || router.get(storeId).isDefined ||
-         ! ctx.copyRegistry.offlineCopies(wait.sds).contains(storeId) || opening.contains(storeId) then
+         ! ctx.copyRegistry.heldOffline(wait.sds, storeId) || opening.contains(storeId) then
         dropRetry(storeId, wait)
       else if entry.contains(None) then
         logger.info(s"Store $storeId awaiting a load retry has no entry on device $deviceId any more. Dropping the " +
@@ -779,6 +779,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           store.frontend.admission.releaseRetained(store.storeId)
         ctx.threading.release(store.storeId)
         ctx.copyRegistry.closeEnded(store.storageDeviceId, store.storeId)
+        // The reconcile's passes leave a closing copy to its close (HostCopies.offlineCopies): its end checks the
+        // device again, so a fail-stopped or unloaded copy is retired or rebuilt without waiting for the periodic check
+        if ctx.devices.devices.contains(store.storageDeviceId) then
+          ctx.reconciler.checkStorageDevice(store.storageDeviceId)
 
   /** The first step of a close, on the executor of `entry`, whose store the router no longer holds. Every task
    *  queued ahead of it has run against the open store. It then sets `closing`, so I/O completions posted from now on

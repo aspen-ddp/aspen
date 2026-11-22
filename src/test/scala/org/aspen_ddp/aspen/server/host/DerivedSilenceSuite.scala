@@ -8,6 +8,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{Host, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
+import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import org.aspen_ddp.aspen.server.store.backend.{DefaultBackendOpener, StoreCreation}
 
 import java.util.UUID
@@ -88,7 +89,12 @@ class DerivedSilenceSuite extends IntegrationTestSuite with ControlFixture:
       delivered = scala.concurrent.Promise[Unit]()
       _ = host.control.router.post(s)(_ => delivered.trySuccess(()))
       _ <- pumpUntil(host, delivered.isCompleted)
-      repairableWithRebuild = host.isRepairable(s)
+      // Queued on B: a rebuild not yet reading, which keeps no repair scan from the served copy (R20)
+      repairableQueued = host.isRepairable(s)
+      _ = host.control.copyRegistry.work("test", deviceB, s, _.isInstanceOf[Work.Rebuild],
+            Some(Work.Rebuild(None, RebuildStage.Running)))
+      // Running on B: the rebuild reads everything, as rebuildingStoreIds kept the old view from repairing it
+      repairableRunning = host.isRepairable(s)
       _ = rebuildWork(host, deviceB, s, on = false)
       repairableWithout = host.isRepairable(s)
       derived = host.control.copyRegistry.silence(s)
@@ -97,7 +103,8 @@ class DerivedSilenceSuite extends IntegrationTestSuite with ControlFixture:
       host.control.copyRegistry.device(deviceB).flatMap(_.copies.get(s)).map(_.phase) should be(Some(Phase.Lost))
       answersUnknown should be(false)
       delivered.isCompleted should be(true)
-      repairableWithRebuild should be(false)
+      repairableQueued should be(true)
+      repairableRunning should be(false)
       repairableWithout should be(true)
       derived should be(Silence.Served)
 
@@ -184,3 +191,41 @@ class DerivedSilenceSuite extends IntegrationTestSuite with ControlFixture:
       derived should be(Silence.Served)
       elsewhereAnswer should be(false)
       host.control.copyRegistry.silence(elsewhere) should be(Silence.Silent(Set(SilenceReason.UnloadedDevice)))
+
+  // I3: the reconcile's passes select from the device's offline copies, which leave a copy whose store has work on
+  // the device to that work. Its entry gone from the device (an abort, a re-placement), the Deleted Stores pass would
+  // otherwise retire the copy under the work, which then discards or promotes the same path
+  for (what, marker, work) <- List(
+        ("an arrived copy while its transfer in's pool update is in flight", StoreTransfer.TransferredInMarkerFile,
+         Work.TransferIn(None, TransferInStage.Recording)),
+        ("a rebuilt copy while its rebuild's flip is in flight", RebuildingStore.RebuildCompleteMarkerFile,
+         Work.Rebuild(None, RebuildStage.Running)))
+  do
+    atest(s"the Deleted Stores pass leaves $what to its work"):
+      given ExecutionContext = executionContext
+      val s = sid(7)
+      val hostRoot = newHostDir()
+      val host = newHost(hostRoot)
+      host.testingOnlyHandleEvents()
+      // Injected, so no device load's own check is in flight
+      val dev = hostRoot / os.up / "injected-device"
+      os.makeDir.all(dev)
+      val dir = writeStoreConfig(dev, s)
+      os.write.over(dir / marker, "")
+      val local = new LocalStorageDeviceState(deviceA, dev, dev / "dummy.file", new org.aspen_ddp.aspen.TestNetwork.TestCRL())
+      injectLoadedDevice(host, local)
+      host.control.copyRegistry.work("test", deviceA, s, w => w.ordinal == work.ordinal, Some(work))
+      val armed = recorded(host).armLookup(deviceA)
+      host.control.reconciler.checkStorageDevice(deviceA)
+      // Its entry is gone from the device
+      armed.success(deviceState(deviceA))
+      for
+        // The check ends, or a retire it started moves the copy away (and checks the device again)
+        _ <- pumpUntil(host, !host.control.reconciler.activeDeviceChecks.contains(deviceA) || !os.exists(dir))
+        // A retire, had one started, completes within these rounds (its CRL calls answer at once)
+        _ <- pumpUntil(host, !os.exists(dir), rounds = 5)
+      yield
+        offlineCopies(host, local) should not contain s
+        os.exists(dir / marker) should be(true)
+        host.control.copyRegistry.device(deviceA).flatMap(_.copies.get(s)) should not be empty
+

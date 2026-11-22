@@ -17,7 +17,7 @@ import java.util.UUID
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.concurrent.duration.{Duration, SECONDS}
+import scala.concurrent.duration.{Duration, FiniteDuration, SECONDS}
 
 /** What a test host did, recorded by the seams it was built with, and the knobs that make it do something else.
  *
@@ -403,6 +403,26 @@ trait ControlFixture:
       Future.unit
     else
       Future(()).flatMap(_ => yieldUntil(condition, maxYields - 1))
+
+  /** Yields and pumps the network's transactions until `condition` holds, failing with `what` once `timeout` of real
+   *  time has passed without it: never a silent end. For waits on work that crosses real-time hops (the client's
+   *  retries, CRL threads), whose progress a count of yields does not bound */
+  protected def awaitLoudly(what: String, timeout: FiniteDuration = FiniteDuration(20, SECONDS))
+                           (condition: => Boolean): Future[Unit] =
+    given ExecutionContext = executionContext
+    val deadline = System.nanoTime() + timeout.toNanos
+    def loop(): Future[Unit] =
+      if condition then
+        Future.unit
+      else if System.nanoTime() > deadline then
+        Future.failed(new AssertionError(s"Timed out after $timeout waiting for $what"))
+      else
+        for
+          _ <- yieldUntil(condition, 20)
+          _ <- waitForTransactionsToComplete()
+          _ <- loop()
+        yield ()
+    loop()
 
   /** Drives `host`'s device check until no store on `deviceId` is Rebuilding.
    *

@@ -828,7 +828,9 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
 
   atest("a superseded copy whose entry then leaves the device is retired by the Deleted Stores pass (RB-W9)"):
     val hostRoot = newHostDir()
-    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    // Injected below, alone at its path: a device loaded from the same directory would register the same copies
+    val deviceDir = hostRoot / os.up / "injected-device"
+    os.makeDir.all(deviceDir)
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
     val rebuilt = StoreId(PoolId.BootstrapPoolId, 0)
@@ -870,8 +872,10 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = recorded(host).armLookup(realDeviceId).success(deviceState(realDeviceId, Map()))
       _ = factory.created.head.promise.success(())
       _ <- waitForTransactionsToComplete()
-      _ <- yieldUntil(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
-      _ <- yieldUntil(!os.exists(storeDir))
+      _ <- awaitLoudly("the flip's outcome")(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
+      // Retired into pending-delete, its record gone with it
+      _ <- awaitLoudly("the retire of the superseded copy")(!os.exists(storeDir) &&
+             !host.control.copyRegistry.device(realDeviceId).exists(_.copies.contains(rebuilt)))
     yield
       recorded(host).rebuildOutcomes((realDeviceId, rebuilt)) should be(RebuildOutcome.Superseded)
       factory.created should have size 1
@@ -901,15 +905,18 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     first.success(deviceState(synthetic, Map(rebuilding(storeN(0)))))
 
     for
-      _ <- yieldUntil(factory.created.size == 1)
+      _ <- awaitLoudly("the rebuild to start")(factory.created.size == 1)
       _ = os.makeDir.all(storeDir)
       _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, "")
       _ = factory.created.head.promise.success(())
-      _ <- yieldUntil(scheduler(host).pending.contains(Host.RebuildRetryInitialDelay), 400)
+      _ <- awaitLoudly("the flip's failure and its backoff")(
+             scheduler(host).pending.contains(Host.RebuildRetryInitialDelay))
       // Re-placed during the backoff: its retry's check finds no entry here
       _ = recorded(host).armLookup(synthetic).success(deviceState(synthetic, Map()))
       _ = runRebuildRetries(host)
-      _ <- yieldUntil(!os.exists(storeDir))
+      // Retired into pending-delete, its record gone with it
+      _ <- awaitLoudly("the retire of the unpromoted copy")(!os.exists(storeDir) &&
+             !host.control.copyRegistry.device(synthetic).exists(_.copies.contains(storeN(0))))
     yield
       factory.created should have size 1
       pending should have size 1
@@ -937,17 +944,24 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     first.success(deviceState(synthetic, Map(rebuilding(storeN(0)))))
 
     for
-      _ <- yieldUntil(factory.created.size == 1)
+      _ <- awaitLoudly("the rebuild to start")(factory.created.size == 1)
       _ = installServedElsewhere(host, storeN(0))
       _ = os.makeDir.all(storeDir)
       _ = os.write.over(storeDir / RebuildingStore.RebuildCompleteMarkerFile, "")
       _ = factory.created.head.promise.success(())
-      _ <- yieldUntil(scheduler(host).pending.contains(Host.RebuildRetryInitialDelay), 400)
+      // The finished copy registered, its flip failed for good and its backoff scheduled
+      _ <- awaitLoudly("the flip's failure and its backoff")(
+             host.control.copyRegistry.heldOffline(local, storeN(0)) &&
+             scheduler(host).pending.contains(Host.RebuildRetryInitialDelay))
     yield
-      offlineCopies(host, local) should contain(storeN(0))
+      // Offline on its own device, held for its rebuild's retry (heldWork)
+      host.control.copyRegistry.heldOffline(local, storeN(0)) should be(true)
       host.control.router.get(storeN(0)).isDefined should be(true)
       host.control.router.isOffline(storeN(0)) should be(false)
-      offlineCopies(host, local) should contain(storeN(0))
+      // The queued rebuild on this device does not stop the served store's repair scans (R20)
+      host.control.currentView.repairable should contain(storeN(0))
+      // Nothing the registry's updates threw was swallowed
+      host.control.copyRegistry.takeShadowErrors() should be(Vector())
 
   atest("a rebuilding store stays silent when another device here retires its old copy (RB-W23)"):
     // replaceRebuild moved the store's rebuild between two devices of this host. The destination never held the store,
@@ -1159,7 +1173,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       // Pre-completed: a re-check of this device right after the failed flip would consume it and restart the store
       _ = recorded(host).armLookup(synthetic).success(rebuildingState)
       _ = factory.created.head.promise.success(())
-      _ <- yieldUntil(scheduler(host).pending.contains(Host.RebuildRetryInitialDelay), 400)
+      _ <- awaitLoudly("the flip's failure and its backoff")(scheduler(host).pending.contains(Host.RebuildRetryInitialDelay))
       _ <- yieldUntil(factory.created.size == 2, 20)
       restartedImmediately = factory.created.size
       _ = runRebuildRetries(host)

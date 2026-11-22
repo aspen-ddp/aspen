@@ -182,7 +182,8 @@ object Host:
                           *  with the disk (HostCopies.verifyAgainstDisk). Implies strictCopyRegistry */
                          verifyCopyRegistry: Boolean = false,
                          /** A throw of the copy registry's silence path (HostCopies.onChange) propagates rather than
-                          *  leaving the store silent, and each lockstep testingOnlyHandleEvents fails on one recorded */
+                          *  leaving the store silent, and each lockstep testingOnlyHandleEvents fails on any throw
+                          *  the registry recorded, its silence path's or one `shadow` swallowed */
                          strictCopyRegistry: Boolean = false)
 
   object Seams:
@@ -557,9 +558,10 @@ class Host(val client: AspenClient,
           throw new IllegalStateException(s"Copy registry of host $hostId after a drain:\n  " +
                                           (problems ++ learned ++ opens).mkString("\n  "))
       else if seams.strictCopyRegistry then
-        val problems = deviceControl.copyRegistry.takeSilenceErrors()
+        val registry = deviceControl.copyRegistry
+        val problems = registry.takeShadowErrors().toList ++ registry.takeSilenceErrors()
         if problems.nonEmpty then
-          throw new IllegalStateException(s"Copy registry of host $hostId after a drain, its silence path threw:\n  " +
+          throw new IllegalStateException(s"Copy registry of host $hostId after a drain, its updates threw:\n  " +
                                           problems.mkString("\n  "))
     case _ => ()
 

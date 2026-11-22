@@ -366,13 +366,16 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         (if awaiting.valuesIterator.exists(_.contains(storeId)) then Set(SilenceReason.DeviceUndecided) else Set())
       if reasons.isEmpty then Silence.Unknown else Silence.Silent(reasons)
 
-  /** Whether a repair scan may run against `storeId` here: Served, not Closing, with no Rebuild or TransferOut work on
-   *  any device, and not being sent out (storeTransferService) */
+  /** Whether a repair scan may run against `storeId` here: Served, not Closing, with no Rebuild work Running and no
+   *  TransferOut work on any device, and not being sent out (storeTransferService). A running rebuild reads
+   *  everything; one queued, discarding its lost copy or abandoned reads nothing yet, and a flip that keeps failing
+   *  keeps its work queued, so it must not stop the served copy's repair scans (R20) */
   def repairable(storeId: StoreId): Boolean =
     silence(storeId) == Silence.Served &&
       !allCopies.exists(_.copies.get(storeId).exists(_.activity.isInstanceOf[Activity.Closing])) &&
-      !allCopies.exists(_.work.get(storeId).exists(w => w.isInstanceOf[Work.Rebuild] ||
-                                                       w.isInstanceOf[Work.TransferOut])) &&
+      !allCopies.exists(_.work.get(storeId).exists:
+        case Work.Rebuild(_, RebuildStage.Running) | Work.TransferOut(_) => true
+        case _ => false) &&
       !ctx.storeTransferService.transferringOutStores.contains(storeId)
 
   /** At unload: the device's records go with it, and `listed` is kept as its unloaded entries */
@@ -403,16 +406,27 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
       awaiting -= path
       onChange(stores)
 
-  /** The stores of `local`'s copies that are not served or opening: Idle, awaiting a load retry, closing or retiring.
-   *  The reconcile's passes select their stores from these */
+  /** Whether `r` is neither served nor opening */
+  private def isOffline(r: CopyRecord): Boolean =
+    !(r.activity == Activity.Served || r.activity.isInstanceOf[Activity.Opening])
+
+  /** The stores of `local`'s copies that the reconcile's passes may act on: Idle or awaiting a load retry (neither
+   *  served, opening, closing nor retiring), with no work on the device. I3: a transfer in, rebuild, create or transfer
+   *  out owns its copy, as a close or a retire does, and each one's end checks the device again */
   def offlineCopies(local: LocalStorageDeviceState): Set[StoreId] =
-    copiesOf(local).map(_.copies.values.collect {
-      case r if !(r.activity == Activity.Served || r.activity.isInstanceOf[Activity.Opening]) => r.storeId
+    copiesOf(local).map(c => c.copies.values.collect {
+      case r if (r.activity == Activity.Idle || r.activity.isInstanceOf[Activity.AwaitingRetry]) &&
+                !c.work.contains(r.storeId) => r.storeId
     }.toSet).getOrElse(Set())
 
-  /** The stores of `local`'s copies that are served or opening: the complement of offlineCopies */
+  /** Whether `local` holds a copy of `storeId` that is neither served nor opening, whatever work it has (a load
+   *  retry waits out that work rather than being dropped: StoreLoader.retryFailedLoads) */
+  def heldOffline(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
+    copiesOf(local).exists(_.copies.get(storeId).exists(isOffline))
+
+  /** The stores of `local`'s copies that are served or opening */
   def openCopies(local: LocalStorageDeviceState): Set[StoreId] =
-    copiesOf(local).map(c => c.copies.keySet -- offlineCopies(local)).getOrElse(Set())
+    copiesOf(local).map(_.copies.values.collect { case r if !isOffline(r) => r.storeId }.toSet).getOrElse(Set())
 
   /** The registry of `sds`, while it is the attached state of its device */
   def copiesOf(sds: LocalStorageDeviceState): Option[DeviceCopies] =
@@ -451,8 +465,15 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def markedLost(site: String, storePath: os.Path): Unit =
     shadow(site):
       copiesAt(storePath).foreach: (copies, storeId) =>
-        if !copies.copies.get(storeId).exists(_.phase == Phase.Lost) then
-          copies.setPhase(storeId, Phase.Lost)
+        copies.copies.get(storeId) match
+          case None =>
+            // Put back at its path after the device's load (a restore finishing late): learned, as readAtLoad learns
+            logger.warn(s"The copy of store $storeId at $storePath was not known to the copy registry. Learned at " +
+                        s"$site, Lost")
+            learnedCopies :+= s"device ${copies.deviceId}: $storeId learned at $site, Lost"
+            copies.register(storeId, Phase.Lost)
+          case Some(r) if r.phase != Phase.Lost => copies.setPhase(storeId, Phase.Lost)
+          case Some(_) => ()
 
   /** A marker below the copy's phase marker, or its phase marker, was removed from the copy at `storePath`: its phase
    *  is what its remaining markers say (CopyPhase), Unread where they cannot be read */

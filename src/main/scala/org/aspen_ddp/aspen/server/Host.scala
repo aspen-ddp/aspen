@@ -563,6 +563,12 @@ class Host(val client: AspenClient,
                                           problems.mkString("\n  "))
     case _ => ()
 
+  /** Test-only, on the control thread (lockstep: the test thread): registers in the copy registry the store
+   *  directories a test placed by hand on loaded device `deviceId` after its load, as the device's load registers the
+   *  directories it finds (HostCopies.rescan). Returns the stores registered */
+  private[aspen] def testingOnlyRescan(deviceId: StorageDeviceId): List[StoreId] =
+    deviceControl.devices.devices.get(deviceId).toList.flatMap(deviceControl.copyRegistry.rescan)
+
   /** The components, for tests. */
   private[aspen] def control: DeviceControl = deviceControl
 

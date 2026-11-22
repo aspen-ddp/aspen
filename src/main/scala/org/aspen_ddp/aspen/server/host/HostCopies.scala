@@ -184,6 +184,18 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
             heldForSync += sds.storageDeviceId -> storeId
             sds.copies.setUnsynced(storeId, true)
 
+  /** Test-only (Host.testingOnlyRescan): registers each store directory on `sds` that has no record, with its phase,
+   *  as `attach` registers the directories a device load finds: copies a test placed by hand after the load. Records
+   *  already there are left as they are, and so is the path of a rebuild whose finish is still to be recorded
+   *  (StoreRebuilds.finishUnrecorded): its completion's handler records it. Returns the stores registered */
+  def rescan(sds: LocalStorageDeviceState): List[StoreId] =
+    copiesOf(sds).toList.flatMap: copies =>
+      storeDirectories(sds.devicePath).collect:
+        case (storeId, path) if !copies.copies.contains(storeId) &&
+                                !ctx.rebuilds.finishUnrecorded(sds.storageDeviceId, storeId) =>
+          copies.register(storeId, CopyPhase.known(path).getOrElse(Phase.Unread))
+          storeId
+
   /** As attach, listing the device itself (ControlFixture.injectLoadedDevice). A listing that fails registers none */
   def attach(sds: LocalStorageDeviceState): Unit =
     val children =
@@ -702,16 +714,23 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
    *   - a record's phase is not the phase its directory's markers read, for records neither Unread nor unsynced;
    *   - a store directory with a config has no record;
    *   - a record has no directory, but one whose create is still placing it (Work.Create).
-   *  Stats and reads that fail are skipped: they say nothing. Empty when consistent. */
+   *  Stats and reads that fail are skipped: they say nothing. A store a rebuild runs for on the device whose
+   *  completion's handler has not yet recorded its copy (StoreRebuilds.finishUnrecorded) is skipped whole: its finish
+   *  places the copy off the control thread, ahead of the handler. A device whose directory is known absent (pulled
+   *  from its running host) is skipped. Empty when consistent. */
   def verifyAgainstDisk(): List[String] =
     ctx.devices.devices.toList.sortBy(_._1.uuid).flatMap: (id, sds) =>
       if !attached.get(id).exists(_ eq sds) then
         List(s"device $id is loaded but not attached to the copy registry")
+      else if Try(FileStat.isDir(sds.devicePath)).toOption.contains(false) then
+        // The device itself is gone (a drive pulled from its running host): its disk says nothing of its copies
+        Nil
       else
-        val records = sds.copies.copies
+        val placing = (storeId: StoreId) => ctx.rebuilds.finishUnrecorded(id, storeId)
+        val records = sds.copies.copies.filterNot((storeId, _) => placing(storeId))
         val onDisk =
-          try storeDirectories(sds.devicePath).filter((_, path) =>
-            FileStat.existence(path / StoreConfig.configFilename).contains(true))
+          try storeDirectories(sds.devicePath).filter((storeId, path) =>
+            !placing(storeId) && FileStat.existence(path / StoreConfig.configFilename).contains(true))
           catch case NonFatal(t) => Nil
         // A create's record is registered at its open, before its create places the copy (off the control thread
         // for FSIF): its directory may not be there yet

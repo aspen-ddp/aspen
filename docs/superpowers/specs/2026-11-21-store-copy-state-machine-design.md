@@ -1,5 +1,9 @@
 # Store copy state machine
 
+**Status:** stage 1 (registry over today's disk) is done, 2026-11-22 (plan
+`docs/superpowers/plans/2026-11-21-store-copy-state-machine-stage1.md`, commits `cde3d375..` on main). Stages 2 and 3
+are not started (`Todo.txt`). The stage 1 audit findings below are kept: stages 2 and 3 build from them.
+
 ## Intent
 
 A store copy's lifecycle (served, closed, lost, retiring, retired, rebuilt, transferring in or out) is currently
@@ -262,6 +266,34 @@ one match, ordered by phase, then entry status.
   refusal) and `retireForeignCopy`'s staging-checkpoint dance. The latter is kept only to the extent that a foreign
   copy may have served since a first pass began: that copy is Lost, and the checkpoint rule stays.
 
+**Stage 1 status.** Stage 1 kept the markers (the phase is read from them by `CopyPhase`, the one ranking,
+RR > TO > TI > RC), so the items tied to the on-disk format wait for stage 2.
+- Gone: `pendingMarkerRemovals` and both marker-removal special cases (every marker write and removal goes through
+  `CopyMarkers`, durable, with `unsynced` for a failed sync); the two "is a rebuild running" predicates (one
+  `HostCopies.rebuilding(stages)`, each caller naming its stages); the three reinstate predicates (one
+  `HostCopies.mayReinstateOut`); `keepMarkedCopyOffline` and `keepUnpromotedCopyOffline`; and every in-memory set the
+  Intent lists except those below (the router's `offline`, `loading` and `awaitingDevice`, `offlineStores`,
+  `storesAwaitingRetry`, `buildRetryWaits`, `silenced`, `droppingCrlState`, `closingForTransfer`, `retiring`,
+  `transferringIn`, `rebuildingStores`, `abandonedRebuilds`, and `opensStarted`). Silence is derived; opens, retries,
+  closes and retires are a copy's Activity; Create, Rebuild, TransferIn and TransferOut are its Work.
+- Kept until stage 2: `StoreDirMarkers` and the marker constants (the reconcile passes' single-marker tests),
+  `keepRebuiltStoreOffline` and its empty `transferring-out` marker (Parked), and `startIn`'s path-collision
+  branches.
+- Kept, because Work and Activity cannot hold what they carry:
+  - `pendingCreateFlips` (`StoreRebuilds`): `Work.Create` ends when the copy is served, on purpose, so a rebuild or
+    transfer out of the served store never overlaps the create (I3). The flip out of Initializing that follows
+    touches no copy, and only stops a check meanwhile from creating the store again.
+  - `recordingTransfersIn` (`StoreTransfers`): it holds the promise a device shutdown waits on, and an abandon's stage
+    can overlay the Recording stage.
+  - `runningRebuilds` (`StoreRebuilds`): it holds the `StoreRebuild` handle a cancel needs and the slot's settled
+    promise. It also counts slots, and keeps a rebuild single flight across its device's unload, which drops the
+    device's Work.
+  - `closedForShutdown` (`DeviceShutdown`): a cancelled shutdown leaves the stores it closed offline with nothing on
+    disk to say so, and the record of a closed copy is Idle like any other offline copy. Stage 3's decision function
+    may make it a case of `reloadClosedStores`'s rule (the open question on Parked).
+  - `declaredMissing` (mirrored as the device's `missing`), `transferInRetries`, and the retry backoffs, which are not
+    copy state.
+
 ### What stays
 
 `FileStat` everywhere a phase directory is listed; the Missing Stores rule (Active entry, no Live copy, no work →
@@ -273,7 +305,9 @@ the device-level markers.
 
 Each stage leaves the full suite green and is reviewable on its own.
 
-1. **Registry over today's disk.**
+1. **Registry over today's disk.** Done (2026-11-22). The registry is authoritative; every lockstep test host fails
+   its drain on a fact or claim violation and on any disagreement with the disk (`Host.Seams.verifyCopyRegistry`).
+   What it removed and kept: "Stage 1 status" under "What disappears".
    - Introduce `Phase`, `CopyRecord`, `Activity`, `Work` and `DeviceCopies`. Phase is computed from the marker
      files by one function, the only one that reads markers.
    - Derive router silence. Delete the in-memory sets listed above.

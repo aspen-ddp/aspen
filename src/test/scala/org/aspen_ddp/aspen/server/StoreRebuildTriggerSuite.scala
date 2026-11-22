@@ -22,11 +22,23 @@ import scala.concurrent.{Future, Promise}
 /** A StoreRebuild that does nothing until the test resolves it. */
 private class RecordedRebuild(val storeId: StoreId,
                               val storageDeviceId: StorageDeviceId,
-                              val episode: Option[UUID] = None) extends StoreRebuild:
+                              val episode: Option[UUID] = None,
+                              val devicePath: Option[os.Path] = None) extends StoreRebuild:
   val promise: Promise[Unit] = Promise()
   def complete: Future[Unit] = promise.future
   @volatile var cancelled: Boolean = false
   def cancel(): Unit = cancelled = true
+
+  /** Completes it as RebuildingStore.finish does: its copy placed at the store's path first, a store config and the
+   *  rebuild-complete marker of its episode */
+  def placeAndComplete(): Unit =
+    val dir = devicePath.get / storeId.directoryName
+    os.makeDir.all(dir)
+    os.write.over(dir / StoreConfig.configFilename,
+      StoreConfig(storeId, StoreConfig.RocksDB(None), None,
+        org.aspen_ddp.aspen.common.ida.Replication(3, 2)).yamlConfig)
+    os.write.over(dir / RebuildingStore.RebuildCompleteMarkerFile, RebuildingStore.rebuildCompleteContent(episode))
+    promise.success(())
 
 private class RecordingRebuildFactory extends StoreRebuildFactory:
   val created: mutable.ListBuffer[RecordedRebuild] = mutable.ListBuffer()
@@ -37,7 +49,7 @@ private class RecordingRebuildFactory extends StoreRebuildFactory:
                     devicePath: os.Path,
                     backends: BackendOpener,
                     episode: Option[UUID]): StoreRebuild =
-    val r = new RecordedRebuild(storeId, storageDeviceId, episode)
+    val r = new RecordedRebuild(storeId, storageDeviceId, episode, Some(devicePath))
     synchronized:
       created += r
     r
@@ -155,7 +167,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       // The first rebuild will complete and trigger a device check. Arm a second lookup
       // that returns a state where store 0 is now Active and store 1 is still Rebuilding.
       second = recorded(host).armLookup(deviceA)
-      _ = factory.created.head.promise.success(())
+      _ = factory.created.head.placeAndComplete()
       _ <- waitForTransactionsToComplete()
       active = (storeN(0), StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))
       oneRebuilding = deviceState(deviceA, Map(active, rebuilding(storeN(1))))
@@ -1199,7 +1211,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ <- yieldUntil(factory.created.size == 1)
       // Pre-completed: a re-check of this device right after the failed flip would consume it and restart the store
       _ = recorded(host).armLookup(synthetic).success(rebuildingState)
-      _ = factory.created.head.promise.success(())
+      _ = factory.created.head.placeAndComplete()
       _ <- awaitLoudly("the flip's failure and its backoff")(scheduler(host).pending.contains(Host.RebuildRetryInitialDelay))
       _ <- yieldUntil(factory.created.size == 2, 20)
       restartedImmediately = factory.created.size

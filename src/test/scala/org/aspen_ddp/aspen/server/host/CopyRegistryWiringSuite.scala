@@ -838,6 +838,8 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     host.control.loader.startOpen(local, cfg, storePath, create = false, None, Some(() => served = true))
     val errors = host.control.copyRegistry.takeRegistryErrors()
     val activity = copies.copies.get(sid(0)).map(_.activity)
+    // The record put back to what the disk reads, for the drain's disk check (Lost -> Live is no legal move)
+    copies.applyPhase(sid(0), Phase.Live, Phase.Live)
     host.testingOnlyHandleEvents()
     Future:
       errors.size should be(1)
@@ -1113,3 +1115,50 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
         loadsWhileHeld should be(loadedAtStart)
         loads should be(loadedAtStart + 1)
         consistent(host)
+
+  // ---- Task 9: the disk check runs in every host test ----
+
+  // A rebuild's finish places its copy off the control thread, ahead of its completion's handler: a drain in between
+  // finds a directory with no record. Its store is exempt from the check until the handler records the copy, and
+  // only its store: a copy placed by hand meanwhile is still reported, until a rescan registers it
+  atest("a rebuild's copy placed ahead of its completion's handler is exempt from the disk check until recorded"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, deviceA)
+    val factory = new HeldRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    val episode = UUID.randomUUID()
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.setRebuilding(sid(0), episode))
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.rebuilds.startRebuild(local, sid(0), Some(episode), acceptLoss = false)
+      _ <- pumpUntil(host, factory.created.nonEmpty)
+      // Where finish places the copy, before its future completes
+      placed = writeStoreConfig(dev, sid(0))
+      _ = os.write.over(placed / RebuildingStore.RebuildCompleteMarkerFile,
+                        RebuildingStore.rebuildCompleteContent(Some(episode)))
+      unrecordedWhilePlacing = host.control.rebuilds.finishUnrecorded(deviceA, sid(0))
+      // The draining check passes: the store is exempt
+      _ = host.testingOnlyHandleEvents()
+      exempt = host.control.copyRegistry.verifyAgainstDisk()
+      // A copy put at another store's path meanwhile is not exempt
+      _ = writeStoreConfig(dev, sid(1))
+      handPlaced = host.control.copyRegistry.verifyAgainstDisk()
+      rescanned = host.testingOnlyRescan(deviceA)
+      _ = factory.created.head.promise.success(())
+      _ <- awaitRebuild(host, deviceA, sid(0))
+      recordedAfterFinish = host.control.rebuilds.finishUnrecorded(deviceA, sid(0))
+    yield
+      unrecordedWhilePlacing should be(true)
+      exempt should be(Nil)
+      handPlaced.size should be(1)
+      handPlaced.head should include(sid(1).directoryName)
+      handPlaced.head should include("has no record")
+      rescanned should be(List(sid(1)))
+      recordedAfterFinish should be(false)
+      recorded(host).rebuildOutcomes((deviceA, sid(0))) should be(RebuildOutcome.Adopt)
+      phases(host, deviceA) should be(Map(sid(0) -> Phase.Live, sid(1) -> Phase.Live))
+      consistent(host)

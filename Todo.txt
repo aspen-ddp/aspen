@@ -30,6 +30,30 @@ Q = transaction-requirements, RP = repair-process, RB = rebuild-process, SL = sy
 X = cross-document-review (its section 5 lists contradictions between documents).
 
 
+Store copy state machine (docs/superpowers/specs/2026-11-21-store-copy-state-machine-design.md)
+------------------------------------------------------------------------------------------------
+
+Stage 1 (the copy registry over today's markers, derived router silence, uniform marker durability) is done; the
+spec's "What disappears" has its Stage 1 status. Every lockstep test host checks the registry against the disk at
+each drain (Host.Seams.verifyCopyRegistry). This list had no open item that stage 1 subsumes.
+
+SCM-2. Stage 2, phase directories. [L]
+  Replace the four store-directory markers with the spec's phase layout and its atomic, durable moves (CopyMoves),
+  and give copies copyId names. Delete StoreDirMarkers, the marker constants and CopyPhase's marker reading;
+  keepRebuiltStoreOffline and its empty transferring-out marker become Parked; startIn's path-collision branches
+  go. Bootstrap (cmdline, DefaultBackendOpener.createStore) creates into live/, and the transfer service ships from
+  outbound/ and stages into transferring-in/. Decide the spec's open question on Outbound keeping a Rebuilt copy's
+  episode. Rename the marker references in server/host, server/rebuild and server/crl CLAUDE.md and in
+  docs/safety (rebuild-process, crash-recovery-log, systemic-loss-protection). Port the suites by replacing marker
+  writes with phase placement; the disk check then reads phases from directories.
+
+SCM-3. Stage 3, the reconcile as a decision function. [L]
+  Extract decide(entries, copies, work, HostFacts) and replace the reconcile passes with one match over its
+  Actions. Add the exhaustive test over every entry status x up to two copies x phase x activity x work, asserting
+  I1-I5, the store-copies release rule and "no Action loads a non-Live copy". Decide whether Parked merges into Live
+  with an Offline entry, and whether closedForShutdown becomes a case of that rule.
+
+
 PRIORITY 0: design rules
 ------------------------
 

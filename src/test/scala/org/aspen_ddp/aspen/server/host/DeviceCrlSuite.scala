@@ -1161,6 +1161,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       // The drop is queued on the CRL thread ahead of this read
       leftInCrl = held(host.control.devices.devices(deviceA).crl, storeId)
       _ <- writeRocksStore(deviceDir, storeId)
+      _ = landRebuiltCopy(storeDir, rebuilds.created.head.episode)
       _ = rebuilds.created.head.promise.success(())
       _ <- pumpWithTx(host, host.control.router.loaded.contains(storeId))
     yield (discarded, leftInCrl)
@@ -1297,6 +1298,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpWithTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty)
       keptWhileRebuilding = copies.forall(os.exists(_))
       _ <- writeRocksStore(deviceDir, storeId)
+      _ = landRebuiltCopy(storeDir, rebuilds.created.head.episode)
       _ = rebuilds.created.head.promise.success(())
       _ <- pumpWithTx(restarted, restarted.control.router.loaded.contains(storeId) && copies.forall(!os.exists(_)))
       deletedOnceActive = copies.forall(!os.exists(_))
@@ -2469,6 +2471,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpWithTx(restarted, requestsFailed.get > 0 && restarted.control.reconciler.activeDeviceChecks.isEmpty)
       // The directory comes back (a restore finishing late) after the request failed
       _ = os.move(aside, storeDir)
+      _ = restarted.testingOnlyRescan(deviceA)
       _ = failRequests.set(false)
       _ = restarted.control.reconciler.checkAll()
       _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)

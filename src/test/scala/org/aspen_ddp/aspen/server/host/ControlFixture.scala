@@ -347,7 +347,7 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
 
   /** The seams that make a Host record and, where a test asks, hold or fail what the old RecordingHost did. `None`
    *  fields keep the production behaviour; the schedule of retries and timeouts goes through `scheduler`. */
-  def seams(scheduler: ControlScheduler, verifyCopyRegistry: Boolean = false): Host.Seams =
+  def seams(scheduler: ControlScheduler, verifyCopyRegistry: Boolean = true): Host.Seams =
     Host.Seams(
       verifyCopyRegistry = verifyCopyRegistry,
       // A throw of the copy registry's silence path fails the test
@@ -522,7 +522,7 @@ trait ControlFixture:
                         hostId: HostId = HostId.BootstrapHostId,
                         keepCheckAllDevices: Boolean = false,
                         keepInitializeTaskExecutor: Boolean = false,
-                        verifyCopyRegistry: Boolean = false): Host =
+                        verifyCopyRegistry: Boolean = true): Host =
     val threading = new LockstepThreading(ec)
     val scheduler = new ManualControlScheduler(threading.controlEvents)
     val recording = new RecordingSeams(ec, failFirstStoreLoad)
@@ -542,7 +542,7 @@ trait ControlFixture:
 
   /** `seams` for a host a suite builds itself, outside newHost: a throw of its copy registry's silence path fails
    *  the test, as every ControlFixture host's does */
-  protected def compared(seams: Host.Seams = Host.Seams.default): Host.Seams = seams.copy(strictCopyRegistry = true)
+  protected def compared(seams: Host.Seams = Host.Seams.default): Host.Seams = seams.copy(strictCopyRegistry = true, verifyCopyRegistry = true)
 
   /** What `host` did, and the knobs that make it do something else. */
   protected def recorded(host: Host): RecordingSeams = rigs.get(host).seams

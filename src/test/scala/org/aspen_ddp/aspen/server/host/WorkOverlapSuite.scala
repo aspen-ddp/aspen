@@ -443,8 +443,10 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- check(host, source, rebuilding)
       _ <- yieldUntil(factory.created.nonEmpty)
-      // Where the rebuild placed its copy
+      // Where the rebuild placed its copy, with the rebuild-complete marker of its episode as finish places it
       storePath = writeStoreConfig(deviceDir, shipped)
+      _ = os.write.over(storePath / RebuildingStore.RebuildCompleteMarkerFile,
+                        RebuildingStore.rebuildCompleteContent(Some(episode)))
       devPtr <- client.getStorageDevicePointer(source)
       _ = net.reportCommitAsUnknown(touches(devPtr))
       _ = tclient.beforeRetry =

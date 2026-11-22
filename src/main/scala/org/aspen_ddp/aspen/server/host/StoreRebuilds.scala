@@ -95,6 +95,12 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private def slotsTaken(except: Option[(StorageDeviceId, StoreId)]): Int =
     runningRebuilds.size + registry.discards(except)
 
+  /** Test-only (HostCopies.verifyAgainstDisk): whether a rebuild of `storeId` runs on device `deviceId` and its
+   *  completion's handler has not yet recorded its copy. RebuildingStore.finish places the copy off the control thread,
+   *  before the handler runs, so the store's path may meanwhile hold a copy the registry does not know yet */
+  private[server] def finishUnrecorded(deviceId: StorageDeviceId, storeId: StoreId): Boolean =
+    runningRebuilds.get(storeId).exists(r => r.deviceId == deviceId && !r.finishRecorded)
+
   /** The rebuild slots taken now (tests) */
   private[server] def rebuildSlotsTaken: Int = slotsTaken(None)
 
@@ -359,7 +365,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           logger.error(s"Rebuild factory's complete threw for store $storeId: $t")
           Future.failed(t)
 
-      runningRebuilds += storeId -> StoreRebuilds.RunningRebuild(sr, settled)
+      runningRebuilds += storeId -> StoreRebuilds.RunningRebuild(sr, deviceId, settled)
       // From Queued, or from the discard that hands its slot to it
       setWork(storeId, deviceId, Some(Work.Rebuild(episode, RebuildStage.Running)))
       ctx.publishView()
@@ -371,6 +377,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       completeFuture.onComplete:
         case Success(_) =>
           // The rebuild placed its finished copy at the store's path (RebuildingStore.finish, off the control thread)
+          runningRebuilds.get(storeId).filter(_.settled eq settled).foreach: r =>
+            runningRebuilds += storeId -> r.copy(finishRecorded = true)
           ctx.copyRegistry.rebuilt("rebuild finish", local, storeId,
             Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)))
           // Loading is downstream of the metadata decision, not ahead of it. An unconditional
@@ -916,8 +924,10 @@ object StoreRebuilds:
    *  Rebuilding episode and whether the entry accepted the loss of unreadable objects */
   private case class HeldRebuild(deviceId: StorageDeviceId, episode: Option[UUID], acceptLoss: Boolean)
 
-  /** A running rebuild's handle, and the promise completed once it has released its slot */
-  private final case class RunningRebuild(sr: StoreRebuild, settled: Promise[Unit])
+  /** A running rebuild's handle, the device it runs on, the promise completed once it has released its slot, and
+   *  whether its completion's handler has recorded the copy it placed (`finishRecorded`) */
+  private final case class RunningRebuild(sr: StoreRebuild, deviceId: StorageDeviceId, settled: Promise[Unit],
+                                          finishRecorded: Boolean = false)
 
   /** Host.StoreFailStopped's `what` for a store whose CRL recovery failed */
   val RecoveryFailed = "failed to recover its transactions from its CRL"

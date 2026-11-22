@@ -102,13 +102,18 @@
   `HostCopies.strict` (`Host.Seams.strictCopyRegistry`, every ControlFixture host; implied by `verifyCopyRegistry`)
   it propagates as `SilenceFailure`, which `fact` and `claim` never swallow. Every lockstep drain of a strict host
   fails on any violation the registry recorded, a fact's or a refused claim's (R21, R22); production logs them at
-  error, applies the fact, and backs off the claim. With `verifyCopyRegistry` (TestNetwork; ControlFixture's
-  `newHost(verifyCopyRegistry = ...)`)
+  error, applies the fact, and backs off the claim. With `verifyCopyRegistry` (every lockstep test host:
+  TestNetwork, every ControlFixture host, `ControlFixture.compared` seams, FsifIntegrationSuite)
   each drain also throws on any `verifyAgainstDisk` mismatch (phase, unrecorded config'd directory, record without
-  directory). A copy put back at its path after its device's load (a restore finishing late) is learned where it is
-  marked rebuild-required (`markedLost`). The drain check can land between an off-thread step and its
-  control-thread handler (a rebuild's copy placed before its completion callback runs), so a test does not drain
-  while such a step is in flight
+  directory). It skips only: an Unread or unsynced record's phase, and stats that fail; a create's record before its copy is placed (`Work.Create`); the store of a rebuild
+  whose completion's handler has not yet recorded the copy its finish placed off the control thread
+  (`StoreRebuilds.finishUnrecorded`, from the rebuild's start until that handler, so a drain may land in between);
+  untracked records; and a loaded device whose directory is known absent (a drive pulled from its running host).
+  A copy put back at its path after its device's load (a restore finishing late) is learned where it is
+  marked rebuild-required (`markedLost`). A test that places a copy by hand after its device's load registers it
+  with `host.testingOnlyRescan(deviceId)` (`HostCopies.rescan`: each unrecorded store directory with its phase, as
+  the load registers them) or `ControlFixture.placedCopies`; a fake rebuild places its copy as finish does (a config
+  and the `rebuild-complete` marker of its episode) before completing
 - The reconcile passes select from the device's offline copies (`HostCopies.offlineCopies`: records Idle or awaiting
   a load retry, with no work on the device): the Deleted Stores, Lost CRL, Abandoned Transfers Out, Completed
   Transfers In and Completed Rebuilds passes and `reloadClosedStores`. A copy that a transfer in, rebuild, create or

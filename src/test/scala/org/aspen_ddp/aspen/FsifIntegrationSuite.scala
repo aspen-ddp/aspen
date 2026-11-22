@@ -39,7 +39,7 @@ private object FsifTestHost:
             systemId: UUID,
             hostRoot: os.Path,
             ec: ExecutionContext): Host =
-    val seams = Host.Seams(strictCopyRegistry = true, wrapIoHandler = Some: queue =>
+    val seams = Host.Seams(verifyCopyRegistry = true, wrapIoHandler = Some: queue =>
       new CompletionHandler:
         override def complete(op: Completion): Unit =
           queue.complete(op)

@@ -1,8 +1,13 @@
 # Store copy state machine
 
 **Status:** stage 1 (registry over today's disk) is done, 2026-11-22 (plan
-`docs/superpowers/plans/2026-11-21-store-copy-state-machine-stage1.md`, commits `cde3d375..` on main). Stages 2 and 3
-are not started (`Todo.txt`). The stage 1 audit findings below are kept: stages 2 and 3 build from them.
+`docs/superpowers/plans/2026-11-21-store-copy-state-machine-stage1.md`, commits `cde3d375..` on main). Stage 2 (phase
+directories replacing the per-copy marker files) is done, 2026-11-22 (plan
+`docs/superpowers/plans/2026-11-22-store-copy-state-machine-stage2.md`, commits `e104a53d..59c39437` on branch
+`state_refactor`, plus test-only flake fixes `44e08ebe`, `34739243` and `ad7eedb1`); its decisions are in "Stage 2
+decisions" below, with an amendment pointer where each changes the text. Stage 3 is not started (`Todo.txt`). The
+stage 1 audit findings below are kept: stage 3 builds from them. The sections below describe the design as drafted;
+the four marker files they name are history after stage 2.
 
 ## Intent
 
@@ -105,10 +110,14 @@ a loadable phase is not in the directory the loader reads, so it cannot be loade
   first made on this device: a create in `creating/`, a transfer's staging and a rebuild's staging. It never changes
   across moves on the device. A copy shipped to another device gets a new `copyId` there. The store id comes from
   the name, never from parsing the contents (as `StoreCopies.pendingDeleteStore` already does).
-- A phase that carries a parameter holds it in one file, `phase-param`, written durably into the copy before the
-  move into that phase. Outbound and Arrived carry the transfer id, and Rebuilt carries the episode. Only the phase
-  the location names reads it, and the next move that needs a parameter overwrites it. A stale `phase-param` is
-  therefore inert.
+- A phase that carries a parameter holds it in its own file, `phase-param.<phase directory>` (`phase-param.arrived`,
+  `phase-param.outbound`, `phase-param.rebuilt`), written durably into the copy before the move into that phase.
+  Outbound and Arrived carry the transfer id, and Rebuilt carries the episode. Only the phase the location names
+  reads its file, and a move writes only its target's file. A file of another phase is therefore inert, and a failed
+  rename or a crash before it leaves the source's parameter as it was. (As first drafted, one file `phase-param` was
+  overwritten by the next move, which was claimed inert; that is false for a move between two parameter phases, such
+  as Rebuilt(e) to Outbound(t): a failed rename would leave `rebuilt/` reading t. Amended by R-T1, "Stage 2
+  decisions".)
 - The files that are not phase (`aspen-store-config.yaml`, `incarnation`, `acceptor-since`, `inherited-votes`,
   `arrived-at`, `crl_save.log`, `lost-crl-state.log`, `lost-crl-entries.log`) keep their meaning and move with the
   copy.
@@ -133,10 +142,15 @@ checks that neither RocksDB nor FSIF records its own absolute path.
 | T7 | Outbound | Live | transfer aborted or abandoned: entry Active, no `transferDevice` (`reinstateAbandonedOut`, adoption) | no Live copy |
 | T8 | `transferring-in/<id>` | Arrived(tid) | promotion after validating the save file | no Arrived copy for another transfer (else delete it first) |
 | T9 | Arrived | Live | pool update committed (`recordTransferIn`, `completeTransfersIn`); `arrived-at` written first | no Live copy |
-| T10 | Live, Outbound, Arrived, Rebuilt, Parked | Lost | backend failure or fail-stop, failed close, missing incarnation, unloadable save file, lost device CRL (except copies that hold their own state), or a copy that stopped being the owner's | copy closed |
+| T10 | Live, Outbound, Arrived, Rebuilt, Parked | Lost | backend failure or fail-stop, failed close, missing incarnation, unloadable save file, lost device CRL (except copies that hold their own state), or a copy that stopped being the owner's | copy closed (P5: a served copy's close ends first, so the move never happens while its backend is open) |
 | T11 | Lost | Retired | retire: save CRL state into `lost-crl-state.log`, `dropStore`, move | the store has no running retire on this device |
 | T12 | Retired | gone | `StoreCopies.release`, rename-first via `deleting/` | store Active on its owner device |
 | T13 | Arrived | gone | unusable or stale arrival, rename-first (source still owns the state) | none |
+
+Amendments from stage 2 (see "Stage 2 decisions"): a retired copy is not recorded, and `Phase.Retired` is only a move
+target (P3, R-P1); T6's sources are Live, Rebuilt, Parked and Outbound of the same or another transfer, and the stage
+1 combination of a transfer in with a transfer out is gone (P10, as amended); T10 is made only when the copy's close
+ends (P5, extended); T8's staging is per attempt (P7).
 
 Notes on the table:
 
@@ -165,10 +179,11 @@ Notes on the table:
 
 `CopyMoves.move(copy, to: Phase, param: Option[String])`:
 
-1. write `phase-param` durably if `param` is set;
+1. write the target phase's `phase-param.<phase directory>` durably if `param` is set;
 2. `DurableFiles.move(from, to)`, which forces both directories.
 
-If step 2's rename succeeds but a directory sync fails, the copy's record takes the new phase with
+If step 2's rename succeeds but a directory sync fails (P11: `DurableFiles.move` throws `MoveNotForced` for exactly this,
+and any other throw means nothing moved), the copy's record takes the new phase with
 `unsynced = true`. An unsynced copy is never loaded, shipped or released. Each device check retries the sync of
 both directories, which `DurableFiles` already makes idempotent, and clears the flag on success. If the rename
 itself fails, the copy stays in its old phase and the action is retried by the pass that issued it. This one rule
@@ -230,7 +245,8 @@ Invariants checked by the registry's moves. A violation is handled as above (app
 claim), and tests assert it never happens:
 
 - I1. At most one Live copy of a store per device. A device load that finds two retires both (T10) and logs an
-  error. The entry is then rebuilt through the normal path.
+  error. The entry is then rebuilt through the normal path. **Amended by P2:** at most one copy of a store per device
+  outside `pending-delete/`, in any phase, with the retire as P2 describes.
 - I2. Only a Live copy has activity Opening or Served.
 - I3. A store has at most one Work per device, and a Work's copy (if any) is on that device.
 - I4. A Retired copy is released only by T12.
@@ -291,7 +307,7 @@ one match, ordered by phase, then entry status.
 - The two "is a rebuild running" predicates (`isRebuilding` vs `rebuildingStoreIds`, which disagree during a
   discard), and the three copies of the "may reinstate an abandoned transfer out" predicate.
 - The path-collision branches of `startIn` (`retireEarlierTenancy`'s path clearing, the "store path already exists"
-  refusal) and `retireForeignCopy`'s staging-checkpoint dance. The latter is kept only to the extent that a foreign
+  refusal; **amended by P1:** the retire itself stays, before a new copy is placed, only the path checks go) and `retireForeignCopy`'s staging-checkpoint dance. The latter is kept only to the extent that a foreign
   copy may have served since a first pass began: that copy is Lost, and the checkpoint rule stays.
 
 **Stage 1 status.** Stage 1 kept the markers (the phase is read from them by `CopyPhase`, the one ranking,
@@ -345,7 +361,7 @@ Each stage leaves the full suite green and is reviewable on its own.
    - Derive router silence. Delete the in-memory sets listed above.
    - Verify I3 and the readers of the silence reason.
    - Expected effect: most of the in-memory bug class is gone, with no format change.
-2. **Phase directories.**
+2. **Phase directories.** Done (2026-11-22; Task 8 is this documentation). The decisions are in "Stage 2 decisions".
    - Replace markers with the layout and `CopyMoves`, and give copies `copyId` names. Delete `StoreDirMarkers` and
      the marker-reading phase function.
    - Update bootstrap (`cmdline`, `DefaultBackendOpener.createStore`) to create into `live/`, and update the
@@ -383,18 +399,142 @@ All deterministic (LockstepThreading) unless noted.
     with the layout, the transition table (by reference to this spec), the registry and derived silence;
   - shorten the store-copies section to "every retire goes through Lost".
 - `server/rebuild/CLAUDE.md`: `rebuild-complete` becomes the Rebuilt phase. `finish` moves the staging copy into
-  `rebuilt/` with the episode as `phase-param`.
+  `rebuilt/` with the episode as `phase-param.rebuilt` (R-T1).
 - `server/crl/CLAUDE.md`, `docs/safety/rebuild-process.md`, `crash-recovery-log.md`, `systemic-loss-protection.md`:
   rename the marker references to phases. No safety argument changes, since each marker maps to one phase.
 - `Todo.txt`: close the items this subsumes.
 
 ## Open questions
 
-- Whether `Outbound` needs to keep a Rebuilt copy's episode in its `phase-param` so the source side can still
-  recognize an Unconfirmed flip after a crash mid-transfer. Today it learns this from the shipped `rebuild-complete`
-  still on its own copy.
+Both questions were resolved in stage 2 (see "Stage 2 decisions").
+
+- Whether `Outbound` needs to keep a Rebuilt copy's episode in its parameter file so the source side can still
+  recognize an Unconfirmed flip after a crash mid-transfer. **Resolved by P8: no.** An Outbound copy goes back to Live
+  (T7) only for an Active entry with no `transferDevice` (`mayReinstateOut`), and Active means the flip committed, so
+  the source needs nothing from the old `rebuild-complete`.
 - Whether `Parked` merges into Live with an Offline entry, if step 1 shows that `reloadClosedStores` and T5 are the
-  same rule.
+  same rule. **Resolved by P9: Parked stays a phase** (the layout's `parked/`), and `reloadClosedStores` stays a
+  Live-copy rule. Stage 3 may revisit it.
+
+## Stage 2 decisions
+
+Decisions the stage 2 plan made where this spec left a choice open or had to be amended, with the controller rulings
+made during execution. Each carries an amendment pointer in the section it changes: P1 under "What disappears", P2
+under I1, P3 and P10 under "Phases and transitions", P5 under T10, R-T1 under "Device layout" and "Uniform move", and
+P8 and P9 close the open questions above. Where this block and the text above disagree, this block governs.
+
+### Constraints
+
+- Run on the current branch (`state_refactor`). No worktree. Never use `git stash`: read an earlier revision with
+  `git show <rev>:<path>`.
+- Persisted-data compatibility is not required (spec Non-goals): there is no migration of flat copies or markers,
+  and devices are recreated.
+- Every existence test under `server/` uses `server.FileStat`. A listing of a phase directory distinguishes a
+  failed listing from an empty one (spec Non-goals). `FileStatUsageSuite` must keep passing.
+- Use os-lib for filesystem work. java.nio only where os-lib has no equivalent (DSYNC channels, directory fsync).
+- Every phase change is one `CopyMoves.move`. It writes the target phase's parameter file (`phase-param.<phase directory>`, R-T1) durably first when
+  that phase carries a parameter, then renames through `DurableFiles.move`. No other code renames a copy between phases.
+- No move is ever made of an installed store's directory. Every phase change happens while the copy is closed
+  (spec Device layout; Step 1 amendment on T10).
+- Each layout name, verbatim: `live/`, `arrived/`, `outbound/`, `rebuilt/`, `parked/`, `lost/`, `pending-delete/`;
+  scratch areas `creating/`, `deleting/`, `transferring-in/<id>/`, `rebuilding/<id>/`; copy name
+  `<storeId.directoryName>.<copyId>`; parameter files `phase-param.arrived`, `phase-param.outbound` and `phase-param.rebuilt` (R-T1).
+- Registry updates stay facts or claims (R22). A move's registry update is a fact. Tests fail on any violation
+  (`Host.Seams.strictCopyRegistry` / `verifyCopyRegistry`). Production logs it at error.
+- Scala 3 quiet syntax, indented if/then/else, no one-line `if a then b` unless clearer.
+- Test priorities: correctness, then reliability (no flaky tests), then speed. Every new test is deterministic
+  (`LockstepThreading`, ControlFixture) unless it names a real-time hop and waits on it with `awaitLoudly`.
+- Full suite: run `sbt Test/compile` first, then `sbt test` with a 70 s Bash timeout. It takes about 50 s idle. A
+  task is done only when the full suite passes.
+- When a subsystem's behaviour changes, update its module CLAUDE.md in the same task (Task 8 does the full rewrite).
+
+### Decisions
+
+- **P1. Retire before placement stays.** `retireEarlierTenancy`, `discardLostStore` and `retireForeignCopy` still
+  retire an earlier copy before a new copy of the store is placed on the device. Unique names remove the path
+  collision, but not the ordering need. An earlier copy's device-CRL entries must be saved (retire step 2) before
+  the new copy's first load, which is a save-file load that drops them (`StoreLoader.awaitCrlLoad`). Only the path
+  checks go: the "store path already exists" refusal, and path clearing as the reason to retire.
+- **P2. At most one copy of a store per device outside `pending-delete/` (I1, strengthened).** The registry stays
+  keyed by `StoreId` per device (`DeviceCopies.copies: Map[StoreId, CopyRecord]`), and `CopyRecord` gains `copyId`.
+  P1 keeps well-behaved code within this rule. A device load that finds a store in more than one copy directory
+  logs an error and moves every one of them to `lost/` (T10). It registers the one with the least `copyId` (Lost),
+  which the normal passes retire, and moves the others into `pending-delete/` whole. They are released like any
+  retired copy. Their files, `crl_save.log` included, stay inside them. The entry is then rebuilt. This is the
+  spec's I1 rule (both retired, store rebuilt), extended to every phase.
+- **P3. Retired copies are not recorded.** As in stage 1, a copy leaves the registry when it reaches
+  `pending-delete/`. `Phase.Retired` exists only as a move target. `StoreCopies.release` lists `pending-delete/`
+  itself, so I4 holds by construction.
+- **P4. A copy gets its `copyId` when it first enters a phase directory.** That happens at the create's rename into
+  `live/`, a rebuild's finish into `rebuilt/`, or a transfer's promotion into `arrived/`. Scratch directories are
+  not copies. During Tasks 2–5 a flat copy gets a fresh `copyId` at its first move into a phase directory. From
+  Task 6 every copy has one (`copyId: UUID`).
+- **P5. A move to Lost waits for the close.** Today `backendFailed` (served), `retireForeignCopy`,
+  `retireUnlistedServed` and `StoreLoader`'s failed unserved backend write `rebuild-required` before the backend
+  closes. Stage 2 moves the copy to `lost/` when its close ends. A failed close moves it too. Purpose
+  `ClosePurpose.FailStop` means "move to Lost when closed". A crash in between leaves the copy in `live/`, and the
+  restart loads it as after any crash: the CRL holds what the backend had not applied, and a backend that is still
+  broken fails its open (`BackendStateLost`) or fails again. Cost if wrong: a fail-stopped copy serves once more
+  after a crash in that window.
+- **P6. A failed listing or `phase-param.*` read at device load leaves the device unloaded** for the next scan, as a
+  failed CRL open does. A parameter file known absent reads as `""`, which matches no transfer or episode.
+  `Phase.Unread` is removed (Task 6).
+- **P7. Transfer staging is per attempt.** `StoreTransfers` passes `<device>/transferring-in/<transferUUID>` as the
+  service's destination directory. The service still extracts into `<that>/<storeDir>`, so `StoreTransferManager`
+  is unchanged apart from paths. Promotion renames `<staging>/<storeDir>` to `arrived/<storeDir>.<newCopyId>`.
+- **P8. Open question 1 is resolved: Outbound does not carry the episode.** An Outbound copy goes back to Live
+  (T7) only for an Active entry with no `transferDevice` (`mayReinstateOut`). Active means the flip committed, so
+  the source needs nothing from the old `rebuild-complete`.
+- **P9. Open question 2 is resolved: Parked stays a phase.** It is the layout's `parked/`, and `reloadClosedStores`
+  stays a Live-copy rule.
+- **P10. Only Live, Rebuilt and Parked copies are T6 sources.** `startOut` refuses, at debug, a copy in any other
+  phase. An Arrived copy whose move to Live failed waits for the Completed Transfers In pass. This replaces the
+  stage-1 TI+TO combination and its transitions (Arrived→Outbound, Outbound→Arrived, Outbound→Rebuilt,
+  Arrived→Rebuilt), which Tasks 4–5 delete.
+- **P11. `DurableFiles.move` reports a rename that landed but was not forced.** It throws
+  `DurableFiles.MoveNotForced(source, target, cause)` when the rename succeeded and a directory sync failed. Any
+  other throw means nothing moved.
+
+### Rulings made during execution
+
+- **R-P1. `Phase.Retired` is a move target only.** Only Lost to Retired is legal. A copy leaves the registry when its
+  move to `pending-delete/` is durable (P3).
+- **R-P2. Hybrid period.** During Tasks 1-5 (before the flat path was removed) marker files inside a copy in a phase
+  directory were inert, and `CopyMoves` stripped them. Stage 2 ended with no marker anywhere (Task 6).
+- **R-T1. One parameter file per phase (amends "Device layout").** Each phase keeps its parameter in
+  `phase-param.<phase directory>` (`CopyLayout.paramFile(phase)`, `readParam(copyPath, phase)`). A move writes only the
+  target phase's file, durably, before the rename; files of other phases are inert. The spec's single `phase-param`,
+  "overwritten by the next move, so inert", is false for a move between two parameter phases (Rebuilt(e) to
+  Outbound(t)): a failed rename or a crash would leave `rebuilt/` reading t. The single-file wording is replaced
+  everywhere in this spec.
+- **P5 extended.** Every device unload (shutdown, relinquish, Failed retirement, CRL failure) waits for the device's
+  closes whose end moves a copy to `lost/`, so T10 is always made while the device is attached.
+  `ClosePurpose.Reload` (a failed CRL load, a failed save-file removal) closes without moving the copy to Lost. A move
+  to Lost that fails holds the copy offline in memory (`CopyMoves.pendingLost`) and is retried at each device check;
+  `CopyMoves.move` refuses (NotMoved) a record that is Opening, Served or Closing.
+- **P10 as amended.** The T6 ship-source set is Live, Rebuilt, Parked and Outbound(_). Outbound(tid) of the same
+  transfer is a reship without a move; Outbound(other) goes T7 (back to Live) and then T6. No copy moves while an
+  earlier send of its store is still registered (`startOut` refuses at debug; the receiver retransmits). A move out of
+  Live drops the copy's load retry; a move into Live retargets it.
+- **Earlier tenancy.** `startIn` acts on an earlier tenancy's copy (retires it, or takes a served Live one out of
+  service as `retireUnlistedServed` does: FailStop close, then Lost, then retire) only after a fresh read of the
+  device's own `StorageDeviceState` still shows the store TransferringIn with this transfer id, holding the
+  TransferIn work's RetiringEarlierTenancy stage across the read. Against the reconcile's pre-commit snapshot the
+  transfer's own copy, just moved Live by its pool update, would look like an earlier tenancy. Waits on an opening
+  copy, an open begun during the read, or a failed read schedule a bounded device re-check
+  (`scheduleDeviceRecheck`).
+- **Initializing over Lost.** An Initializing entry whose store has a Lost copy on the device counts as created:
+  `createNewStore` flips it out of Initializing and the Lost CRL pass rebuilds it (the copy may have served before its
+  flip, and a fresh create could drop what it acknowledged).
+- **Release hold.** `StoreCopies.release` keeps a `pending-delete/` copy while the device holds a Lost copy of the same
+  store: an Active entry over a Lost copy is not "Active on its owner device" in substance (P2's extra copies would
+  otherwise be released at the first check).
+- **Copies are directories.** A child of a phase directory is a copy only if it is a directory (a failed stat counts as
+  a copy). A non-directory, or a name that is not a copy name, is a stray: logged once, never touched.
+- **`RebuildingStore.start`** runs on the control thread; its existing-copy lookup comes from the registry, not from a
+  listing.
+- **Deletions.** Per-attempt staging (P7) and the deletion of `StoreDirMarkers` and `CopyMarkers` were done in Task 5;
+  `CopyPhase.read`, `CopyPhase.known` and `Phase.Unread` were deleted in Task 6.
 
 ## Stage 1 audit findings
 

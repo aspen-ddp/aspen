@@ -45,7 +45,8 @@ outline, Tests, Documentation. Stage 1 is done: plan `docs/superpowers/plans/202
 
 ## Decisions this plan makes (the spec leaves them open or must be amended)
 
-Task 8 copies these into the spec.
+Task 8 copied these into the spec ("Stage 2 decisions"), which also holds the rulings made during execution. The
+single `phase-param` file named below was superseded by R-T1: each phase keeps its own `phase-param.<phase directory>`.
 
 - **P1. Retire before placement stays.** `retireEarlierTenancy`, `discardLostStore` and `retireForeignCopy` still
   retire an earlier copy before a new copy of the store is placed on the device. Unique names remove the path

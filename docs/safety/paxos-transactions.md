@@ -876,7 +876,7 @@ changes, overwritten revisions), and memory cannot be infinite. The fix is a tim
   `StoreLoader`. Normally it is `min(load + MaxStartLead, JoinCeiling.boundAtLoad)`: before its load the store may have
   joined, and forgotten, a T started up to `MaxStartLead` ahead of its clock, but never one at or above the join ceiling
   its previous life on this host ran under (below). A store that arrived from another host (a transfer in,
-  `StoreTransfers.clearTransferredInMarker`; an adoption, `DeviceDiscovery.bringIntoService`, before it rewrites `owning-host`, and
+  `StoreTransfers.bringArrivedLive`; an adoption, `DeviceDiscovery.bringIntoService`, before it rewrites `owning-host`, and
   a store directory whose stat fails leaves the adoption to the next scan) durably writes `StoreLoader.ArrivedAtFile`
   before it can load here, and a stat or read of that file that fails counts as an
   arrival now (`StoreLoader.readArrivedAt`); a load less than `AcceptorSinceMargin` (10 s) after the arrival uses `load + AcceptorSinceMargin`,

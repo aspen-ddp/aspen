@@ -649,7 +649,7 @@ no CRL state still holding a blind Insert of the key that the store applied rema
 applied (10.5c).
 
 A fail-stopped store drops every transaction message, read, repair and heartbeat, and `Store.onFailStop` has its host
-mark it rebuild-required and unload it. Every fail-stop is a lost-store declaration (Backlog.txt, "System-level
+move its copy to `lost/` (when its backend closes) and unload it. Every fail-stop is a lost-store declaration (Backlog.txt, "System-level
 protection against correlated lost store declarations"), so only a thrown apply and a failed load fail-stop.
 
 Objects whose earlier backend commit failed (`failedHere`) are left out of the apply for every Tx, voter or not, and

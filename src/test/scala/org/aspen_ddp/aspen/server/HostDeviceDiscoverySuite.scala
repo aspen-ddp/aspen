@@ -813,12 +813,12 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       // is the actual regression: the old code held it for the life of the process.
       host.control.reconciler.activeDeviceChecks should not contain deviceA
 
-  /** Places a copy of `sid` holding only its transfer-out marker, which is what
-   *  startStoreTransferOut leaves in the source's store directory the moment a transfer begins. */
+  /** Places a copy of `sid` in outbound/ holding nothing else, which is what a transfer out leaves of the source's
+   *  copy the moment it begins. */
   private def writeTransferringOutStore(deviceDir: os.Path, sid: StoreId = storeId): os.Path =
     CopyFixtures.placeCopy(deviceDir, sid, Phase.Outbound(""), configured = false)
 
-  /** Whether the copy of `sid` on the device at `deviceDir` is Outbound (its transfer-out marker) */
+  /** Whether the copy of `sid` on the device at `deviceDir` is Outbound (in outbound/) */
   private def outbound(deviceDir: os.Path, sid: StoreId): Boolean =
     CopyFixtures.phaseOf(deviceDir, sid).exists(_.isInstanceOf[Phase.Outbound])
 
@@ -835,7 +835,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     placedCopies(host, loadedDevices(host)(deviceA), sids*)
     dirs
 
-  atest("an abandoned transfer-out's marker is cleared and the store loaded"):
+  atest("an abandoned transfer out's outbound copy is moved back to Live and the store loaded"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newHost(hostRoot)
@@ -866,7 +866,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       // And the load goes back through tryLoadStore rather than a parallel path, which is what
       // takes the copy from offline to served in production. The recording override loads
       // nothing, so this attempt is the assertion available here.
-      recorded(host).storeLoadAttempts.toList.drop(before) should be(List((deviceA, storeDir)))
+      // Loaded from the flat Live path it was moved back to (T7)
+      storeDir / os.up should be(deviceDir / CopyLayout.OutboundDirectory)
+      recorded(host).storeLoadAttempts.toList.drop(before) should be(
+        List((deviceA, CopyLayout.path(deviceDir, storeId, None, Phase.Live))))
 
   atest("a store whose transfer-out is still outstanding keeps its marker"):
     val hostRoot = newHostDir()
@@ -1584,7 +1587,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       dest.stores.get(t.movingStore).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Active))
       recorded(t.host).loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
 
-  atest("the source of an aborted transfer clears its marker and loads the store"):
+  atest("the source of an aborted transfer moves its copy back to Live and loads the store"):
     given ExecutionContext = executionContext
 
     // This host owns the transfer's source rather than its destination. The recording
@@ -1622,7 +1625,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     yield
       markedBeforeAbort should be(true)
       outbound(deviceDir, movingStore) should be(false)
-      recorded(host).storeLoadAttempts.toList.drop(before) should be(List((sourceId, storeDir)))
+      storeDir / os.up should be(deviceDir / CopyLayout.OutboundDirectory)
+      recorded(host).storeLoadAttempts.toList.drop(before) should be(
+        List((sourceId, CopyLayout.path(deviceDir, movingStore, None, Phase.Live))))
 
   /** A host owning the source of a transfer of `movingStore` whose send has begun through a real
    *  StartStoreTransfer: the store directory is marked and the StagedSendService is sending. */
@@ -1878,12 +1883,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         poolState.stores(t.movingStore.poolIndex).storageDeviceId should not be net.secondDeviceId
 
   // An arrived copy found lost (moved to lost/, its transferred-in marker inert there) is retired like any lost copy,
-  // not deleted. Likewise a copy carrying transferring-out beside transferred-in is Outbound (CopyPhase ranks it
-  // first), retired rather than deleted.
+  // not deleted.
   for (what, mark) <- List[(String, (os.Path, StoreId, os.Path) => Unit)](
-        "in lost/" -> ((dev, s, _) => CopyFixtures.markCopy(dev, s, Phase.Lost): Unit),
-        "carrying transferring-out and transferred-in" -> ((_, _, promoted) =>
-          os.write.over(promoted / StoreTransfer.TransferOutMarkerFile, "")))
+        "in lost/" -> ((dev, s, _) => CopyFixtures.markCopy(dev, s, Phase.Lost): Unit))
   do
     atest(s"a promoted copy $what is retired on resume and the store shipped again"):
       given ExecutionContext = executionContext
@@ -1907,10 +1909,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
           CopyFixtures.retiredCopies(t.deviceDir, t.movingStore))
         CopyFixtures.retiredCopies(t.deviceDir, t.movingStore) should have size 1
 
-  // A promoted copy whose transfer-in marker is replaced by transfer-out (a store transferred back onto its old
-  // source before that device's Deleted Stores pass ran): its entry is still TransferringIn, so nothing else clears
+  // A promoted copy moved to outbound/ (a store transferred back onto its old source before that device's Deleted
+  // Stores pass ran; its transferred-in marker inert there): its entry is still TransferringIn, so nothing else clears
   // it. It was refused forever as "store path already exists"; now it is retired and the store shipped again
-  atest("a transferring-out copy at a transfer in's path is retired on resume and the store shipped again"):
+  atest("an outbound copy at a transfer in's path is retired on resume and the store shipped again"):
     given ExecutionContext = executionContext
 
     for
@@ -1919,8 +1921,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ = t.transfers.finishTransferIn(t.movingStore)
       _ <- pumpUntil(CopyFixtures.copyPath(t.deviceDir, t.movingStore).isDefined)
       promoted = CopyFixtures.copyPath(t.deviceDir, t.movingStore).get
-      _ = os.remove(promoted / StoreTransfer.TransferredInMarkerFile)
-      _ = os.write.over(promoted / StoreTransfer.TransferOutMarkerFile, "")
+      _ = CopyFixtures.markCopy(t.deviceDir, t.movingStore, Phase.Outbound(""))
 
       transfers2 = new StagedTransferService
       host2 = newHost(t.hostRoot, transferService = transfers2)
@@ -1938,7 +1939,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
   // A copy marked for transfer out (a store transferred back onto its old source before that device's Deleted Stores
   // pass ran) is never the owner's either: retired, where it was once refused forever
   for (marker, phase) <- List(("rebuild-complete", Phase.Rebuilt("")), ("rebuild-required", Phase.Lost),
-                              ("transferring-out", Phase.Outbound(""))) do
+                              ("outbound", Phase.Outbound(""))) do
     atest(s"a transfer in over an earlier tenancy's $marker copy retires the copy and starts"):
       given ExecutionContext = executionContext
 

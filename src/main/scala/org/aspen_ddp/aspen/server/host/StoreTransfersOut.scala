@@ -5,11 +5,9 @@ import org.aspen_ddp.aspen.common.metadata.{HostState, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.{StartStoreTransfer, StoreOffline}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
-import org.aspen_ddp.aspen.server.{DurableFiles, FileStat}
+import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
-import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.Backend
-import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
 import java.util.UUID
 import scala.concurrent.Future
@@ -24,7 +22,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   import ctx.given
 
   // A transfer out's work is its copy's Work.TransferOut on the source device: Closing from startOut's close (and CRL
-  // extraction) until the control task that writes the transferring-out marker, or fails the request, has run, and
+  // extraction) until the control task that moves the copy to outbound/, or fails the request, has run, and
   // AbortingLost while returnLostTransferToRebuild aborts the transfer of a Lost copy. It refuses
   // every open of the copy meanwhile (StoreLoader.startOpen, R12), so a store is never served from a save file whose
   // entries the extraction is still deleting from the device CRL
@@ -77,13 +75,13 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
    *  retained for them when the extraction began. An unusable save file fails the close before anything is read: its
    *  state is lost, and writing the CRL's entries over it would hide that. So does a stat of the directory or the
    *  file that fails (FileStat): it says nothing of whether the file is there, and taken for an absence it would
-   *  write the CRL's entries over a valid file. Runs on the control thread, as the marker writes beside it do;
+   *  write the CRL's entries over a valid file. Runs on the control thread, as the move beside it does;
    *  nothing blocks on the CRL.
    *
    *  The store must stay closed throughout: one loaded meanwhile would recover the entries read, which the deletion
    *  would take from under it, and might save others the file would lack (or, from a save file, remove the file). The
    *  store's TransferOut work on the device keeps it closed: an open of the copy is refused from startOut's close
-   *  until the control task that writes the transfer-out marker, which keeps every later open off the store
+   *  until the control task that moves the copy to outbound/, which keeps every later open off the store
    *  (StoreLoader.startOpen, R12). The release is of the charge read when the extraction began
    *  (`releaseRetained(storeId, charge)`), so it never takes a later one.
    *
@@ -197,7 +195,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
             s"being shut down")
       // Single flight per store (I3: one piece of work per (device, store)). A retransmit or readdressed request that
       // arrives while an earlier one is closing the store, or extracting its CRL state (extractUnloaded), does
-      // nothing: a second close would find the store gone and write the marker and begin the send while the first
+      // nothing: a second close would find the store gone and move the copy and begin the send while the first
       // is still extracting, and its end would end the first's work under it. If the first fails, the receiver's next
       // retransmit tries again. Keyed host-wide by store id
       if ctx.copyRegistry.transferringOut(m.storeId, TransferOutStage.Closing) then
@@ -220,12 +218,23 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
       if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut then
         // A retransmitted request finds the store already closed, and its going offline already gossiped
         val wasLoaded = ctx.router.loaded.contains(m.storeId)
-        // The store stays closed between its close and the marker below, written in a later control task: its
+        // Only a Live, Rebuilt or parked copy is a T6 source (P10), or one already Outbound, which a retransmit (or a
+        // restart's) ships again. An Arrived copy, whose move to Live failed, waits for the Completed Transfers In pass
+        sourcePhase(sourceDs, m.storeId) match
+          case None =>
+            refuse(s"Not starting the transfer out of store ${m.storeId}: device ${sourceDs.storageDeviceId} holds no " +
+                   s"copy of it")
+          case Some(phase) if !isSource(phase) =>
+            refuse(s"Not starting the transfer out of store ${m.storeId}: its copy on device " +
+                   s"${sourceDs.storageDeviceId} is $phase, which is never shipped")
+          case Some(_) => ()
+        // The store stays closed between its close and its move to outbound/ below, made in a later control task: its
         // TransferOut work, started here before the close, refuses every open of the copy until then (R12). A claim
         // refused (other work holds the copy, recorded) starts nothing: the receiver's retransmit asks again. Nor does
-        // a copy whose marker change is not durable (unsynced: a crash could undo it): the next device check forces it
+        // a copy whose last change is not durable (unsynced: a crash could undo it, an earlier move to outbound/
+        // among them): the next device check forces it, and the retransmit after that ships it
         if ctx.copyRegistry.isUnsynced(sourceDs, m.storeId) then
-          refuse(s"Not starting the transfer out of store ${m.storeId} yet: a marker change to its copy is not durable")
+          refuse(s"Not starting the transfer out of store ${m.storeId} yet: a change to its copy is not durable")
         if !claimWork(m.storeId, sourceDs, devEntry.transferId, TransferOutStage.Closing) then
           refuse(s"Not starting the transfer out of store ${m.storeId} yet: the copy registry refused its work")
         val fclosed =
@@ -241,8 +250,38 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
               if ctx.devices.isLoaded(sourceDs) then
                 ctx.reconciler.checkStorageDevice(sourceDs.storageDeviceId)
 
+  /** The phase of the record of `storeId`'s copy on `sds`, None without one */
+  private def sourcePhase(sds: LocalStorageDeviceState, storeId: StoreId): Option[Phase] =
+    ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(storeId)).map(_.phase)
+
+  /** Whether a copy in `phase` may be shipped (P10): Live, Rebuilt (an Unconfirmed rebuild's), parked (Outbound(""))
+   *  or already Outbound (a retransmit's) */
+  private def isSource(phase: Phase): Boolean = phase match
+    case Phase.Live | Phase.Rebuilt(_) | Phase.Outbound(_) => true
+    case _ => false
+
+  /** T6: moves the closed copy of `storeId` on `sds` into outbound/ with transfer id `tid`, returning the copy's path
+   *  there once the move is durable. One already Outbound for `tid` stays where it is. One Outbound for another
+   *  transfer (aborted, then a new one started before the Abandoned Transfers Out pass reinstated it) goes back to
+   *  Live first (T7), its state still in its crl_save.log. None, logged, when a move fails or is not forced: nothing
+   *  ships, and the receiver's retransmit retries (an unsynced copy once a device check has forced it) */
+  private def moveToOutbound(sds: LocalStorageDeviceState, storeId: StoreId, tid: String): Option[os.Path] =
+    def moveTo(to: Phase): Boolean =
+      ctx.moves.move("transfer out", sds, storeId, to) match
+        case MoveResult.Durable => true
+        case MoveResult.Unsynced(_) | MoveResult.NotMoved(_) => false
+    val moved = sourcePhase(sds, storeId) match
+      case Some(Phase.Outbound(t)) if t == tid => true
+      case Some(Phase.Outbound(t)) if t.nonEmpty => moveTo(Phase.Live) && moveTo(Phase.Outbound(tid))
+      case Some(phase) if isSource(phase) => moveTo(Phase.Outbound(tid))
+      case other =>
+        logger.warn(s"Not shipping store $storeId: its copy on device ${sds.storageDeviceId} is now $other")
+        false
+    if moved then ctx.copyRegistry.pathOf(sds, storeId) else None
+
   /** The rest of startOut once the store's close for its transfer out has completed, in that completion's control
-   *  task: either the transferring-out marker is written and the send begun, or the request is refused */
+   *  task: either the closed copy is moved to outbound/ (T6) and the send begun from there, or the request is
+   *  refused */
   private def closedForTransfer(m: StartStoreTransfer, devEntry: StorageDeviceState.StoreEntry,
                                 sourceDs: LocalStorageDeviceState, toHostState: HostState, wasLoaded: Boolean,
                                 result: Try[Unit]): Unit =
@@ -256,7 +295,6 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
                     s"its close failed. Error: $t")
 
     result.foreach: _ =>
-      val storePath = ctx.copyRegistry.pathOrLive(sourceDs, m.storeId)
       // Checked again now the close is done: a shutdown that began during it has already
       // run stopDeviceWork, which found no send to cancel, so a send begun here would run
       // on a device being shelved. The store is left closed and unmarked, its state in the
@@ -275,18 +313,17 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
         logger.error(s"Not starting the transfer out of store ${m.storeId}: it became Lost while it closed")
         returnLostTransferToRebuild(m.storeId, sourceDs)
       else try
-        // Written before archiving, so it travels with the store and keeps this copy
-        // offline across restarts until the transfer is resolved one way or the other.
-        // A sync that fails leaves the copy Outbound and unsynced, and the send unstarted
-        ctx.markers.write(sourceDs, m.storeId, StoreDirMarkers.Marker.TransferOut,
-                          devEntry.transferId.map(_.toString).getOrElse(""))
-        ctx.storeTransferService.beginTransferOut(m.storeId, m.transferUUID, storePath,
-          toHostState.address, toHostState.storeTransferPort, m.timestamp)
+        // Moved before archiving, after the extraction made crl_save.log durable: outbound/ keeps this copy offline
+        // across restarts until the transfer is resolved one way or the other, and the shipped copy carries its
+        // phase-param.outbound, inert at the destination. A move that fails or is not forced ships nothing
+        val outbound = moveToOutbound(sourceDs, m.storeId, devEntry.transferId.map(_.toString).getOrElse(""))
+        outbound.foreach: outboundPath =>
+          ctx.storeTransferService.beginTransferOut(m.storeId, m.transferUUID, outboundPath,
+            toHostState.address, toHostState.storeTransferPort, m.timestamp)
         ctx.publishView()
-        // The transfer may have been aborted after the reads above, and the abort's
-        // nudge handled before the marker above existed. No check would then ever see
-        // the marker beside the Active entry, leaving the store dark for a full
-        // checkStorageDevicePeriod while the tree counts it online.
+        // The transfer may have been aborted after the reads above, and the abort's nudge handled before the copy
+        // was in outbound/. No check would then ever see it beside the Active entry, leaving the store dark for a
+        // full checkStorageDevicePeriod while the tree counts it online. An unsynced move is forced by it too
         ctx.reconciler.scheduleDeviceRecheck(sourceDs.storageDeviceId)
         if wasLoaded then
           ctx.services.gossipRetransmitter.broadcast(StoreOffline(m.storeId, HLCTimestamp.now))
@@ -324,7 +361,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   /** Brings a store back online after its transfer out was abandoned rather than completed.
    *
    *  Purely local: the tree already says Active and the pool already names this device, so there
-   *  is nothing to transact and no retry loop to get wrong. Removing the marker is what makes
+   *  is nothing to transact and no retry loop to get wrong. The move from outbound/ back to Live (T7) is what makes
    *  the repair survive a restart; loading is what makes it take effect now.
    *
    *  Loading goes through tryLoadStore rather than opening a backend here, because that method
@@ -335,22 +372,23 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
    *  queues has installed it and it has recovered, whether the backend opened in the caller or off the control
    *  thread. A store whose open or LoadStore leaves it offline is not gossiped.
    *
-   *  If the load fails after the marker is gone, this pass will not pick it up again, since it
-   *  keys off the marker that is now removed: the store stays offline and the device scans retry
+   *  If the load fails after the move, this pass will not pick it up again, since it keys off the
+   *  Outbound phase the copy has left: the store stays offline and the device scans retry
    *  it (its copy AwaitingRetry, StoreLoader.retryFailedLoads), its gossip kept for the load that serves it.
    *
-   *  Caller has established the tree entry and the marker.
+   *  Caller has established the tree entry and the copy's Outbound phase.
    */
   def reinstateAbandonedOut(local: LocalStorageDeviceState,
                             storeId: StoreId): Unit =
-    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
+    logger.warn(s"Store $storeId on device ${local.storageDeviceId} is offline in outbound/, but the " +
+                s"storage-devices tree records it as Active with no transfer outstanding. Clearing the abandoned " +
+                s"transfer and loading the store")
 
-    logger.warn(s"Store $storeId on device ${local.storageDeviceId} is offline behind a " +
-                s"transfer-out marker, but the storage-devices tree records it as Active with " +
-                s"no transfer outstanding. Clearing the abandoned transfer and loading the store")
-
-    // A failed removal leaves the store offline. Loading it with the marker still in place would be undone by the next
-    // restart, so this pass would have logged a repair that did not hold. A failed sync after the unlink leaves it
-    // unsynced, which the next check of the device forces and loads (CopyMarkers)
-    if ctx.markers.remove(local, storeId, StoreDirMarkers.Marker.TransferOut) then
-      ctx.tryLoadStore(local, storePath, Some(() => ctx.gossipStoreOnline(storeId)))
+    // T7. A failed move leaves the store offline in outbound/, for a later check. Loading it before its move is
+    // durable could be undone by the next restart, so this pass would have logged a repair that did not hold. A move
+    // not forced leaves it unsynced, which the next check of the device forces and loads (DeviceReconciler)
+    ctx.moves.move("reinstate abandoned transfer out", local, storeId, Phase.Live) match
+      case MoveResult.Durable =>
+        ctx.tryLoadStore(local, ctx.copyRegistry.pathOrLive(local, storeId),
+          Some(() => ctx.gossipStoreOnline(storeId)))
+      case MoveResult.Unsynced(_) | MoveResult.NotMoved(_) => ()

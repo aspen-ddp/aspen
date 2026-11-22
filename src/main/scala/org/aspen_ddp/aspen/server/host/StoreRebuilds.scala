@@ -585,32 +585,34 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           ctx.reconciler.checkStorageDevice(latest.deviceId)
 
   /** Keeps a rebuilt store whose entry was written Offline (RebuildOutcome.AdoptOffline) out of
-   *  service: it is not loaded, and it is recorded offline behind an empty transfer-out marker
-   *  beside the empty CRL save file the rebuild wrote (RebuildingStore.writeEmptyCrlState). A restart
-   *  keeps it offline behind the marker until the reconcile or bringIntoService finds its entry
-   *  Active, and an adoption classes it Clean (a transfer-out marker with a valid save file).
+   *  service: it is not loaded, and its copy is parked, moved from its flat Rebuilt path into
+   *  outbound/ with no transfer id (`Outbound("")`, T4 until Parked is a phase of its own) in one
+   *  move, beside the empty CRL save file the rebuild wrote (RebuildingStore.writeEmptyCrlState).
+   *  Its rebuild-complete marker, inert there, is stripped once the move is durable (CopyMoves). A
+   *  restart keeps it offline there until the reconcile or bringIntoService finds its entry Active,
+   *  and an adoption classes it Clean (outbound/ with a valid save file).
    *
-   *  Written even when the device has already been unloaded (its shutdown finished first): the
-   *  device path is still known, and without the pair an adopting host would refuse the whole
-   *  device for a store that is in fact complete. A disk already pulled makes the writes fail,
-   *  which is logged; an adopter then refuses the device until it is returned and shut down
-   *  again, the same as any other store whose close did not finish.
+   *  Moved even when the device has already been unloaded (its shutdown finished first): the
+   *  device path is still known, and without the move an adopting host would find a Rebuilt copy
+   *  whose entry is no longer Rebuilding. A disk already pulled makes the move fail, which is
+   *  logged; the copy then stays Rebuilt, offline.
    */
   private def keepRebuiltStoreOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit =
-    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
-    try
-      ctx.markers.write(local, storeId, StoreDirMarkers.Marker.TransferOut, "")
-      // After the pair: the transfer-out marker now keeps it offline, and its reinstatement loads it. A failed
-      // removal leaves the copy Outbound either way (CopyPhase ranks the transfer-out marker first)
-      if !ctx.markers.remove(local, storeId, StoreDirMarkers.Marker.RebuildComplete) then
-        logger.error(s"Failed to remove the rebuild-complete marker of rebuilt store $storeId at $storePath, kept " +
-                     "offline behind its transfer-out marker")
-    catch
-      case t: Throwable =>
-        // Offline for the life of this process either way. A restart cancelling the shutdown
-        // loses the abandoned-transfer-out pass's reinstatement without the marker, so the store
-        // waits for this host's next start to load; an adopter refuses the device.
-        logger.error(s"Failed to mark rebuilt store $storeId offline at $storePath: $t")
+    val site = "keep rebuilt store offline"
+    val result = ctx.devices.devices.get(local.storageDeviceId) match
+      case Some(sds) if ctx.copyRegistry.copiesOf(sds).isDefined =>
+        ctx.moves.move(site, sds, storeId, Phase.Outbound(""))
+      case _ =>
+        // Unloaded: its copy is where its rebuild finished it, at the flat path
+        ctx.moves.moveUnattached(site, CopyLayout.path(local.devicePath, storeId, None, Phase.Live), storeId, None,
+          Phase.Outbound(""))._1
+    result match
+      case MoveResult.NotMoved(_) =>
+        // Logged by the move. Offline either way: a Rebuilt copy loads only once its entry is Active (the Completed
+        // Rebuilds pass)
+        logger.error(s"Failed to park rebuilt store $storeId on device ${local.storageDeviceId}: it stays offline, " +
+                     "Rebuilt")
+      case _ => ()
 
   /** Removes the rebuild-complete marker of a rebuilt store whose entry has left Rebuilding, durably, so it can be
    *  loaded. Returns whether its removal is durable; a failure is logged and leaves its copy offline on its device: a

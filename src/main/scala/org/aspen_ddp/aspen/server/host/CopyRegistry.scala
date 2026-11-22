@@ -57,14 +57,16 @@ object Transitions:
     case (Phase.Lost, _) => false
     case (Phase.Retired, _) | (_, Phase.Retired) => false
     case (_, Phase.Unread) => true
+    // T6 from Live, T10
     case (Phase.Live, Phase.Lost | Phase.Outbound(_)) => true
-    // Outbound -> Rebuilt | Arrived: the transfer-out marker removed from a copy that also carries rebuild-complete
-    // (an Unconfirmed rebuilt copy shipped, then reinstated) or transferred-in (a failed TI removal at the source)
-    case (Phase.Outbound(_), Phase.Live | Phase.Lost | Phase.Rebuilt(_) | Phase.Arrived(_)) => true
-    // Outbound("") -> Outbound(tid): a parked copy (an AdoptOffline rebuild's empty transfer-out marker) transferred out
+    // T7 (an aborted or abandoned transfer out reinstated), T10. Never back to Rebuilt or Arrived: only Live, Rebuilt
+    // and parked copies are T6 sources (P10), and a reinstated one is Live (P8)
+    case (Phase.Outbound(_), Phase.Live | Phase.Lost) => true
+    // Outbound("") -> Outbound(tid): a parked copy (an AdoptOffline rebuild's, in outbound/ with no transfer id)
+    // transferred out (T6)
     case (Phase.Outbound(""), Phase.Outbound(tid)) => tid.nonEmpty
-    // Arrived -> Outbound: a transfer out of a copy whose transferred-in marker could not be removed
-    case (Phase.Arrived(_), Phase.Rebuilt(_) | Phase.Live | Phase.Lost | Phase.Outbound(_)) => true
+    case (Phase.Arrived(_), Phase.Rebuilt(_) | Phase.Live | Phase.Lost) => true
+    // T3, T6 (an Unconfirmed rebuilt copy shipped; Outbound(""): an AdoptOffline rebuild parked, T4), T10
     case (Phase.Rebuilt(_), Phase.Live | Phase.Outbound(_) | Phase.Lost) => true
     case _ => false
 

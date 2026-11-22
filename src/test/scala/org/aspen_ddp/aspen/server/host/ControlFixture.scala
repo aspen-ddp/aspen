@@ -601,7 +601,8 @@ trait ControlFixture:
   protected def placedCopies(host: Host, sds: LocalStorageDeviceState, storeIds: StoreId*): Unit =
     storeIds.foreach: storeId =>
       host.control.copyRegistry.registered("placed after load", sds, storeId,
-        CopyFixtures.phaseOf(sds.devicePath, storeId).get)
+        CopyFixtures.phaseOf(sds.devicePath, storeId).get,
+        CopyFixtures.copyPath(sds.devicePath, storeId).flatMap(p => CopyLayout.parseName(p.last)).map(_._2))
 
   /** Records `storeIds` as served from `sds` without loading them, as the recording seams load nothing: their copies
    *  (registered if placed after the load) Served. The recording shutdown close ends that */

@@ -58,7 +58,7 @@ object Host:
   private[server] case class StoreFailStopped(store: Store, err: Throwable, what: String) extends Event
 
   /** The close of a store (ShutdownStore) found its backend failed-stop: the store is moved to lost/
-   *  rather than closed cleanly, so a caller must not mark it as cleanly closed (transfer-out marker) or ship it. */
+   *  rather than closed cleanly, so a caller must not take it as cleanly closed (move it to outbound/) or ship it. */
   final case class StoreFailedOnClose(storeId: StoreId)
     extends Exception(s"Store $storeId failed on an I/O error while closing; it is marked for rebuild")
 

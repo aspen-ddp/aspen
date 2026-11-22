@@ -10,11 +10,9 @@ object StoreDirMarkers:
 
   /** A marker that keeps a store from being loaded:
    *   - TransferredIn: it arrived from another host and awaits its pool update
-   *   - TransferOut: it is marked for transfer out; its state travels in crl_save.log
    *   - RebuildComplete: a finished rebuild whose entry flip may not have committed */
   enum Marker(val fileName: String):
     case TransferredIn extends Marker(StoreTransfer.TransferredInMarkerFile)
-    case TransferOut extends Marker(StoreTransfer.TransferOutMarkerFile)
     case RebuildComplete extends Marker(RebuildingStore.RebuildCompleteMarkerFile)
 
   /** Whether `storePath` carries `marker`. Throws the stat's error when that cannot be told */

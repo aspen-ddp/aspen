@@ -1,7 +1,11 @@
 package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.network.StartStoreTransfer
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{DurableFiles, Host, StorageDeviceConfig, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, StoreRecoveryState}
@@ -9,14 +13,18 @@ import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendStateLost, DefaultBackendOpener, StoreCreation}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, SECONDS}
-import scala.util.Try
+import scala.util.{Failure, Success, Try}
 
 /** Stage 2, Task 2: Lost is the lost/ directory. Every T10 trigger moves a closed copy into lost/<copy> (a FailStop
  *  close moves it when the close ends, P5), retire moves lost/<copy> to pending-delete/<copy> (T11), and a copy whose
- *  move to lost/ fails is held offline until a device check moves it. */
+ *  move to lost/ fails is held offline until a device check moves it.
+ *
+ *  Task 3: Outbound is the outbound/ directory. A transfer out moves the closed copy there with its transfer id (T6)
+ *  and ships it from there; an aborted or abandoned one moves it back to Live (T7). */
 class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
 
   private val s = storeId
@@ -459,3 +467,198 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     host.control.moves.resync(sds) should be(List(s))
     record.unsynced should be(false)
     host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  // ---- Task 3: Outbound is outbound/ ----
+
+  // A store of the bootstrap pool, whose pool entry names the bootstrap device: startOut reads both fresh
+  private val shipped = StoreId(PoolId.BootstrapPoolId, 1)
+  private val source = StorageDeviceId.BootstrapStorageDeviceId
+
+  private def ask(host: Host): Future[Try[Unit]] =
+    given ExecutionContext = executionContext
+    host.control.transfersOut.startOut(StartStoreTransfer(host.hostId, client.clientId, source, shipped,
+      HLCTimestamp.now, UUID.randomUUID())).transform(Success(_))
+
+  /** A host over the bootstrap device holding `shipped` as `place` leaves it, its sends staged, and the store's
+   *  transfer to the second device started in the tree: yields the host, its device, the device path and the
+   *  transfer's id */
+  private def transferring(place: os.Path => Unit, sends: StagedSendService)
+      : Future[(Host, LocalStorageDeviceState, os.Path, String)] =
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dev = writeDevice(hostRoot, "dev0", source)
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(dev))
+    place(dev)
+    val host = newHost(hostRoot, transferService = sends)
+    host.testingOnlyHandleEvents()
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(shipped, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      st <- client.getStorageDeviceState(source)
+    yield (host, loadedDevices(host)(source), dev, st.stores(shipped).transferId.get.toString)
+
+  /** Asks `host` to ship `shipped`, and waits for the request's handling to end: its close's work too */
+  private def askAndSettle(host: Host): Future[Try[Unit]] =
+    given ExecutionContext = executionContext
+    for
+      started <- ask(host)
+      _ <- awaitLoudly("the transfer out's work to end"):
+             host.testingOnlyHandleEvents()
+             !host.control.copyRegistry.transferringOut(shipped, TransferOutStage.Closing) &&
+               !host.control.copyRegistry.transferringOut(shipped, TransferOutStage.AbortingLost)
+    yield started
+
+  private def recordOf(host: Host, local: LocalStorageDeviceState, storeId: StoreId): Option[CopyRecord] =
+    host.control.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId))
+
+  atest("a transfer out moves the closed copy to outbound with its transfer id and ships it from there"):
+    given ExecutionContext = executionContext
+    val sends = new StagedSendService
+    for
+      (host, local, dev, tid) <- transferring(dev => writeStoreConfig(dev, shipped): Unit, sends)
+      flat = CopyLayout.path(dev, shipped, None, Phase.Live)
+      started <- askAndSettle(host)
+    yield
+      started should be(Success(()))
+      sends.sources.map(_._1) should be(Vector(shipped))
+      val from = sends.sources.head._2
+      from / os.up should be(dev / CopyLayout.OutboundDirectory)
+      CopyLayout.parseName(from.last).map(_._1) should be(Some(shipped))
+      CopyLayout.readParam(from, Phase.Outbound("")) should be(tid)
+      CopyFixtures.phaseOf(dev, shipped) should be(Some(Phase.Outbound(tid)))
+      CopyFixtures.copyPath(dev, shipped) should be(Some(from))
+      os.exists(flat) should be(false)
+      recordOf(host, local, shipped).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Outbound(tid), false)))
+      host.control.copyRegistry.pathOf(local, shipped) should be(Some(from))
+
+  atest("an aborted transfer out moves the copy back to live and serves it"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val flat = rocksCopy(dev, s)
+    CopyFixtures.markCopy(dev, s, Phase.Outbound("t"))
+    val opener = new TestOpener
+    val host = realHost(hostRoot, opener)
+    host.testingOnlyHandleEvents()
+    val outboundAtLoad = CopyFixtures.phaseOf(dev, s)
+    val opensAtLoad = opener.opens.get
+    val active = Map(s -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))
+    for
+      _ <- check(host, active)
+      _ <- pump(host, host.control.router.loaded.contains(s))
+    yield
+      outboundAtLoad should be(Some(Phase.Outbound("t")))
+      opensAtLoad should be(0)
+      CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Live))
+      CopyFixtures.copyPath(dev, s) should be(Some(flat))
+      os.exists(dev / CopyLayout.OutboundDirectory) && os.list(dev / CopyLayout.OutboundDirectory).nonEmpty should be(
+        false)
+      host.control.router.loaded.contains(s) should be(true)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("an Unconfirmed rebuilt copy transferred out and then reinstated ends Live, loads, and carries no rebuild-complete marker"):
+    given ExecutionContext = executionContext
+    val sends = new StagedSendService
+    for
+      (host, local, dev, tid) <- transferring(dev => CopyFixtures.placeCopy(dev, shipped, Phase.Rebuilt("ep")): Unit,
+                                              sends)
+      flat = CopyLayout.path(dev, shipped, None, Phase.Live)
+      started <- askAndSettle(host)
+      outbound = CopyFixtures.phaseOf(dev, shipped)
+      markerWhileOutbound = os.exists(sends.sources.head._2 / RebuildingStore.RebuildCompleteMarkerFile)
+      _ <- client.abortStoreTransfer(shipped)
+      _ <- waitForTransactionsToComplete()
+      _ = sends.endTransferOut(shipped)
+      _ = host.control.transfersOut.reinstateAbandonedOut(local, shipped)
+      _ = host.testingOnlyHandleEvents()
+    yield
+      started should be(Success(()))
+      outbound should be(Some(Phase.Outbound(tid)))
+      markerWhileOutbound should be(false)
+      CopyFixtures.phaseOf(dev, shipped) should be(Some(Phase.Live))
+      CopyFixtures.copyPath(dev, shipped) should be(Some(flat))
+      os.exists(flat / RebuildingStore.RebuildCompleteMarkerFile) should be(false)
+      recordOf(host, local, shipped).map(_.phase) should be(Some(Phase.Live))
+      recorded(host).storeLoadAttempts.toList should contain((source, flat))
+
+  atest("startOut refuses a copy that is not Live, Rebuilt or Parked"):
+    given ExecutionContext = executionContext
+    val sends = new StagedSendService
+    for
+      (host, local, dev, _) <- transferring(dev => CopyFixtures.placeCopy(dev, shipped, Phase.Arrived("t-in")): Unit,
+                                            sends)
+      started <- askAndSettle(host)
+    yield
+      started shouldBe a[Failure[?]]
+      started.failed.get.getMessage should include("never shipped")
+      sends.sources should be(Vector())
+      CopyFixtures.phaseOf(dev, shipped) should be(Some(Phase.Arrived("t-in")))
+      recordOf(host, local, shipped).map(_.phase) should be(Some(Phase.Arrived("t-in")))
+
+  atest("a sync that fails after the move to outbound ships nothing until resynced"):
+    given ExecutionContext = executionContext
+    val sends = new StagedSendService
+    @volatile var failures = 0
+    for
+      (host, local, dev, tid) <- transferring(dev => writeStoreConfig(dev, shipped): Unit, sends)
+      outboundDir = dev / CopyLayout.OutboundDirectory
+      _ = failures = 1
+      _ = host.control.moves.syncDirectory = d =>
+            if d == outboundDir && failures > 0 then
+              failures -= 1
+              throw new java.io.IOException("injected sync")
+            DurableFiles.syncDirectory(d)
+      first <- askAndSettle(host)
+      shippedAfterFirst = sends.sources
+      phaseAfterFirst = CopyFixtures.phaseOf(dev, shipped)
+      unsyncedAfterFirst = recordOf(host, local, shipped).map(r => (r.phase, r.unsynced))
+      // A retransmit while it is unsynced ships nothing either
+      second <- askAndSettle(host)
+      shippedAfterSecond = sends.sources
+      resynced = host.control.moves.resync(local)
+      third <- askAndSettle(host)
+    yield
+      first should be(Success(()))
+      failures should be(0)
+      shippedAfterFirst should be(Vector())
+      phaseAfterFirst should be(Some(Phase.Outbound(tid)))
+      unsyncedAfterFirst should be(Some((Phase.Outbound(tid), true)))
+      second shouldBe a[Failure[?]]
+      shippedAfterSecond should be(Vector())
+      resynced should be(List(shipped))
+      third should be(Success(()))
+      sends.sources.map(_._1) should be(Vector(shipped))
+      sends.sources.head._2 should be(CopyFixtures.copyPath(dev, shipped).get)
+      sends.sources.head._2 / os.up should be(outboundDir)
+      recordOf(host, local, shipped).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Outbound(tid), false)))
+
+  atest("a copy whose move to lost failed is never shipped"):
+    given ExecutionContext = executionContext
+    val sends = new StagedSendService
+    for
+      (host, local, dev, _) <- transferring(dev => writeStoreConfig(dev, shipped): Unit, sends)
+      _ = host.control.moves.holdLost(local, shipped, held = true)
+      started <- askAndSettle(host)
+    yield
+      started shouldBe a[Failure[?]]
+      started.failed.get.getMessage should include("Lost")
+      sends.sources should be(Vector())
+      CopyFixtures.phaseOf(dev, shipped).exists(_.isInstanceOf[Phase.Outbound]) should be(false)
+
+  // While Parked shares outbound/ as Outbound("") (Tasks 3-4), its T6 changes only its parameter, in place
+  atest("a parked copy is shipped from where it is, with the transfer's id"):
+    given ExecutionContext = executionContext
+    val sends = new StagedSendService
+    for
+      (host, local, dev, tid) <- transferring(dev => CopyFixtures.placeCopy(dev, shipped, Phase.Outbound("")): Unit,
+                                              sends)
+      parkedAt = CopyFixtures.copyPath(dev, shipped).get
+      started <- askAndSettle(host)
+    yield
+      started should be(Success(()))
+      sends.sources should be(Vector(shipped -> parkedAt))
+      CopyLayout.readParam(parkedAt, Phase.Outbound("")) should be(tid)
+      CopyFixtures.phaseOf(dev, shipped) should be(Some(Phase.Outbound(tid)))
+      recordOf(host, local, shipped).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Outbound(tid), false)))
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())

@@ -9,7 +9,7 @@ import scribe.Logging
 import scala.util.control.NonFatal
 
 /** Small files that must survive a power cut or a pulled disk the moment their write returns:
- *  the device markers, the per-store transfer-out marker and CRL save file that a network transfer
+ *  the device markers, a copy's phase parameter file and the CRL save file that a network transfer
  *  or a rebuild leaves behind, and anything else a "safe to remove" decision depends on.
  *
  *  os-lib writes go through the page cache and return before anything reaches the disk, so a

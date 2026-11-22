@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.server.host.{CopyFixtures, Phase}
+import org.aspen_ddp.aspen.server.host.{AdoptionClass, CopyFixtures, Phase}
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService, StoreLoader}
 import org.aspen_ddp.aspen.client.Transaction
@@ -110,13 +110,20 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
   private def writeClosedStore(deviceDir: os.Path, storeId: StoreId): os.Path =
     writeStoreConfig(deviceDir, storeId)
 
-  /** A store directory as a network transfer out leaves it: a transfer-out marker and a CRL save file. */
-  private def writeTransferringOutStore(deviceDir: os.Path, storeId: StoreId): os.Path =
-    val dir = CopyFixtures.placeCopy(deviceDir, storeId, Phase.Outbound(""))
+  /** A store copy as a network transfer out leaves it: in outbound/, with a CRL save file. */
+  private def writeTransferringOutStore(deviceDir: os.Path, storeId: StoreId, transferId: String = ""): os.Path =
+    val dir = CopyFixtures.placeCopy(deviceDir, storeId, Phase.Outbound(transferId))
     CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, Backend.crlSaveFile(dir))
     dir
 
-  /** Whether the copy of `storeId` on the device at `deviceDir` is Outbound (its transfer-out marker) */
+  /** Moves the copy of `storeId` already on the device into outbound/, as a transfer out leaves it, with a valid CRL
+   *  save file: returns its path there */
+  private def markTransferringOut(deviceDir: os.Path, storeId: StoreId): os.Path =
+    val dir = CopyFixtures.markCopy(deviceDir, storeId, Phase.Outbound(""))
+    CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, Backend.crlSaveFile(dir))
+    dir
+
+  /** Whether the copy of `storeId` on the device at `deviceDir` is Outbound (in outbound/) */
   private def outbound(deviceDir: os.Path, storeId: StoreId): Boolean =
     CopyFixtures.phaseOf(deviceDir, storeId).exists(_.isInstanceOf[Phase.Outbound])
 
@@ -292,20 +299,62 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
         ("a truncated", (file, _) => os.write.over(file, "")),
         ("another store's", (file, s) =>
           CrashRecoveryLog.saveStoreState(StoreId(s.poolId, (s.poolIndex + 1).toByte), StoreRecoveryState.Empty, file))) do
-    atest(s"a store whose network transfer left transferring-out with $what save file is adopted as Rebuilding"):
+    atest(s"a store whose network transfer left it in outbound/ with $what save file is adopted as Rebuilding"):
       adoptWithLostStore: (dir, s) =>
-        writeTransferringOutStore(dir / os.up, s)
-        corrupt(Backend.crlSaveFile(dir), s)
+        corrupt(Backend.crlSaveFile(markTransferringOut(dir / os.up, s)), s)
 
-  // The transferred-in marker no longer outranks the transfer-out one: a copy carrying both is Outbound, so its save
+  // Stage 2 Task 3: an outbound/ copy is classed by its location and its save file; a Clean one whose entry the
+  // adoption makes Active is reinstated (T7), the CrlLost one moved to lost/ (T10) and retired before its rebuild
+  atest("an adopted outbound copy is Clean only with a valid save file"):
+    given ExecutionContext = executionContext
+    val rebuilds = new RecordingRebuildFactory
+    @volatile var renames = Vector.empty[(os.Path, os.Path)]
+    val rename: (os.Path, os.Path) => Unit = (from, to) =>
+      renames :+= (from, to)
+      org.aspen_ddp.aspen.server.DurableFiles.atomicRename(from, to)
+    for
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 2, registerOldHost = true): ss =>
+                  Map(ss(0) -> offline, ss(1) -> offline)
+      List(s0, s1) = stores: @unchecked
+      (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
+      d0 = writeTransferringOutStore(deviceDir, s0)
+      d1 = writeTransferringOutStore(deviceDir, s1)
+      _ = os.remove(Backend.crlSaveFile(d1))
+      before <- state(deviceA)
+      host = newHost(hostRoot, storeRebuildFactory = rebuilds, adjustSeams = _.copy(copyRename = Some(rename)))
+      clean = host.control.discovery.servedStoresIn(deviceDir, before, AdoptionClass.Clean)
+      crlLost = host.control.discovery.servedStoresIn(deviceDir, before, AdoptionClass.CrlLost)
+      _ <- resolve(host)
+      _ <- pumpUntil(rebuilds.created.nonEmpty)
+      st <- state(deviceA)
+    yield
+      clean should be(List(s0))
+      crlLost should be(List(s1))
+      st.hostId should be(HostId.BootstrapHostId)
+      st.stores(s0).status should be(StoreStatus.Active)
+      st.stores(s1).status should be(StoreStatus.Rebuilding)
+      // s0 is reinstated to Live, and loaded
+      val flat0 = deviceDir / s0.directoryName
+      CopyFixtures.phaseOf(deviceDir, s0) should be(Some(Phase.Live))
+      CopyFixtures.copyPath(deviceDir, s0) should be(Some(flat0))
+      recorded(host).storeLoadAttempts.map(_._2) should contain(flat0)
+      // s1 went from outbound/ to lost/ under its copy name, then to pending-delete/ for its rebuild
+      val lostName = d1.last
+      renames.filter(r => r._1 == d1 || r._1.last == lostName) should be(Vector(
+        d1 -> deviceDir / "lost" / lostName,
+        deviceDir / "lost" / lostName -> deviceDir / RebuildingStore.PendingDeleteDirectory / lostName))
+      renames.filter(_._1 == d0) should be(Vector(d0 -> flat0))
+      rebuilds.created.map(_.storeId).toList should be(List(s1))
+
+  // A transferred-in marker inside an outbound/ copy is inert (its location is its phase): it is Outbound, so its save
   // file must be valid (it was adopted as Clean whatever its save file before CopyPhase)
-  atest("a store carrying transferring-out and transferred-in with a truncated save file is adopted as Rebuilding"):
+  atest("an outbound copy carrying a transferred-in marker with a truncated save file is adopted as Rebuilding"):
     adoptWithLostStore: (dir, s) =>
-      writeTransferringOutStore(dir / os.up, s)
-      os.write.over(dir / StoreTransfer.TransferredInMarkerFile, "t1")
-      os.write.over(Backend.crlSaveFile(dir), "")
+      val outbound = markTransferringOut(dir / os.up, s)
+      os.write.over(outbound / StoreTransfer.TransferredInMarkerFile, "t1")
+      os.write.over(Backend.crlSaveFile(outbound), "")
 
-  atest("a store carrying transferring-out and transferred-in with a valid save file is adopted as Clean"):
+  atest("an outbound copy carrying a transferred-in marker with a valid save file is adopted as Clean"):
     given ExecutionContext = executionContext
     val rebuilds = new RecordingRebuildFactory
     for
@@ -324,7 +373,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       CopyFixtures.phaseOf(deviceDir, s0).contains(Phase.Lost) should be(false)
       rebuilds.created should be(empty)
 
-  atest("a transferring-out store whose save file cannot be read fails the adoption for a later scan (SL-W18)"):
+  atest("an outbound store whose save file cannot be read fails the adoption for a later scan (SL-W18)"):
     given ExecutionContext = executionContext
     val rebuilds = new RecordingRebuildFactory
     for
@@ -659,8 +708,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       _ = rebuilds.created.head.promise.success(())
       _ <- pumpUntil(outbound(oldDir, s0))
       entryAfterRebuild <- state(deviceA).map(_.stores(s0))
-      markerWritten = outbound(oldDir, s0)
-      crlWritten = os.exists(Backend.crlSaveFile(d0Old))
+      parked = outbound(oldDir, s0)
+      crlWritten = CopyFixtures.copyPath(oldDir, s0).exists(p => os.exists(Backend.crlSaveFile(p)))
       // Carried to the new host.
       newRoot = newHostDir()
       newDir = StorageDeviceManager.deviceDirectory(newRoot, "dev0")
@@ -670,7 +719,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       st <- state(deviceA)
     yield
       entryAfterRebuild.status should be(StoreStatus.Offline)
-      markerWritten should be(true)
+      parked should be(true)
       crlWritten should be(true)
       recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
       st.status should be(DeviceStatus.Operational)
@@ -711,8 +760,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       firstAsk = startTransfers()
       _ <- setDeviceState(deviceA)(_.copy(status = DeviceStatus.Shutdown))
       (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
-      // The transfer's own marker, as the old host's transfer out left it.
-      _ = writeTransferringOutStore(deviceDir, s0)
+      // In outbound/ with its transfer's id, as the old host's transfer out left it.
+      _ = writeTransferringOutStore(deviceDir, s0, transferId.toString)
       host = newHost(hostRoot, transferService = sends)
       _ <- resolve(host)
       _ = net.takeCapturedHostMessages()

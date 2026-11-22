@@ -710,15 +710,15 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         host.control.router.silentStores should not contain storeId
 
 
-  /** An FSIF store left offline behind a transfer-out marker, whose device check then finds its entry Active with no
-   *  transfer outstanding (an abandoned transfer out) and reinstates it. FSIF opens are queued, not run: returns
-   *  once the reinstate has removed the marker and queued the store's open. */
+  /** An FSIF store left offline in outbound/, whose device check then finds its entry Active with no transfer
+   *  outstanding (an abandoned transfer out) and reinstates it. FSIF opens are queued, not run: returns once the
+   *  reinstate has moved it back to Live and queued the store's open. */
   private def reinstateAbandoned(host: Host, deviceDir: os.Path, storeDir: os.Path,
                                  queued: java.util.concurrent.ConcurrentLinkedQueue[Runnable]): Future[Unit] =
     given ExecutionContext = executionContext
     FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
       CopyFixtures.markCopy(deviceDir, storeId, Phase.Outbound(""))
-      load(host) // skipped for its marker: offline
+      load(host) // skipped in outbound/: offline
       host.control.router.silentStores should contain(storeId)
       fsif(host).openEc = new ExecutionContext:
         def execute(r: Runnable): Unit = queued.add(r)
@@ -818,8 +818,10 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         host.testingOnlyHandleEvents()
         // Its CRL load completes off the control context (CrashRecoveryLog.loadStore), then the failed removal
         // posts SaveFileRemovalFailed
-        yieldUntil({ host.testingOnlyHandleEvents(); host.control.loader.awaitingRetryHasCallback(storeId).contains(true) },
-                   maxYields = 100000).map: _ =>
+        awaitLoudly("the failed save-file removal to leave the store awaiting a retry") {
+          host.testingOnlyHandleEvents()
+          host.control.loader.awaitingRetryHasCallback(storeId).contains(true)
+        }.map: _ =>
           host.getStoreIds should not contain storeId
           host.control.router.silentStores should contain(storeId)
           host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(true))
@@ -830,7 +832,10 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         queued.poll().run()
         host.testingOnlyHandleEvents()
         host.getStoreIds should contain(storeId)
-        yieldUntil({ host.testingOnlyHandleEvents(); fsif(host).gossipedOnline.nonEmpty }, maxYields = 100000).map: _ =>
+        awaitLoudly("the retried load's gossip") {
+          host.testingOnlyHandleEvents()
+          fsif(host).gossipedOnline.nonEmpty
+        }.map: _ =>
           os.exists(Backend.crlSaveFile(storeDir)) should be(false)
           fsif(host).gossipedOnline should be(List(storeId))
 
@@ -843,7 +848,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
       storeDir / os.up / StoreCreation.CreatingDirectory)
     CopyFixtures.markCopy(deviceDir, storeId, Phase.Outbound(""))
-    load(host) // skipped for its marker: offline
+    load(host) // skipped in outbound/: offline
     host.control.router.silentStores should contain(storeId)
     fsif(host).deviceStates = Map(deviceA -> deviceState(deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
@@ -899,16 +904,17 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val storeDir = CopyLayout.path(deviceDir, storeId, Some(UUID.randomUUID()), Phase.Live)
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
       storeDir / os.up / StoreCreation.CreatingDirectory)
-    CopyFixtures.markCopy(deviceDir, storeId, Phase.Outbound(""))
-    load(host) // skipped for its marker: offline
-    val cfg = os.read.bytes(storeDir / StoreConfig.configFilename)
-    os.write.over(storeDir / StoreConfig.configFilename, "not: [a store config")
+    val outboundDir = CopyFixtures.markCopy(deviceDir, storeId, Phase.Outbound(""))
+    load(host) // skipped in outbound/: offline
+    val cfg = os.read.bytes(outboundDir / StoreConfig.configFilename)
+    os.write.over(outboundDir / StoreConfig.configFilename, "not: [a store config")
     fsif(host).deviceStates = Map(deviceA -> deviceState(deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
     host.control.reconciler.checkAll()
     yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).flatMap: _ =>
-      // The marker is gone, so only the retry can take the store up again
+      // Moved back to Live at its flat path (T7), so only the retry can take the store up again
       CopyFixtures.phaseOf(deviceDir, storeId).exists(_.isInstanceOf[Phase.Outbound]) should be(false)
+      CopyFixtures.copyPath(deviceDir, storeId) should be(Some(storeDir))
       host.control.router.silentStores should contain(storeId)
       host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(true))
       fsif(host).gossipedOnline should be(Nil)

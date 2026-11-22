@@ -28,7 +28,8 @@
   before the move; its content is the episode (empty for None). A store directory carrying it is a finished rebuild
   awaiting its flip: `start()` takes the final path for done only with the marker of its own episode
   (`RebuildingStore.isRebuildCompleteFor`), `StoreLoader.tryLoadStore` leaves it offline, and `StoreRebuilds` removes it
-  once the flip commits (before the load, or after the transfer-out pair for `AdoptOffline`); the reconcile's Completed
+  once the flip commits (before the load; for `AdoptOffline` the move into `outbound/`, `Outbound("")`, strips it,
+  stage 2 R-P2); the reconcile's Completed
   Rebuilds pass removes it for an Active entry after a crash. A directory at a Rebuilding store's path without this
   episode's marker (a copy finished for an earlier episode included) is retired as a lost copy
   (`StoreRebuilds.retireForeignCopy`: moved to `lost/`, then retired into `pending-delete/`, rebuilt). Such a copy, or

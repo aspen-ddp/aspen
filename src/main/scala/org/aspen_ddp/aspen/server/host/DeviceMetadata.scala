@@ -101,7 +101,7 @@ object DeviceMetadata:
 
     /** The device is shutting down or shut down, so the entry was written Offline rather than
      *  Active (or was found Offline already). The rebuilt store is the device's, but must not be
-     *  served: it is kept offline behind a transfer-out marker (keepRebuiltStoreOffline) until a
+     *  served: it is kept offline, parked in outbound/ (keepRebuiltStoreOffline) until a
      *  restart or adoption brings it back. */
     case AdoptOffline
 
@@ -279,7 +279,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
 
             // This method runs on the destination host, so the source is a different
             // host and learns nothing from the write above. Its copy is still offline
-            // behind the transfer-out marker while the pool goes on naming it, which means the
+            // in outbound/ while the pool goes on naming it, which means the
             // slice answers nothing until that host's own poll reinstates it -- up to
             // Main.CheckStorageDevicesPeriod away. Best-effort, because that poll is the
             // guarantee and this is only the latency.

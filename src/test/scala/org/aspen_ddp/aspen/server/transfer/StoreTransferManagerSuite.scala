@@ -482,6 +482,29 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     eventually(timeout(Span(5, Seconds))) { a.isTransferringOut(sid) should be(false) }
     a.transferringOutStores should be(Set.empty)
 
+  // Stage 2 Task 3: the source ships its copy from outbound/<copy>, carrying its phase-param.outbound. The service
+  // ships whatever directory it is given; the destination still extracts into <dest>/<storeDir>
+  test("a copy in outbound/ ships under the store's directory name with its phase parameter file"):
+    val a = newManager()
+    val b = newManager()
+    val sid = newStoreId()
+    val u = UUID.randomUUID()
+    val copy = tempDir() / org.aspen_ddp.aspen.server.host.CopyLayout.OutboundDirectory /
+      org.aspen_ddp.aspen.server.host.CopyLayout.copyName(sid, UUID.randomUUID())
+    os.makeDir.all(copy)
+    mkTree(copy)
+    val paramFile = org.aspen_ddp.aspen.server.host.CopyLayout.paramFile(
+      org.aspen_ddp.aspen.server.host.Phase.Outbound("")).get
+    os.write(copy / paramFile, u.toString)
+    val dest = tempDir()
+    val f = b.beginTransferIn(sid, u, dest)
+    a.beginTransferOut(sid, u, copy, "127.0.0.1", b.boundPort, HLCTimestamp.now)
+    await(f).isSuccess should be(true)
+    assertExtracted(dest / sid.directoryName)
+    os.read(dest / sid.directoryName / paramFile) should be(u.toString)
+    os.list(dest).map(_.last) should be(Seq(sid.directoryName))
+    eventually(timeout(Span(5, Seconds))) { a.isTransferringOut(sid) should be(false) }
+
   test("isTransferringOut is true while sending"):
     val a = newManager(ioTimeout = 30.seconds)
     val r = recordingServer()

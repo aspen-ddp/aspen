@@ -56,7 +56,6 @@ object CopyFixtures:
   /** The marker file and content a flat copy in `phase` carries */
   private def marker(phase: Phase): Option[(String, String)] = phase match
     case Phase.Live => None
-    case Phase.Outbound(t) => Some(StoreTransfer.TransferOutMarkerFile -> t)
     case Phase.Arrived(t) => Some(StoreTransfer.TransferredInMarkerFile -> t)
     case Phase.Rebuilt(e) => Some(RebuildingStore.RebuildCompleteMarkerFile -> e)
     case p => throw IllegalArgumentException(s"No copy can be placed in $p")

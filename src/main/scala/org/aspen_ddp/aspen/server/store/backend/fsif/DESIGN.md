@@ -713,11 +713,11 @@ correlated loss.
 | # | Trigger | Where | What happens | Why believed | False trigger looks like |
 |---|---|---|---|---|---|
 | L20 | `crl_save.log` exists but `CrashRecoveryLog.loadValidStoreState` rejects it (truncated, unparsable, or naming another store), or its state can never fit the device's CRL (`StoreLoader.neverFits`: a transaction above `maxTransactionBytes`, or the whole above the admission limit at the most streams any config allows plus that bound) | `StoreLoader.handleLoad`, then `StoreRebuilds.crlSaveFileLost` and `retireUnserved` | Closed unserved, marked, offline, device checked | The file is the only copy of the store's transaction state | A CRL save format change: every store with a save file (every store closed by a network transfer out) is declared lost on its next load; for never-fits, a change to `CrlAdmission.recoveredBytes` or the CRL bounds in a release, or a transfer onto a device with a smaller CRL. **Generic: all backends** |
-| L21 | Adoption of a device: an Offline or Active store has a transfer-out marker (a network transfer out) but a missing or unusable `crl_save.log` | `DeviceDiscovery.adoptionClass`; marked in `DeviceMetadata.adoptDevice`; entry written Rebuilding in the same transaction | Adopted as Rebuilding, marked | The transfer's close forced the file, so it was lost afterwards | A save-file read path that fails on the adopting host's version (format, or a path change in `Backend.crlSaveFile`): every store on every moved device. **Generic** |
+| L21 | Adoption of a device: an Offline or Active store's copy is in `outbound/` (a network transfer out) but has a missing or unusable `crl_save.log` | `DeviceDiscovery.adoptionClass`; marked in `DeviceMetadata.adoptDevice`; entry written Rebuilding in the same transaction | Adopted as Rebuilding, marked | The transfer's close forced the file, so it was lost afterwards | A save-file read path that fails on the adopting host's version (format, or a path change in `Backend.crlSaveFile`): every store on every moved device. **Generic** |
 | L22 | Adoption: an Offline or Active store's copy is in `lost/` | `DeviceDiscovery.adoptionClass` | CrlLost, so adopted Rebuilding | The previous host already marked it | Inherits whatever falsely marked it on the previous host. **Generic** |
 
 At LoadStore a *missing* `crl_save.log` is not a loss: it loads with no saved state (`StoreLoader.handleLoad`). A missing file
-counts as loss only at adoption (L21), where a transfer-out marker shows that a transfer's close extracted the state.
+counts as loss only at adoption (L21), where a copy in `outbound/` shows that a transfer's close extracted the state.
 
 ### 4.4 Count
 
@@ -782,7 +782,7 @@ Tests for the automatic paths:
 - `DeviceShutdownSuite` "a store whose backend fails during its shutdown close does not stop the shutdown" and "a
   transfer out whose store fails during its close is never sent and goes back to be rebuilt";
 - `DeviceAdoptionSuite` "a store marked rebuild-required is adopted as Rebuilding" and "a store whose network transfer
-  left transferring-out with ... save file is adopted as Rebuilding";
+  left it in outbound/ with ... save file is adopted as Rebuilding";
 - `HostDeviceDiscoverySuite` truncated-CRL tests;
 - `StoreRebuildTriggerSuite` "an Active store marked rebuild-required is flipped to Rebuilding, discarded and
   rebuilt";

@@ -123,8 +123,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 // retires this copy before writing a fresh one.
                 logger.warn(s"Not loading store $storeId: it is in lost/ and awaits a rebuild. $potentialStoreFile")
               case Phase.Outbound(_) =>
-                logger.info(s"Skipping load of offline store marked for transfer out. StoreId $storeId. " +
-                            s"$potentialStoreFile")
+                logger.info(s"Skipping load of offline store in outbound/ (a transfer out, or parked). StoreId " +
+                            s"$storeId. $potentialStoreFile")
               case Phase.Arrived(_) =>
                 // Arrived, but the pool may still name the source. StoreTransfers.startIn resumes the
                 // metadata step for it, and reconcileDeviceState loads it if that step already committed.
@@ -222,7 +222,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *
    *  The copy's Opening is a claim (HostCopies.opening), and a refused one opens nothing (I1). It is refused while the
    *  store has TransferOut work on the device (R12: the transfer's close and extraction need the store closed until
-   *  its transferring-out marker is written; asked first, and logged at debug), and for any move the table refuses (a
+   *  its copy is moved to outbound/; asked first, and logged at debug), and for any move the table refuses (a
    *  copy Closing, Retiring or not Live; recorded as a violation). A refused open records a load retry (R23), with
    *  the waiting load's onServed and the usual backoff, so the device scans offer it again once whatever held the
    *  copy has ended; a refused create does not, as its entry, still Initializing, has the next check create again. */
@@ -242,7 +242,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val transferOut = ctx.copyRegistry.transferOutWork(sds, storeId)
     if transferOut.isDefined then
       logger.debug(s"Not opening store $storeId on device ${sds.storageDeviceId}: it has ${transferOut.get} there, " +
-                   "which keeps it closed until its transferring-out marker is written. Retrying at the device scans")
+                   "which keeps it closed until its copy is moved to outbound/. Retrying at the device scans")
       refused(s"it has ${transferOut.get}")
     else
       lastOpenId += 1

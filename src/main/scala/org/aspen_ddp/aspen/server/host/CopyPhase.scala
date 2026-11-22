@@ -8,7 +8,8 @@ enum Phase:
   case Live
   /** Arrived from another host (transferred-in) and awaiting its pool update; carries the transfer's id, trimmed */
   case Arrived(transferId: String)
-  /** Transferring out; carries the marker's trimmed content verbatim, "" when empty */
+  /** In outbound/: closed for a transfer out, its state in crl_save.log; carries the transfer id (phase-param.outbound,
+   *  trimmed), "" for a parked copy (an AdoptOffline rebuild's, StoreRebuilds.keepRebuiltStoreOffline) */
   case Outbound(transferId: String)
   /** A finished rebuild (rebuild-complete); carries the marker's trimmed content verbatim, "" when empty (compare as RebuildingStore.isRebuildCompleteFor does) */
   case Rebuilt(episode: String)
@@ -24,13 +25,11 @@ enum Phase:
 object CopyPhase:
   import StoreDirMarkers.Marker.*
 
-  /** The phase of the flat copy at `storePath`. Precedence is TO > TI > RC, stopping at the first marker present, so
-   *  the content of only that marker is read. Throws a failed stat or read: a stat that fails is no absence. */
+  /** The phase of the flat copy at `storePath`. Precedence is TI > RC, stopping at the first marker present, so the
+   *  content of only that marker is read. Throws a failed stat or read: a stat that fails is no absence. */
   def read(storePath: os.Path): Phase =
     def content(marker: StoreDirMarkers.Marker): String = os.read(storePath / marker.fileName).trim
-    if StoreDirMarkers.has(storePath, TransferOut) then
-      Phase.Outbound(content(TransferOut))
-    else if StoreDirMarkers.has(storePath, TransferredIn) then
+    if StoreDirMarkers.has(storePath, TransferredIn) then
       Phase.Arrived(content(TransferredIn))
     else if StoreDirMarkers.has(storePath, RebuildComplete) then
       Phase.Rebuilt(content(RebuildComplete))

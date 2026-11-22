@@ -530,8 +530,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def isRetiring(storeId: StoreId): Boolean =
     allCopies.exists(_.copies.get(storeId).exists(_.activity == Activity.Retiring))
 
-  /** Whether an entry says no transfer out of its store is outstanding: Active, no destination named. A copy behind a
-   *  transfer-out marker under it was left by a transfer that ended without completing */
+  /** Whether an entry says no transfer out of its store is outstanding: Active, no destination named. A copy in
+   *  outbound/ under it was left by a transfer that ended without completing */
   def noTransferOut(entry: StorageDeviceState.StoreEntry): Boolean =
     entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
 
@@ -700,10 +700,12 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
 
   // ---- Updates from the disk mutation sites, right after each durable step: facts, but a new record's claim ----
 
-  /** A new copy at `storeId`'s path on `sds`. A claim: refused (false) where a record exists */
-  def registered(site: String, sds: LocalStorageDeviceState, storeId: StoreId, phase: Phase): Boolean =
+  /** A new copy at `storeId`'s path on `sds`, as `copyId` (a copy in a phase directory has one). A claim: refused
+   *  (false) where a record exists */
+  def registered(site: String, sds: LocalStorageDeviceState, storeId: StoreId, phase: Phase,
+                 copyId: Option[java.util.UUID] = None): Boolean =
     claim(site):
-      copiesOf(sds).foreach(_.register(storeId, phase))
+      copiesOf(sds).foreach(_.register(storeId, phase, copyId))
 
   /** A copy a rebuild produced at `storeId`'s path on `sds`: registered, unless the rebuild found its own finished
    *  copy there, which is already registered in `phase` */

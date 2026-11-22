@@ -12,8 +12,8 @@ import java.util.UUID
 import scala.concurrent.Future
 
 /** CopyMoves: every phase change of a copy is one move, the target phase's parameter file first, then a rename forced
- *  in both directories (spec "Uniform move and Unsynced"). Until a phase is converted these drive the one phase directory there is,
- *  Retired, from a flat Lost copy */
+ *  in both directories (spec "Uniform move and Unsynced"). Most drive Retired, from a Lost copy; the parameter tests
+ *  drive Outbound, the first converted phase that carries one */
 class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
 
   private val s = StoreId(PoolId(UUID.fromString("33333333-3333-3333-3333-333333333333")), 0)
@@ -55,20 +55,29 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     record(host, s) should be(None)
     os.list(renames.head._2).map(_.last).toSet should be(Set(org.aspen_ddp.aspen.server.StoreConfig.configFilename))
 
-    // A target phase that carries a parameter has it in place, durably, before the rename
-    val tdir = scratch()
-    val a = tdir / "a"
-    val b = tdir / "b"
-    os.makeDir.all(a / "copy")
-    os.makeDir.all(b)
-    var seen = Option.empty[String]
+  test("a move to a phase that carries a parameter has it in place before the rename, and records the phase"):
+    val hostRoot = newHostDir()
+    val dev = writeDevice(hostRoot, "dev0", deviceA)
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(dev))
+    val flat = CopyFixtures.placeCopy(dev, s, Phase.Live)
+    val host = newHost(hostRoot, verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    var seen = List.empty[(os.Path, os.Path, String)]
+    val rename = host.control.moves.rename
     host.control.moves.rename = (x, y) =>
-      seen = Some(CopyLayout.readParam(x, Phase.Outbound("")))
+      seen ::= (x, y, CopyLayout.readParam(x, Phase.Outbound("")))
       rename(x, y)
-    host.control.moves.relocate(a / "copy", b / "copy", fromFlat = false, toFlat = false,
-      Phase.Outbound("t-7")) should be(MoveResult.Durable)
-    seen should be(Some("t-7"))
-    CopyLayout.readParam(b / "copy", Phase.Outbound("")) should be("t-7")
+    host.control.moves.move("test", local, s, Phase.Outbound("t-7")) should be(MoveResult.Durable)
+    host.testingOnlyHandleEvents()
+    val newPath = CopyFixtures.copyPath(dev, s).get
+    seen should be(List((flat, newPath, "t-7")))
+    newPath / os.up should be(dev / CopyLayout.OutboundDirectory)
+    CopyLayout.readParam(newPath, Phase.Outbound("")) should be("t-7")
+    CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Outbound("t-7")))
+    record(host, s).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Outbound("t-7"), false)))
+    host.control.copyRegistry.pathOf(local, s) should be(Some(newPath))
+    host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
   test("a copy leaving a phase directory for the flat path is stripped of markers first, or not moved"):
     val (host, _, _) = withDevice()

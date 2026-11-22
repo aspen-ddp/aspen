@@ -367,9 +367,10 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val sourceId = StorageDeviceId.BootstrapStorageDeviceId
     val deviceDir = writeDevice(hostRoot, "dev0", sourceId)
     val sends = new StagedSendService
-    val host = newHost(hostRoot, transferService = sends)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+    // Placed before the device's load, which records it: startOut ships only a recorded copy
     bareCopy(deviceDir, movingStore)
+    val host = newHost(hostRoot, transferService = sends)
 
     for
       _ <- net.createSecondDevice()
@@ -671,9 +672,10 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", sourceId)
     val sends = new StagedSendService
     val rebuilds = new RecordingRebuildFactory
-    val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = rebuilds)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+    // Placed before the device's load, which records it: startOut ships only a recorded copy
     bareCopy(deviceDir, movingStore)
+    val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = rebuilds)
     def ask() = host.control.transfersOut.startOut(StartStoreTransfer(host.hostId, client.clientId,
       sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
 
@@ -713,9 +715,10 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val sourceId = StorageDeviceId.BootstrapStorageDeviceId
     val deviceDir = writeDevice(hostRoot, "dev0", sourceId)
     val sends = new StagedSendService
-    val host = newHost(hostRoot, transferService = sends)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+    // Placed before the device's load, which records it: startOut ships only a recorded copy
     bareCopy(deviceDir, movingStore)
+    val host = newHost(hostRoot, transferService = sends)
 
     for
       _ <- net.createSecondDevice()

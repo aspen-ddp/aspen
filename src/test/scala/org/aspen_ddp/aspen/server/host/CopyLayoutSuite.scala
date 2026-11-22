@@ -22,7 +22,7 @@ class CopyLayoutSuite extends FileBasedTests:
     val table = List(
       (Phase.Live, "live", false),
       (Phase.Arrived("t"), "arrived", false),
-      (Phase.Outbound("t"), "outbound", false),
+      (Phase.Outbound("t"), "outbound", true),
       (Phase.Rebuilt("e"), "rebuilt", false),
       (Phase.Lost, "lost", true),
       (Phase.Retired, "pending-delete", true))
@@ -32,7 +32,8 @@ class CopyLayoutSuite extends FileBasedTests:
     val u = UUID.randomUUID()
     CopyLayout.path(tdir, s, Some(u), Phase.Retired) should be(tdir / "pending-delete" / CopyLayout.copyName(s, u))
     CopyLayout.path(tdir, s, Some(u), Phase.Lost) should be(tdir / "lost" / CopyLayout.copyName(s, u))
-    CopyLayout.path(tdir, s, None, Phase.Outbound("t")) should be(tdir / s.directoryName)
+    CopyLayout.path(tdir, s, Some(u), Phase.Outbound("t")) should be(tdir / "outbound" / CopyLayout.copyName(s, u))
+    CopyLayout.path(tdir, s, None, Phase.Rebuilt("e")) should be(tdir / s.directoryName)
     CopyLayout.path(tdir, s, Some(u), Phase.Live) should be(tdir / s.directoryName)
 
   test("param is the phase's parameter"):
@@ -98,3 +99,22 @@ class CopyLayoutSuite extends FileBasedTests:
     os.perms.set(dir, "-wx------")
     try an[java.io.IOException] should be thrownBy CopyLayout.list(dev)
     finally os.perms.set(dir, "rwx------")
+
+  test("an outbound copy's phase is read from its own parameter file, and a failed read throws"):
+    val dev = tdir / "dev"
+    val sending = CopyFixtures.placeCopy(dev, s, Phase.Outbound("t-1"))
+    val parked = CopyFixtures.placeCopy(dev, StoreId(s.poolId, 7), Phase.Outbound(""))
+    // Another phase's parameter file is inert there, and a parked copy may have none
+    os.write(sending / CopyLayout.paramFile(Phase.Arrived("")).get, "t-other")
+    os.remove(parked / CopyLayout.paramFile(Phase.Outbound("")).get)
+    CopyLayout.list(dev).copies.map(f => (f.storeId, f.phase, f.path)).toSet should be(Set(
+      (s, Phase.Outbound("t-1"), sending),
+      (StoreId(s.poolId, 7), Phase.Outbound(""), parked)))
+    CopyLayout.phaseAt(sending) should be(Some(Phase.Outbound("t-1")))
+    CopyLayout.knownPhase(sending) should be(Some(Phase.Outbound("t-1")))
+    // The copy without search permission: its parameter file cannot be stat'd
+    os.perms.set(sending, "rw-------")
+    try
+      an[java.io.IOException] should be thrownBy CopyLayout.list(dev)
+      CopyLayout.knownPhase(sending) should be(None)
+    finally os.perms.set(sending, "rwx------")

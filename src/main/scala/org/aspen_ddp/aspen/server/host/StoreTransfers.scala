@@ -537,11 +537,11 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
               case Success(_) =>
                 stopRetransmitting()
 
-                // The transfer-out marker was archived along with the source's store directory and
-                // is swapped for the transferred-in marker before the move, so the copy reaches
-                // finalPath already marked. Unmarked, a crash before the metadata step finishes
-                // would have the restart load a copy the pool does not name, and the device check
-                // would then refuse the existing directory instead of resuming that step.
+                // The source's copy carries its phase-param.outbound, inert here. The transferred-in
+                // marker is written before the move, so the copy reaches finalPath already marked.
+                // Unmarked, a crash before the metadata step finishes would have the restart load a
+                // copy the pool does not name, and the device check would then refuse the existing
+                // directory instead of resuming that step.
                 val stagedPath = devicePath / StoreTransfer.StagingDirectory / storeId.directoryName
 
                 // The copy's CRL save file is checked while the source still holds the state: once
@@ -566,8 +566,6 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                     false
                   else
                     try
-                      val marker = stagedPath / StoreTransfer.TransferOutMarkerFile
-                      os.remove(marker, checkExists = false)
                       // Durable, marker and move both: a copy that lands during a shutdown is
                       // accepted by an adopter on the strength of this marker alone.
                       DurableFiles.write(stagedPath / StoreTransfer.TransferredInMarkerFile,

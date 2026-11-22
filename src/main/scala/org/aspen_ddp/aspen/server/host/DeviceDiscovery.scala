@@ -307,14 +307,14 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *    closing, a lost CRL).
    *  - `transferred-in`: Clean. A transfer in that landed during the shutdown (PoolRepointedOffline);
    *    it was never opened on this device, so it has no CRL state to carry.
-   *  - `transferring-out`: a network transfer out had taken its state out of the device CRL into
+   *  - In outbound/: a network transfer out had taken its state out of the device CRL into
    *    crl_save.log. Clean with a valid save file. Without one the state is gone -- a disk pulled
    *    before the file reached the platter, or later damage -- and the host that wrote it no longer
    *    holds it either: refusing the device would not bring it back, so it is CrlLost and adopted as
    *    Rebuilding. The save file is parsed, not just found: loadValidStoreState rejects a file cut
    *    short, and one whose header names another store. One it cannot read (CrashRecoveryLog.isUnreadable)
    *    throws, failing the adoption for the next scan to retry, rather than be taken for lost. A store rebuilt
-   *    during or after the shutdown (keepRebuiltStoreOffline) carries the marker with an empty save file: Clean.
+   *    during or after the shutdown (keepRebuiltStoreOffline) is parked in outbound/ with an empty save file: Clean.
    *  - Any other directory: Clean. The shutdown closed it, or a crash or a pulled drive stopped it,
    *    with its state in the device CRL, which the adopting host opens before loading it.
    *
@@ -326,9 +326,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       case Some(found) if CopyLayout.dirOf(found.phase).isEmpty && !FileStat.isDir(found.path) =>
         AdoptionClass.Unclean
       case Some(found) =>
-        // A flat copy is read again: its listing's Unread is no phase. A failed read throws
-        val phase = if CopyLayout.dirOf(found.phase).isDefined then found.phase else CopyPhase.read(found.path)
-        phase match
+        // A flat copy is read again: its listing's Unread is no phase. A failed read throws. Outbound and Lost are
+        // known by their location
+        CopyLayout.readPhase(found.path) match
           case Phase.Lost =>
             AdoptionClass.CrlLost
           case Phase.Outbound(_) =>
@@ -441,13 +441,14 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  the next scan, which finds shutdown.state still present and lands here again:
    *  1. `owning-host` is rewritten to name this host (adoption only), so once shutdown.state is
    *     gone the device loads here on its own. Each store's arrival (StoreLoader.ArrivedAtFile) is
-   *     recorded just before, for its load floor.
-   *  2. A stray transfer-out marker (a rebuilt store's, keepRebuiltStoreOffline, or an abandoned
-   *     transfer's) is removed from every store now Active, except one whose entry still names a
-   *     transfer or that this process is sending: there the marker belongs to a transfer. Offline
-   *     entries -- none are expected -- keep theirs and stay unloaded. The shutdown itself leaves
-   *     no marker. A transferred-in marker is left alone: the reconcile's completed-transfers-in
-   *     pass clears it and loads the store, as it would after any crash.
+   *     recorded just before, for its load floor, in its flat or outbound/ copy.
+   *  2. A copy in outbound/ (a rebuilt store parked, keepRebuiltStoreOffline, or an abandoned
+   *     transfer's) is moved back to Live (T7, CopyMoves.moveUnattached) for every store now Active,
+   *     except one whose entry still names a transfer or that this process is sending: there it
+   *     belongs to a transfer. Offline entries -- none are expected -- keep theirs and stay
+   *     unloaded. The shutdown itself leaves none. A transferred-in marker is left alone: the
+   *     reconcile's completed-transfers-in pass clears it and loads the store, as it would after any
+   *     crash.
    *  3. shutdown.state is removed.
    *  4. The device is loaded through tryLoadDevice and checked at once, so its Rebuilding and
    *     TransferringIn work resumes now rather than at the next periodic check.
@@ -456,7 +457,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *     also learn the new host. loadOwnedDevice does it, once the stores' LoadStore events are
    *     queued ahead of any message a peer sends in response.
    *
-   *  A failed marker removal in step 2 only leaves that store offline: the reconcile's
+   *  A failed move in step 2 only leaves that store offline: the reconcile's
    *  abandoned-transfer-out pass picks it up on a later check. A failed step 3 leaves the whole
    *  device to the next scan. A step 4 that does not load the device (its CRL is still shutting
    *  down, or the load throws) leaves it to a plain scan, shutdown.state being gone: the scan
@@ -466,23 +467,29 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                                sdCfg: StorageDeviceConfig,
                                state: StorageDeviceState,
                                rewriteOwner: Boolean): Unit =
+    // A failed listing throws, leaving the device to the next scan
+    val listing = CopyLayout.list(path).copies
     if rewriteOwner then
       // Each store arrives from another host, whose clock may lead this one's: its load floor must cover that. Before
-      // the owner is rewritten, so that a crash between the two finds the adoption still to finish. A directory
-      // stat that fails throws (FileStat), leaving the owner unwritten and the adoption to the next scan
-      state.stores.keys.map(storeId => CopyLayout.path(path, storeId, None, Phase.Live)).filter(FileStat.isDir(_))
-        .foreach(StoreLoader.writeArrivedAt)
+      // the owner is rewritten, so that a crash between the two finds the adoption still to finish. Each flat copy of
+      // a store the device lists, and each in outbound/, which step 2 may reinstate. A directory stat that fails
+      // throws (FileStat), leaving the owner unwritten and the adoption to the next scan
+      listing.filter(f => state.stores.contains(f.storeId) &&
+          (CopyLayout.dirOf(f.phase).isEmpty || f.phase.isInstanceOf[Phase.Outbound]))
+        .map(_.path).filter(FileStat.isDir(_)).foreach(StoreLoader.writeArrivedAt)
       DeviceMarkers.writeOwningHost(path, ctx.hostId)
 
     val active = state.stores.collect {
       case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Active => storeId -> entry
     }
+    val outbound = listing.filter(_.phase.isInstanceOf[Phase.Outbound])
     active.foreach: (storeId, entry) =>
       if ctx.copyRegistry.mayReinstateOut(entry, storeId) then
-        // A marker that cannot be removed keeps the store offline as a present one does, until a later check of its
-        // device; one removed whose directory could not be forced leaves the copy unsynced, which its attach takes
-        // and the device's check forces and loads (CopyMarkers, logged there)
-        ctx.markers.removeAt(CopyLayout.path(path, storeId, None, Phase.Live), StoreDirMarkers.Marker.TransferOut): Unit
+        // T7. A move that fails keeps the store offline in outbound/, until a later check of its device (logged by
+        // the move); one not forced leaves the copy unsynced, which its attach takes and the device's check forces
+        // and loads
+        outbound.filter(_.storeId == storeId).foreach: found =>
+          ctx.moves.moveUnattached("adoption reinstates outbound", found.path, storeId, found.copyId, Phase.Live): Unit
 
     announceOnLoad += path -> active.keySet
     DeviceMarkers.removeShutdownState(path)

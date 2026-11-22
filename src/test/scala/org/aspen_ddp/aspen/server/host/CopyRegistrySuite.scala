@@ -26,13 +26,14 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
   private def expectedPhase(from: Phase, to: Phase): Boolean =
     val legal = Set(
       "Live" -> "Lost", "Live" -> "Outbound",
-      "Outbound" -> "Live", "Outbound" -> "Lost", "Outbound" -> "Rebuilt", "Outbound" -> "Arrived",
-      "Arrived" -> "Rebuilt", "Arrived" -> "Live", "Arrived" -> "Lost", "Arrived" -> "Outbound",
+      // Only Live, Rebuilt and parked copies are T6 sources, and a reinstated one is Live (P8, P10)
+      "Outbound" -> "Live", "Outbound" -> "Lost",
+      "Arrived" -> "Rebuilt", "Arrived" -> "Live", "Arrived" -> "Lost",
       "Rebuilt" -> "Live", "Rebuilt" -> "Outbound", "Rebuilt" -> "Lost")
     kind(from) match
       case "Unread" => true
       case "Lost" => false
-      // A parked copy (empty TO, AdoptOffline) transferred out: Outbound("") -> Outbound(tid), tid non-empty (R14)
+      // A parked copy (Outbound(""), AdoptOffline) transferred out: Outbound("") -> Outbound(tid), tid non-empty (R14)
       case _ if from == Phase.Outbound("") && kind(to) == "Outbound" => to != Phase.Outbound("")
       case f => kind(to) == "Unread" || legal.contains(f -> kind(to))
 
@@ -97,7 +98,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
     Transitions.phaseLegal(Phase.Outbound("a"), Phase.Outbound("")) should be(false)
     Transitions.phaseLegal(Phase.Outbound(""), Phase.Outbound("")) should be(false)
 
-  test("a parked copy (empty transfer-out marker) may be transferred out (R14)"):
+  test("a parked copy (Outbound(\"\")) may be transferred out (R14)"):
     Transitions.phaseLegal(Phase.Outbound(""), Phase.Outbound("t")) should be(true)
 
   // Retiring is only ever entered from Idle while Lost, so it is no starting point under another phase

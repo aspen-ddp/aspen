@@ -274,8 +274,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   private def flipLostCrlStores(local: LocalStorageDeviceState, remote: StorageDeviceState) =
     // A store whose copy is Lost (crlSaveFileLost, a failed backend, or an adoption) whose entry still
     // reads Active is flipped to Rebuilding; startRebuilds then discards its
-    // directory and rebuilds it. Before the abandoned-transfers-out pass, which would
-    // otherwise take a marked store left behind a transfer-out marker for one to reinstate.
+    // directory and rebuilds it. Before the abandoned-transfers-out pass, which leaves the
+    // stores it returns alone.
     //
     // A store still being shipped (its transfer aborted while the send runs: the abandoned-out pass below makes the
     // same check) waits, re-checked shortly: its rebuild's discard would move the directory the send may still be
@@ -290,14 +290,13 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
           ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
     lostCrl
 
-  /** Reinstates stores left offline behind a transfer-out marker whose transfer was abandoned. */
+  /** Reinstates stores left offline in outbound/ whose transfer was abandoned (T7). */
   private def reinstateAbandonedTransfersOut(local: LocalStorageDeviceState, remote: StorageDeviceState, lostCrl: Set[StoreId]): Unit =
-    // Nothing else ever clears a transfer-out marker from the source. StoreTransfers.startIn
-    // deletes it only from the destination's unpacked copy, and a transfer that completes
-    // normally has the source's whole store directory deleted by the pass above -- the marker
-    // goes with it. So a transfer that ends without completing, which is what a destination
-    // declared failed mid-flight produces, strands the marker forever, and tryLoadStore re-reads
-    // it on every restart and keeps the store's copy offline.
+    // Nothing else ever moves an Outbound copy back to Live at the source, and a transfer that
+    // completes normally has the source's copy retired by the pass above. So a transfer that ends
+    // without completing, which is what a destination declared failed mid-flight produces, strands
+    // the copy in outbound/ forever, and every restart keeps it offline there.
+    // A parked copy (an AdoptOffline rebuild's, Outbound("")) is reinstated the same way.
     //
     // That pairs badly with the metadata repair for the same event. That repair puts this
     // entry back to Active and leaves the pool naming this device, so afterwards the metadata
@@ -312,7 +311,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     //
     // The guard is narrow on purpose. Active *and* no transferDevice is the only combination
     // that says no transfer is outstanding; an entry still TransferringOut, or Active with a
-    // destination still named, means the marker is doing its job. isTransferringOut is the
+    // destination still named, means outbound/ is doing its job. isTransferringOut is the
     // same question asked of this process rather than the tree, and covers the window where
     // the drain restores the entry while this host is still shipping bytes.
     //
@@ -321,7 +320,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // receive) with nothing to prompt another check for a full checkStorageDevicePeriod.
     val (abandonedOut, stillSending) = (ctx.copyRegistry.offlineCopies(local) -- lostCrl).filter(storeId =>
       remote.stores.get(storeId).exists(ctx.copyRegistry.noTransferOut) &&
-      hasMarker(local, storeId, StoreDirMarkers.Marker.TransferOut)
+      ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase.isInstanceOf[Phase.Outbound])
     ).partition(storeId => remote.stores.get(storeId).exists(ctx.copyRegistry.mayReinstateOut(_, storeId)))
     abandonedOut.foreach: storeId =>
       ctx.transfersOut.reinstateAbandonedOut(local, storeId)
@@ -474,8 +473,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         if clear then
           checkStorageDevice(local.storageDeviceId)
 
-  /** Checks `storageDeviceId` again after TransferOutRecheckDelay, so a store left offline behind
-   *  a transfer-out marker is reinstated soon after an aborted transfer's send ends rather than at
+  /** Checks `storageDeviceId` again after TransferOutRecheckDelay, so a store left offline in
+   *  outbound/ is reinstated soon after an aborted transfer's send ends rather than at
    *  the next periodic check. At most one is scheduled per device; requests made meanwhile are
    *  covered by it.
    */

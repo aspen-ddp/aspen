@@ -244,10 +244,10 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
     val local = loadedDevices(host)(deviceA)
-    val dir = CopyFixtures.placeCopy(dev, sid(0), Phase.Outbound("t"))
+    val dir = CopyFixtures.placeCopy(dev, sid(0), Phase.Rebuilt("t"))
     host.control.copyRegistry.verifyAgainstDisk().size should be(1)
     host.control.loader.tryLoadStore(local, dir)
-    phases(host, deviceA) should be(Map(sid(0) -> Phase.Outbound("t")))
+    phases(host, deviceA) should be(Map(sid(0) -> Phase.Rebuilt("t")))
     host.control.copyRegistry.takeLearned().size should be(1)
     host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
     host.control.copyRegistry.takeRegistryErrors() should be(Vector())
@@ -409,7 +409,6 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       val host = newHost(hostRoot, transferService = sends, verifyCopyRegistry = true)
       host.testingOnlyHandleEvents()
       val local = loadedDevices(host)(source)
-      val before = if rebuilt then Phase.Rebuilt("ep") else Phase.Live
       for
         _ <- net.createSecondDevice()
         _ <- waitForTransactionsToComplete()
@@ -425,7 +424,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       yield
         started should be(Success(()))
         outbound should be(a[Phase.Outbound])
-        phases(host, source) should be(Map(shipped -> before))
+        // Reinstated to Live either way: the move into outbound/ stripped an Unconfirmed copy's rebuild-complete
+        // marker, and the Active entry says its flip committed (P8)
+        phases(host, source) should be(Map(shipped -> Phase.Live))
         consistent(host)
 
   for (variant, extra) <- List(("arrived copy", Nil), ("shipped rebuilt copy", List(RebuildingStore.RebuildCompleteMarkerFile)))
@@ -933,9 +934,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       val copies = registry.copiesOf(local).get
       // Idle -> Closing is not in the table: applied anyway
       registry.removedFromRouter(deviceA, sid(0))
-      // Outbound(t) -> Outbound(u) is not in the table: the disk reads Live, so Live is recorded
-      copies.setPhase(sid(1), Phase.Outbound("t"))
-      registry.placed("test", local, sid(1), Phase.Outbound("u"))
+      // Arrived(t) -> Arrived(u) is not in the table: the disk reads Live, so Live is recorded
+      copies.applyPhase(sid(1), Phase.Arrived("t"), Phase.Arrived("t"))
+      registry.placed("test", local, sid(1), Phase.Arrived("u"))
       val errors = registry.takeRegistryErrors()
       copies.copies(sid(0)).activity should be(Activity.Closing(ClosePurpose.FailStop))
       copies.copies(sid(1)).phase should be(Phase.Live)
@@ -1033,20 +1034,25 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     host.control.copyRegistry.silence(sid(3)) should be(Silence.Silent(Set(SilenceReason.CopyHere)))
     host.control.router.answersUnknown(sid(3)) should be(false)
 
-  // R6: marker durability is uniform. A removal whose directory sync fails after the unlink leaves the copy unsynced,
-  // and it is never loaded until a later device check forces the directory again, which loads it
-  for (name, phase) <- List(("TI", Phase.Arrived("x")), ("TO", Phase.Outbound("x")), ("RC", Phase.Rebuilt("x"))) do
+  // R6: marker durability is uniform, and the same for a move (Outbound's T7, into the flat path): a removal or move
+  // whose directory sync fails after it landed leaves the copy unsynced, and it is never loaded until a later device
+  // check forces the directory again, which loads it
+  for (name, phase) <- List(("TI", Phase.Arrived("x")), ("Outbound, moved to Live", Phase.Outbound("x")),
+                            ("RC", Phase.Rebuilt("x"))) do
     atest(s"a failed sync after removing any marker leaves the copy unsynced and unloaded, and the next check loads it ($name)"):
       given ExecutionContext = executionContext
       val hostRoot = newHostDir()
       val dev = device(hostRoot, deviceA)
-      val dir = CopyFixtures.placeCopy(dev, sid(0), phase)
+      val placed = CopyFixtures.placeCopy(dev, sid(0), phase)
+      // The directory whose sync fails: the copy's own for a marker, the one it leaves for a move
+      val failing = if CopyLayout.dirOf(phase).isDefined then placed / os.up else placed
+      val dir = CopyLayout.path(dev, sid(0), None, Phase.Live)
       val host = newHost(hostRoot, verifyCopyRegistry = true)
       var failSync = true
       var syncs = List.empty[os.Path]
       host.control.markers.syncDirectory = d =>
         syncs = d :: syncs
-        if failSync && d == dir then throw new java.io.IOException("injected directory sync failure")
+        if failSync && d == failing then throw new java.io.IOException("injected directory sync failure")
       host.testingOnlyHandleEvents()
       val local = loadedDevices(host)(deviceA)
       val active = deviceState(deviceA,
@@ -1072,7 +1078,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
         removed should be(true)
         unsynced should be(Some(true))
         loadsAfterFailure should be(loadedAtStart)
-        syncs should contain(dir)
+        syncs should contain(failing)
         record(host, deviceA, sid(0)).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Live, false)))
         loads should be(loadedAtStart + 1)
         consistent(host)
@@ -1123,11 +1129,13 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       given ExecutionContext = executionContext
       val hostRoot = newHostDir()
       val dev = device(hostRoot, deviceA)
-      val dir = CopyFixtures.placeCopy(dev, sid(0), Phase.Outbound("x"))
+      // An Outbound copy's move back to Live (T7) whose sync fails in the directory it leaves
+      val placed = CopyFixtures.placeCopy(dev, sid(0), Phase.Outbound("x"))
+      val dir = CopyLayout.path(dev, sid(0), None, Phase.Live)
       val host = newHost(hostRoot, verifyCopyRegistry = true)
       var failSync = true
       host.control.markers.syncDirectory = d =>
-        if failSync && d == dir then throw new java.io.IOException("injected directory sync failure")
+        if failSync && d == placed / os.up then throw new java.io.IOException("injected directory sync failure")
       host.testingOnlyHandleEvents()
       def entry(status: StorageDeviceState.StoreStatus) =
         deviceState(deviceA, Map(sid(0) -> StorageDeviceState.StoreEntry(status, None)))

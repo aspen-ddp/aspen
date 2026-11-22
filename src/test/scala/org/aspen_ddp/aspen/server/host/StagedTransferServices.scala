@@ -37,14 +37,14 @@ class StagedTransferService extends StoreTransferService:
 
   /** Resolves `storeId`'s latest transfer as if every byte had arrived. Leaves behind what
    *  extraction would have: `<dir>/<storeId.directoryName>`, still carrying the source's
-   *  transfer-out marker and the CRL save file its close wrote, for Host's promotion step to
+   *  phase-param.outbound and the CRL save file its close wrote, for Host's promotion step to
    *  move into place. `crlValid = false` leaves a truncated save file instead. `extraFiles` are written into the
    *  copy too, as files the source's copy carried (a rebuild-complete marker, say). */
   def finishTransferIn(storeId: StoreId, crlValid: Boolean = true, extraFiles: List[String] = Nil): Unit =
     latest(storeId).foreach: (sid, _, dir, p) =>
       val staged = dir / sid.directoryName
       os.makeDir.all(staged)
-      os.write.over(staged / StoreTransfer.TransferOutMarkerFile, "")
+      os.write.over(staged / CopyLayout.paramFile(Phase.Outbound("")).get, "")
       extraFiles.foreach(f => os.write.over(staged / f, ""))
       if crlValid then
         CrashRecoveryLog.saveStoreState(sid, StoreRecoveryState.Empty, Backend.crlSaveFile(staged))
@@ -99,9 +99,13 @@ class StagedTransferService extends StoreTransferService:
 class StagedSendService extends StoreTransferService:
   private var sending = Set[StoreId]()
   private var begun = Vector[(StoreId, UUID)]()
+  private var shippedFrom = Vector[(StoreId, os.Path)]()
 
   /** Every beginTransferOut call, in order. */
   def transfersOut: Vector[(StoreId, UUID)] = synchronized(begun)
+
+  /** The source directory of every beginTransferOut call, in order */
+  def sources: Vector[(StoreId, os.Path)] = synchronized(shippedFrom)
 
   /** Ends `storeId`'s send, as a failure or a completion would: it is no longer transferring out. */
   def endTransferOut(storeId: StoreId): Unit = synchronized:
@@ -115,6 +119,7 @@ class StagedSendService extends StoreTransferService:
   def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
                        destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit = synchronized:
     begun :+= (storeId, transferUUID)
+    shippedFrom :+= (storeId, sourceDirectory)
     sending += storeId
 
   def cancelTransferOut(storeId: StoreId): Unit = endTransferOut(storeId)

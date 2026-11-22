@@ -9,7 +9,6 @@ import org.scalatest.matchers.should.Matchers
 
 class CopyPhaseSuite extends AnyFunSuite with Matchers:
 
-  private val TO = StoreTransfer.TransferOutMarkerFile
   private val TI = StoreTransfer.TransferredInMarkerFile
   private val RC = RebuildingStore.RebuildCompleteMarkerFile
 
@@ -30,24 +29,22 @@ class CopyPhaseSuite extends AnyFunSuite with Matchers:
   test("each single marker maps to its phase with its content"):
     val u = UUID.randomUUID()
     withStore(TI -> " t1\n")(dir => CopyPhase.read(dir) should be(Phase.Arrived("t1")))
-    withStore(TO -> "")(dir => CopyPhase.read(dir) should be(Phase.Outbound("")))
-    withStore(TO -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Outbound(u.toString)))
     withStore(RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Rebuilt(u.toString)))
     withStore(RC -> "")(dir => CopyPhase.read(dir) should be(Phase.Rebuilt("")))
 
   test("content is kept verbatim: garbage is distinct from empty"):
-    withStore(TO -> " xyz\n")(dir => CopyPhase.read(dir) should be(Phase.Outbound("xyz")))
+    withStore(TI -> " xyz\n")(dir => CopyPhase.read(dir) should be(Phase.Arrived("xyz")))
     withStore(RC -> "xyz")(dir => CopyPhase.read(dir) should be(Phase.Rebuilt("xyz")))
     CopyPhase.read(os.temp.dir()) should not be(Phase.Rebuilt("xyz"))
     Phase.Rebuilt("xyz") should not be(Phase.Rebuilt(""))
     Phase.Outbound("xyz") should not be(Phase.Outbound(""))
 
-  test("precedence is TO > TI > RC, and Lost is never read from markers"):
+  test("precedence is TI > RC, and Lost and Outbound are never read from markers"):
     val u = UUID.randomUUID()
     withStore("rebuild-required" -> "")(dir => CopyPhase.read(dir) should be(Phase.Live))
-    withStore(TO -> "", TI -> "t1")(dir => CopyPhase.read(dir) should be(Phase.Outbound("")))
+    withStore("transferring-out" -> "t")(dir => CopyPhase.read(dir) should be(Phase.Live))
     withStore(TI -> "t1", RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Arrived("t1")))
-    withStore(TO -> "", RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Outbound("")))
+    withStore("transferring-out" -> "", RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Rebuilt(u.toString)))
 
   test("a failed stat throws and known answers None"):
     withStore(RC -> ""): dir =>

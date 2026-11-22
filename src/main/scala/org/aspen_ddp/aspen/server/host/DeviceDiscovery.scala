@@ -326,11 +326,10 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     if !FileStat.isDir(storePath) then
       AdoptionClass.Unclean
     else
-      import StoreDirMarkers.Marker.*
-      StoreDirMarkers.firstPresent(storePath, RebuildRequired, TransferredIn, TransferOut) match
-        case Some(StoreDirMarkers.Marker.RebuildRequired) =>
+      CopyPhase.read(storePath) match
+        case Phase.Lost =>
           AdoptionClass.CrlLost
-        case Some(StoreDirMarkers.Marker.TransferOut) =>
+        case Phase.Outbound(_) =>
           CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storePath), storeId) match
             case Right(_) => AdoptionClass.Clean
             case Left(_) => AdoptionClass.CrlLost
@@ -678,9 +677,12 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       catch
         case t: Throwable if CrashRecoveryLog.isUnreadable(t) => throw t
         case NonFatal(_) => None
-    StoreDirMarkers.has(storeDir, StoreDirMarkers.Marker.RebuildComplete) ||
+    def ownSaveFile: Boolean =
       FileStat.exists(saveFile) && configuredStoreId.exists: storeId =>
         CrashRecoveryLog.loadValidStoreState(saveFile, storeId).isRight
+    CopyPhase.read(storeDir) match
+      case Phase.Rebuilt(_) => true
+      case _ => ownSaveFile
 
   /** The load half of tryLoadDevice, run only once the device is known to be ours. */
   private def loadOwnedDevice(storageDevicePath: os.Path,

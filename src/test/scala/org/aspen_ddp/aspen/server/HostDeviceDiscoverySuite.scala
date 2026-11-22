@@ -1887,9 +1887,39 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         recorded(host2).transferOutcomes.get(t.movingStore) should be(None)
         poolState.stores(t.movingStore.poolIndex).storageDeviceId should not be net.secondDeviceId
 
+  // CopyPhase ranks rebuild-required above transferred-in: an arrived copy found lost is retired like any lost copy, not
+  // deleted. Likewise a copy carrying transferring-out beside transferred-in is Outbound, retired rather than deleted.
+  for (what, markers) <- List[(String, Seq[String])](
+        "rebuild-required and transferred-in" -> Seq(RebuildingStore.RebuildRequiredMarkerFile),
+        "transferring-out and transferred-in" -> Seq(StoreTransfer.TransferOutMarkerFile))
+  do
+    atest(s"a promoted copy carrying $what is retired on resume and the store shipped again"):
+      given ExecutionContext = executionContext
+
+      for
+        t <- startTransferIn()
+        _ = recorded(t.host).holdTransferOutcomes()
+        promoted = t.deviceDir / t.movingStore.directoryName
+        _ = t.transfers.finishTransferIn(t.movingStore)
+        _ <- pumpUntil(os.exists(promoted))
+        _ = markers.foreach(m => os.write.over(promoted / m, ""))
+
+        transfers2 = new StagedTransferService
+        host2 = newHost(t.hostRoot, transferService = transfers2)
+        _ = host2.control.reconciler.checkAll()
+        _ <- pumpUntil(transfers2.transfersIn.nonEmpty)
+      yield
+        transfers2.transfersIn.size should be(1)
+        os.exists(promoted) should be(false)
+        os.list(t.deviceDir / RebuildingStore.PendingDeleteDirectory).map(_.last.startsWith(t.movingStore.directoryName))
+          .toList should be(List(true))
+
   // rebuild-process FS17: a copy an earlier tenancy left at the store's path (a finished rebuild awaiting its flip, a
   // lost copy), the store having since been re-placed away and transferred back
-  for marker <- List(RebuildingStore.RebuildCompleteMarkerFile, RebuildingStore.RebuildRequiredMarkerFile) do
+  // A copy marked for transfer out (a store transferred back onto its old source before that device's Deleted Stores
+  // pass ran) is never the owner's either: retired, where it was once refused forever
+  for marker <- List(RebuildingStore.RebuildCompleteMarkerFile, RebuildingStore.RebuildRequiredMarkerFile,
+                     StoreTransfer.TransferOutMarkerFile) do
     atest(s"a transfer in over an earlier tenancy's $marker copy retires the copy and starts"):
       given ExecutionContext = executionContext
 

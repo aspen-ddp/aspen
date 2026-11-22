@@ -111,30 +111,29 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         try
           val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath)
           val storeId = storeCfg.storeId
-          import StoreDirMarkers.Marker.*
-          val blocker = StoreDirMarkers.firstPresent(potentialStoreFile,
-            RebuildRequired, TransferOut, TransferredIn, RebuildComplete)
-          if blocker.isDefined then
-            blocker.get match
-              case StoreDirMarkers.Marker.RebuildRequired =>
+          val phase = CopyPhase.read(potentialStoreFile)
+          if phase != Phase.Live then
+            phase match
+              case Phase.Lost =>
                 // Its CRL state is gone. The reconcile flips its entry to Rebuilding, and the rebuild
                 // discards this directory before writing a fresh copy.
                 logger.warn(s"Not loading store $storeId: its CRL save file was lost and it " +
                             s"awaits a rebuild. $potentialStoreFile")
-              case StoreDirMarkers.Marker.TransferOut =>
+              case Phase.Outbound(_) =>
                 logger.info(s"Skipping load of offline store marked for transfer out. StoreId $storeId. " +
                             s"$potentialStoreFile")
-              case StoreDirMarkers.Marker.TransferredIn =>
+              case Phase.Arrived(_) =>
                 // Arrived, but the pool may still name the source. StoreTransfers.startIn resumes the
                 // metadata step for it, and reconcileDeviceState loads it if that step already committed.
                 logger.info("Skipping load of transferred-in store awaiting its pool update. " +
                             s"StoreId $storeId. $potentialStoreFile")
-              case StoreDirMarkers.Marker.RebuildComplete =>
+              case Phase.Rebuilt(_) =>
                 // A finished rebuild whose flip may not have committed (a crash between the move and the flip,
                 // rebuild-process 5.7). The rebuild's completion removes the marker and loads it once the flip
                 // commits; for an entry already Active, the reconcile does (DeviceReconciler)
                 logger.info("Skipping load of rebuilt store awaiting its device entry's flip out of Rebuilding. " +
                             s"StoreId $storeId. $potentialStoreFile")
+              case _ => ()
             keepMarkedCopyOffline(sds, storeId)
           else if opening.contains(storeCfg.storeId) || router.get(storeCfg.storeId).isDefined then
             logger.debug(s"Not loading store ${storeCfg.storeId} again: it is already open or opening")

@@ -280,6 +280,31 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).storeLoadAttempts.map(_._2).toSet should contain allOf(deviceDir / s0.directoryName,
                                                                   deviceDir / s1.directoryName)
 
+  // A copy whose phase cannot be read is still offered to tryLoadStore, which reads it again and holds it back until it
+  // answers: it has left closedForShutdown, so skipping it would leave it unserved until a restart
+  atest("a cancelled shutdown offers a store whose phase cannot be read"):
+    given ExecutionContext = executionContext
+    for
+      (host, deviceDir) <- setUp(Map(s0 -> active, s1 -> active), loaded = Set(s0, s1))
+      gate = recorded(host).holdShutdownCloses()
+      _ <- client.shutdownStorageDevice(deviceA)
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
+      // Its stats now fail (EACCES): CopyPhase.known answers None
+      unreadable = deviceDir / s0.directoryName
+      _ = os.perms.set(unreadable, "rw-------")
+      _ <- client.restartStorageDevice(deviceA)
+      _ <- waitForTransactionsToComplete()
+      _ = gate.success(())
+      paths = List(s0, s1).map(s => deviceDir / s.directoryName)
+      _ <- pumpUntil(recorded(host).shutdownOutcomes.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty &&
+                     paths.forall(recorded(host).storeLoadAttempts.map(_._2).contains))
+      _ = os.perms.set(unreadable, "rwx------")
+    yield
+      recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Cancelled))
+      recorded(host).storeLoadAttempts.map(_._2).toSet should contain allOf(unreadable, deviceDir / s1.directoryName)
+
   atest("an Initializing store is not created while the device is ShuttingDown"):
     given ExecutionContext = executionContext
     // A real pool, so createNewStore would get as far as creating the directory.

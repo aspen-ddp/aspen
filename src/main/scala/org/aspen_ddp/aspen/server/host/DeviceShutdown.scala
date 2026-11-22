@@ -349,12 +349,13 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         closedForShutdown -= deviceId
       else
         closedForShutdown += deviceId -> notYet
-      // A marker whose stat fails (FileStat) is taken as absent: the load stats it again and holds the store back
-      // until it answers (StoreLoader.tryLoadStore)
+      // A copy whose phase cannot be read (FileStat) is offered too: it has left closedForShutdown above, so skipping
+      // it would leave it unserved until a restart, and the load reads its phase again and holds it back until it
+      // answers (StoreLoader.tryLoadStore)
       val plain = ready.filter: storeId =>
-        StoreDirMarkers.Marker.values.forall: marker =>
-          marker == StoreDirMarkers.Marker.RebuildComplete ||
-            !StoreDirMarkers.knownPresent(storePath(storeId), marker)
+        CopyPhase.known(storePath(storeId)) match
+          case None | Some(Phase.Live) => true
+          case Some(_) => false
       plain.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
         logger.info(s"Loading store $storeId on device $deviceId again: the shutdown that closed it was cancelled")
         ctx.tryLoadStore(local, storePath(storeId), Some(() => ctx.gossipStoreOnline(storeId)))

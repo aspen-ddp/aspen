@@ -295,6 +295,33 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
         writeTransferringOutStore(dir / os.up, s)
         corrupt(Backend.crlSaveFile(dir), s)
 
+  // The transferred-in marker no longer outranks the transfer-out one: a copy carrying both is Outbound, so its save
+  // file must be valid (it was adopted as Clean whatever its save file before CopyPhase)
+  atest("a store carrying transferring-out and transferred-in with a truncated save file is adopted as Rebuilding"):
+    adoptWithLostStore: (dir, s) =>
+      writeTransferringOutStore(dir / os.up, s)
+      os.write.over(dir / StoreTransfer.TransferredInMarkerFile, "t1")
+      os.write.over(Backend.crlSaveFile(dir), "")
+
+  atest("a store carrying transferring-out and transferred-in with a valid save file is adopted as Clean"):
+    given ExecutionContext = executionContext
+    val rebuilds = new RecordingRebuildFactory
+    for
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 1, registerOldHost = true): ss =>
+                  Map(ss(0) -> offline)
+      s0 = stores.head
+      (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
+      d0 = writeTransferringOutStore(deviceDir, s0)
+      _ = os.write.over(d0 / StoreTransfer.TransferredInMarkerFile, "t1")
+      host = newHost(hostRoot, storeRebuildFactory = rebuilds)
+      _ <- resolve(host)
+      st <- state(deviceA)
+    yield
+      st.hostId should be(HostId.BootstrapHostId)
+      st.stores(s0).status should not be(StoreStatus.Rebuilding)
+      os.exists(d0 / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+      rebuilds.created should be(empty)
+
   atest("a transferring-out store whose save file cannot be read fails the adoption for a later scan (SL-W18)"):
     given ExecutionContext = executionContext
     val rebuilds = new RecordingRebuildFactory

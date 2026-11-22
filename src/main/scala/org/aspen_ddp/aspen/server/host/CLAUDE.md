@@ -9,9 +9,14 @@
   (retire, release and rename-first delete of store copies) and `LocalDevices` (the loaded devices). `StoreRouter`,
   `StoreThreadPool`/`StoreMailbox`/`StoreBalancer` and `HostStoreView` are the store-side and cross-thread pieces
 - `StoreDirMarkers` is the single source for the marker files a store directory carries (`rebuild-required`,
-  `transferred-in`, `transferring-out`, `rebuild-complete`) and `firstPresent`, which stats a
-  caller's markers in the caller's priority order (`tryLoadStore` and `adoptionClass` each list their own). Its tests are FileStat's: `has` throws on a failed stat, `knownPresent`
-  answers false for a pass that waits for a later one. `tryLoadStore`, `adoptionClass` and the marker tests go through it
+  `transferred-in`, `transferring-out`, `rebuild-complete`). Its tests are FileStat's: `has` throws on a failed stat,
+  `knownPresent` answers false for a pass that waits for a later one
+- `CopyPhase` (`Phase`: Live, Arrived, Outbound, Rebuilt, Lost) is the one reader of a copy's markers and the one
+  place that ranks them: RR > TO > TI > RC, first present wins (`read` throws a failed stat or read, `known`
+  answers None for a pass that waits). `tryLoadStore`, `adoptionClass` (Outbound needs a valid save file, else
+  CrlLost), `holdsOwnState` (Rebuilt), `reloadClosedStores` (offers Live, and a copy whose phase cannot be read) and
+  `startIn` (Arrived: stale check; Lost, Rebuilt and Outbound: `retireEarlierTenancy`; Live: refuse or receive; None:
+  wait) match on it. The single-marker tests of the reconciler passes, `retire` and the rebuilds stay `StoreDirMarkers`
 - `DeviceControl.markStoreOffline` keeps the router's offline mark and the device's
   `offlineStores` together; `LocalDevices.isLoaded(sds)` says whether a device state is still the loaded one
 

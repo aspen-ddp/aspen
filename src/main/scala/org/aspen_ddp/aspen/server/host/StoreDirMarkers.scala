@@ -27,8 +27,3 @@ object StoreDirMarkers:
    *  later pass, whose load stats it again */
   def knownPresent(storePath: os.Path, marker: Marker): Boolean =
     FileStat.existence(storePath / marker.fileName).contains(true)
-
-  /** The first of `markers`, in the caller's priority order, that `storePath` carries. Stats them in that order,
-   *  stopping at the first present, and throws the stat's error when that cannot be told */
-  def firstPresent(storePath: os.Path, markers: Marker*): Option[Marker] =
-    markers.find(has(storePath, _))

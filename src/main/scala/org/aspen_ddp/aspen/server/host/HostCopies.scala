@@ -693,6 +693,19 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
       copiesOf(sds).foreach: copies =>
         ctx.moves.holdLost(sds, storeId, held = false)
         copies.applyMove(storeId, to, copyId, unsynced).foreach(violation(site, _))
+        // A load retry the copy awaited names the path it left: retargeted to its new path for a move into Live (T7),
+        // where it may still load; dropped for any other phase, which never loads (its onServed unrun: the copy is
+        // being shipped, parked or retired)
+        copies.copies.get(storeId).map(_.activity).foreach:
+          case Activity.AwaitingRetry(r) =>
+            if to == Phase.Live then
+              activityFact(site, copies, storeId,
+                Activity.AwaitingRetry(r.copy(storePath = CopyLayout.path(sds.devicePath, storeId, Some(copyId), to))))
+            else
+              logger.info(s"Dropping the load retry of store $storeId on device ${sds.storageDeviceId}: its copy " +
+                          s"moved to $to ($site)")
+              activityFact(site, copies, storeId, Activity.Idle)
+          case _ => ()
         if copies.copies.get(storeId).exists(_.unsynced) then
           heldForSync += copies.deviceId -> storeId
         else if to == Phase.Retired then

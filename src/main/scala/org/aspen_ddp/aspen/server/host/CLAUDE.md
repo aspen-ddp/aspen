@@ -46,7 +46,8 @@
   transfer's promotion). `CopyRecord.copyId` is None for a flat copy. Every phase change into or out of a phase
   directory is one `CopyMoves.move` (`DeviceControl.moves`; `moveUnattached` for a device being loaded): the target
   phase's parameter file written durably, then `DurableFiles.move` through the `rename` and `syncDirectory` seams,
-  recorded as a fact (`HostCopies.moved`, a fresh `copyId` on a copy's first move). `DurableFiles.move` throws
+  recorded as a fact (`HostCopies.moved`, a fresh `copyId` on a copy's first move; a load retry the copy awaited is
+  retargeted to its new path for a move into Live and dropped for any other phase). `DurableFiles.move` throws
   `DurableFiles.MoveNotForced` for a rename that landed but was not forced: `MoveResult.Unsynced`, the record takes
   the phase with `unsynced` (the same flag a marker change sets) and `resync` forces both directories again; any
   other failure is `NotMoved`, nothing changed. A durable move to Retired unregisters the record (P3); an unsynced one
@@ -65,7 +66,9 @@
   debug a source with no record or whose phase is not Live, Rebuilt or Outbound (P10: an Arrived copy waits for the
   Completed Transfers In pass), and an unsynced one. `closedForTransfer`, once the close's extraction has made
   `crl_save.log` durable, moves the copy to `Outbound(tid)` (`StoreTransfersOut.moveToOutbound`: one already
-  Outbound for `tid` stays, a retransmit's; one Outbound for another transfer goes back to Live first) and begins the
+  Outbound for `tid` stays, a retransmit's; one Outbound for another transfer goes back to Live first; a copy that
+  must move is refused at debug, in `startOut` and again here, while a send of the store is still registered,
+  `isTransferringOut`: the supersession abort runs only inside the next `beginTransferOut`, after the move) and begins the
   send from the outbound path; a NotMoved or Unsynced move ships nothing and ends the work, the receiver's
   retransmit retries (an unsynced copy once a device check's resync has forced it). The service ships whatever
   directory it is given, so a shipped copy carries `phase-param.outbound`, inert at the destination, whose promotion

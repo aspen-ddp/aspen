@@ -227,6 +227,12 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
           case Some(phase) if !isSource(phase) =>
             refuse(s"Not starting the transfer out of store ${m.storeId}: its copy on device " +
                    s"${sourceDs.storageDeviceId} is $phase, which is never shipped")
+          // A send of the store still registered (an earlier transfer's, aborted, its archiver possibly still reading
+          // the copy) keeps its directory where it is: the move this request needs waits until that send has ended.
+          // A request for the transfer the copy is already Outbound for moves nothing, and its send supersedes
+          case Some(phase) if needsMove(phase, tidOf(devEntry)) && ctx.storeTransferService.isTransferringOut(m.storeId) =>
+            refuse(s"Not starting the transfer out of store ${m.storeId} yet: an earlier send of it is still " +
+                   s"registered, and its copy on device ${sourceDs.storageDeviceId} ($phase) must move")
           case Some(_) => ()
         // The store stays closed between its close and its move to outbound/ below, made in a later control task: its
         // TransferOut work, started here before the close, refuses every open of the copy until then (R12). A claim
@@ -260,6 +266,12 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
     case Phase.Live | Phase.Rebuilt(_) | Phase.Outbound(_) => true
     case _ => false
 
+  /** The transfer id a transfer out of `devEntry` moves its copy to Outbound with ("" for none) */
+  private def tidOf(devEntry: StorageDeviceState.StoreEntry): String = devEntry.transferId.map(_.toString).getOrElse("")
+
+  /** Whether a copy in `phase` must change place or parameter to be Outbound(tid) */
+  private def needsMove(phase: Phase, tid: String): Boolean = phase != Phase.Outbound(tid)
+
   /** T6: moves the closed copy of `storeId` on `sds` into outbound/ with transfer id `tid`, returning the copy's path
    *  there once the move is durable. One already Outbound for `tid` stays where it is. One Outbound for another
    *  transfer (aborted, then a new one started before the Abandoned Transfers Out pass reinstated it) goes back to
@@ -272,6 +284,10 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
         case MoveResult.Unsynced(_) | MoveResult.NotMoved(_) => false
     val moved = sourcePhase(sds, storeId) match
       case Some(Phase.Outbound(t)) if t == tid => true
+      case Some(phase) if ctx.storeTransferService.isTransferringOut(storeId) =>
+        // startOut refused this; a send registered since (none starts but here) would have its directory moved
+        logger.warn(s"Not shipping store $storeId: a send of it is registered, and its copy ($phase) must move")
+        false
       case Some(Phase.Outbound(t)) if t.nonEmpty => moveTo(Phase.Live) && moveTo(Phase.Outbound(tid))
       case Some(phase) if isSource(phase) => moveTo(Phase.Outbound(tid))
       case other =>
@@ -316,7 +332,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
         // Moved before archiving, after the extraction made crl_save.log durable: outbound/ keeps this copy offline
         // across restarts until the transfer is resolved one way or the other, and the shipped copy carries its
         // phase-param.outbound, inert at the destination. A move that fails or is not forced ships nothing
-        val outbound = moveToOutbound(sourceDs, m.storeId, devEntry.transferId.map(_.toString).getOrElse(""))
+        val outbound = moveToOutbound(sourceDs, m.storeId, tidOf(devEntry))
         outbound.foreach: outboundPath =>
           ctx.storeTransferService.beginTransferOut(m.storeId, m.transferUUID, outboundPath,
             toHostState.address, toHostState.storeTransferPort, m.timestamp)

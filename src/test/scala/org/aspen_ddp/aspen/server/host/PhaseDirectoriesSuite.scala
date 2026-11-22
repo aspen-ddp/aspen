@@ -662,3 +662,114 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       CopyFixtures.phaseOf(dev, shipped) should be(Some(Phase.Outbound(tid)))
       recordOf(host, local, shipped).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Outbound(tid), false)))
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  // ---- Task 3 fix round 1 ----
+
+  /** Places `shipped` in outbound/ for transfer `t`, with the valid save file its transfer's close left */
+  private def placeOutbound(t: String)(dev: os.Path): Unit =
+    val dir = CopyFixtures.placeCopy(dev, shipped, Phase.Outbound(t))
+    CrashRecoveryLog.saveStoreState(shipped, StoreRecoveryState.Empty, Backend.crlSaveFile(dir))
+
+  /** Records every rename of `host`'s moves, failing those `fail` names */
+  private def recordRenames(host: Host, fail: (os.Path, os.Path) => Boolean = (_, _) => false)
+      : () => Vector[(os.Path, os.Path)] =
+    @volatile var seen = Vector.empty[(os.Path, os.Path)]
+    host.control.moves.rename = (from, to) =>
+      seen :+= (from, to)
+      if fail(from, to) then throw new java.io.IOException("injected rename")
+      DurableFiles.atomicRename(from, to)
+    () => seen
+
+  atest("a copy outbound for an earlier transfer goes back to live and out again with the new transfer's id"):
+    given ExecutionContext = executionContext
+    val sends = new StagedSendService
+    for
+      (host, local, dev, tid) <- transferring(placeOutbound("old"), sends)
+      before = CopyFixtures.copyPath(dev, shipped).get
+      flat = CopyLayout.path(dev, shipped, None, Phase.Live)
+      renames = recordRenames(host)
+      started <- askAndSettle(host)
+    yield
+      started should be(Success(()))
+      renames() should be(Vector(before -> flat, flat -> before))
+      sends.sources should be(Vector(shipped -> before))
+      CopyLayout.readParam(before, Phase.Outbound("")) should be(tid)
+      CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(before), shipped).isRight should be(true)
+      recordOf(host, local, shipped).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Outbound(tid), false)))
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("a copy outbound for an earlier transfer whose move back out fails is left live with its save file"):
+    given ExecutionContext = executionContext
+    val sends = new StagedSendService
+    @volatile var failOut = true
+    for
+      (host, local, dev, tid) <- transferring(placeOutbound("old"), sends)
+      flat = CopyLayout.path(dev, shipped, None, Phase.Live)
+      _ = recordRenames(host, (_, to) => failOut && (to / os.up).last == CopyLayout.OutboundDirectory)
+      first <- askAndSettle(host)
+      shippedAfterFirst = sends.sources
+      pathAfterFirst = CopyFixtures.copyPath(dev, shipped)
+      phaseAfterFirst = recordOf(host, local, shipped).map(_.phase)
+      saveFileKept = os.exists(Backend.crlSaveFile(flat)) &&
+        CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(flat), shipped).isRight
+      // The receiver's retransmit: the Live copy, its state in its save file, ships
+      _ = failOut = false
+      second <- askAndSettle(host)
+    yield
+      first should be(Success(()))
+      shippedAfterFirst should be(Vector())
+      pathAfterFirst should be(Some(flat))
+      phaseAfterFirst should be(Some(Phase.Live))
+      saveFileKept should be(true)
+      second should be(Success(()))
+      sends.sources.map(_._1) should be(Vector(shipped))
+      CopyLayout.readParam(sends.sources.head._2, Phase.Outbound("")) should be(tid)
+      recordOf(host, local, shipped).map(_.phase) should be(Some(Phase.Outbound(tid)))
+
+  atest("a copy that must move is not moved while an earlier send of its store is registered"):
+    given ExecutionContext = executionContext
+    val sends = new StagedSendService
+    for
+      (host, local, dev, tid) <- transferring(placeOutbound("old"), sends)
+      before = CopyFixtures.copyPath(dev, shipped).get
+      // The earlier transfer's send, still running: its archiver may be reading the copy
+      _ = sends.beginTransferOut(shipped, UUID.randomUUID(), before, "127.0.0.1", 1, HLCTimestamp.now)
+      renames = recordRenames(host)
+      whileSending <- askAndSettle(host)
+      afterRefusal = (CopyFixtures.copyPath(dev, shipped), CopyFixtures.phaseOf(dev, shipped), renames())
+      _ = sends.endTransferOut(shipped)
+      afterEnd <- askAndSettle(host)
+      // A retransmit of this transfer while its own send runs moves nothing, and ships again
+      retransmit <- askAndSettle(host)
+    yield
+      whileSending shouldBe a[Failure[?]]
+      whileSending.failed.get.getMessage should include("earlier send")
+      afterRefusal should be((Some(before), Some(Phase.Outbound("old")), Vector()))
+      afterEnd should be(Success(()))
+      retransmit should be(Success(()))
+      sends.sources should be(Vector.fill(3)(shipped -> before))
+      CopyLayout.readParam(before, Phase.Outbound("")) should be(tid)
+      renames().size should be(2)
+
+  atest("a move out of live drops the copy's load retry, and a move into live retargets it"):
+    given ExecutionContext = executionContext
+    val sends = new StagedSendService
+    for
+      (host, local, dev, tid) <- transferring(dev => writeStoreConfig(dev, shipped): Unit, sends)
+      flat = CopyLayout.path(dev, shipped, None, Phase.Live)
+      claimed = host.control.copyRegistry.awaitingRetry("test", shipped, Host.LoadRetry(local, flat, 1, 1))
+      started <- askAndSettle(host)
+      afterShip = (recordOf(host, local, shipped).map(_.activity), host.control.copyRegistry.retryOn(local, shipped))
+      // Its send ends and the transfer is abandoned: a retry the outbound copy awaits follows it back to Live
+      outbound = CopyFixtures.copyPath(dev, shipped).get
+      _ = sends.endTransferOut(shipped)
+      _ = host.control.copyRegistry.awaitingRetry("test", shipped, Host.LoadRetry(local, outbound, 1, 1))
+      _ = host.control.transfersOut.reinstateAbandonedOut(local, shipped)
+      _ = host.testingOnlyHandleEvents()
+    yield
+      claimed should be(true)
+      started should be(Success(()))
+      afterShip should be((Some(Activity.Idle), None))
+      host.control.copyRegistry.retryOn(local, shipped).map(_.storePath) should be(Some(flat))
+      CopyFixtures.copyPath(dev, shipped) should be(Some(flat))
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())

@@ -32,6 +32,11 @@ import scala.util.Random
   * Each host's object cache is disabled, so every read is served by the FSIF backends. Every backend it loads reports
   * its completions through a handler that also schedules `network.handleEvents()` on the test's execution context:
   * FSIF completes I/O on its own threads, and nothing else would drain the events they queue.
+  *
+  * That drain runs only while `testRunning()` holds. A completion can land after its test's last step (the reads of
+  * the stores a read's quorum no longer waited for), and the suite's serial execution context then runs its drain
+  * during the next test, after the fixture removed this host's directories: the drain's copy registry disk check
+  * would find every record's directory gone and fail that next test.
   */
 private object FsifTestHost:
   def apply(network: TestNetwork,
@@ -39,12 +44,13 @@ private object FsifTestHost:
             hostId: HostId,
             systemId: UUID,
             hostRoot: os.Path,
-            ec: ExecutionContext): Host =
+            ec: ExecutionContext,
+            testRunning: () => Boolean): Host =
     val seams = Host.Seams(verifyCopyRegistry = true, wrapIoHandler = Some: queue =>
       new CompletionHandler:
         override def complete(op: Completion): Unit =
           queue.complete(op)
-          ec.execute(() => network.handleEvents()))
+          ec.execute(() => if testRunning() then network.handleEvents()))
     new Host(client, hostId, systemId, hostRoot, ec, new LockstepThreading(ec), (_, _) => ObjectCache.NoCache, network,
       BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL, network.FinalizerFactory,
       TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
@@ -157,8 +163,12 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
 
   // ---- Setup ------------------------------------------------------------------------------------------------
 
+  /** The host's completions drain `net` while it is still this test's network: the fixture replaces it at the next
+    * test and clears it at teardown. Read on the test's execution context, where the drains run
+    */
   private def newFsifHost(): Host =
-    FsifTestHost(net, client, fsifHostId, systemId, hostRoot, executionContext)
+    val testNet = net
+    FsifTestHost(testNet, client, fsifHostId, systemId, hostRoot, executionContext, () => net eq testNet)
 
   /** The FSIF host, its device and the pool, with every store created and served */
   private def setUp(): Future[Unit] =

@@ -18,10 +18,12 @@
   `unsynced` (`HostCopies.unsynced`; a copy of a device not attached yet, an adoption's or a lost CRL's marks, is held
   in `unsyncedPaths` until its attach): a write then throws, a removal returns false. An unsynced copy is never loaded
   (`tryLoadStore`), shipped (`startOut` refuses) or retired (`StoreCopies.retire` answers false). Each device check
-  first forces every unsynced copy again (`CopyMarkers.resync`, at the top of `reconcileDeviceState`), and the
-  operational passes then load each one now synced that is Live, offline, free of work and Active
-  (`DeviceReconciler.loadResynced`, with its online gossip): the pass that removed its marker keys off that marker and
-  will not see it again. A removal that finds the marker absent forces the directory only if the copy is unsynced.
+  first forces every unsynced copy again (`CopyMarkers.resync`, at the top of `reconcileDeviceState`). A copy marked
+  unsynced stays held for its load (`HostCopies.heldForSyncOn`) until a load opens or installs it, or it leaves its
+  path or device, and every operational check loads each held copy that is synced, Live, offline, free of work and
+  Active (`DeviceReconciler.loadResynced`, with its online gossip): the pass that removed its marker keys off that
+  marker and will not see it again, and a check that finds the entry not Active or work holding the copy only defers
+  it. A removal that finds the marker absent forces the directory only if the copy is unsynced.
   The sites: `clearRebuildCompleteMarker`, `clearTransferredInMarker`, `reinstateAbandonedOut`, `bringIntoService`'s
   transfer-out removal, `keepRebuiltStoreOffline`, `closedForTransfer`'s transfer-out marker, `markRebuildRequired`
   and `StoreCopies.retire`'s rebuild-required marker. Markers in staging (a transfer's, a rebuild's) travel with the

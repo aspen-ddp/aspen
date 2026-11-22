@@ -186,19 +186,19 @@ The premises other subsystems take from this:
   until its host's unload closes it, and `SimpleDriverRecoveryMixin` may start more meanwhile (`Store.driveTransaction`
   has no `failStopped` check, unlike `Store.heartbeat`): a proposer holds no acceptor state, so it decides only what
   the other stores' votes and accepts allow, its own store drops every message, and its finalizer marks that store.
-* A store whose entry names this device is served, or is in the device's `offlineStores`, where a reconcile pass (lost
+* A store whose entry names this device is served, or is an offline copy on the device (its copy-registry record,
+  `HostCopies.offlineCopies`), where a reconcile pass (lost
   CRL, abandoned transfer out, cancelled shutdown, completed transfer in or rebuild) or a load retry takes it up. A
   backend open that fails for anything but a lost state (out of space, an I/O, lock or resource error) leaves the store
   offline and retries the load at the device scans with backoff (the copy's AwaitingRetry, `StoreLoader.retryFailedLoads`,
   capped at `Host.LoadRetryCap`); a create that left nothing at the path is created again by the next device check
   instead; a retry whose store config cannot be read keeps its entry and tries again at the next scan. A rebuilt copy
-  whose `rebuild-complete` marker cannot be removed after its flip is kept in `offlineStores`
-  (`keepUnpromotedCopyOffline`); a failed unlink leaves the marker for the Completed Rebuilds pass, which retries the
-  removal and the load at each device check, and an unlink whose directory sync failed leaves the copy unsynced
-  (`host.CopyMarkers`), which the next device check forces and loads. A transferred-in
-  copy's marker is removed by a plain unlink after a durable `ArrivedAtFile`
-  (`StoreTransfers.clearTransferredInMarker`): a crash may bring the marker back, and the Completed Transfers In pass
-  then loads the copy again. A failed `crl.loadStore` (`UnloadFailedStore`) is not retried, but it fails only with the
+  whose `rebuild-complete` marker cannot be removed after its flip stays an offline copy (its Rebuilt record); a
+  failed unlink leaves the marker for the Completed Rebuilds pass, which retries the removal and the load at each
+  device check, and an unlink whose directory sync failed leaves the copy unsynced and held for its load
+  (`host.CopyMarkers`), which every later device check that finds it synced, free and Active loads. A transferred-in
+  copy's marker is removed the same way, after a durable `ArrivedAtFile` (`StoreTransfers.clearTransferredInMarker`):
+  a failed unlink leaves the marker for the Completed Transfers In pass, a failed sync the copy unsynced and held. A failed `crl.loadStore` (`UnloadFailedStore`) is not retried, but it fails only with the
   CRL itself, whose failure unloads the device (`DeviceShutdown.crlFailed`). A store whose `config.yaml` cannot be read
   by `StoreLoader.tryLoadStore` (`awaitUnreadRetry`), or whose load finds its executor slot still held
   (`HostThreading.AlreadyAssigned`), is left offline and AwaitingRetry like a failed open, its `onServed`
@@ -260,7 +260,7 @@ The premises other subsystems take from this:
   `retireForeignCopy` and `discardLostStore` hold the rebuild for a later check, neither starting it over a copy
   they cannot see nor retiring a finished one; `startIn` neither resumes nor discards an arrived copy whose marker
   cannot be stat'd or read, and refuses a path whose stat fails; `openDeviceCrl` throws before moving `crl/`;
-  `keepUnpromotedCopyOffline` and an unserved `backendFailed` treat the directory as present (kept offline, marked).
+  an unserved `backendFailed` treats the directory as present (marked).
   A marker a reconcile pass looks for counts only when a stat finds it, so the pass waits for a later reconcile,
   and `reloadClosedStores` loads a store whose marker stat fails, the load then holding it back with its own
   `FileStat` tests. `StoreTransfersOut.extractUnloaded` tests the directory and the save file with `FileStat`, failing
@@ -277,11 +277,11 @@ The premises other subsystems take from this:
   asking for any bytes, and not while a rebuild of the store still runs here (rebuild-process.md FS18). So an Active
   entry here over this rebuild's copy was made Active by this episode. The retire waits for a copy served from the
   destination's path or a store opening, never for the transfer's source served from another device of this host,
-  which closes only for the StartStoreTransfer sent past the retire; a marked copy's load leaves the store served there
-  unsilenced (`StoreLoader.keepMarkedCopyOffline`), as does an unpromoted rebuilt copy whose flip settles after the
-store came to be served from another device here (`StoreRebuilds.keepUnpromotedCopyOffline`; both through
-`DeviceControl.markCopyOffline`), and a removed copy clears the router's offline mark only when no
-  other device here holds the store offline and no Rebuilding entry here silences it (`StoreRouter.clearOfflineUnlessHeld`). A rebuilt copy carries an empty
+  which closes only for the StartStoreTransfer sent past the retire. Silence is derived (`HostCopies.silence`): a copy
+  served from any device here makes the store Served, so a marked copy's load, or an unpromoted rebuilt copy whose
+  flip settles after the store came to be served from another device here, leaves the store served there; and a
+  removed copy's record goes alone, so the store stays silent while another device here holds a copy of it or Rebuild
+  work silences it. A rebuilt copy carries an empty
   `crl_save.log` (`RebuildingStore.writeEmptyCrlState`), so its first load (by the flip, the Completed Rebuilds pass,
   a restart, a reinstatement or an adoption) drops whatever device-CRL entries an earlier copy left under its id
   (`StoreLoader.awaitCrlLoad`), and a transfer out of the unloaded copy ships the file and drops them

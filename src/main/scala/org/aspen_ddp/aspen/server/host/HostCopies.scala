@@ -58,6 +58,10 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   // Store paths whose marker change could not be synced before their device was attached (unsynced): its attach
   // marks their records
   private var unsyncedPaths: Set[os.Path] = Set()
+  // Copies held back from loading for a marker change whose sync failed (unsynced), by device and store: held until
+  // a load opens or installs them, or they leave their path or device, so every later device check that finds one
+  // synced, free and Active loads it (DeviceReconciler.loadResynced), not only the check whose re-sync succeeded
+  private var heldForSync: Set[(StorageDeviceId, StoreId)] = Set()
 
   /** Tests: a throw of the silence path propagates rather than leaving the store silent (Host.Seams) */
   var strict: Boolean = false
@@ -177,6 +181,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
             case scala.util.Failure(_) => sds.copies.register(storeId, Phase.Unread)
           if unsyncedPaths.contains(path) && sds.copies.copies.contains(storeId) then
             unsyncedPaths -= path
+            heldForSync += sds.storageDeviceId -> storeId
             sds.copies.setUnsynced(storeId, true)
 
   /** As attach, listing the device itself (ControlFixture.injectLoadedDevice). A listing that fails registers none */
@@ -230,6 +235,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         if create && !copies.copies.contains(storeId) then
           copies.register(storeId, Phase.Live)
         copies.setActivity(storeId, Activity.Opening(openId))
+        heldForSync -= copies.deviceId -> storeId
 
   /** A create's open failed and left nothing at the path (StoreCreation): the record its open registered goes */
   def createFailed(sds: LocalStorageDeviceState, storeId: StoreId): Unit =
@@ -308,6 +314,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
       known("install", id, storeId)
       // Served -> Served: a reload over the served store (StoreRouter.install replacing an entry)
       device(id).foreach: copies =>
+        heldForSync -= copies.deviceId -> storeId
         if copies.copies.contains(storeId) then
           activityFact("install", copies, storeId, Activity.Served)
 
@@ -540,6 +547,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     val had = attached.get(id).map(_.copies)
     attached -= id
     parkedRetries = parkedRetries.filter((key, _) => key._1 != id)
+    // A later load of the device reads its copies anew, and its device load offers each
+    heldForSync = heldForSync.filter(_._1 != id)
     // A device unloaded before its first reconcile keeps what it listed before its load too
     val before = unloaded.getOrElse(id, Set())
     unloaded += id -> (listed ++ before)
@@ -640,7 +649,9 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def unsynced(site: String, storePath: os.Path): Unit =
     fact(site):
       copiesAt(storePath) match
-        case Some((copies, storeId)) if copies.copies.contains(storeId) => copies.setUnsynced(storeId, true)
+        case Some((copies, storeId)) if copies.copies.contains(storeId) =>
+          heldForSync += copies.deviceId -> storeId
+          copies.setUnsynced(storeId, true)
         case _ => unsyncedPaths += storePath
 
   /** The directory at `storePath` was forced: its copy is synced */
@@ -655,6 +666,10 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def isUnsyncedAt(storePath: os.Path): Boolean =
     unsyncedPaths.contains(storePath) ||
       copiesAt(storePath).exists((copies, storeId) => copies.copies.get(storeId).exists(_.unsynced))
+
+  /** The stores of `local`'s copies held back from loading for an unsynced marker change and not loaded since */
+  def heldForSyncOn(local: LocalStorageDeviceState): Set[StoreId] =
+    copiesOf(local).map(c => heldForSync.collect { case (id, s) if id == c.deviceId => s }).getOrElse(Set())
 
   /** Whether the copy of `storeId` on `sds` is unsynced */
   def isUnsynced(sds: LocalStorageDeviceState, storeId: StoreId): Boolean =
@@ -680,6 +695,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     fact(site):
       copiesOf(sds).foreach: copies =>
         parkedRetries -= ((copies.deviceId, storeId))
+        heldForSync -= copies.deviceId -> storeId
         copies.unregister(storeId)
 
   /** Test-only. For every loaded device, where its records and its disk disagree:

@@ -95,6 +95,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private def slotsTaken(except: Option[(StorageDeviceId, StoreId)]): Int =
     runningRebuilds.size + registry.discards(except)
 
+  /** The rebuild slots taken now (tests) */
+  private[server] def rebuildSlotsTaken: Int = slotsTaken(None)
+
   /** Cancels the rebuilds of the given stores of `deviceId` for its shutdown, returning, by store, the future of
    *  each one's slot release. A cancel during the walk, sweep, retries or finish's close fails the pass; a rebuild
    *  already past finish's abort-latch re-check (or found finished by start, awaiting its flip) completes instead
@@ -252,8 +255,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                    acceptLoss: Boolean, handoff: Boolean = false): Unit =
     val deviceId = local.storageDeviceId
     val held = StoreRebuilds.HeldRebuild(deviceId, episode, acceptLoss)
-    // Host-wide by store id: a rebuild of the store runs (on any device), so nothing more starts for it
-    val runs = registry.rebuilding(HostCopies.RebuildReads).contains(storeId)
+    // Host-wide by store id: a rebuild of the store runs (on any device), so nothing more starts for it. Its handle
+    // counts too: a rebuild running for a device unloaded under it (crlFailed and relinquish cancel nothing) has lost
+    // its Work with the device's records, and still holds its slot until it releases it
+    val runs = registry.rebuilding(HostCopies.RebuildReads).contains(storeId) || runningRebuilds.contains(storeId)
     // Nor queued while a transfer out is still closing it (and extracting its CRL state from its directory): that
     // close is the (device, store)'s one piece of work (I3), and its end checks the device again
     // (StoreTransfersOut.deferRebuildUntilClosed). The close took the store out of service already

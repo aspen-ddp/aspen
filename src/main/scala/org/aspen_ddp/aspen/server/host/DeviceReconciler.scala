@@ -147,7 +147,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                                    remote: StorageDeviceState): Unit =
     local.reconciledEntries = Some(remote.stores)
     // Copies whose marker change was not durable (CopyMarkers) are forced again first, so the passes see them synced
-    val resynced = ctx.markers.resync(local)
+    ctx.markers.resync(local)
     if remote.isFailed then
       // An operator has declared this device dead. Its directory can still mount -- a dead
       // controller rather than a dead platter -- and its zeroed host id must not be mistaken for
@@ -183,7 +183,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
 
       completeTransfersIn(local, remote)
       completeRebuilds(local, remote)
-      loadResynced(local, remote, resynced)
+      loadResynced(local, remote)
       // New stores
       remote.stores.filter((storeId, entry) =>
         entry.status == StorageDeviceState.StoreStatus.Initializing
@@ -362,15 +362,14 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       if ctx.rebuilds.clearRebuildCompleteMarker(local, storeId) then
         ctx.tryLoadStore(local, storePath, None)
 
-  /** Loads each copy this check forced again (`resynced`, CopyMarkers.resync) that a marker removal had left unsynced
-   *  over a Live copy: the removal's own load was held back (an unsynced copy is never loaded), and the pass that made
-   *  it keys off the marker it removed. Only a copy still offline and free of work, whose entry is Active; one whose
-   *  entry is not Active then is left as a restart's scan would leave it. Its online gossip goes with the load, as a
-   *  reinstated transfer out's does */
-  private def loadResynced(local: LocalStorageDeviceState, remote: StorageDeviceState,
-                           resynced: List[StoreId]): Unit =
+  /** Loads each copy held back from loading for a marker change whose sync failed (HostCopies.heldForSyncOn), once it
+   *  is synced again (CopyMarkers.resync): the removal's own load was held back (an unsynced copy is never loaded),
+   *  and the pass that made it keys off the marker it removed. Only a Live copy still offline and free of work, whose
+   *  entry is Active; one that is not yet stays held, for every later check, until a load opens it or it leaves its
+   *  path or device. Its online gossip goes with the load, as a reinstated transfer out's does */
+  private def loadResynced(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     val free = ctx.copyRegistry.offlineCopies(local)
-    resynced.filter(storeId =>
+    ctx.copyRegistry.heldForSyncOn(local).toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).filter(storeId =>
       free.contains(storeId) && !ctx.copyRegistry.isUnsynced(local, storeId) &&
       ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase == Phase.Live) &&
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active)

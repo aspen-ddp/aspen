@@ -84,7 +84,9 @@
   rebuild registered", `HostCopies.rebuilding(stages)`, each caller naming its stages (R20): `RebuildReads` (Running,
   Abandoned: repairability, the Completed Rebuilds pass, an earlier tenancy's retire, a second start), `RebuildHolds`
   (plus DiscardingLost: a load retry waits, `startOut` refuses), all stages for silence; `hasRebuildWork(store,
-  device)` is any stage on one device. Slots (`maxConcurrentRebuilds`) count running rebuilds by handle and discards by
+  device)` is any stage on one device. `startRebuild`'s host-wide "a rebuild of the store runs" also counts a running
+  handle, so a rebuild still running for a device unloaded under it (crlFailed and relinquish cancel nothing; its
+  Work went with the device's records) blocks a second rebuild of the store until it releases its slot. Slots (`maxConcurrentRebuilds`) count running rebuilds by handle and discards by
   work; a discard hands its slot to the rebuild with no gap (`startRebuild(handoff = true)`: DiscardingLost goes
   straight to Running, the discard's own slot not counted), and a rebuild that does not start leaves the work Queued.
   An outcome that ends the work ends it at the slot's release, after the outcome's steps (an Adopt's marker removal

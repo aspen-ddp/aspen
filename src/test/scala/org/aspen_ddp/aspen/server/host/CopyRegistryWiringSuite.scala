@@ -1064,3 +1064,52 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
         holds should be(stage.exists(HostCopies.RebuildHolds.contains))
         reads should be(stage.exists(HostCopies.RebuildReads.contains))
       consistent(host)
+
+  // A copy whose marker removal was forced again stays held for its load until a check that finds it loadable loads
+  // it: a check whose entry is not Active, or whose copy other work holds, only defers it
+  for variant <- List("entry not Active", "work holds the copy") do
+    atest(s"a re-synced copy that the re-syncing check cannot load is loaded by a later check ($variant)"):
+      given ExecutionContext = executionContext
+      val hostRoot = newHostDir()
+      val dev = device(hostRoot, deviceA)
+      val dir = writeStoreConfig(dev, sid(0))
+      os.write(dir / StoreTransfer.TransferOutMarkerFile, "x")
+      val host = newHost(hostRoot, verifyCopyRegistry = true)
+      var failSync = true
+      host.control.markers.syncDirectory = d =>
+        if failSync && d == dir then throw new java.io.IOException("injected directory sync failure")
+      host.testingOnlyHandleEvents()
+      def entry(status: StorageDeviceState.StoreStatus) =
+        deviceState(deviceA, Map(sid(0) -> StorageDeviceState.StoreEntry(status, None)))
+      def check(state: StorageDeviceState): Future[Unit] =
+        val armed = recorded(host).armLookup(deviceA)
+        host.control.reconciler.checkStorageDevice(deviceA)
+        armed.success(state)
+        awaitLoudly(s"the check of device $deviceA") {
+          host.testingOnlyHandleEvents()
+          !host.control.reconciler.activeDeviceChecks.contains(deviceA)
+        }
+      def loads: Int = recorded(host).storeLoadAttempts.count(_ == (deviceA, dir))
+      val held = Work.TransferIn(None, TransferInStage.RetiringEarlierTenancy)
+      def hold(on: Boolean): Unit =
+        host.control.copyRegistry.work("test", deviceA, sid(0), _.isInstanceOf[Work.TransferIn],
+          if on then Some(held) else None): Unit
+      val loadedAtStart = loads
+      for
+        _ <- check(entry(StorageDeviceState.StoreStatus.Active))
+        unsynced = record(host, deviceA, sid(0)).map(_.unsynced)
+        _ = failSync = false
+        // The re-syncing check cannot load it
+        _ = if variant == "work holds the copy" then hold(on = true)
+        _ <- check(entry(if variant == "entry not Active" then StorageDeviceState.StoreStatus.Offline
+                         else StorageDeviceState.StoreStatus.Active))
+        synced = record(host, deviceA, sid(0)).map(_.unsynced)
+        loadsWhileHeld = loads
+        _ = if variant == "work holds the copy" then hold(on = false)
+        _ <- check(entry(StorageDeviceState.StoreStatus.Active))
+      yield
+        unsynced should be(Some(true))
+        synced should be(Some(false))
+        loadsWhileHeld should be(loadedAtStart)
+        loads should be(loadedAtStart + 1)
+        consistent(host)

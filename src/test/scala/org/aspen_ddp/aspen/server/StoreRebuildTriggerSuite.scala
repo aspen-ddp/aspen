@@ -266,6 +266,33 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       heldBack should be(1)
       factory.created.size should be(2)
 
+  // A rebuild still running for a device unloaded under it (crlFailed cancels nothing) keeps the store's host-wide
+  // single flight and its slot: a second rebuild of the store on another device of the host does not start, and the
+  // running one's handle is not overwritten
+  atest("a rebuild running for an unloaded device blocks a second rebuild of its store and keeps its slot"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    writeDevice(hostRoot, "dev1", deviceB)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 2)
+    val firstA = recorded(host).armLookup(deviceA)
+    host.control.reconciler.checkStorageDevice(deviceA)
+    firstA.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
+    for
+      _ <- awaitLoudly("the rebuild on device A to start")(factory.created.size == 1)
+      _ = host.control.shutdown.crlFailed(loadedDevices(host)(deviceA), new Exception("injected CRL failure"))
+      _ <- awaitLoudly("device A to be unloaded")(!loadedDevices(host).contains(deviceA))
+      // Re-placed onto device B of the same host, its reconcile asks for the rebuild there
+      _ = host.control.rebuilds.startRebuild(loadedDevices(host)(deviceB), storeN(0), None, acceptLoss = false)
+      startedAgain = factory.created.size
+      slots = host.control.rebuilds.rebuildSlotsTaken
+      // Each rebuild's end releases its slot
+      _ = factory.created.foreach(_.promise.failure(new Exception("CRL gone")))
+      _ <- awaitLoudly("the rebuilds to release their slots")(host.control.rebuilds.rebuildSlotsTaken == 0)
+    yield
+      startedAgain should be(1)
+      slots should be(1)
+
   atest("a failed rebuild releases its slot for another device"):
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)

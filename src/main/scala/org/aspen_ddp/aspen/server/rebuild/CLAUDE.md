@@ -26,12 +26,12 @@
   and the walk starts over. `lossAccepted` honours `acceptLoss` only on an entry of its episode
 - Completion identity (rebuild-process 2.2, 5.6): `finish` writes the episode (empty for None) durably as
   `phase-param.rebuilt` in staging, the last write, then renames staging into `<device>/rebuilt/` under a fresh copy
-  id (T2; `rebuild-complete` is never written), and `complete` reports that id (`StoreRebuild.complete:
-  Future[UUID]`), with which the host records the copy. A copy in `rebuilt/` is a finished rebuild awaiting its
-  flip: `start()` asks its `existingCopy` lookup (`StoreRebuildFactory.createRebuild`'s; `copyOnDisk`, over
-  `CopyLayout.list`, since the rebuild must not read the control thread's registry) and takes a copy for done only
-  when it is Rebuilt for its own episode (`RebuildingStore.isRebuiltFor`), failing on any other copy of the store
-  outside `pending-delete/`. `StoreLoader.tryLoadStore` leaves a Rebuilt copy offline, and `StoreRebuilds` moves it
+  id (T2), and `complete` reports that id (`StoreRebuild.complete: Future[UUID]`), with which the host records the
+  copy. A copy in `rebuilt/` is a finished rebuild awaiting its flip: `start()`, run by the constructor on the
+  control thread, reads its `existingCopy: Option[(Phase, os.Path)]` (`StoreRebuildFactory.createRebuild`'s,
+  built by `StoreRebuilds.startRebuild` from the store's copy record on the device; nothing lists the device) and
+  takes a copy for done only when it is Rebuilt for its own episode (`RebuildingStore.isRebuiltFor`), failing on any
+  other copy of the store outside `pending-delete/`. Tests build it with `CopyFixtures.existingCopy`. `StoreLoader.tryLoadStore` leaves a Rebuilt copy offline, and `StoreRebuilds` moves it
   once the flip commits: `Adopt` to Live before the load (`bringRebuiltLive`, T3), `AdoptOffline` to `parked/` in one
   move (`keepRebuiltStoreOffline`, T4), `Discard` deletes it rename-first (T13). The reconcile's Completed Rebuilds
   pass moves an offline Rebuilt copy of an Active entry Live after a crash. A copy of a Rebuilding store that is not

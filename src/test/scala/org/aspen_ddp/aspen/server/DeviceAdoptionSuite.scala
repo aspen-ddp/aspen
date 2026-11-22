@@ -179,7 +179,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       List(s0, s1, s2) = stores: @unchecked
       (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
       d0 = writeClosedStore(deviceDir, s0)
-      // A transfer out interrupted by the shutdown: its own marker, which adoption must leave.
+      // A transfer out interrupted by the shutdown: its copy in outbound/, which adoption must leave.
       d2 = writeTransferringOutStore(deviceDir, s2)
       _ = net.takeCapturedGossip()
       host = newHost(hostRoot, storeRebuildFactory = rebuilds)
@@ -286,10 +286,10 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(d0) should be(false)
       recorded(host).storeLoadAttempts.map(_._2) should contain(d1)
 
-  // Marked by the host that closed it (a backend that failed during its close, StoreRebuilds.failedOnClose): its
-  // state cannot be trusted whatever else its directory holds.
-  atest("a store marked rebuild-required is adopted as Rebuilding"):
-    adoptWithLostStore((dir, s) => CopyFixtures.markCopy(dir / os.up, s, Phase.Lost))
+  // Moved to lost/ by the host that closed it (a backend that failed during its close, StoreRebuilds.failedOnClose):
+  // its state cannot be trusted whatever else its directory holds.
+  atest("a store in lost/ is adopted as Rebuilding"):
+    adoptWithLostStore((dir, s) => CopyFixtures.markCopy(dir / os.up / os.up, s, Phase.Lost))
 
   // A network transfer out extracted the store's state from the device CRL into its save file. A save file missing
   // or unusable now (a disk pulled before it reached the platter, or a file copied from another store) leaves no
@@ -301,7 +301,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
           CrashRecoveryLog.saveStoreState(StoreId(s.poolId, (s.poolIndex + 1).toByte), StoreRecoveryState.Empty, file))) do
     atest(s"a store whose network transfer left it in outbound/ with $what save file is adopted as Rebuilding"):
       adoptWithLostStore: (dir, s) =>
-        corrupt(Backend.crlSaveFile(markTransferringOut(dir / os.up, s)), s)
+        corrupt(Backend.crlSaveFile(markTransferringOut(dir / os.up / os.up, s)), s)
 
   // Stage 2 Task 3: an outbound/ copy is classed by its location and its save file; a Clean one whose entry the
   // adoption makes Active is reinstated (T7), the CrlLost one moved to lost/ (T10) and retired before its rebuild
@@ -334,7 +334,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       st.stores(s0).status should be(StoreStatus.Active)
       st.stores(s1).status should be(StoreStatus.Rebuilding)
       // s0 is reinstated to Live, and loaded
-      val flat0 = deviceDir / s0.directoryName
+      val flat0 = CopyFixtures.livePathOf(deviceDir, s0)
       CopyFixtures.phaseOf(deviceDir, s0) should be(Some(Phase.Live))
       CopyFixtures.copyPath(deviceDir, s0) should be(Some(flat0))
       recorded(host).storeLoadAttempts.map(_._2) should contain(flat0)
@@ -347,10 +347,10 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       rebuilds.created.map(_.storeId).toList should be(List(s1))
 
   // An arrived phase-param inside an outbound/ copy is inert (its location is its phase): it is Outbound, so its save
-  // file must be valid (a transferred-in marker once had it adopted as Clean whatever its save file)
+  // file must be valid
   atest("an outbound copy carrying an arrived phase-param with a truncated save file is adopted as Rebuilding"):
     adoptWithLostStore: (dir, s) =>
-      val outbound = markTransferringOut(dir / os.up, s)
+      val outbound = markTransferringOut(dir / os.up / os.up, s)
       os.write.over(outbound / CopyLayout.paramFile(Phase.Arrived("")).get, "t1")
       os.write.over(Backend.crlSaveFile(outbound), "")
 
@@ -678,11 +678,11 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       st.status should be(DeviceStatus.Operational)
       st.stores(s1).status should be(StoreStatus.Active)
       CopyFixtures.phaseOf(deviceDir, s1) should be(Some(Phase.Live))
-      // Offered once in arrived/ at the device's load, and kept offline; loaded once, at its Live path, after its move
-      // there (T9)
-      recorded(host).storeLoadAttempts.map(_._2).count(_ == d1) should be(1)
-      recorded(host).storeLoadAttempts.map(_._2).count(_ == CopyLayout.path(deviceDir, s1, None, Phase.Live)) should be(1)
-      os.exists(CopyLayout.path(deviceDir, s1, None, Phase.Live) / StoreLoader.ArrivedAtFile) should be(true)
+      // Never offered in arrived/ (only live/ copies are), and kept offline; loaded once, at its Live path, after its
+      // move there (T9)
+      recorded(host).storeLoadAttempts.map(_._2).count(_ == d1) should be(0)
+      recorded(host).storeLoadAttempts.map(_._2).count(_ == CopyFixtures.livePathOf(deviceDir, s1)) should be(1)
+      os.exists(CopyFixtures.livePathOf(deviceDir, s1) / StoreLoader.ArrivedAtFile) should be(true)
 
   atest("a store rebuilt after its device was shut down and unloaded is adopted"):
     given ExecutionContext = executionContext
@@ -917,3 +917,37 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       after.caCertificate should be(before.caCertificate)
       pool.stores.toList.map(_.hostId) should be(List.fill(3)(HostId.BootstrapHostId))
       pool.stores(kept.poolIndex).storageDeviceId should be(StorageDeviceId.BootstrapStorageDeviceId)
+
+  // Spec "Adoption": a lookup on the copy's phase alone. live, arrived, rebuilt and parked copies are Clean; an outbound
+  // copy is Clean with a valid save file and CrlLost without; a lost copy is CrlLost; an entry whose store has no copy in
+  // any phase (pending-delete/ is none) is Unclean
+  atest("adoption classifies by phase"):
+    val host = newHost(newHostDir())
+    host.testingOnlyHandleEvents()
+    val deviceDir = newHostDir() / "carried"
+    val pool = PoolId(UUID.randomUUID())
+    def sid(i: Int) = StoreId(pool, i.toByte)
+    val placements = List(
+      (Phase.Live, AdoptionClass.Clean),
+      (Phase.Arrived("t"), AdoptionClass.Clean),
+      (Phase.Rebuilt("e"), AdoptionClass.Clean),
+      (Phase.Parked, AdoptionClass.Clean),
+      (Phase.Outbound("t"), AdoptionClass.Clean),
+      (Phase.Outbound("t"), AdoptionClass.CrlLost),
+      (Phase.Lost, AdoptionClass.CrlLost),
+      (Phase.Retired, AdoptionClass.Unclean))
+    placements.zipWithIndex.foreach:
+      case ((phase, cls), i) =>
+        val copy = CopyFixtures.placeCopy(deviceDir, sid(i), phase)
+        if phase.isInstanceOf[Phase.Outbound] && cls == AdoptionClass.Clean then
+          RebuildingStore.writeEmptyCrlState(copy, sid(i))
+    // No copy at all
+    val absent = sid(placements.size)
+    val expected = placements.zipWithIndex.map((p, i) => sid(i) -> p._2).toMap + (absent -> AdoptionClass.Unclean)
+    // Offline and Active entries are both served by an adoption
+    val state = deviceState(deviceA, expected.keys.zipWithIndex.map((s, i) =>
+      s -> StoreEntry(if i % 2 == 0 then StoreStatus.Active else StoreStatus.Offline, None)).toMap)
+    Future.successful:
+      AdoptionClass.values.toList.map(cls => cls -> host.control.discovery.servedStoresIn(deviceDir, state, cls).toSet)
+        .toMap should be(AdoptionClass.values.toList.map(cls =>
+          cls -> expected.collect { case (s, c) if c == cls => s }.toSet).toMap)

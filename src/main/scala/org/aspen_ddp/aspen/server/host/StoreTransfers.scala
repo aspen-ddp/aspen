@@ -437,9 +437,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         // A copy in any other phase is an earlier tenancy's, retired before the receive (retireEarlierTenancy).
         val next: Next = record match
           case None => Next.Receive
-          // A retired copy still recorded awaits the resync that forces its move (CopyMoves), as an unread one awaits
-          // a read
-          case Some(r) if r.phase == Phase.Unread || r.phase == Phase.Retired => Next.Wait
+          // A retired copy still recorded awaits the resync that forces its move (CopyMoves)
+          case Some(r) if r.phase == Phase.Retired => Next.Wait
           // A move a crash could undo (a promotion's included): the next device check forces it first
           case Some(r) if r.unsynced =>
             logger.info(s"Not transferring store $storeId onto device $toDeviceid yet: a move of its copy is not " +
@@ -620,7 +619,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  TransferringIn for `transferId` (see the body). */
   private def retireEarlierTenancy(local: LocalStorageDeviceState, storeId: StoreId, transferId: Option[UUID]): Unit =
     val deviceId = local.storageDeviceId
-    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
+    def storePath: Option[os.Path] = ctx.copyRegistry.pathOf(local, storeId)
     def record: Option[CopyRecord] = registry.copiesOf(local).flatMap(_.copies.get(storeId))
     def openingOrClosing: Boolean =
       ctx.loader.isOpening(storeId) || record.exists(r =>
@@ -631,6 +630,10 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     if registry.rebuilding(HostCopies.RebuildReads).contains(storeId) || openingOrClosing then
       logger.info(s"Not transferring store $storeId onto device $deviceId yet: it holds a copy of an earlier " +
                   s"tenancy, which waits for a rebuild, an open or a close of the store here to end")
+      // A rebuild's end and a close's end check the device again; an open's end does not, so a store opening is
+      // checked again soon rather than at the periodic check
+      if openingOrClosing then
+        ctx.reconciler.scheduleDeviceRecheck(deviceId)
     else if !ctx.copies.isRetiring(storeId) && inWork(storeId, deviceId).isEmpty &&
             claimWork(storeId, deviceId, Work.TransferIn(None, TransferInStage.RetiringEarlierTenancy)) then
       // The reconcile's tree read may predate this transfer's own pool update: once that commits, recordTransferIn
@@ -650,6 +653,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           case Failure(t) =>
             logger.warn(s"Not retiring the copy of store $storeId on device $deviceId yet: its device state could " +
                         s"not be read again. Retrying at a later check. Error: $t")
+            // Checked again after a delay, not at once, so a read that keeps failing cannot spin
+            ctx.reconciler.scheduleDeviceRecheck(deviceId)
             false
         if !confirmed || !ctx.devices.isLoaded(local) then
           endWork()
@@ -658,15 +663,17 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                         s"TransferringIn for transfer $transferId. Checking the device again")
             ctx.reconciler.checkStorageDevice(deviceId)
         else if registry.rebuilding(HostCopies.RebuildReads).contains(storeId) || openingOrClosing then
-          // Begun while the state was read: its end, or a later check, comes back here
+          // Begun while the state was read: a rebuild's or a close's end comes back here, and a check soon after
+          // covers an open's, whose end checks nothing
           endWork()
+          ctx.reconciler.scheduleDeviceRecheck(deviceId)
         else if ctx.router.entry(storeId).exists(e => e.store.storageDeviceId == deviceId &&
-                                                      e.store.backend.path == storePath) then
+                                                      storePath.contains(e.store.backend.path)) then
           // A copy served here is not the owner's (the transfer's source is): taken out of service as a failed
           // backend is (a FailStop close, the copy moved to lost/ when the close ends, its CRL entries kept), and the
           // check its close's end makes retires it
           endWork()
-          logger.warn(s"Taking the served copy of an earlier tenancy of store $storeId at $storePath on device " +
+          logger.warn(s"Taking the served copy of an earlier tenancy of store $storeId at ${storePath.get} on device " +
                       s"$deviceId out of service before transferring the store onto it")
           ctx.rebuilds.takeOutOfService(local, storeId,
             s"is served from a copy of an earlier tenancy on device $deviceId, which the store is transferring onto")
@@ -674,7 +681,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           // Served by nothing installed here (a stand-in): left for whatever ends it
           endWork()
         else
-          logger.warn(s"Retiring the copy of an earlier tenancy of store $storeId at $storePath on device " +
+          logger.warn(s"Retiring the copy of an earlier tenancy of store $storeId at ${storePath.getOrElse("(none)")} on device " +
                       s"$deviceId before transferring the store onto it")
           ctx.copies.retire(local, storeId).foreach: clear =>
             endWork()

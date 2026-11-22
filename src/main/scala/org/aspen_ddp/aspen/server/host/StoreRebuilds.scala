@@ -157,8 +157,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  the flip completes, keeps a check meanwhile from creating it again (I3: one piece of work per (device, store)).
    */
   def createNewStore(local: LocalStorageDeviceState, storeId: StoreId): Unit =
-    // The create's target: the copy has no record yet
-    val storePath = CopyLayout.path(local.devicePath, storeId, None, Phase.Live)
+    // The create's target, live/<copy> under a fresh copy id, which its record (registered by its open, before the
+    // create places the copy) takes
+    val storePath = CopyLayout.freshLivePath(local.devicePath, storeId)
     val deviceId = local.storageDeviceId
 
     // The create claims its work first (I3): refused (other work holds the copy, recorded), nothing starts, and the
@@ -168,13 +169,17 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
        registry.work("create", deviceId, storeId, _ == Work.Create, Some(Work.Create)) then
       pendingCreateFlips += storeId
 
-      // True when the store exists on disk (created here, or by an attempt that crashed before
-      // its flip), false when the create was skipped for a shutdown. A stat that fails (FileStat) fails the flip, which
-      // the next check tries again: never a create over a store that may be there, nor a flip of one that may not.
-      val fcreate: Future[Boolean] = Try(FileStat.exists(storePath)) match
-        case Failure(t) => Future.failed(t)
-        case Success(true) => Future.successful(true)
-        case Success(false) =>
+      // True when the store exists on disk (created here, or by an attempt that crashed before its flip, whose Live
+      // copy the device's load registered), false when the create was skipped for a shutdown. A copy in any other
+      // phase fails the flip, which the next check tries again: never a create beside a copy of the store (T1), nor a
+      // flip of one that is not Live.
+      val existing = registry.copiesOf(local).flatMap(_.copies.get(storeId))
+      val fcreate: Future[Boolean] = existing match
+        case Some(r) if r.phase == Phase.Live => Future.successful(true)
+        case Some(r) =>
+          Future.failed(IllegalStateException(s"Store $storeId, Initializing on device $deviceId, has a copy there in " +
+                                              s"${r.phase}: not creating it"))
+        case None =>
           ctx.client.getStoragePoolState(storeId.poolId).flatMap: pstate =>
             if ctx.shutdown.isShuttingDown(deviceId) || ! ctx.devices.isLoaded(local) then
               logger.info(s"Not creating store $storeId: device $deviceId is being shut down")
@@ -183,7 +188,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               val storeConfig = StoreConfig.forPool(storeId, pstate)
 
               // Created wherever its backend opens, atomically (BackendOpener.create, StoreCreation): the
-              // directory, config included, appears at storePath only complete, so the FileStat check above
+              // directory, config included, appears at storePath only complete, so a Live record after a restart
               // means the store exists. startOpen registers its copy Opening now, so a shutdown of this
               // device waits for the create and then closes the store. A create that fails, out of space
               // included, leaves nothing at storePath, and the next device check tries again.
@@ -305,10 +310,12 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
        slotsTaken(Option.when(handoff)((deviceId, storeId))) < ctx.maxConcurrentRebuilds &&
        ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId, episode) &&
        discardLostStore(local, storeId, episode, held) then
-      // The rebuild's start asks the disk, not the registry, for a copy already there: it may run off the control thread
+      // The copy already there, as its record has it: the rebuild's start (on this thread, in its constructor) takes
+      // this episode's Rebuilt copy for done and fails on any other
+      val existing = registry.copiesOf(local).flatMap(_.copies.get(storeId)).filter(_.phase != Phase.Retired)
+        .map(r => (r.phase, CopyLayout.path(local.devicePath, storeId, r.copyId, r.phase)))
       val sr = ctx.storeRebuildFactory.createRebuild(
-        ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends, episode,
-        RebuildingStore.copyOnDisk(local.devicePath, storeId))
+        ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends, episode, existing)
 
       val settled = Promise[Unit]()
 
@@ -465,7 +472,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                 // device before the retry
                 logger.error(s"Failed to record the completed rebuild of store $storeId on " +
                              s"device ${local.storageDeviceId}. The store is on disk in " +
-                             s"${ctx.copyRegistry.pathOrLive(local, storeId)} but is not " +
+                             s"${ctx.copyRegistry.pathOf(local, storeId).getOrElse("rebuilt/")} but is not " +
                              s"loaded, and the device entry still says Rebuilding. Retrying with a backoff", t)
               finally
                 release()
@@ -607,8 +614,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         ctx.moves.move(site, sds, storeId, Phase.Parked)
       case _ =>
         // Unloaded: its copy is where its rebuild finished it, in rebuilt/
-        val rebuilt = CopyLayout.path(local.devicePath, storeId, Some(copyId), Phase.Rebuilt(""))
-        ctx.moves.moveUnattached(site, rebuilt, storeId, Some(copyId), Phase.Parked)._1
+        val rebuilt = CopyLayout.path(local.devicePath, storeId, copyId, Phase.Rebuilt(""))
+        ctx.moves.moveUnattached(site, rebuilt, storeId, copyId, Phase.Parked)._1
     result match
       case MoveResult.NotMoved(_) =>
         // Logged by the move. Offline either way: a Rebuilt copy goes Live only once its entry is Active (the
@@ -635,10 +642,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  an earlier Rebuilding episode, superseded by a re-placement away and back), or a copy put there by hand. Nothing
    *  ties it to the store's current state, so it is retired as a lost copy: moved to lost/, and then kept in
    *  pending-delete by discardLostStore like any other. A served one is first taken out of service as a failed backend
-   *  is, and its rebuild waits for a later check. The copy is told by its record's phase; with no record, a copy at the
-   *  flat path (put there by hand after the device's load) by its stat. A stat that fails is no absence (FileStat), nor
-   *  is an Unread record known: the rebuild waits for a later check, neither starting over a copy it cannot see nor
-   *  retiring a finished one it cannot read.
+   *  is, and its rebuild waits for a later check. The copy is told by its record's phase; a store with no record has
+   *  no copy on the device.
    *
    *  Any copy other than this episode's finished one, a foreign or a Lost one, may have served since the rebuild's
    *  first pass began: a restart's device load serves a Live copy until the device's first reconcile, and a served
@@ -647,22 +652,14 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  next pass a first pass (dropStagingCheckpoint). No rebuild of the store runs here when this is called. Returns
    *  whether the rebuild may go on now. */
   private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
-    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
+    val storePath = ctx.copyRegistry.pathOf(local, storeId).getOrElse(local.devicePath)
     // Some(None): no copy or this episode's finished copy; Some(Some(lost)): another copy, Lost (in lost/) or not
     val found: Option[Option[Boolean]] =
       registry.copiesOf(local).flatMap(_.copies.get(storeId)).map(_.phase) match
         case Some(Phase.Lost) => Some(Some(true))
-        case Some(Phase.Unread) =>
-          logger.error(s"The copy of store $storeId at $storePath could not be read. Not rebuilding it yet")
-          None
         case Some(phase) if RebuildingStore.isRebuiltFor(phase, episode) => Some(None)
         case Some(_) => Some(Some(false))
-        case None =>
-          try
-            if FileStat.exists(storePath) then Some(Some(false)) else Some(None)
-          catch case NonFatal(t) =>
-            logger.error(s"Failed to stat the path of store $storeId at $storePath. Not rebuilding it yet: $t")
-            None
+        case None => Some(None)
     if ctx.moves.isPendingLost(local, storeId) then
       // Its move to lost/ failed: held offline until a device check moves it
       false
@@ -718,12 +715,12 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  moved to lost/ when the close ends (P5), its CRL entries kept for its retire. `why` completes "store <id> ...".
    *  Nothing is done for a store still opening, or one not served from this device's copy */
   def takeOutOfService(local: LocalStorageDeviceState, storeId: StoreId, why: String): Unit =
-    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
+    val storePath = ctx.copyRegistry.pathOf(local, storeId)
     if !ctx.loader.isOpening(storeId) then
       ctx.router.entry(storeId) match
         case Some(entry) if entry.store.storageDeviceId == local.storageDeviceId &&
-                            entry.store.backend.path == storePath =>
-          val err = new IllegalStateException(s"$storePath holds a copy of store $storeId that $why")
+                            storePath.contains(entry.store.backend.path) =>
+          val err = new IllegalStateException(s"${entry.store.backend.path} holds a copy of store $storeId that $why")
           backendFailed(storeId, Some(entry.store.backend), err, why)
         case _ => ()
 
@@ -738,14 +735,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       case Some(r) if r.phase == Phase.Lost =>
         ctx.moves.holdLost(sds, storeId, held = false)
         MoveResult.Durable
-      case found =>
-        // A copy at the flat path with no record (put there by hand after the device's load) is learned first. A
-        // stat that fails learns it too: the move's own rename then fails or not
-        val record = found.orElse:
-          if registry.copiesOf(sds).isDefined &&
-             Try(FileStat.isDir(CopyLayout.path(sds.devicePath, storeId, None, Phase.Live))).getOrElse(true) then
-            registry.learn(site, sds, storeId)
-          registry.copiesOf(sds).flatMap(_.copies.get(storeId))
+      case record =>
+        // No record: no copy to move, NotMoved
         val result = ctx.moves.move(site, sds, storeId, Phase.Lost)
         result match
           case MoveResult.NotMoved(t) if record.isDefined =>
@@ -798,9 +789,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       case None =>
         logger.error(s"The copy of store $storeId at $path closed after its device $deviceId was unloaded ($site), " +
                      "a bug: an unload waits for its closes. Moving it to lost/ unattached")
-        val flat = CopyLayout.parseName(path.last).isEmpty
-        if flat && Try(FileStat.isDir(path)).getOrElse(true) then
-          ctx.moves.moveUnattached(site, path, storeId, None, Phase.Lost)._1 match
+        // A copy in live/ (the only phase a served copy closes from); one already elsewhere is left
+        CopyLayout.nameOf(path).filter(_ => CopyLayout.isLivePath(path)).foreach: (_, copyId) =>
+          ctx.moves.moveUnattached(site, path, storeId, copyId, Phase.Lost)._1 match
             case MoveResult.NotMoved(t) =>
               logger.error(s"Failed to move the copy of store $storeId at $path to lost/: $t")
             case _ => ()
@@ -910,7 +901,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *
    *  Only a collision is retried, as everywhere else in Host. A permanent failure is logged and
    *  left for a later reconcile: the Lost CRL State pass requests it again while the store's
-   *  copy is in lost/, and the Missing Stores pass (which has no marker) while
+   *  copy is in lost/, and the Missing Stores pass (which has no copy to go by) while
    *  the store it declared stays Active and unserved (LocalStorageDeviceState.declaredMissing),
    *  its directory back or not.
    */
@@ -967,7 +958,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  while the device holds any copy of the store that is not its finished rebuild (RebuildingStore.start). Returns whether
    *  the path is clear now, so the rebuild may start.
    *
-   *  The copy is retired (StoreCopies.retire: marker, CRL state saved into the copy, device-CRL entries dropped,
+   *  The copy is retired (StoreCopies.retire: moved to lost/, CRL state saved into the copy, device-CRL entries dropped,
    *  moved into pending-delete), and deleted once the store is Active on the device its pool names. The retire
    *  completes asynchronously: this returns false meanwhile, the store holding a rebuild slot (its work DiscardingLost).
    *  Once the copy is in pending-delete the rebuild is started at once, in the same callback, so the slot passes to

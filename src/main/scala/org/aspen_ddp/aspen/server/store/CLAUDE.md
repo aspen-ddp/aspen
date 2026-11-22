@@ -332,7 +332,9 @@
   `server/host/CLAUDE.md`
 - Creation is atomic for every backend (`StoreCreation`, systemic-loss-protection 4.1, row D5): `BackendOpener.create`
   builds the store, backend initialized and closed plus its config, in a scratch directory under `<device>/creating/`,
-  forces the tree and renames it to the store's path. Open never creates: FSIF throws `StoreLost` for a missing
+  forces the tree and renames it to the store's path: for a store, a fresh Live copy `<device>/live/<copy>`
+  (`CopyLayout.freshLivePath`; `live/` made durably if absent), whose copy id the create's record takes before the
+  create. Open never creates: FSIF throws `StoreLost` for a missing
   directory or blank files, RocksDB `RocksDBStateLost` when `CURRENT` is missing, so a store that lost its files is
   rebuilt, never served empty. Only a known absence is lost: those tests (and `NioFsifFiles.exists`/`size`, which
   FSIF recovery decides on) are `server.FileStat`'s, so a failed stat is an `IOException` the host's load retries. A new backend must keep both rules: create only in `init`, and treat an absent or empty

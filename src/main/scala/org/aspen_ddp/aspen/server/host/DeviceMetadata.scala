@@ -132,7 +132,7 @@ object DeviceMetadata:
    *  go round again, or undo its own on-disk work.
    *
    *  Returned rather than acted on inside that method for the same reason as TransferOutcome:
-   *  the decision is metadata, while unloading and marker files are local work.
+   *  the decision is metadata, while unloading and copy moves are local work.
    */
   private[aspen] enum ShutdownOutcome:
     /** The device is Shutdown and has no Active entry. It may be unloaded. */

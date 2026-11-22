@@ -263,7 +263,16 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
   private def await[T](f: Future[T]): T = Await.result(f, Duration(Bound, SECONDS))
 
   /** A store's backend in `dir` (a fresh temp directory by default, a bare directory no device holds) */
-  private def bootstrappedBackend(storeId: StoreId, dir: os.Path = os.temp.dir()): TrackingBackend =
+  /** A fresh copy-named directory for `storeId` in a live/ of its own */
+  private def copyDir(storeId: StoreId): os.Path =
+    val dir = CopyFixtures.freshCopyPath(os.temp.dir(), storeId)
+    os.makeDir.all(dir)
+    dir
+
+  /** A store at `dir`: by default a copy-named directory in a live/ of its own, so a load onto a fixture's device
+   *  learns its copy by its path (HostCopies.loadHandled) */
+  private def bootstrappedBackend(storeId: StoreId, at: Option[os.Path] = None): TrackingBackend =
+    val dir = at.getOrElse(copyDir(storeId))
     os.makeDir.all(dir)
     val backend = new TrackingBackend(storeId, dir)
     backend.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
@@ -497,14 +506,14 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
         val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
         fx.ctx.copyRegistry.attach(sds)
         fx.ctx.devices.devices += deviceId -> sds
-      intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, os.temp.dir()))))
+      intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, copyDir(s0)))))
       admission.admittedBytes should be(0)
 
   test("a load whose store fails to build is undone and the store can load again"):
     val s0 = StoreId(poolId, 0)
     withRouter(emptyCrl): fx =>
       val sds = fx.addDevice(s0)
-      val failing = new UnwirableBackend(s0, os.temp.dir())
+      val failing = new UnwirableBackend(s0, copyDir(s0))
       val err = intercept[IllegalStateException](await(fx.load(failing)))
       err.getMessage should be("injected setCompletionHandler failure")
       assertAbandoned(fx, s0, sds, failing)
@@ -513,7 +522,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       // Retried at the next device scan, then with backoff per build failure in a row (SL-W17)
       fx.onControl(fx.ctx.loader.awaitingRetryHasCallback(s0)) should be(Some(false))
       fx.onControl(fx.ctx.loader.awaitingRetryWaitScans(s0)) should be(Some(1))
-      intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, os.temp.dir()))))
+      intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, copyDir(s0)))))
       fx.onControl(fx.ctx.loader.awaitingRetryWaitScans(s0)) should be(Some(2))
 
       val backend = bootstrappedBackend(s0)
@@ -524,7 +533,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       // A failed rebuild over the served store leaves it serving, awaiting no retry, and the backoff starts over
       fx.onControl(fx.ctx.loader.retryFailedLoads())
       fx.onControl(fx.ctx.loader.awaitingRetryWaitScans(s0)) should be(None)
-      intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, os.temp.dir()))))
+      intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, copyDir(s0)))))
       fx.onControl(fx.ctx.router.entry(s0).map(_.store.backend)) should be(Some(backend))
       fx.onControl(fx.ctx.loader.awaitingRetryWaitScans(s0)) should be(None)
 
@@ -565,14 +574,14 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
     fx.ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(s0)).exists(_.phase == Phase.Lost) ||
       fx.ctx.moves.isPendingLost(sds, s0)
 
-  /** Whether the copy of `s0` on `sds` is in lost/, on disk and in its record, nothing left at its flat path, and not
+  /** Whether the copy of `s0` on `sds` is in lost/, on disk and in its record, nothing left in live/, and not
    *  held for a move's retry */
   private def inLost(fx: Fixture, sds: LocalStorageDeviceState, s0: StoreId): Boolean = fx.onControl:
     fx.ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(s0)).exists(_.phase == Phase.Lost) &&
       !fx.ctx.moves.isPendingLost(sds, s0) &&
       CopyFixtures.phaseOf(sds.devicePath, s0).contains(Phase.Lost) &&
       CopyFixtures.copyPath(sds.devicePath, s0).exists(_ / os.up == sds.devicePath / CopyLayout.LostDirectory) &&
-      !os.exists(CopyLayout.path(sds.devicePath, s0, None, Phase.Live))
+      !(os.exists(sds.devicePath / CopyLayout.LiveDirectory) && os.list(sds.devicePath / CopyLayout.LiveDirectory).nonEmpty)
 
   private def addCountingDevice(fx: Fixture, storeId: StoreId, crl: CrashRecoveryLog,
                                 admission: CrlAdmission): LocalStorageDeviceState = fx.onControl:
@@ -731,8 +740,8 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       val admission = new CrlAdmission(if what.contains("limit") then 100 else Long.MaxValue)
       withRouter(crl): fx =>
         val sds = addCountingDevice(fx, s0, crl, admission)
-        // At its flat path on the device, so its retire moves it into lost/
-        val backend = bootstrappedBackend(s0, CopyLayout.path(sds.devicePath, s0, None, Phase.Live))
+        // In live/ on the device, so its retire moves it into lost/
+        val backend = bootstrappedBackend(s0, Some(CopyFixtures.freshCopyPath(sds.devicePath, s0)))
         CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(states(s0)), backend.crlSaveFile)
         intercept[Exception](await(fx.load(backend)))
         assertAbandoned(fx, s0, sds, backend)
@@ -788,7 +797,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       hc.forStore(id, ec)
     withRouter(emptyCrl, objectCacheFactory = factory): fx =>
       fx.addDevice(s0)
-      intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, os.temp.dir()))))
+      intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, copyDir(s0)))))
       executors.asScala.foreach(fx.awaitExecutor)
       hc.viewCount should be(0)
 

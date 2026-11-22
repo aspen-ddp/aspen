@@ -99,77 +99,55 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // error, an unreadable config, no executor slot, no CRL room yet) hands it to the store's next open (LoadRetry). It
   // runs at most once. A caller that must act once the store is served passes it rather than reading the copy
   // registry after the call.
+  //
+  // Every caller offers a Live copy's path (`live/<copy>`): its record's, or, at a device's load, the listing's. Any
+  // other path is a caller's bug, logged at error and not loaded.
   def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: os.Path,
                    onServed: Option[() => Unit] = None): Unit =
-    val storeCfgPath = potentialStoreFile / StoreConfig.configFilename
-    // Every existence test here is FileStat's: a stat that fails is no absence. A marker taken as absent would load a
-    // store it must keep offline, so a failed stat takes the unreadable-config retry like a failed read
-    val hasConfig =
-      try Right(FileStat.exists(storeCfgPath))
-      catch case NonFatal(t) => Left(t)
-    hasConfig match
-      case Left(t) => awaitUnreadRetry(sds, potentialStoreFile, onServed, t)
-      case Right(true) =>
-        try
-          val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath)
-          val storeId = storeCfg.storeId
-          // A copy in a phase directory is in its phase by its location; a flat one's markers say it
-          val phase = CopyLayout.readPhase(potentialStoreFile)
-          ctx.copyRegistry.readAtLoad(sds, potentialStoreFile, storeId, phase)
-          if phase != Phase.Live then
-            phase match
-              case Phase.Lost =>
-                // Its CRL state is gone. The reconcile flips its entry to Rebuilding, and the rebuild
-                // retires this copy before writing a fresh one.
-                logger.warn(s"Not loading store $storeId: it is in lost/ and awaits a rebuild. $potentialStoreFile")
-              case Phase.Outbound(_) =>
-                logger.info(s"Skipping load of offline store in outbound/ (a transfer out). StoreId " +
-                            s"$storeId. $potentialStoreFile")
-              case Phase.Parked =>
-                // An AdoptOffline rebuild's copy: it goes Live once its entry is Active with no transfer device (T5)
-                logger.info(s"Skipping load of offline store in parked/. StoreId $storeId. $potentialStoreFile")
-              case Phase.Arrived(_) =>
-                // Arrived, but the pool may still name the source. StoreTransfers.startIn resumes the
-                // metadata step for it, and reconcileDeviceState loads it if that step already committed.
-                logger.info("Skipping load of arrived store awaiting its pool update. " +
-                            s"StoreId $storeId. $potentialStoreFile")
-              case Phase.Rebuilt(_) =>
-                // A finished rebuild whose flip may not have committed (a crash between the move and the flip,
-                // rebuild-process 5.7). The rebuild's completion moves it Live and loads it once the flip commits;
-                // for an entry already Active, the reconcile does (DeviceReconciler)
-                logger.info("Skipping load of rebuilt store awaiting its device entry's flip out of Rebuilding. " +
-                            s"StoreId $storeId. $potentialStoreFile")
-              case _ => ()
-            // Its copy's record (readAtLoad) keeps it silent and offline on its device
-          else if isOpening(storeCfg.storeId) || router.get(storeCfg.storeId).isDefined then
-            logger.debug(s"Not loading store ${storeCfg.storeId} again: it is already open or opening")
-          else if ctx.moves.isPendingLost(sds, storeId) then
-            // Its move to lost/ failed: held offline until a check of its device moves it (StoreRebuilds.moveToLost)
-            logger.info(s"Not loading store $storeId: its move to lost/ failed and is retried. $potentialStoreFile")
-          else if ctx.copyRegistry.isUnsynced(sds, storeId) then
-            // A move a crash could undo (CopyMoves): the next check of its device forces its directories
-            // and loads it (DeviceReconciler.loadResynced)
-            logger.info(s"Not loading store $storeId yet: a move of its copy is not durable. $potentialStoreFile")
-          else
-            startOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)
-        catch
-          case t: Throwable => awaitUnreadRetry(sds, potentialStoreFile, onServed, t)
-      // Only logged, so a directory whose stat fails is passed over quietly
-      case Right(false) if Try(FileStat.isDir(potentialStoreFile)).getOrElse(false) &&
-                           isStoreDirectoryName(potentialStoreFile) =>
-        // Never a half-made store (creates, transfers and rebuilds move a store into place whole), so a store whose
-        // config was lost. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass
-        logger.error(s"Not loading $potentialStoreFile: it has no ${StoreConfig.configFilename}")
-      case Right(false) => ()
+    if !CopyLayout.isLivePath(potentialStoreFile) then
+      logger.error(s"Not loading $potentialStoreFile: it is no Live copy's path (live/<copy>), a bug in the caller")
+    else
+      val storeCfgPath = potentialStoreFile / StoreConfig.configFilename
+      // Every existence test here is FileStat's: a stat that fails is no absence, so a failed stat takes the
+      // unreadable-config retry like a failed read
+      val hasConfig =
+        try Right(FileStat.exists(storeCfgPath))
+        catch case NonFatal(t) => Left(t)
+      hasConfig match
+        case Left(t) => awaitUnreadRetry(sds, potentialStoreFile, onServed, t)
+        case Right(true) =>
+          try
+            val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath)
+            val storeId = storeCfg.storeId
+            ctx.copyRegistry.readAtLoad(sds, potentialStoreFile, storeId, Phase.Live)
+            if isOpening(storeCfg.storeId) || router.get(storeCfg.storeId).isDefined then
+              logger.debug(s"Not loading store ${storeCfg.storeId} again: it is already open or opening")
+            else if ctx.moves.isPendingLost(sds, storeId) then
+              // Its move to lost/ failed: held offline until a check of its device moves it (StoreRebuilds.moveToLost)
+              logger.info(s"Not loading store $storeId: its move to lost/ failed and is retried. $potentialStoreFile")
+            else if ctx.copyRegistry.isUnsynced(sds, storeId) then
+              // A move a crash could undo (CopyMoves): the next check of its device forces its directories
+              // and loads it (DeviceReconciler.loadResynced)
+              logger.info(s"Not loading store $storeId yet: a move of its copy is not durable. $potentialStoreFile")
+            else
+              startOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)
+          catch
+            case t: Throwable => awaitUnreadRetry(sds, potentialStoreFile, onServed, t)
+        // Only logged, so a directory whose stat fails is passed over quietly
+        case Right(false) if Try(FileStat.isDir(potentialStoreFile)).getOrElse(false) =>
+          // Never a half-made store (creates, transfers and rebuilds move a store into place whole), so a store whose
+          // config was lost. An Active entry naming it is rebuilt by the reconcile's Missing Stores pass
+          logger.error(s"Not loading $potentialStoreFile: it has no ${StoreConfig.configFilename}")
+        case Right(false) => ()
 
   /** A load that threw before any open started: its config could not be read (an I/O error, a resource limit, a
-   *  corrupt file), or the stat of its config or a marker failed (FileStat). Also a LoadStore whose save file or
+   *  corrupt file), or the stat of its config failed (FileStat). Also a LoadStore whose save file or
    *  incarnation file could not be read or stat'd (handleLoad, `ofLoad`, whose own open is still Opening). Unless the
    *  store is otherwise open or opening (an offer repeated over a served store), it is left offline and AwaitingRetry,
    *  as a failed open is, so the device scans offer it to tryLoadStore again with backoff. Without this, a load from a
-   *  pass that removed its marker first (Completed Transfers In, Completed Rebuilds) or that offers it once (device
+   *  pass that moved its copy Live first (Completed Transfers In, Completed Rebuilds) or that offers it once (device
    *  load, reloadClosedStores) would leave an Active store unserved and untracked until a restart. `onServed` is kept for the load that
-   *  serves it. A directory whose name is no store id is only logged. */
+   *  serves it. A path that names no copy is only logged. */
   private def awaitUnreadRetry(sds: LocalStorageDeviceState, storePath: os.Path, onServed: Option[() => Unit],
                                err: Throwable, ofLoad: Boolean = false): Unit =
     storeIdOf(storePath) match
@@ -192,11 +170,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         awaitRetry("awaitUnreadRetry", storeId, LoadRetry(sds, storePath, waitScans, waitScans,
           composeServed(previous.flatMap(_.onServed), onServed)))
 
-  /** The store a directory's name identifies, if it is a store directory name */
+  /** The store a copy's path identifies, from its copy name (CopyLayout.parseName) */
   private def storeIdOf(storePath: os.Path): Try[StoreId] =
-    Try(StoreId(storePath.last)).filter(_.directoryName == storePath.last)
-
-  private def isStoreDirectoryName(storePath: os.Path): Boolean = storeIdOf(storePath).isSuccess
+    CopyLayout.nameOf(storePath).map(_._1).toRight(
+      IllegalArgumentException(s"$storePath names no store copy")).toTry
 
   /** A waiting load's callback and a new load's, composed only when both are real callbacks, so retries without one
    *  never nest */
@@ -249,7 +226,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       refused(s"it has ${transferOut.get}")
     else
       lastOpenId += 1
-      if !ctx.copyRegistry.opening(sds, storeId, lastOpenId, create) then
+      if !ctx.copyRegistry.opening(sds, storeId, lastOpenId, create, storePath) then
         logger.error(s"Not opening store $storeId on device ${sds.storageDeviceId}: the copy registry refused its " +
                      "Opening. Retrying at the device scans")
         refused("the copy registry refused its Opening")
@@ -413,7 +390,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  transfer or the rebuild owns the copy; before the device's first reconcile no entry is known, and nothing the
    *  tree drives has started on the store but a transfer out, whose TransferOut work refuses the open: startOpen),
    *  while the Missing Stores pass has declared the store (declaredMissing) or while a rebuild of it runs here. Held
-   *  rather than dropped, so a store whose transfer is aborted before its marker is written, or whose entry returns
+   *  rather than dropped, so a store whose transfer is aborted before its copy is moved to outbound/, or whose entry returns
    *  to Active, is still served. */
   def retryFailedLoads(): Unit =
     ctx.copyRegistry.retries.foreach: (storeId, wait) =>
@@ -472,7 +449,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     // The open that queued this LoadStore ends here: this task installs the store or gives up. Its deferred
     // ShutdownStores run after it, so a store installed is closed like any served one. A LoadStore queued by no
     // startOpen (Host.loadStore, a test's reload) leaves an open in progress alone
-    ctx.copyRegistry.loadHandled(storageDeviceId, backend.storeId)
+    ctx.copyRegistry.loadHandled(storageDeviceId, backend.storeId, backend.path)
     val fromOpen = awaitingInstall.get(backend.storeId).exists(_._1 eq backend)
     // The retry the open took, or, for a LoadStore no open queued, the one its copy awaits: a failed build's backoff
     // doubles it
@@ -860,7 +837,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   def handleLoadById(e: LoadStoreById): Unit =
     ctx.devices.devices.get(e.sstorageDeviceId).foreach: sds =>
-      ctx.tryLoadStore(sds, ctx.copyRegistry.pathOrLive(sds, e.toreId), None)
+      // Only a Live copy is offered; a store with no Live copy on the device has nothing to load
+      ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(e.toreId)).filter(_.phase == Phase.Live).foreach: _ =>
+        ctx.copyRegistry.pathOf(sds, e.toreId).foreach(ctx.tryLoadStore(sds, _, None))
 
   /** Closes a store (spec section 5): removes it from the router, which marks it offline so new traffic gets the
    *  offline handling, then runs the close on its executor, behind any tasks already queued for it: the object cache

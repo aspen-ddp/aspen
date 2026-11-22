@@ -110,12 +110,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       loadedDevices(host).keySet should be(Set(deviceA))
       loadedDevices(host)(deviceA).devicePath should be(deviceDir)
 
-      // Also pins the recording seam itself: tryLoadStore is offered every child of the
-      // device directory, and dev0's only children are the device config file and the
-      // owning-host marker. Compared as a set so the assertion does not depend on listing order.
-      recorded(host).storeLoadAttempts.toList.toSet should be(Set(
-        (deviceA, deviceDir / StorageDeviceConfig.configFilename),
-        (deviceA, deviceDir / DeviceMarkers.OwningHostFile)))
+      // Also pins the recording seam itself: tryLoadStore is offered only live/ copies, and dev0 holds none (its only
+      // children are the device config file and the owning-host marker)
+      recorded(host).storeLoadAttempts.toList should be(Nil)
 
   atest("a device created after construction is discovered on the next CheckAllDevices"):
     val hostRoot = newHostDir()
@@ -138,21 +135,16 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
   atest("an already-loaded device is not reloaded"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    os.makeDir.all(deviceDir / "some-store-dir")
+    // With its CRL, so the copy is not taken for one whose CRL was lost
+    os.makeDir.all(org.aspen_ddp.aspen.server.crl.CrashRecoveryLog.deviceCrlDir(deviceDir))
+    val live = writeStoreConfig(deviceDir, StoreId(PoolId.BootstrapPoolId, 0))
 
     val host = newHost(hostRoot)
     val firstState = loadedDevices(host)(deviceA)
     val attemptsAfterConstruction = recorded(host).storeLoadAttempts.toList
 
-    // tryLoadDevice offers every child of the device directory to tryLoadStore: here the
-    // device config file, the owning-host marker and some-store-dir. The real tryLoadStore
-    // would load none of them -- it requires a store config file inside the candidate, and the
-    // two files are not directories while some-store-dir is empty -- but the recording override
-    // takes all three. Compared as a set so the assertion does not depend on listing order.
-    attemptsAfterConstruction.map(_._2).toSet should be(Set(
-      deviceDir / StorageDeviceConfig.configFilename,
-      deviceDir / DeviceMarkers.OwningHostFile,
-      deviceDir / "some-store-dir"))
+    // tryLoadDevice offers each live/ copy to tryLoadStore, once
+    attemptsAfterConstruction should be(List((deviceA, live)))
 
     host.control.reconciler.checkAll()
     host.control.reconciler.checkAll()
@@ -163,7 +155,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
   atest("a device whose stores fail to load is retried on a later scan"):
     val hostRoot = newHostDir()
-    writeDevice(hostRoot, "dev0", deviceA)
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    // With its CRL, so the copy is not taken for one whose CRL was lost
+    os.makeDir.all(org.aspen_ddp.aspen.server.crl.CrashRecoveryLog.deviceCrlDir(deviceDir))
+    writeStoreConfig(deviceDir, StoreId(PoolId.BootstrapPoolId, 0))
 
     val host = newHost(hostRoot, failFirstStoreLoad = true)
 
@@ -822,9 +817,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
   private def outbound(deviceDir: os.Path, sid: StoreId): Boolean =
     CopyFixtures.phaseOf(deviceDir, sid).exists(_.isInstanceOf[Phase.Outbound])
 
-  /** Stages a store that this host skipped at load time because of its transfer-out marker.
+  /** Stages a store that this host skipped at load time because its copy is in outbound/.
    *
-   *  The directory and the marker are written after construction and the copy registered by
+   *  The copy is placed in outbound/ after construction and the copy registered by
    *  hand, as the device's load would have registered it. Writing them before construction would
    *  only add a recorded attempt, not the state under test.
    */
@@ -847,7 +842,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     host.control.reconciler.checkAll()
 
     // Active with no transferDevice: the destination was declared failed mid-flight and the
-    // source's entry has been put back. Nothing will ever clear the marker on its own -- the
+    // source's entry has been put back. Nothing will ever move the copy out of outbound/ on its own -- the
     // destination only deletes its own unpacked copy's, and a normal completion deletes the
     // whole source directory -- so without this pass the pool names a device whose local copy
     // stays offline through every restart, with the metadata reading entirely healthy.
@@ -859,19 +854,19 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       // yieldUntil gives up silently, so assert the condition it waited on.
       host.control.reconciler.activeDeviceChecks should not contain deviceA
 
-      // Both representations of "not served" have to go. The marker is the one that survives a
+      // Both representations of "not served" have to go. The outbound/ location is the one that survives a
       // restart, so leaving it would make the repair last only until the process bounced.
       outbound(deviceDir, storeId) should be(false)
 
       // And the load goes back through tryLoadStore rather than a parallel path, which is what
       // takes the copy from offline to served in production. The recording override loads
       // nothing, so this attempt is the assertion available here.
-      // Loaded from the flat Live path it was moved back to (T7)
+      // Loaded from the live/ path it was moved back to (T7)
       storeDir / os.up should be(deviceDir / CopyLayout.OutboundDirectory)
       recorded(host).storeLoadAttempts.toList.drop(before) should be(
-        List((deviceA, CopyLayout.path(deviceDir, storeId, None, Phase.Live))))
+        List((deviceA, CopyLayout.path(deviceDir, storeId, CopyFixtures.copyIdOf(storeDir), Phase.Live))))
 
-  atest("a store whose transfer-out is still outstanding keeps its marker"):
+  atest("a store whose transfer out is still outstanding stays in outbound/"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newHost(hostRoot)
@@ -883,7 +878,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val armed = recorded(host).armLookup(deviceA)
     host.control.reconciler.checkAll()
 
-    // The two states that mean a transfer is still outstanding and the marker is doing its job.
+    // The two states that mean a transfer is still outstanding and outbound/ is doing its job.
     // Only Active *and* no transferDevice says the transfer is over and was abandoned.
     armed.success(deviceState(
       deviceA,
@@ -999,7 +994,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
 
     // Where Host promotes the staged copy once the bytes "arrive": an unpacked store directory
-    // with the transfer marker removed, so tryLoadStore would happily load it. It appears only
+    // moved out of outbound/, so tryLoadStore would happily load it. It appears only
     // on completion, which keeps it out of the construction scan.
 
     for
@@ -1059,7 +1054,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       os.exists(deviceDir / StoreTransfer.StagingDirectory / movingStore.directoryName) should be(false)
 
       // This runs on the destination host, so the source is a different Host and reads
-      // nothing of the restore above. Its copy stays offline behind the transfer-out marker
+      // nothing of the restore above. Its copy stays offline in outbound/
       // while the pool names it, so without the nudge the slice answers nothing until that
       // host's next poll -- up to Main.CheckStorageDevicesPeriod later.
       nudges should contain(
@@ -1198,7 +1193,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       recorded(t.host).transferOutcomes.get(t.movingStore) should be(
         Some(DeviceMetadata.TransferOutcome.PoolRepointed))
       CopyFixtures.copyPath(t.deviceDir, t.movingStore) should be(defined)
-      // Left in place, either marker would keep the promoted store offline on every restart.
+      // Left in place, a copy left in arrived/ would keep the promoted store offline on every restart.
       CopyFixtures.phaseOf(t.deviceDir, t.movingStore) should be(Some(Phase.Live))
       os.exists(t.deviceDir / "transferring-in" / dirName) should be(false)
 
@@ -1581,7 +1576,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.transferStore(movingStore, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
-      // While the transfer is outstanding the marker is doing its job.
+      // While the transfer is outstanding outbound/ is doing its job.
       _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(!host.control.reconciler.activeDeviceChecks.contains(sourceId))
       markedBeforeAbort = outbound(deviceDir, movingStore)
@@ -1597,7 +1592,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       outbound(deviceDir, movingStore) should be(false)
       storeDir / os.up should be(deviceDir / CopyLayout.OutboundDirectory)
       recorded(host).storeLoadAttempts.toList.drop(before) should be(
-        List((sourceId, CopyLayout.path(deviceDir, movingStore, None, Phase.Live))))
+        List((sourceId, CopyLayout.path(deviceDir, movingStore, CopyFixtures.copyIdOf(storeDir), Phase.Live))))
 
   /** A host owning the source of a transfer of `movingStore` whose send has begun through a real
    *  StartStoreTransfer: the store directory is marked and the StagedSendService is sending. */
@@ -1645,7 +1640,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.abortStoreTransfer(t.movingStore)
       _ <- waitForTransactionsToComplete()
 
-      // The abort's nudge: the send is still running, so the marker must stay for now.
+      // The abort's nudge: the send is still running, so the copy stays in outbound/ for now.
       _ = t.host.control.reconciler.checkAll()
       _ <- pumpUntil(!t.host.control.reconciler.activeDeviceChecks.contains(t.sourceId))
       markedWhileSending = outbound(t.deviceDir, t.movingStore)
@@ -1667,7 +1662,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     given ExecutionContext = executionContext
 
     // startStoreTransferOut read TransferringOut before the abort committed and the abort's
-    // nudge was handled before the marker existed, so no device check ever sees the marker
+    // nudge was handled before the copy was in outbound/, so no device check ever sees it there
     // alongside the Active entry. Only the re-check the send's start arranges does.
     for
       t <- startTransferOut()
@@ -1764,7 +1759,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       recorded(host2).transferOutcomes.get(t.movingStore) should be(Some(DeviceMetadata.TransferOutcome.PoolRepointed))
       poolState.stores(t.movingStore.poolIndex).storageDeviceId should be(net.secondDeviceId)
 
-      // Loaded only once the pool names this device, and the marker goes with it.
+      // Loaded only once the pool names this device, and it leaves arrived/ with it.
       recorded(host2).loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
       CopyFixtures.phaseOf(t.deviceDir, t.movingStore).exists(_.isInstanceOf[Phase.Arrived]) should be(false)
       // It came from another host, whose clock may lead this one's: its load floor takes the cross-host margin
@@ -1828,10 +1823,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       transfers2.transfersIn should be(Vector())
       recorded(host2).transferOutcomes.get(t.movingStore) should be(Some(DeviceMetadata.TransferOutcome.PoolRepointed))
 
-  // SL-W12: a promoted copy found lost before its pool update commits (marked rebuild-required by a CRL loss
+  // SL-W12: a promoted copy found lost before its pool update commits (moved to lost/ by a CRL loss
   // declaration, or its save file damaged since promotion) is not repointed while the source still holds the state
   for (lost, damage) <- List[(String, (os.Path, StoreId) => Unit)](
-        "marked rebuild-required" -> ((d, s) => CopyFixtures.markCopy(d, s, Phase.Lost): Unit),
+        "in lost/" -> ((d, s) => CopyFixtures.markCopy(d, s, Phase.Lost): Unit),
         "with a damaged crl_save.log" -> ((d, s) =>
           os.write.over(Backend.crlSaveFile(CopyFixtures.copyPath(d, s).get), Array[Byte](1, 2, 3))))
   do
@@ -1911,7 +1906,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
   // rebuild-process FS17: a copy an earlier tenancy left at the store's path (a finished rebuild awaiting its flip, a
   // lost copy), the store having since been re-placed away and transferred back
-  // A copy marked for transfer out (a store transferred back onto its old source before that device's Deleted Stores
+  // A copy in outbound/ (a store transferred back onto its old source before that device's Deleted Stores
   // pass ran) is never the owner's either: retired, where it was once refused forever
   for (marker, phase) <- List(("rebuilt", Phase.Rebuilt("")), ("parked", Phase.Parked), ("lost", Phase.Lost),
                               ("outbound", Phase.Outbound(""))) do
@@ -1990,13 +1985,13 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
   atest("a store in arrived/ is not loaded at startup"):
     // A real Host rather than one with the recording tryLoadStore seam, which records every
-    // candidate and honours no marker.
+    // candidate and reads no phase.
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
-    val storeDir = CopyLayout.path(deviceDir, storeId, Some(UUID.randomUUID()), Phase.Live)
+    val storeDir = CopyFixtures.freshCopyPath(deviceDir, storeId)
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
-      storeDir / os.up / StoreCreation.CreatingDirectory)
+      storeDir / os.up / os.up / StoreCreation.CreatingDirectory)
     val arrivedDir = CopyFixtures.markCopy(deviceDir, storeId, Phase.Arrived(""))
     val filesBefore = os.list(arrivedDir).toSet
 
@@ -2017,9 +2012,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
-    val storeDir = CopyLayout.path(deviceDir, storeId, Some(UUID.randomUUID()), Phase.Live)
+    val storeDir = CopyFixtures.freshCopyPath(deviceDir, storeId)
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
-      storeDir / os.up / StoreCreation.CreatingDirectory)
+      storeDir / os.up / os.up / StoreCreation.CreatingDirectory)
     val rebuiltDir = CopyFixtures.markCopy(deviceDir, storeId, Phase.Rebuilt(""))
     val filesBefore = os.list(rebuiltDir).toSet
 
@@ -2039,7 +2034,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val factory = new StoreRebuildFactory:
       def createRebuild(client: org.aspen_ddp.aspen.client.AspenClient, sid: StoreId, deviceId: StorageDeviceId,
                         devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener,
-                        episode: Option[java.util.UUID], existingCopy: () => Option[(Phase, os.Path)]) =
+                        episode: Option[java.util.UUID], existingCopy: Option[(Phase, os.Path)]) =
         new org.aspen_ddp.aspen.server.rebuild.StoreRebuild:
           val storeId: StoreId = sid
           def complete: Future[java.util.UUID] = scala.concurrent.Promise[java.util.UUID]().future
@@ -2067,7 +2062,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       CopyFixtures.phaseOf(deviceDir, storeId) should be(Some(Phase.Live))
       CopyFixtures.phaseOf(deviceDir, storeIdB) should be(Some(Phase.Rebuilt("")))
       recorded(host).storeLoadAttempts.toList.drop(before) should be(
-        List((deviceA, CopyLayout.path(deviceDir, storeId, None, Phase.Live))))
+        List((deviceA, CopyLayout.path(deviceDir, storeId, CopyFixtures.copyIdOf(activeDir), Phase.Live))))
       // The Rebuilding one's rebuild started over its finished copy, not over a retired one
       host.control.copyRegistry.rebuilding(org.aspen_ddp.aspen.server.host.HostCopies.RebuildReads) should contain(storeIdB)
       CopyFixtures.phaseOf(deviceDir, storeIdB).contains(Phase.Lost) should be(false)
@@ -2100,12 +2095,12 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       CopyFixtures.phaseOf(deviceDir, storeId) should be(Some(Phase.Live))
       CopyFixtures.phaseOf(deviceDir, storeIdB) should be(Some(Phase.Arrived("")))
-      os.exists(CopyLayout.path(deviceDir, storeId, None, Phase.Live) / StoreLoader.ArrivedAtFile) should be(true)
+      os.exists(CopyLayout.path(deviceDir, storeId, CopyFixtures.copyIdOf(activeDir), Phase.Live) / StoreLoader.ArrivedAtFile) should be(true)
       os.exists(pendingDir / StoreLoader.ArrivedAtFile) should be(false)
       recorded(host).storeLoadAttempts.toList.drop(before) should be(
-        List((deviceA, CopyLayout.path(deviceDir, storeId, None, Phase.Live))))
+        List((deviceA, CopyLayout.path(deviceDir, storeId, CopyFixtures.copyIdOf(activeDir), Phase.Live))))
 
-  /** A real Host, which opens RocksDB backends and honours the markers, over `hostRoot`. */
+  /** A real Host, which opens RocksDB backends and reads the copies' phases, over `hostRoot`. */
   private def newRealHost(hostRoot: os.Path): Host =
     new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
@@ -2113,9 +2108,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared())
 
   private def writeStoreDir(deviceDir: os.Path, storeId: StoreId = storeId): os.Path =
-    val storeDir = CopyLayout.path(deviceDir, storeId, Some(UUID.randomUUID()), Phase.Live)
+    val storeDir = CopyFixtures.freshCopyPath(deviceDir, storeId)
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
-      storeDir / os.up / StoreCreation.CreatingDirectory)
+      storeDir / os.up / os.up / StoreCreation.CreatingDirectory)
     storeDir
 
   atest("a store whose CRL save file is truncated is not served and its load fails"):

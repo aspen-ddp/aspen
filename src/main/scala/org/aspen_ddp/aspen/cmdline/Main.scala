@@ -29,7 +29,7 @@ import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrashRec
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.DeviceMarkers
-import org.aspen_ddp.aspen.server.host.StoreThreadPool
+import org.aspen_ddp.aspen.server.host.{CopyLayout, StoreThreadPool}
 import org.aspen_ddp.aspen.vdisk.{DiskCatalog, DiskHandle, DiskInfo, VDiskError}
 import org.aspen_ddp.aspen.vdisk.tcmu.{LinuxTcmuKernel, TcmuEvent, TcmuNetlink, TcmuService}
 import org.aspen_ddp.aspen.vdisk.tcmu.dbus.{HandlerLogic, TcmuDbusService}
@@ -1900,7 +1900,8 @@ object Main {
       yield
 
         val storeId = StoreId(PoolId.BootstrapPoolId, poolIndex.toByte)
-        val storeRoot = bootstrapDevDir / storeId.toString
+        // A fresh Live copy, live/<storeId.directoryName>.<copyId> (CopyLayout.copyName), as every create makes
+        val storeRoot = CopyLayout.freshLivePath(bootstrapDevDir, storeId)
         val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB(None), None, bootstrapIda, AdmissionTier.Bootstrap)
 
         println(s"Creating data store $storeId. Path $storeRoot")
@@ -1913,7 +1914,8 @@ object Main {
         poolIndex <- 0 until bootstrapIda.width
       yield
         val storeId = StoreId(PoolId.InitialMetadataPoolId, poolIndex.toByte)
-        val storeRoot = bootstrapDevDir / storeId.toString
+        // A fresh Live copy, live/<storeId.directoryName>.<copyId> (CopyLayout.copyName), as every create makes
+        val storeRoot = CopyLayout.freshLivePath(bootstrapDevDir, storeId)
         val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB(None), None, bootstrapIda, AdmissionTier.Metadata)
 
         println(s"Creating data store $storeId. Path $storeRoot")
@@ -2575,8 +2577,8 @@ object Main {
               "A competing transfer took the pool to its redundancy floor, so this transfer was " +
               "rolled back. Retry later, or use --force to transfer anyway")
 
-    // transferStore atomically marks the store as transferring-out on its current
-    // device and transferring-in on the target device, then nudges the destination
+    // transferStore atomically writes the store TransferringOut in its current
+    // device's entry and TransferringIn in the target device's, then nudges the destination
     // host with a CheckStorageDevice message so it begins the transfer immediately
     // rather than waiting for its next device-state poll.
     //

@@ -13,7 +13,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
 
   private val Live = Phase.Live
   private val phases: List[Phase] = List(Phase.Live, Phase.Arrived("a"), Phase.Arrived("b"), Phase.Outbound("a"),
-    Phase.Outbound("b"), Phase.Outbound(""), Phase.Rebuilt("e"), Phase.Rebuilt(""), Phase.Parked, Phase.Lost, Phase.Unread)
+    Phase.Outbound("b"), Phase.Outbound(""), Phase.Rebuilt("e"), Phase.Rebuilt(""), Phase.Parked, Phase.Lost, Phase.Retired)
 
   private def kind(p: Phase): String = p match
     case Phase.Live => "Live"
@@ -22,7 +22,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
     case Phase.Rebuilt(_) => "Rebuilt"
     case Phase.Parked => "Parked"
     case Phase.Lost => "Lost"
-    case Phase.Unread => "Unread"
+    case Phase.Retired => "Retired"
 
   private def expectedPhase(from: Phase, to: Phase): Boolean =
     val legal = Set(
@@ -31,11 +31,10 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
       "Outbound" -> "Live", "Outbound" -> "Lost",
       "Arrived" -> "Live", "Arrived" -> "Lost",
       "Rebuilt" -> "Live", "Rebuilt" -> "Parked", "Rebuilt" -> "Outbound", "Rebuilt" -> "Lost",
-      "Parked" -> "Live", "Parked" -> "Outbound", "Parked" -> "Lost")
-    kind(from) match
-      case "Unread" => true
-      case "Lost" => false
-      case f => kind(to) == "Unread" || legal.contains(f -> kind(to))
+      "Parked" -> "Live", "Parked" -> "Outbound", "Parked" -> "Lost",
+      // Every retire goes through Lost (T11)
+      "Lost" -> "Retired")
+    legal.contains(kind(from) -> kind(to))
 
   private val retry = LoadRetry(null.asInstanceOf[LocalStorageDeviceState], os.root / "x", 1, 1)
   private val activities: List[Activity] = List(Activity.Idle, Activity.AwaitingRetry(retry), Activity.Opening(1L),
@@ -69,7 +68,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
   /** A registry holding `storeId` at `phase`, with its activity driven to `activity` over legal moves */
   private def at(phase: Phase, activity: Activity): DeviceCopies =
     val d = device()
-    d.register(storeId, phase)
+    d.register(storeId, phase, UUID.randomUUID())
     val path: List[Activity] = activity match
       case Activity.Idle => Nil
       case a @ Activity.AwaitingRetry(_) => List(a)
@@ -84,7 +83,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
     for from <- phases; to <- phases do
       Transitions.phaseLegal(from, to) should be(expectedPhase(from, to))
       val d = device()
-      d.register(storeId, from)
+      d.register(storeId, from, UUID.randomUUID())
       if expectedPhase(from, to) then
         d.setPhase(storeId, to)
         d.copies(storeId).phase should be(to)
@@ -126,8 +125,8 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
 
   test("register over an existing record throws"):
     val d = device()
-    d.register(storeId, Live)
-    an[IllegalStateException] should be thrownBy d.register(storeId, Phase.Lost)
+    d.register(storeId, Live, UUID.randomUUID())
+    an[IllegalStateException] should be thrownBy d.register(storeId, Phase.Lost, UUID.randomUUID())
     d.copies(storeId).phase should be(Live)
 
   test("mutators on an unregistered store throw, and unregister removes the record"):
@@ -135,7 +134,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
     an[IllegalStateException] should be thrownBy d.setPhase(storeId, Phase.Lost)
     an[IllegalStateException] should be thrownBy d.setActivity(storeId, Activity.Served)
     an[IllegalStateException] should be thrownBy d.setUnsynced(storeId, true)
-    d.register(storeId, Live)
+    d.register(storeId, Live, UUID.randomUUID())
     d.unregister(storeId)
     d.copies.contains(storeId) should be(false)
 
@@ -158,7 +157,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
 
   test("Opening is refused during TransferOut work"):
     val d = device()
-    d.register(storeId, Live)
+    d.register(storeId, Live, UUID.randomUUID())
     d.startWork(storeId, Work.TransferOut(None))
     an[IllegalStateException] should be thrownBy d.setActivity(storeId, Activity.Opening(1L))
     d.endWork(storeId)
@@ -166,7 +165,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
 
   test("unsynced and missing are tracked"):
     val d = device()
-    d.register(storeId, Live)
+    d.register(storeId, Live, UUID.randomUUID())
     d.setUnsynced(storeId, true)
     d.copies(storeId).unsynced should be(true)
     d.declareMissing(other)
@@ -177,9 +176,9 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
   test("onChange runs once per successful mutation and not on a throw"):
     val changes = collection.mutable.ArrayBuffer[StoreId]()
     val d = device(changes)
-    d.register(storeId, Live)
+    d.register(storeId, Live, UUID.randomUUID())
     changes.toList should be(List(storeId))
-    an[IllegalStateException] should be thrownBy d.register(storeId, Live)
+    an[IllegalStateException] should be thrownBy d.register(storeId, Live, UUID.randomUUID())
     an[IllegalStateException] should be thrownBy d.setPhase(storeId, Phase.Live)
     an[IllegalStateException] should be thrownBy d.setActivity(storeId, Activity.Retiring)
     an[IllegalStateException] should be thrownBy d.updateWork(storeId, Work.Create)

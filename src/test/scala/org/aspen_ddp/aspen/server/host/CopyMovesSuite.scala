@@ -51,7 +51,7 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     renames.map(_._1) should be(List(from))
     CopyFixtures.retiredCopies(dev, s) should be(renames.map(_._2))
     CopyFixtures.copyPath(dev, s) should be(None)
-    // A durable move to Retired takes the copy out of the registry (P3); marker files left behind are stripped (R-P2)
+    // A durable move to Retired takes the copy out of the registry (P3)
     record(host, s) should be(None)
     os.list(renames.head._2).map(_.last).toSet should be(Set(org.aspen_ddp.aspen.server.StoreConfig.configFilename))
 
@@ -81,7 +81,7 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
 
   test("a sync that fails after the rename leaves the record unsynced and the next resync clears it"):
     val (host, local, dev) = withDevice()
-    val target = dev / CopyLayout.dirOf(Phase.Retired).get
+    val target = dev / CopyLayout.dirOf(Phase.Retired)
     var failures = 1
     host.control.moves.syncDirectory = d =>
       if d == target && failures > 0 then

@@ -265,7 +265,7 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
         case _ => ()
     () => seen.toList
 
-  /** A host with device A loaded, its CRL `crl`, and the device's path: a store loaded onto it at its flat path
+  /** A host with device A loaded, its CRL `crl`, and the device's path: a store loaded onto it in live/
    *  (copyAt) is a copy of the device, which a fail-stop moves to lost/ */
   private def deviceCrlHost(crl: CrashRecoveryLog): (Host, os.Path) =
     val hostRoot = newHostDir()
@@ -283,10 +283,11 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
     (host, dev)
 
   /** Where device A's copy of the suite's store lives while Live */
-  private def copyAt(dev: os.Path): Option[os.Path] = Some(CopyLayout.path(dev, crlStoreId, None, Phase.Live))
+  private val copyId = java.util.UUID.randomUUID()
+  private def copyAt(dev: os.Path): Option[os.Path] = Some(CopyLayout.path(dev, crlStoreId, copyId, Phase.Live))
 
   /** The store, loaded onto device A at `dev`, is not served, was closed as a fail-stop, and its copy is in lost/ once
-   *  that close has ended, nothing left at its flat path */
+   *  that close has ended, nothing left in live/ */
   private def assertRetired(host: Host, loaded: Future[Unit], dev: os.Path): Future[compatible.Assertion] =
     given ExecutionContext = executionContext
     val closes = closesSeen(host)

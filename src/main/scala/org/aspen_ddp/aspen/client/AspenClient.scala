@@ -727,7 +727,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
         // double-send. Empty when nothing was changed.
         dstRead.toList.flatMap: (dstPtr, dstKvos) =>
           // Offline rather than Active on a source being shut down: see serviceStatus. Its copy
-          // is closed behind the transfer-out marker its transfer wrote.
+          // is closed, in outbound/ where its transfer moved it.
           val newSrcState = srcState.setStoreEntry(storeId, srcState.serviceStatus, None)
           tx.update(srcPtr, None, None,
             List(KeyRevision(StorageDeviceState.StateKey, srcKvos.contents(StorageDeviceState.StateKey).revision)),

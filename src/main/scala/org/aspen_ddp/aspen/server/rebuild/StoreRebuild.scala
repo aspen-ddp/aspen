@@ -26,8 +26,8 @@ trait StoreRebuild:
 
 /** Constructs a store rebuild, whose staging store is opened through `backends`. The default `Filesystem` factory
  *  produces the real implementation. Tests inject a factory that records the request and resolves on command.
- *  `existingCopy` answers the copy of the store on the device outside pending-delete/, with its phase, from a thread
- *  that is not the control thread (RebuildingStore.copyOnDisk) */
+ *  `existingCopy` is the copy of the store on the device outside pending-delete/, with its phase and path, as the copy
+ *  registry recorded it when the rebuild was started (StoreRebuilds.startRebuild, on the control thread) */
 trait StoreRebuildFactory:
   def createRebuild(client: AspenClient,
                     storeId: StoreId,
@@ -35,7 +35,7 @@ trait StoreRebuildFactory:
                     devicePath: os.Path,
                     backends: BackendOpener,
                     episode: Option[UUID],
-                    existingCopy: () => Option[(Phase, os.Path)]): StoreRebuild
+                    existingCopy: Option[(Phase, os.Path)]): StoreRebuild
 
 object StoreRebuildFactory:
   object Filesystem extends StoreRebuildFactory:
@@ -45,5 +45,5 @@ object StoreRebuildFactory:
                       devicePath: os.Path,
                       backends: BackendOpener,
                       episode: Option[UUID],
-                      existingCopy: () => Option[(Phase, os.Path)]): StoreRebuild =
+                      existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
       new RebuildingStore(client, storeId, storageDeviceId, devicePath, backends, existingCopy, episode)

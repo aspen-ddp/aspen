@@ -39,7 +39,7 @@ private class CancellableRebuildFactory extends StoreRebuildFactory:
                     devicePath: os.Path,
                     backends: BackendOpener,
                     episode: Option[UUID],
-                    existingCopy: () => Option[(Phase, os.Path)]): StoreRebuild = synchronized:
+                    existingCopy: Option[(Phase, os.Path)]): StoreRebuild = synchronized:
     val r = new CancellableRebuild(storeId)
     created += r
     r
@@ -130,7 +130,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
   private def noMoveFiles(deviceDir: os.Path, s: StoreId): Boolean =
     !outbound(deviceDir, s) && CopyFixtures.copyPath(deviceDir, s).forall(dir => !os.exists(Backend.crlSaveFile(dir)))
 
-  /** Whether the copy of `s` is Outbound (its transfer-out marker) */
+  /** Whether the copy of `s` is Outbound (in outbound/) */
   private def outbound(deviceDir: os.Path, s: StoreId): Boolean =
     CopyFixtures.phaseOf(deviceDir, s).exists(_.isInstanceOf[Phase.Outbound])
 
@@ -295,7 +295,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Active))
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
       loadedDevices(host).contains(deviceA) should be(true)
-      // The reconcile brought both stores back: there were no markers to remove
+      // The reconcile brought both stores back: no copy left live/ to bring back
       List(s0, s1).forall(noMoveFiles(deviceDir, _)) should be(true)
       recorded(host).storeLoadAttempts.map(_._2).toSet should contain allOf(copyAt(deviceDir, s0),
                                                                   copyAt(deviceDir, s1))
@@ -342,7 +342,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
-      // Its stats now fail (EACCES): CopyPhase.known answers None
+      // Its stats now fail (EACCES): its load cannot read it
       unreadable = copyAt(deviceDir, s0)
       _ = os.perms.set(unreadable, "rw-------")
       _ <- client.restartStorageDevice(deviceA)
@@ -481,7 +481,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       entryAfterFlip.map(_.status) should be(Some(StoreStatus.Offline))
       recorded(host).loadStoreByIdRequests.toList should be(Nil)
       parked(deviceDir, s0) should be(true)
-      // Kept beside the marker, so an adopter accepts it.
+      // Kept in the parked copy, so an adopter accepts it.
       os.exists(Backend.crlSaveFile(copyAt(deviceDir, s0))) should be(true)
       host.control.router.silentStores should contain(s0)
       st.stores(s0).status should be(StoreStatus.Offline)
@@ -689,10 +689,11 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
 
     for
-      // The device's other stores, which the TestNetwork serves elsewhere: directories here, so the reconcile does not
-      // take them for lost ones
+      // The device's other stores, which the TestNetwork serves elsewhere: copies here, registered as a load would
+      // find them, so the reconcile does not take them for lost ones
       sourceState <- state(sourceId)
       _ = sourceState.stores.keysIterator.filter(_ != movingStore).foreach(writeStoreConfig(deviceDir, _))
+      _ = host.testingOnlyRescan(sourceId)
       _ <- net.createSecondDevice()
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(movingStore, net.secondDeviceId)

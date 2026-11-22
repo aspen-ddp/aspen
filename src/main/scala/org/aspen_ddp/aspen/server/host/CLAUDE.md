@@ -8,10 +8,8 @@
   end: close with CRL extraction, answering a receiver's request, reinstating an abandoned transfer), `StoreCopies`
   (retire, release and rename-first delete of store copies) and `LocalDevices` (the loaded devices). `StoreRouter`,
   `StoreThreadPool`/`StoreMailbox`/`StoreBalancer` and `HostStoreView` are the store-side and cross-thread pieces
-- No copy carries a marker file (store copy state machine stage 2, Task 5): `StoreDirMarkers`, `CopyMarkers` and
-  `transferred-in` are gone, and nothing writes `transferring-out`, `rebuild-complete` or `rebuild-required`. Every
-  phase but Live is a directory (below); the flat path is Live (`CopyPhase.read`, which Task 6 deletes with the flat
-  path, reads nothing)
+- No copy carries a marker file, and there is no flat store path (store copy state machine stage 2): every copy is
+  in a phase directory (below), its phase by location, under a copy id it keeps on the device
 - Unsynced copies: a move that lands but whose directory sync fails sets the record's `unsynced` (`CopyMoves`,
   `HostCopies.unsynced`; a copy of a device not attached yet, an adoption's or a lost CRL's moves, is held in
   `unsyncedPaths` until its attach). An unsynced copy is never loaded (`tryLoadStore`), shipped (`startOut`
@@ -22,28 +20,29 @@
   and Active (`DeviceReconciler.loadResynced`, with its online gossip): the pass that moved it will not see it again,
   and a check that finds the entry not Active or work holding the copy only defers it
 - Copy layout (store copy state machine, stage 2; spec "Device layout"): `CopyLayout` says where each copy lives.
-  A converted phase is a directory under the device root holding copies named `<storeId.directoryName>.<copyId>`
+  Each phase is a directory under the device root holding copies named `<storeId.directoryName>.<copyId>`
   (`copyName`/`parseName`; the store id comes from the name only), its parameter in the copy's own file for that
   phase, `phase-param.<phase directory>` (`paramFile`, `param`, `readParam(copy, phase)`: "" when known absent, a
   failed stat throws). Each location reads only its own phase's file and a move writes only its target's, so a
   failed move or a crash before the rename leaves the source's parameter as it was; an earlier phase's file is
-  inert. So far Arrived (`arrived/`, `CopyLayout.ArrivedDirectory`, its transfer id in `phase-param.arrived`), Outbound
-  (`outbound/`, `CopyLayout.OutboundDirectory`, its transfer id in `phase-param.outbound`),
-  Rebuilt (`rebuilt/`, `RebuiltDirectory`, its episode in `phase-param.rebuilt`), Parked (`parked/`,
-  `ParkedDirectory`), Lost (`lost/`, `CopyLayout.LostDirectory`) and Retired (`pending-delete/`) are directories
-  (`dirOf`);
-  Live is the flat path `<device>/<storeId.directoryName>`. A copy in a phase directory has its phase by location
-  (`CopyLayout.phaseAt`; `knownPhase`/`readPhase` for any copy path, which `tryLoadStore` and `reloadClosedStores`
-  read).
-  `CopyLayout.list` is the one listing of a device's copies (device load and its CRL-lost decision, `storesIn`,
-  `HostCopies.attach`/`rescan`/`verifyAgainstDisk`): flat store-named directories (config or not; a failed stat
-  counts) and each converted directory's children; a child that is no copy name is a stray, logged at warn at the
-  device's load and never touched. Code never builds a copy's path: it asks `HostCopies.pathOf` (the record's,
-  `CopyLayout.path` over its `copyId` and phase), `pathOrLive` where the copy may have no record, or
-  `CopyLayout.path(..., None, Phase.Live)` for a copy not recorded yet (a create's target). `CopyRecord.copyId` is None for a flat copy. Every phase change into or out of a phase
-  directory is one `CopyMoves.move` (`DeviceControl.moves`; `moveUnattached` for a device being loaded): the target
-  phase's parameter file written durably, then `DurableFiles.move` through the `rename` and `syncDirectory` seams,
-  recorded as a fact (`HostCopies.moved`, a fresh `copyId` on a copy's first move; a load retry the copy awaited is
+  inert. Live is `live/` (`CopyLayout.LiveDirectory`), Arrived `arrived/` (`ArrivedDirectory`, its transfer id in
+  `phase-param.arrived`), Outbound `outbound/` (`OutboundDirectory`, its transfer id in `phase-param.outbound`),
+  Rebuilt `rebuilt/` (`RebuiltDirectory`, its episode in `phase-param.rebuilt`), Parked `parked/`
+  (`ParkedDirectory`), Lost `lost/` (`LostDirectory`) and Retired `pending-delete/` (`dirOf`, total). A copy has its
+  phase by location (`CopyLayout.phaseAt` for a path; `locate(devicePath, storeId, copyId)` finds which phase
+  directory holds a copy id, the fallback of a refused phase fact; `isLivePath`). `CopyLayout.list` is the one listing
+  of a device's copies (device load, its CRL-lost decision and P2, `storesIn`, `HostCopies.attach`/`rescan`/
+  `verifyAgainstDisk`): each phase directory's children (config or not); a child that is no copy name is a stray,
+  logged at warn at the device's load and never touched, and anything at the device root (a stage-1 store-named
+  directory included) is no copy. Code never builds a copy's path: it asks `HostCopies.pathOf` (the record's,
+  `CopyLayout.path(device, storeId, copyId, phase)`; a store with no record has no copy on the device:
+  `HostCopies.existence` answers absent), or, for a create's target, `CopyLayout.freshLivePath` (`live/<copy>` under
+  a fresh copy id; also bootstrap's, `cmdline` `Main.bootstrap`). `CopyRecord.copyId: UUID` is mandatory: a copy gets
+  it when it first enters a phase directory (a create's rename into `live/`, whose record its open registers under the
+  target's copy id before the create; a rebuild's finish into `rebuilt/`; a transfer's promotion into `arrived/`; P4)
+  and keeps it across moves. Every phase change is one `CopyMoves.move` (`DeviceControl.moves`; `moveUnattached` for a
+  device being loaded): the target phase's parameter file written durably, then `DurableFiles.move` through the
+  `rename` and `syncDirectory` seams, recorded as a fact (`HostCopies.moved`; a load retry the copy awaited is
   retargeted to its new path for a move into Live and dropped for any other phase). `DurableFiles.move` throws
   `DurableFiles.MoveNotForced` for a rename that landed but was not forced: `MoveResult.Unsynced`, the record takes
   the phase with `unsynced` (above) and `resync` forces both directories again; any
@@ -55,7 +54,17 @@
   error as a bug) a record that is Opening, Served or Closing, and a copy unsynced before a move stays unsynced after
   it (its earlier directories still to force move with it), until the resync. A move whose target is the copy's own
   path is NotMoved (no move changes only a parameter). A failed read of an `arrived/`, `outbound/` or `rebuilt/` copy's
-  parameter file fails `CopyLayout.list` (the device stays unloaded for the next scan, P6) and makes `knownPhase` answer None
+  parameter file, or a phase directory that cannot be listed, fails `CopyLayout.list`: the device stays unloaded, nothing
+  on it moved, for the next scan (P6; `DeviceDiscovery.loadOwnedDevice` lists before anything but the scratch sweeps)
+- Device load (`DeviceDiscovery.loadOwnedDevice`): the listing (P6), the device CRL's open (a lost CRL's moves), then
+  P2 (`retireDuplicates`): a store with more than one copy directory outside `pending-delete/` (any phases) is logged
+  at error, every one moved to `lost/` (T10), the one with the least copy id kept there (registered Lost, so the Lost
+  CRL pass flips its Active entry to Rebuilding and the rebuild's discard retires it) and the others moved on into
+  `pending-delete/` whole, their files inside them; a failed move leaves the device unloaded. Then `attach`, and only
+  `live/` copies are offered to `tryLoadStore`, which takes only a Live copy's path (`CopyLayout.isLivePath`; any other
+  is a caller's bug, logged at error) and every load caller passes a Live record's. `StoreCopies.release` keeps a
+  `pending-delete/` copy whose store's entry here is Active while this device holds a Lost copy of it (P2's case, or
+  a copy failed since): the store is not Active on its owner device in substance until its rebuild
 - Outbound is `outbound/<copy>` (T6, T7); `transferring-out` is never written or read. `startOut` refuses at
   debug a source with no record or whose phase is not Live, Rebuilt, Parked or Outbound (P10: an Arrived copy waits
   for the Completed Transfers In pass), and an unsynced one. `closedForTransfer`, once the close's extraction has made
@@ -69,23 +78,23 @@
   writes `phase-param.arrived`. T7 is a move to Live: `reinstateAbandonedOut` (the Abandoned Transfers Out pass
   selects offline records whose phase is Outbound or Parked) and `bringIntoService` (`moveUnattached` for each
   `outbound/` and `parked/` copy of an Active entry that `mayReinstateOut`; the adoption's arrived-at is written into
-  flat, `outbound/`, `rebuilt/` and `parked/` copies; an `arrived/` copy's is written when it goes Live). A reinstated copy is Live (P8: an Active entry means the flip
+  `live/`, `outbound/`, `rebuilt/` and `parked/` copies; an `arrived/` copy's is written when it goes Live). A reinstated copy is Live (P8: an Active entry means the flip
   committed)
 - Rebuilt is `rebuilt/<copy>` and Parked is `parked/<copy>` (store copy state machine stage 2, Task 4). A rebuild's
   `finish` writes its episode as `phase-param.rebuilt` in staging, last, then renames staging into `rebuilt/` under a
   fresh copy id (T2, off the control thread; a failed rename leaves staging for the next pass), and its completion
   (`StoreRebuild.complete: Future[UUID]`) reports that id: the control-thread handler records the copy with it
-  (`HostCopies.rebuilt`). `RebuildingStore.start` asks the lookup it is given (`existingCopy`, built by
-  `StoreRebuilds` over `CopyLayout.list`, `RebuildingStore.copyOnDisk`, since it must not read control-thread state):
-  a Rebuilt copy of its own episode (`isRebuiltFor`) completes at once with its copy id; any other copy fails it.
+  (`HostCopies.rebuilt`). `RebuildingStore.start`, run by its constructor on the control thread, reads the
+  `existingCopy` it is given, `(phase, path)` of the store's record on the device (`StoreRebuilds.startRebuild` builds
+  it from the registry; nothing lists the device): a Rebuilt copy of its own episode (`isRebuiltFor`) completes at once
+  with its copy id; any other copy fails it.
   The flip then moves the copy: `Adopt` Rebuilt -> Live (`StoreRebuilds.bringRebuiltLive`, T3: a NotMoved copy stays
   Rebuilt for the Completed Rebuilds pass, which selects offline Rebuilt records of Active entries; an Unsynced one
   is Live and held for `loadResynced`), `AdoptOffline` Rebuilt -> Parked in one move (`keepRebuiltStoreOffline`, T4;
   `moveUnattached` at its `rebuilt/` path when the device is already unloaded), `Discard` deletes it rename-first
   (`discardStoreDirectory`, `StoreCopies.delete`, T13), `Superseded`/`Unconfirmed`/`NotOwned` leave it Rebuilt. A
   Parked copy goes Live (T5) as an abandoned Outbound one does, and is a T6 source (Parked -> Outbound(tid), a real
-  move). `retireForeignCopy` keys off the record's phase (a flat copy with no record, put there by hand, by its
-  stat; an Unread record waits). A lost device CRL leaves Rebuilt copies alone (`holdsOwnState`, by location) and
+  move). `retireForeignCopy` keys off the record's phase (no record, no copy). A lost device CRL leaves Rebuilt copies alone (`holdsOwnState`, by location) and
   treats Parked ones as Live or Outbound (kept with a valid own save file). A shipped Rebuilt copy arrives as any
   other: Arrived, then Live at its pool update, its `phase-param.*` files inert. `finishPlacing`'s exemption
   (`HostCopies.finishInFlight`) is a `rebuilt/` copy of the store whose parameter reads the running rebuild's
@@ -134,30 +143,36 @@
   MoveResult`, `arrived-at` written durably first, while it is Arrived); a NotMoved move leaves it Arrived and
   offline for the Completed Transfers In pass (offline Arrived records of Active entries, no receive attempt), an
   Unsynced one leaves it Live for `loadResynced`. `PoolRepointedOffline` leaves it Arrived. `startIn` decides from the
-  record: none, receive; Unread, Retired or unsynced, wait; `Arrived(tid)` of this transfer with a valid save file,
+  record: none, receive; Retired or unsynced, wait; `Arrived(tid)` of this transfer with a valid save file,
   resume the pool update; Arrived of another transfer, or with an unusable save file, deleted rename-first (T13,
   `StoreCopies.delete`, the record removed) and received; any other phase, Live included, the earlier tenancy's,
   retired (`retireEarlierTenancy`, below; the "store path already exists" refusal is gone). The reconcile's tree
   snapshot may predate this transfer's own pool update, after which `recordTransferIn` has moved the transfer's copy
   Live, so `retireEarlierTenancy` claims its work (RetiringEarlierTenancy) and acts only once a fresh read of the
   device's own state (`DeviceMetadata.lookupStorageDeviceState`) still shows the store TransferringIn for this
-  transfer id; anything else ends the work and checks the device again. `startOut` refuses an
+  transfer id; anything else ends the work and checks the device again. A wait whose end checks nothing (the copy or
+  store opening, an open begun during the fresh read, a fresh read that failed) schedules a device recheck
+  (`DeviceReconciler.scheduleDeviceRecheck`, after `Host.TransferOutRecheckDelay`), so the transfer never waits for
+  the periodic check. `startOut` refuses an
   Arrived copy (P10). `discardArrivedTransferIn` (SourceRestored, Aborted) deletes the record's path
-- `CopyPhase` (`Phase`: Live, Arrived, Outbound, Rebuilt, Parked, Lost, Retired, and stage 1's Unread) names the
-  phases. `CopyPhase.read` reads no marker: a flat copy is Live, and `Unread` no longer arises from a listing.
-  `tryLoadStore`, `adoptionClass` (arrived/ is Clean; Outbound, by location, needs a valid save file, else CrlLost),
-  `holdsOwnState` (Rebuilt), `reloadClosedStores` (offers Live) and `startIn` (by the record, above) match on the
-  phase
+- `Phase` (`CopyPhase.scala`: Live, Arrived, Outbound, Rebuilt, Parked, Lost, Retired) names the phases; there is
+  no reader of a phase but the location. `adoptionClass` is a lookup on the phase (spec "Adoption"): live, arrived,
+  rebuilt and parked copies are Clean, an outbound copy is Clean with a valid save file and CrlLost otherwise, a lost
+  copy is CrlLost, an entry whose store has no copy in any phase is Unclean. `holdsOwnState` (Rebuilt),
+  `reloadClosedStores` (Live records only) and `startIn` (by the record, above) match on the record's phase.
+  `Transitions.phaseLegal` is the spec's table T1-T13 with P10 (Rebuilt, Parked -> Outbound) and an Outbound copy of
+  another transfer moved back to Live before its new move
 - Copy registry (store copy state machine, stage 1): `HostCopies` (`DeviceControl.copyRegistry`) holds one
   `DeviceCopies` per loaded device, the device state's `LocalStorageDeviceState.copies`. `attach` at device load
-  (before any store is offered; `ControlFixture.injectLoadedDevice` too) registers every store directory, by name,
-  with its `CopyPhase` (`Unread` where it cannot be read); `detach` at unload. Every disk mutation site of a store
+  (before any store is offered; `ControlFixture.injectLoadedDevice` too) registers every copy the listing found, with
+  its phase and copy id (a Retired one only while its move is unsynced, and not beside another copy of its store:
+  P2's extras stay in `unsyncedPaths`, which keeps `release` off them); `detach` at unload. Every disk mutation site of a store
   path (create, rebuild finish's handler, transfer-in promotion, every move, retire into pending-delete, discards)
   updates it right after its durable step. Every update is one of two kinds (R22):
   a **fact** (`HostCopies.fact`: something that already happened, i.e. an install, a router removal, the end of a
   close, an open, a retire or a retry, a retire's start, a phase a move reached, a copy leaving its path) is
   applied even where the transition table refuses it (`DeviceCopies.applyActivity`/`applyPhase`; a refused phase is
-  set to what the directory reads, `CopyPhase.known`), and the violation recorded. A **claim** (`HostCopies.claim`:
+  set to where the copy is, `CopyLayout.locate`), and the violation recorded. A **claim** (`HostCopies.claim`:
   Opening, AwaitingRetry, a work's start or update, a new record) that the table refuses is refused, recorded and
   returned `false`, and its caller backs off: `startOpen` opens nothing; `createNewStore`, `startRebuild`'s queuing,
   `startOut`, `returnLostTransferToRebuild` and `startIn`'s receive, earlier-tenancy retire and abandon start nothing
@@ -191,8 +206,8 @@
   table refuses, I1) records a load retry with the waiting load's `onServed` and the usual backoff (R23), so the
   device scans serve the store once whatever held the copy has ended; a refused create records none (its entry,
   still Initializing, has the next check create it again). An install on a loaded device with no record learns the
-  copy (`learned`), as `readAtLoad` does, and so do a LoadStore and a load retry that find none (copies put at a path
-  after the device's load). Stores loaded onto a device this host has not loaded, through
+  copy (`learned`) at its backend's path, which must name a copy of the store, as `readAtLoad` does, and so do a
+  LoadStore and a load retry that find none (copies put at a path after the device's load). Stores loaded onto a device this host has not loaded, through
   `Host.Seams.unloadedDeviceCrl` (TestNetwork), get an untracked record (Live) at install, Served there and Closing
   then Idle once the router removes the store, kept so the store stays silent; `HostCopies.device` returns them like
   any other, and the disk check skips them
@@ -221,7 +236,7 @@
   each drain also throws on any `verifyAgainstDisk` mismatch (phase, unrecorded config'd directory, record without
   directory) and on any copy a load, retry, LoadStore or `markedLost` learned since the last drain
   (`HostCopies.takeLearned`): a learn is a site that placed a copy without recording it. The disk check skips only:
-  an Unread or unsynced record's phase, and stats that fail; a create's record before its copy is placed
+  stats that fail; a create's record before its copy is placed
   (`Work.Create`); the copy a running rebuild's finish placed off the control thread before its completion's
   handler records it, recognised as a `rebuilt/` copy of the store reading that rebuild's `Rebuilt(episode)` phase
   (`StoreRebuilds.finishPlacing`; any other copy of the rebuilding store is checked); untracked records; and
@@ -278,8 +293,11 @@
   `BackendStateLost` and `Backend.isOutOfSpace`; only `DefaultBackendOpener` names concrete backends
 - Store creation is atomic (`BackendOpener.create`, `server.store.backend.StoreCreation`,
   systemic-loss-protection 4.1): `startOpen` with `create` (only `StoreRebuilds.createNewStore`) builds the
-  store in `<device>/creating/` and renames it to its path before opening it, so a store directory exists only
-  complete and `open` never creates. The create's work (`Work.Create`) ends when its copy is served, its open
+  store in `<device>/creating/` and renames it to its target, a fresh `live/<copy>` (`CopyLayout.freshLivePath`; its
+  record registered under that copy id by the create's open), before opening it, so a store directory exists only
+  complete and `open` never creates. A store whose Initializing entry already has a Live record here (a create that
+  crashed before its flip) is taken as created; one with a record in any other phase is not created (T1), its flip
+  failed for a later check. The create's work (`Work.Create`) ends when its copy is served, its open
   fails or the create is skipped, not at the flip out of Initializing, which touches no copy: once the flip commits,
   a rebuild or transfer out of the served store may start, and must not overlap the create (I3). The pending flip
   is tracked apart (`pendingCreateFlips`), so a check meanwhile does not create the store again.
@@ -296,7 +314,7 @@
   to the entries the device's latest reconcile read (`LocalStorageDeviceState.reconciledEntries`, set by
   `reconcileDeviceState`) and to the host's own work: it waits while that entry is neither Active nor Offline, the
   store is `declaredMissing` or a rebuild of it discards or runs (`HostCopies.rebuilding(RebuildHolds)`), its copy is
-  unsynced (CopyMarkers), its open is refused while the store has TransferOut
+  unsynced (CopyMoves), its open is refused while the store has TransferOut
   work on the device (from `startOut`'s close until its move-to-outbound task has run), and it is dropped once the entry has
   left the device (before a first reconcile only the host-work checks apply). A retry
   keeps the waiting load's `onServed` (e.g. its `StoreMoved` gossip) for the open that serves it. A load's `onServed`
@@ -339,7 +357,7 @@
   for the next scan, and `DeviceMarkers`' host-id reads and `storesIn` throw too. `StoreLoader.readArrivedAt` counts
   a failed stat as an arrival now; `adoptionClass` throws (adoption retried next scan), and so does
   `bringIntoService` on a store directory it cannot stat, before it rewrites `owning-host`, so no adopted store loads
-  without its `ArrivedAtFile`; `RebuildingStore.copyOnDisk` throws on a `phase-param.rebuilt` it cannot stat or read;
+  without its `ArrivedAtFile`; a `phase-param.rebuilt` that cannot be stat'd or read fails the device's listing (P6);
   `startOut` never ships a Lost copy; `retireForeignCopy` and `startIn` wait for a later check (an arrived copy's
   `phase-param.arrived` that cannot be read leaves its device unloaded, P6: it says nothing of which transfer the copy
   belongs to). Tests fail a stat with a directory lacking search permission, or
@@ -443,7 +461,7 @@
   resumes nor discards a promoted copy it cannot read. It is moved to `lost/`, its entry is flipped to Rebuilding by the reconcile, and the
   copy is retired (below) before the rebuild. Adoption of a device does the same for an `outbound/` copy
   without a valid save file instead of refusing the device, and adopts any copy in `lost/` as Rebuilding
-  whatever its other markers. A network transfer validates the staged copy's save file before promotion and retries on
+  whatever files it holds. A network transfer validates the staged copy's save file before promotion and retries on
   failure, since the source still holds the state; a resume of a promoted copy's pool update (`StoreTransfers.startIn`)
   checks it again, and a copy whose save file no longer validates is deleted and the
   transfer restarted, as is one whose `phase-param.arrived` names another transfer
@@ -533,7 +551,7 @@
 
   Every delete of a copy is **rename-first** (`StoreCopies.delete`). The copy is renamed into `<device>/deleting/`,
   durably, then removed, and whatever is left there is removed at device load and at each reconcile. So an
-  interrupted delete never strips a marker from a copy at a store path or leaves a partial copy in `pending-delete/`.
+  interrupted delete never leaves part of a copy in a phase directory, loadable, or a partial copy in `pending-delete/`.
   A copy that never was the owner's and holds nothing its source lacks is deleted directly (still rename-first):
   `LocalDevices.discardStoreDirectory` and a stale or unusable arrived copy in `StoreTransfers.startIn`. Scratch areas
   are never loaded, so they are deleted in place: `creating/`, transfer staging (`transferring-in/`, every attempt's

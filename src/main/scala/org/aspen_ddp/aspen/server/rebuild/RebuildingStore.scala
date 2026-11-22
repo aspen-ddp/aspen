@@ -59,13 +59,6 @@ object RebuildingStore:
   /** Whether a copy in `phase` is the finished rebuild of `episode`: Rebuilt (in rebuilt/), with that episode */
   def isRebuiltFor(phase: Phase, episode: Option[UUID]): Boolean = phase == Phase.Rebuilt(rebuildCompleteContent(episode))
 
-  /** The copy of `storeId` on the device at `devicePath`, outside pending-delete/, with its phase, read from the disk
-   *  (CopyLayout.list), which a rebuild's start (off the control thread's state) asks for. Throws a failed listing or
-   *  phase read. A device holding more than one (P2) answers the first listed: none is this rebuild's to take */
-  def copyOnDisk(devicePath: os.Path, storeId: StoreId): () => Option[(Phase, os.Path)] = () =>
-    CopyLayout.list(devicePath).copies.find(f => f.storeId == storeId && f.phase != Phase.Retired)
-      .map(f => (f.phase, f.path))
-
   /** In a store directory being discarded: the store's device-CRL entries, saved by CrashRecoveryLog.saveStoreState
    *  before they are dropped from the device CRL, which a rebuild onto the same device would otherwise recover */
   val LostCrlStateFile = "lost-crl-state.log"
@@ -195,10 +188,10 @@ class RebuildingStore(client: AspenClient,
                       storageDeviceId: StorageDeviceId,
                       devicePath: os.Path,
                       backends: BackendOpener,
-                      /** The copy of the store on the device outside pending-delete/, if any, with its phase: asked by
-                        * start, which takes a Rebuilt copy of its own episode for done and fails on any other
-                        * (copyOnDisk) */
-                      existingCopy: () => Option[(Phase, os.Path)],
+                      /** The copy of the store on the device outside pending-delete/, if any, with its phase and path,
+                        * from the copy registry (StoreRebuilds.startRebuild): start takes a Rebuilt copy of its own
+                        * episode for done and fails on any other */
+                      existingCopy: Option[(Phase, os.Path)],
                       /** The Rebuilding episode this rebuild runs for (StoreEntry.rebuildEpisode) */
                       episode: Option[UUID] = None,
                       checkpointInterval: Int = RebuildingStore.CheckpointInterval,
@@ -297,14 +290,14 @@ class RebuildingStore(client: AspenClient,
   private val pendingSweep = PendingAllocationSweep(storeId, client, peerQueryTimeout, pendingWaitLimit, aborted,
     () => synchronized(abortCause), restorePending, checkpointBestEffort)
 
-  // Started from the constructor. Host holds its instance
-  // lock across the call, so everything expensive is inside the future.
+  // Started from the constructor, which runs on the host's control thread (StoreRebuilds.startRebuild): start reads
+  // only `existingCopy`, already in hand, before its pass runs in futures.
   start()
 
   private def start(): Unit =
     val f: Future[UUID] =
       try
-        existingCopy() match
+        existingCopy match
           case Some((phase, path)) if isRebuiltFor(phase, episode) =>
             // A crash between the move and the flip. The store is already whole; there is nothing to
             // rebuild, only the flip left, and that is Host's job on completion.
@@ -805,7 +798,7 @@ class RebuildingStore(client: AspenClient,
     RebuildState.removeAll(stagingPath)
     // A fresh copy id, as every copy takes when it first enters a phase directory (P4)
     val copyId = UUID.randomUUID()
-    val finalPath = CopyLayout.path(devicePath, storeId, Some(copyId), rebuilt)
+    val finalPath = CopyLayout.path(devicePath, storeId, copyId, rebuilt)
     val dir = finalPath / os.up
     if !FileStat.exists(dir) then
       os.makeDir.all(dir)

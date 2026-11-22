@@ -17,27 +17,39 @@ class CopyLayoutSuite extends FileBasedTests:
     CopyLayout.parseName(s.directoryName) should be(None)
     CopyLayout.parseName(s"${s.directoryName}.not-a-uuid") should be(None)
 
-  test("every phase maps to the spec's directory once converted"):
-    // Each task that converts a phase flips its row to Some
+  test("every phase maps to the spec's directory"):
     val table = List(
-      (Phase.Live, "live", false),
-      (Phase.Arrived("t"), "arrived", true),
-      (Phase.Outbound("t"), "outbound", true),
-      (Phase.Rebuilt("e"), "rebuilt", true),
-      (Phase.Parked, "parked", true),
-      (Phase.Lost, "lost", true),
-      (Phase.Retired, "pending-delete", true))
-    table.foreach: (phase, name, converted) =>
-      withClue(phase):
-        CopyLayout.dirOf(phase) should be(if converted then Some(name) else None)
+      (Phase.Live, "live"),
+      (Phase.Arrived("t"), "arrived"),
+      (Phase.Outbound("t"), "outbound"),
+      (Phase.Rebuilt("e"), "rebuilt"),
+      (Phase.Parked, "parked"),
+      (Phase.Lost, "lost"),
+      (Phase.Retired, "pending-delete"))
     val u = UUID.randomUUID()
-    CopyLayout.path(tdir, s, Some(u), Phase.Retired) should be(tdir / "pending-delete" / CopyLayout.copyName(s, u))
-    CopyLayout.path(tdir, s, Some(u), Phase.Lost) should be(tdir / "lost" / CopyLayout.copyName(s, u))
-    CopyLayout.path(tdir, s, Some(u), Phase.Outbound("t")) should be(tdir / "outbound" / CopyLayout.copyName(s, u))
-    CopyLayout.path(tdir, s, Some(u), Phase.Rebuilt("e")) should be(tdir / "rebuilt" / CopyLayout.copyName(s, u))
-    CopyLayout.path(tdir, s, Some(u), Phase.Parked) should be(tdir / "parked" / CopyLayout.copyName(s, u))
-    CopyLayout.path(tdir, s, Some(u), Phase.Arrived("t")) should be(tdir / "arrived" / CopyLayout.copyName(s, u))
-    CopyLayout.path(tdir, s, Some(u), Phase.Live) should be(tdir / s.directoryName)
+    table.foreach: (phase, name) =>
+      withClue(phase):
+        CopyLayout.dirOf(phase) should be(name)
+        CopyLayout.isPhaseDirectory(name) should be(true)
+        CopyLayout.path(tdir, s, u, phase) should be(tdir / name / CopyLayout.copyName(s, u))
+        CopyLayout.isLivePath(CopyLayout.path(tdir, s, u, phase)) should be(phase == Phase.Live)
+    CopyLayout.isLivePath(tdir / s.directoryName) should be(false)
+    val fresh = CopyLayout.freshLivePath(tdir, s)
+    fresh / os.up should be(tdir / "live")
+    CopyLayout.parseName(fresh.last).map(_._1) should be(Some(s))
+
+  test("locate finds a copy's phase by its location, and None where no phase directory holds it"):
+    val dev = tdir / "dev-locate"
+    val u = UUID.randomUUID()
+    CopyLayout.locate(dev, s, u) should be(None)
+    os.makeDir.all(CopyLayout.path(dev, s, u, Phase.Outbound("")))
+    os.write(CopyLayout.path(dev, s, u, Phase.Outbound("")) / CopyLayout.paramFile(Phase.Outbound("")).get, "t-1")
+    CopyLayout.locate(dev, s, u) should be(Some(Phase.Outbound("t-1")))
+    CopyLayout.locate(dev, s, UUID.randomUUID()) should be(None)
+    // A phase directory without search permission: its stat fails, which is no absence
+    os.perms.set(dev / "outbound", "rw-------")
+    try an[java.io.IOException] should be thrownBy CopyLayout.locate(dev, s, u)
+    finally os.perms.set(dev / "outbound", "rwx------")
 
   test("param is the phase's parameter"):
     CopyLayout.param(Phase.Arrived("t")) should be(Some("t"))
@@ -73,8 +85,8 @@ class CopyLayoutSuite extends FileBasedTests:
     val dev = tdir / "dev"
     val retired = CopyFixtures.placeCopy(dev, s, Phase.Retired)
     val live = CopyFixtures.placeCopy(dev, StoreId(s.poolId, 4))
-    // Each converted phase directory holds the operator's strays
-    val strays = List(CopyLayout.dirOf(Phase.Retired).get).flatMap: d =>
+    // Each phase directory holds the operator's strays
+    val strays = List(CopyLayout.dirOf(Phase.Retired), CopyLayout.dirOf(Phase.Live)).flatMap: d =>
       os.makeDir.all(dev / d / "stray")
       os.write(dev / d / "notes.txt", "")
       List(dev / d / "stray", dev / d / "notes.txt")
@@ -83,23 +95,35 @@ class CopyLayoutSuite extends FileBasedTests:
     listing.copies.map(f => (f.storeId, f.phase, f.path)).toSet should be(Set(
       (s, Phase.Retired, retired),
       (StoreId(s.poolId, 4), Phase.Live, live)))
-    listing.copies.find(_.phase == Phase.Retired).flatMap(_.copyId) should be(CopyLayout.parseName(retired.last).map(_._2))
+    listing.copies.find(_.phase == Phase.Retired).map(_.copyId) should be(CopyLayout.parseName(retired.last).map(_._2))
 
-  test("a flat directory counts as a copy by its store's name, and scratch areas never do"):
+  test("only a phase directory's children are copies: a store-named directory at the device root and scratch areas never are"):
     val dev = tdir / "dev"
-    CopyFixtures.placeCopy(dev, s)
+    val live = CopyFixtures.placeCopy(dev, s)
     // A copy that lost its config is still a copy: the Missing Stores pass rebuilds its store, a retire takes it
-    os.makeDir.all(dev / StoreId(s.poolId, 5).directoryName)
-    // A file is no copy
-    os.write(dev / StoreId(s.poolId, 6).directoryName, "")
+    val unconfigured = CopyFixtures.placeCopy(dev, StoreId(s.poolId, 5), configured = false)
+    // The stage-1 flat path is nothing now
+    os.makeDir.all(dev / StoreId(s.poolId, 6).directoryName)
     List("creating", "deleting", "transferring-in", "rebuilding", "crl", "crl.creating").foreach(d =>
-      os.makeDir.all(dev / d))
-    CopyLayout.list(dev).copies.map(_.storeId).toSet should be(Set(s, StoreId(s.poolId, 5)))
+      os.makeDir.all(dev / d / CopyLayout.copyName(StoreId(s.poolId, 8), UUID.randomUUID())))
+    val listing = CopyLayout.list(dev)
+    listing.copies.map(f => (f.storeId, f.phase, f.path)).toSet should be(Set(
+      (s, Phase.Live, live), (StoreId(s.poolId, 5), Phase.Live, unconfigured)))
+    listing.strays should be(Nil)
+
+  test("no phase is read from a former marker file: a live/ copy is Live whatever it carries"):
+    val dev = tdir / "dev-markers"
+    val copies = List("rebuild-required" -> "", "transferring-out" -> "t", "rebuild-complete" -> UUID.randomUUID().toString,
+      "transferred-in" -> "t1").zipWithIndex.map: (marker, i) =>
+        val copy = CopyFixtures.placeCopy(dev, StoreId(s.poolId, i.toByte))
+        os.write(copy / marker._1, marker._2)
+        copy
+    CopyLayout.list(dev).copies.map(f => (f.phase, f.path)).toSet should be(copies.map(Phase.Live -> _).toSet)
 
   test("a failed listing throws"):
     val dev = tdir / "dev"
     CopyFixtures.placeCopy(dev, s, Phase.Retired)
-    val dir = dev / CopyLayout.dirOf(Phase.Retired).get
+    val dir = dev / CopyLayout.dirOf(Phase.Retired)
     os.perms.set(dir, "-wx------")
     try an[java.io.IOException] should be thrownBy CopyLayout.list(dev)
     finally os.perms.set(dir, "rwx------")
@@ -121,7 +145,7 @@ class CopyLayoutSuite extends FileBasedTests:
     os.perms.set(rebuilt, "rw-------")
     try
       an[java.io.IOException] should be thrownBy CopyLayout.list(dev)
-      CopyLayout.knownPhase(rebuilt) should be(None)
+      an[java.io.IOException] should be thrownBy CopyLayout.phaseAt(rebuilt)
     finally os.perms.set(rebuilt, "rwx------")
 
   test("an outbound copy's phase is read from its own parameter file, and a failed read throws"):
@@ -135,10 +159,9 @@ class CopyLayoutSuite extends FileBasedTests:
       (s, Phase.Outbound("t-1"), sending),
       (StoreId(s.poolId, 7), Phase.Outbound(""), parked)))
     CopyLayout.phaseAt(sending) should be(Some(Phase.Outbound("t-1")))
-    CopyLayout.knownPhase(sending) should be(Some(Phase.Outbound("t-1")))
     // The copy without search permission: its parameter file cannot be stat'd
     os.perms.set(sending, "rw-------")
     try
       an[java.io.IOException] should be thrownBy CopyLayout.list(dev)
-      CopyLayout.knownPhase(sending) should be(None)
+      an[java.io.IOException] should be thrownBy CopyLayout.phaseAt(sending)
     finally os.perms.set(sending, "rwx------")

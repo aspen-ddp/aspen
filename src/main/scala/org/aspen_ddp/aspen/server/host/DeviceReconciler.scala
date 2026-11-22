@@ -105,7 +105,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       case Success(stores) =>
         def leftover(storeId: StoreId): Boolean =
           !remote.stores.contains(storeId) && !ctx.copyRegistry.openCopies(local).contains(storeId) &&
-            FileStat.existence(ctx.copyRegistry.pathOrLive(local, storeId)).contains(false) &&
+            ctx.copyRegistry.existence(local, storeId).contains(false) &&
             !crlDropsRunning.contains(storeId) &&
             !ctx.copies.isRetiring(storeId)
         // Only while the device is still loaded: an unloaded one's CRL is shut down
@@ -229,7 +229,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   private def requestMissingStoresRebuild(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     // An Active entry with no store behind it: its directory, or the directory's config.yaml, is gone (a bad
     // restore, a partial mount, a hand removal). No other pass sees such a store, since each starts from a
-    // directory, a marker or a transitional entry, and the pool counts it writable meanwhile: one fault would cost
+    // copy, a phase or a transitional entry, and the pool counts it writable meanwhile: one fault would cost
     // a unit of margin for good. It is silenced and a rebuild requested, whose Rebuilding pass retires whatever is
     // at the path. Its device-CRL entries stay: the directory may come back before the flip commits (a restore or
     // a mount finishing late), and a copy loaded without them would answer for transactions whose state it lost.
@@ -251,14 +251,13 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     val missing = remote.stores.collect {
       case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Active &&
           !local.declaredMissing.contains(storeId) &&
-          FileStat.existence(ctx.copyRegistry.pathOrLive(local, storeId) / StoreConfig.configFilename)
-            .contains(false) &&
+          ctx.copyRegistry.existence(local, storeId, Some(StoreConfig.configFilename)).contains(false) &&
           unserved(storeId) =>
         storeId
     }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
     missing.foreach: storeId =>
-      logger.error(s"Store $storeId is Active on storage device ${local.storageDeviceId}, but " +
-                   s"${ctx.copyRegistry.pathOrLive(local, storeId)} holds no store. Rebuilding it")
+      val where = ctx.copyRegistry.pathOf(local, storeId).map(p => s"$p holds no store").getOrElse("it has no copy there")
+      logger.error(s"Store $storeId is Active on storage device ${local.storageDeviceId}, but $where. Rebuilding it")
       local.declaredMissing += storeId
       ctx.copyRegistry.missingIs(local)
     local.declaredMissing.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
@@ -340,7 +339,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but its copy is still in arrived/. " +
                   s"Completing the transfer and loading the store")
       if ctx.transfers.bringArrivedLive(local, storeId) == MoveResult.Durable then
-        ctx.tryLoadStore(local, ctx.copyRegistry.pathOrLive(local, storeId), None)
+        ctx.copyRegistry.pathOf(local, storeId).foreach(ctx.tryLoadStore(local, _, None))
 
   /** Completes a rebuild whose flip committed but whose copy did not move Live, and loads the store (T3). */
   private def completeRebuilds(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
@@ -357,11 +356,11 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but its copy is still in rebuilt/. " +
                   s"Completing the rebuild and loading the store")
       if ctx.rebuilds.bringRebuiltLive(local, storeId) == MoveResult.Durable then
-        ctx.tryLoadStore(local, ctx.copyRegistry.pathOrLive(local, storeId), None)
+        ctx.copyRegistry.pathOf(local, storeId).foreach(ctx.tryLoadStore(local, _, None))
 
   /** Loads each copy held back from loading for a move whose sync failed (HostCopies.heldForSyncOn), once it
    *  is synced again (CopyMoves.resync): the removal's own load was held back (an unsynced copy is never loaded),
-   *  and the pass that made it keys off the marker it removed. Only a Live copy still offline and free of work, whose
+   *  and the pass that made it keys off the phase it left. Only a Live copy still offline and free of work, whose
    *  entry is Active; one that is not yet stays held, for every later check, until a load opens it or it leaves its
    *  path or device. Its online gossip goes with the load, as a reinstated transfer out's does */
   private def loadResynced(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
@@ -371,8 +370,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase == Phase.Live) &&
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active)
     ).foreach: storeId =>
-      logger.info(s"Loading store $storeId on device ${local.storageDeviceId}: its marker removal is durable now")
-      ctx.tryLoadStore(local, ctx.copyRegistry.pathOrLive(local, storeId), Some(() => ctx.gossipStoreOnline(storeId)))
+      logger.info(s"Loading store $storeId on device ${local.storageDeviceId}: its move Live is durable now")
+      ctx.copyRegistry.pathOf(local, storeId).foreach(ctx.tryLoadStore(local, _, Some(() => ctx.gossipStoreOnline(storeId))))
 
   /** Drops the transfers in this host is still tracking that the tree no longer records. */
   private def dropAbortedTransfersIn(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
@@ -459,7 +458,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  so it is released without waiting for the periodic check. A record whose directory is known gone (removed by
    *  hand) goes at once. */
   private def retireUnowned(local: LocalStorageDeviceState, storeId: StoreId): Unit =
-    val present = FileStat.existence(ctx.copyRegistry.pathOrLive(local, storeId))
+    val present = ctx.copyRegistry.existence(local, storeId)
     if present.contains(false) then
       ctx.copyRegistry.removed("retireUnowned: no directory", local, storeId)
     else if present.isDefined && !ctx.copies.isRetiring(storeId) then

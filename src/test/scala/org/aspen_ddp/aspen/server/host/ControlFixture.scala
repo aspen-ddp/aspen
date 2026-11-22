@@ -586,7 +586,7 @@ trait ControlFixture:
     host.control.router.install(store, HostThreading.InlineStoreExecutor)
 
   /** Whether `host` holds TransferOut work for `storeId` on any loaded device: from startOut's close until its
-   *  marker task has run, or while it aborts a lost transfer */
+   *  move-to-outbound task has run, or while it aborts a lost transfer */
   protected def hasTransferOutWork(host: Host, storeId: StoreId): Boolean =
     host.control.devices.devices.keys.exists(id =>
       host.control.copyRegistry.device(id).exists(_.work.get(storeId).exists(_.isInstanceOf[Work.TransferOut])))
@@ -596,13 +596,12 @@ trait ControlFixture:
     host.control.devices.devices.keys.exists(id =>
       host.control.copyRegistry.device(id).exists(_.work.get(storeId).exists(_.isInstanceOf[Work.Rebuild])))
 
-  /** Registers the copies at `storeIds`' paths on `sds`, placed after its load, with the phases their markers read,
-   *  as a production load would have found them: offline on the device, which keeps their stores silent */
+  /** Registers the copies of `storeIds` on `sds`, placed after its load, with the phases their locations name, as a
+   *  production load would have found them: offline on the device, which keeps their stores silent */
   protected def placedCopies(host: Host, sds: LocalStorageDeviceState, storeIds: StoreId*): Unit =
     storeIds.foreach: storeId =>
       host.control.copyRegistry.registered("placed after load", sds, storeId,
-        CopyFixtures.phaseOf(sds.devicePath, storeId).get,
-        CopyFixtures.copyPath(sds.devicePath, storeId).flatMap(p => CopyLayout.parseName(p.last)).map(_._2))
+        CopyFixtures.phaseOf(sds.devicePath, storeId).get, CopyFixtures.copyIdOn(sds.devicePath, storeId))
 
   /** Records `storeIds` as served from `sds` without loading them, as the recording seams load nothing: their copies
    *  (registered if placed after the load) Served. The recording shutdown close ends that */

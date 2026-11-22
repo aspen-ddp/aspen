@@ -24,7 +24,7 @@ enum MoveResult:
  *  DurableFiles.move, which forces the directories that name the copy before and after. A rename that landed but was not forced leaves the copy
  *  unsynced (CopyRecord.unsynced, the one unsynced mechanism): it is never loaded, shipped or released until a device
  *  check forces both directories again (`resync`, at the top of DeviceReconciler.reconcileDeviceState). A rename that
- *  failed changes nothing. No copy carries a marker file any more (stage 2, Task 5): the flat path is Live. */
+ *  failed changes nothing. */
 final class CopyMoves(ctx: DeviceControl) extends Logging:
 
   /** How a move and a resync force a directory. Replaced only by tests */
@@ -59,8 +59,8 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
   private[host] def detached(id: StorageDeviceId): Unit =
     lostPending -= id
 
-  /** Moves the copy of `storeId` on the attached `sds` to `to`, recording the fact (HostCopies.moved). A copy with no
-   *  copyId gets a fresh one (P4). A copy that is opening, served or closing is never moved (no move of an installed
+  /** Moves the copy of `storeId` on the attached `sds` to `to`, recording the fact (HostCopies.moved). The copy keeps
+   *  its copyId (P4). A copy that is opening, served or closing is never moved (no move of an installed
    *  store's directory): refused, NotMoved, and logged at error as the caller's bug. A copy already unsynced stays
    *  unsynced after the move, whose syncs force only the directories naming it, until a resync forces it whole */
   def move(site: String, sds: LocalStorageDeviceState, storeId: StoreId, to: Phase): MoveResult =
@@ -76,12 +76,12 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
         logger.error(s"Copy move ($site), a bug: $t")
         MoveResult.NotMoved(t)
       case Some(r) =>
-        val copyId = r.copyId.getOrElse(UUID.randomUUID())
-        val from = CopyLayout.path(sds.devicePath, storeId, r.copyId, r.phase)
-        val target = CopyLayout.path(sds.devicePath, storeId, Some(copyId), to)
+        val copyId = r.copyId
+        val from = CopyLayout.path(sds.devicePath, storeId, copyId, r.phase)
+        val target = CopyLayout.path(sds.devicePath, storeId, copyId, to)
         // An earlier unsynced change's directories still to force go with the copy to its new path
         val earlier = unforced.get(from)
-        val result = relocateCopy(site, from, CopyLayout.dirOf(r.phase).isEmpty, target, to)
+        val result = relocateCopy(site, from, target, to)
         result match
           case MoveResult.NotMoved(_) => ()
           case _ =>
@@ -97,24 +97,20 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
    *  as a fact (HostCopies.placed), unsynced for a rename that landed but was not forced. Returns the result */
   def place(site: String, sds: LocalStorageDeviceState, storeId: StoreId, from: os.Path, to: Phase): MoveResult =
     val copyId = UUID.randomUUID()
-    val target = CopyLayout.path(sds.devicePath, storeId, Some(copyId), to)
-    val result = relocateCopy(site, from, fromFlat = false, target, to)
+    val target = CopyLayout.path(sds.devicePath, storeId, copyId, to)
+    val result = relocateCopy(site, from, target, to)
     result match
       case MoveResult.NotMoved(_) => ()
       case _ =>
         ctx.copyRegistry.placed(site, sds, storeId, to, copyId, unsynced = result.isInstanceOf[MoveResult.Unsynced])
     result
 
-  /** As `move`, for a copy of a device being loaded (lost CRL, adoption), at `from` as `copyId` (None while flat):
+  /** As `move`, for a copy of a device being loaded (lost CRL, adoption, P2), at `from` as `copyId`:
    *  returns the copy's new path, and an unsynced result is held for the device's attach, as an unsynced move
    *  of such a device is (HostCopies.unsynced) */
-  def moveUnattached(site: String, from: os.Path, storeId: StoreId, copyId: Option[UUID],
-                     to: Phase): (MoveResult, os.Path) =
-    // A copy in a phase directory is named for its copy; a flat one for its store
-    val fromFlat = CopyLayout.parseName(from.last).isEmpty
-    val devicePath = if fromFlat then from / os.up else from / os.up / os.up
-    val target = CopyLayout.path(devicePath, storeId, Some(copyId.getOrElse(UUID.randomUUID())), to)
-    val result = relocateCopy(site, from, fromFlat, target, to)
+  def moveUnattached(site: String, from: os.Path, storeId: StoreId, copyId: UUID, to: Phase): (MoveResult, os.Path) =
+    val target = CopyLayout.path(from / os.up / os.up, storeId, copyId, to)
+    val result = relocateCopy(site, from, target, to)
     result match
       case MoveResult.Unsynced(_) => ctx.copyRegistry.unsynced(site, target)
       case _ => ()
@@ -134,22 +130,17 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
           logger.warn(s"Failed to force $path again. Its copy stays unsynced and unloaded. Error: $t")
           false
 
-  /** `relocate` for a copy in `fromPhase` moving to `to`, logged */
-  private def relocateCopy(site: String, from: os.Path, fromFlat: Boolean, target: os.Path, to: Phase): MoveResult =
-    val toFlat = CopyLayout.dirOf(to).isEmpty
-    if fromFlat && toFlat then
-      // Only Live is flat: no move is between two flat phases
-      MoveResult.NotMoved(IllegalArgumentException(s"$to is the flat path $from, where the copy already is"))
-    else
-      val result = relocate(from, target, to)
-      result match
-        case MoveResult.Durable => logger.info(s"Moved the copy at $from to $target ($site)")
-        case MoveResult.Unsynced(t) =>
-          logger.error(s"Moved the copy at $from to $target ($site), but the move could not be forced. The copy stays " +
-                       s"unsynced until a later check of its device forces it. Error: $t")
-        case MoveResult.NotMoved(t) =>
-          logger.error(s"Failed to move the copy at $from to $target ($site). It stays where it is. Error: $t")
-      result
+  /** `relocate` of the copy at `from` to `target`, in `to`, logged */
+  private def relocateCopy(site: String, from: os.Path, target: os.Path, to: Phase): MoveResult =
+    val result = relocate(from, target, to)
+    result match
+      case MoveResult.Durable => logger.info(s"Moved the copy at $from to $target ($site)")
+      case MoveResult.Unsynced(t) =>
+        logger.error(s"Moved the copy at $from to $target ($site), but the move could not be forced. The copy stays " +
+                     s"unsynced until a later check of its device forces it. Error: $t")
+      case MoveResult.NotMoved(t) =>
+        logger.error(s"Failed to move the copy at $from to $target ($site). It stays where it is. Error: $t")
+    result
 
   /** The steps of a move from `from` to `target`, into phase `to`: the target's directory made if absent, `to`'s own
    *  parameter file placed durably (the source phase's file is never touched, so a failed move leaves the source

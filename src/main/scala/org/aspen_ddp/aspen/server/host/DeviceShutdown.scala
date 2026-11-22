@@ -335,14 +335,13 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
 
   /** Run by the reconcile of an Operational device that is not shutting down: loads each store a
    *  cancelled shutdown of it closed, once its entry is Active with no transfer named. A store whose
-   *  copy has since left Live (moved to lost/, or a transfer's marker) is left to the pass that
+   *  copy has since left Live (moved to lost/ or outbound/) is left to the pass that
    *  owns that phase. One that is no longer offline here was loaded by something else. Each is
    *  offered to tryLoadStore once; a load that fails with its data intact leaves it offline and retried at the
    *  device scans (its copy AwaitingRetry, StoreLoader.retryFailedLoads). */
   def reloadClosedStores(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     val deviceId = local.storageDeviceId
     closedForShutdown.get(deviceId).foreach: closed =>
-      def storePath(storeId: StoreId): os.Path = ctx.copyRegistry.pathOrLive(local, storeId)
       // One loaded by something else since (served or opening), or gone, is dropped. One still closing, retiring or
       // held by other work on the device is left to it (I3) and kept, for a later reconcile once that has ended
       val free = ctx.copyRegistry.offlineCopies(local)
@@ -354,16 +353,13 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         closedForShutdown -= deviceId
       else
         closedForShutdown += deviceId -> notYet
-      // A copy whose phase cannot be read (FileStat) is offered too: it has left closedForShutdown above, so skipping
-      // it would leave it unserved until a restart, and the load reads its phase again and holds it back until it
-      // answers (StoreLoader.tryLoadStore)
-      val plain = ready.filter: storeId =>
-        CopyLayout.knownPhase(storePath(storeId)) match
-          case None | Some(Phase.Live) => true
-          case Some(_) => false
-      plain.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
+      // Live records only, by their record's phase: a copy in any other phase is its pass's
+      val live = ready.toList.flatMap: storeId =>
+        ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).filter(_.phase == Phase.Live)
+          .flatMap(_ => ctx.copyRegistry.pathOf(local, storeId)).map(storeId -> _)
+      live.sortBy((s, _) => (s.poolId.uuid, s.poolIndex)).foreach: (storeId, path) =>
         logger.info(s"Loading store $storeId on device $deviceId again: the shutdown that closed it was cancelled")
-        ctx.tryLoadStore(local, storePath(storeId), Some(() => ctx.gossipStoreOnline(storeId)))
+        ctx.tryLoadStore(local, path, Some(() => ctx.gossipStoreOnline(storeId)))
 
   /** Unloads a device whose Shutdown has committed, first closing any store loaded on it since
    *  the shutdown's own close: a rebuild or transfer in that flipped its entry Active before

@@ -27,7 +27,7 @@ enum TransferInStage:
   case RetiringEarlierTenancy, Receiving, Recording, Abandoning
 
 enum TransferOutStage:
-  /** From startOut's close (and CRL extraction) until the control task that writes its marker has run */
+  /** From startOut's close (and CRL extraction) until the control task that moves its copy to outbound/ has run */
   case Closing
   /** returnLostTransferToRebuild is aborting the transfer of a Lost copy */
   case AbortingLost
@@ -42,25 +42,24 @@ enum Work:
   case TransferIn(transferId: Option[UUID], stage: TransferInStage, attempt: Option[UUID] = None)
   case TransferOut(transferId: Option[UUID], stage: TransferOutStage = TransferOutStage.Closing)
 
-/** The one in-memory record of a store copy on a device. `copyId` is assigned when the copy first enters a phase
- *  directory (CopyMoves.move); a flat copy has none (stage 2, P4) */
-final case class CopyRecord(storeId: StoreId, copyId: Option[UUID], phase: Phase, unsynced: Boolean,
-                            activity: Activity)
+/** The one in-memory record of a store copy on a device. `copyId` is assigned when the copy's directory first enters
+ *  a phase directory (a create's rename into live/, a rebuild's finish into rebuilt/, a transfer's promotion into
+ *  arrived/; P4) and never changes on the device */
+final case class CopyRecord(storeId: StoreId, copyId: UUID, phase: Phase, unsynced: Boolean, activity: Activity)
 
-/** The stage-1 legal moves. Anything not listed is a bug in the caller */
+/** The legal phase moves (spec "Phases and transitions", T1-T13; T1, T2, T8 place a new copy, T12 and T13 remove
+ *  one). Anything not listed is a bug in the caller */
 object Transitions:
 
   def phaseLegal(from: Phase, to: Phase): Boolean = (from, to) match
-    case (Phase.Unread, _) => true
     // Every retire goes through Lost (T11)
     case (Phase.Lost, Phase.Retired) => true
     case (Phase.Lost, _) => false
     case (Phase.Retired, _) | (_, Phase.Retired) => false
-    case (_, Phase.Unread) => true
     // T6 from Live, T10
     case (Phase.Live, Phase.Lost | Phase.Outbound(_)) => true
-    // T7 (an aborted or abandoned transfer out reinstated), T10. Never back to Rebuilt, Parked or Arrived: only Live,
-    // Rebuilt and Parked copies are T6 sources (P10), and a reinstated one is Live (P8)
+    // T7 (an aborted or abandoned transfer out reinstated; also an Outbound copy of another transfer moved back
+    // before its new move to outbound/), T10. Never back to Rebuilt, Parked or Arrived: a reinstated copy is Live (P8)
     case (Phase.Outbound(_), Phase.Live | Phase.Lost) => true
     // T9, T10
     case (Phase.Arrived(_), Phase.Live | Phase.Lost) => true
@@ -94,10 +93,6 @@ final class DeviceCopies(val deviceId: StorageDeviceId, val devicePath: os.Path,
   def pathOf(storeId: StoreId): Option[os.Path] =
     records.get(storeId).map(r => CopyLayout.path(devicePath, storeId, r.copyId, r.phase))
 
-  /** The path of the copy of `storeId`: its record's, or else where a Live copy not recorded would be, for a site that
-   *  tells a copy's presence by its path's stat */
-  def pathOrLive(storeId: StoreId): os.Path =
-    pathOf(storeId).getOrElse(CopyLayout.path(devicePath, storeId, None, Phase.Live))
   def work: Map[StoreId, Work] = works
   def missing: Set[StoreId] = missingIds
 
@@ -105,7 +100,7 @@ final class DeviceCopies(val deviceId: StorageDeviceId, val devicePath: os.Path,
     records.getOrElse(storeId, throw IllegalStateException(s"No copy record for $storeId"))
 
   /** A new record. Throws where one exists */
-  def register(storeId: StoreId, phase: Phase, copyId: Option[UUID] = None, unsynced: Boolean = false): Unit =
+  def register(storeId: StoreId, phase: Phase, copyId: UUID, unsynced: Boolean = false): Unit =
     if records.contains(storeId) then
       throw IllegalStateException(s"Copy record for $storeId already exists")
     records += storeId -> CopyRecord(storeId, copyId, phase, unsynced, Activity.Idle)
@@ -139,8 +134,8 @@ final class DeviceCopies(val deviceId: StorageDeviceId, val devicePath: os.Path,
     onChange(storeId)
     illegal
 
-  /** A fact: the copy's markers moved it to `to`. A move the table does not allow sets what its directory reads now
-   *  (`onDisk`) instead, and returns its description, for the caller to record */
+  /** A fact: the copy is in `to` (a load read it there). A move the table does not allow sets where the copy is now
+   *  (`onDisk`, its location) instead, and returns its description, for the caller to record */
   def applyPhase(storeId: StoreId, to: Phase, onDisk: => Phase): Option[String] =
     val r = record(storeId)
     if Transitions.phaseLegal(r.phase, to) then
@@ -151,7 +146,7 @@ final class DeviceCopies(val deviceId: StorageDeviceId, val devicePath: os.Path,
       val disk = onDisk
       records += storeId -> r.copy(phase = disk)
       onChange(storeId)
-      Some(s"Illegal phase move for $storeId: ${r.phase} -> $to; recorded $disk, as its directory reads")
+      Some(s"Illegal phase move for $storeId: ${r.phase} -> $to; recorded $disk, where the copy is")
 
   /** A fact: a move (CopyMoves) put the copy at its path in `to`, as `copyId`, durably unless `unsynced`. A copy
    *  unsynced before the move stays so: the move forced only the directories naming it. The copy's location is its
@@ -161,7 +156,7 @@ final class DeviceCopies(val deviceId: StorageDeviceId, val devicePath: os.Path,
     val r = record(storeId)
     val illegal = Option.when(!Transitions.phaseLegal(r.phase, to))(
       s"Illegal phase move for $storeId: ${r.phase} -> $to, applied as a fact")
-    records += storeId -> r.copy(copyId = Some(copyId), phase = to, unsynced = unsynced || r.unsynced)
+    records += storeId -> r.copy(copyId = copyId, phase = to, unsynced = unsynced || r.unsynced)
     onChange(storeId)
     illegal
 

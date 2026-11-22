@@ -156,8 +156,8 @@ case class StorageDeviceState(storageDeviceId: StorageDeviceId,
    *  rebalancing's ownedStores. Nothing else about the transfer needs undoing at this level.
    *
    *  On a device that is shutting down or shut down the entry goes back to Offline instead; see
-   *  serviceStatus. The source's copy is already closed behind its transfer-out marker, which is
-   *  exactly how the shutdown leaves its other Offline stores.
+   *  serviceStatus. The source's copy is already closed, in outbound/, as the shutdown leaves its
+   *  other Offline stores closed.
    *
    *  None when this device is not, or is no longer, the source of that particular transfer. Both
    *  callers read this state inside a transaction that carries a KeyRevision on StateKey, so a

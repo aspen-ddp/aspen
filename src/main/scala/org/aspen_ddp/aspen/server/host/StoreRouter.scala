@@ -367,7 +367,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
             logger.warn(s"Failed to close the replaced store ${store.storeId}: $t"))(
             using scala.concurrent.ExecutionContext.parasitic)
     // Its copy's record is Served, so the store is not silent
-    ctx.copyRegistry.installed(store.storageDeviceId, store.storeId)
+    ctx.copyRegistry.installed(store.storageDeviceId, store.storeId, store.backend.path)
     ctx.copyRegistry.onChange(store.storeId)
 
   /** Marks the store silent, then unloads it, returning the entry it had. Its copy is Closing until the close ends,

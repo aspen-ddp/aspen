@@ -24,7 +24,8 @@ object StoreCreation extends Logging:
   val CreatingDirectory = "creating"
 
   /** Builds `storeCfg`'s store in a scratch directory under `creatingRoot`, with `init` writing (and closing) the
-   *  backend's files there, writes the config, forces the tree, and renames it to `target`, durably. `target` must not
+   *  backend's files there, writes the config, forces the tree, and renames it to `target`, durably. A store's
+   *  target is a fresh Live copy, `live/<copy>` (CopyLayout.freshLivePath); a rebuild's staging is its own. `target` must not
    *  exist: the rename refuses to replace it. `creatingRoot` must be on `target`'s file system. On any failure the
    *  scratch copy is removed, best effort, and the error rethrown; `target` is untouched. Blocks on I/O.
    */
@@ -40,7 +41,10 @@ object StoreCreation extends Logging:
       StoreIncarnationFile.writeFresh(scratch)
       DurableFiles.write(scratch / StoreConfig.configFilename, storeCfg.yamlConfig)
       DurableFiles.syncTree(scratch)
-      os.makeDir.all(target / os.up)
+      // The target's phase directory (live/ for a store's create), made durably if absent
+      if !FileStat.exists(target / os.up) then
+        os.makeDir.all(target / os.up)
+        DurableFiles.syncDirectory(target / os.up / os.up)
       // atomicMove is a rename(2), which on Linux would replace an empty directory at target: checked above
       os.move(scratch, target, atomicMove = true)
       DurableFiles.syncDirectory(target / os.up)

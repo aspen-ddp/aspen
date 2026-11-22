@@ -22,7 +22,7 @@ import scala.concurrent.ExecutionContext
  *     names its context explicitly, and its result comes back through a control-context callback.
  *  2. **Never block the control thread on a Future** (`Await`, `.get` on a Java future, a `LinkedBlockingQueue.take`
  *     waiting for another thread's answer). The thread would deadlock against its own callbacks. Slow local disk
- *     work (marker files, directory moves, fsyncs through `DurableFiles`) is allowed there, because those operations
+ *     work (device marker and phase-param files, directory moves, fsyncs through `DurableFiles`) is allowed there, because those operations
  *     are rare.
  *  3. **State owned by the control thread is never read from other threads.** Other threads that need an answer
  *     either post a request and receive a Future, or read an immutable snapshot that the control thread publishes

@@ -6,6 +6,7 @@ import org.aspen_ddp.aspen.server.{FileStat, StoreConfig}
 import org.aspen_ddp.aspen.server.Host.LoadRetry
 import scribe.Logging
 
+import java.util.UUID
 import scala.util.Try
 import scala.util.control.NonFatal
 
@@ -28,7 +29,7 @@ import scala.util.control.NonFatal
  *   - a fact (`fact`): something that already happened (an install, a router removal, the end of a close, an open,
  *     a retire or a retry, a retire's start, a phase a disk mutation reached, a copy's leaving its path). It is
  *     applied even when the table does not allow it (DeviceCopies.applyActivity / applyPhase; a phase the table
- *     refuses is set to what the copy's directory reads, CopyPhase.known), and the violation recorded;
+ *     refuses is set to where the copy is, CopyLayout.locate), and the violation recorded;
  *   - a claim (`claim`): something about to start that another actor may hold (Opening, AwaitingRetry, a work's
  *     start or update, a new record). An illegal one is refused, recorded, and returned as `false`, and the caller
  *     backs off: no open, no work start.
@@ -45,7 +46,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   // Copies a load found with no record (readAtLoad), for the drain check to report
   private var learnedCopies: Vector[String] = Vector()
   // The records of stores this host serves from a device it has not loaded: only a load through the unloaded-device
-  // CRL seam (Host.Seams.unloadedDeviceCrl, tests) makes them, never production. No marker site reaches them, and the
+  // CRL seam (Host.Seams.unloadedDeviceCrl, tests) makes them, never production. No move reaches them, and the
   // disk check skips them: their backends have no directory
   private var untracked: Map[StorageDeviceId, DeviceCopies] = Map()
   // The purpose each close asked for (closingFor) is for, until the router removes its store
@@ -143,17 +144,10 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   private def activityFact(site: String, copies: DeviceCopies, storeId: StoreId, to: Activity): Unit =
     copies.applyActivity(storeId, to).foreach(violation(site, _))
 
-  /** Records a phase fact on `copies`: one the table refuses takes what the copy's directory reads */
-  private def phaseFact(site: String, copies: DeviceCopies, storeId: StoreId, to: Phase): Unit =
-    copies.applyPhase(storeId, to, diskPhase(copies.devicePath, copies.copies(storeId))).foreach(violation(site, _))
-
-  /** The phase the copy of record `r` reads on disk: a converted phase's location is its phase; a flat copy's markers
-   *  say it (CopyPhase), Unread where they cannot be read */
-  private def diskPhase(devicePath: os.Path, r: CopyRecord): Phase =
-    if CopyLayout.dirOf(r.phase).isDefined then
-      r.phase
-    else
-      CopyPhase.known(CopyLayout.path(devicePath, r.storeId, r.copyId, r.phase)).getOrElse(Phase.Unread)
+  /** The phase the copy of record `r` is in on disk, by its location (CopyLayout.locate), or `fallback` where no
+   *  phase directory holds it or the location cannot be read */
+  private def diskPhase(devicePath: os.Path, r: CopyRecord, fallback: Phase): Phase =
+    Try(CopyLayout.locate(devicePath, r.storeId, r.copyId)).toOption.flatten.getOrElse(fallback)
 
   /** The throws of the silence path since the last call, which clears them */
   def takeSilenceErrors(): Vector[String] =
@@ -195,9 +189,11 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     e
 
   /** At load, before any store is offered: registers each copy of the device's `listing` (CopyLayout.list) with its
-   *  phase, Unread where it cannot be read, but a Retired one, which is not recorded (P3) unless its move was not
-   *  forced before the attach (moveUnattached). Logs each stray at warn. Never throws: the device is attached whatever
-   *  the registration meets, and a copy it cannot read waits for its load to read it (readAtLoad) */
+   *  phase, but a Retired one, which is not recorded (P3) unless its move was not forced before the attach
+   *  (moveUnattached). A Retired copy not forced whose store has another copy listed (one of P2's extras, beside the
+   *  Lost copy registered for its store) is not recorded either: it stays in `unsyncedPaths`, which keeps
+   *  StoreCopies.release off it (isUnsyncedAt) until the process ends. Logs each stray at warn. Never throws: the
+   *  device is attached whatever the registration meets */
   def attach(sds: LocalStorageDeviceState, listing: CopyLayout.Listing): Unit =
     attached += sds.storageDeviceId -> sds
     // Its last tree entry's stores (unloaded) stay silent until its first reconcile reads the entry anew
@@ -213,7 +209,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
       logger.warn(s"$stray on storage device ${sds.storageDeviceId} is not a store copy. Leaving it alone")
     listing.copies.foreach: found =>
       val unsyncedMove = unsyncedPaths.contains(found.path)
-      if found.phase != Phase.Retired || unsyncedMove then
+      val besideAnother = listing.copies.exists(f => f.storeId == found.storeId && f.phase != Phase.Retired)
+      if found.phase != Phase.Retired || (unsyncedMove && !besideAnother) then
         fact("attach"):
           sds.copies.register(found.storeId, found.phase, found.copyId)
           if unsyncedMove then
@@ -221,7 +218,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
             heldForSync += sds.storageDeviceId -> found.storeId
             sds.copies.setUnsynced(found.storeId, true)
 
-  /** Test-only (Host.testingOnlyRescan): registers each store directory on `sds` that has no record, with its phase,
+  /** Test-only (Host.testingOnlyRescan): registers each copy on `sds` whose store has no record, with its phase,
    *  as `attach` registers the directories a device load finds: copies a test placed by hand after the load. Records
    *  already there are left as they are, and so is a copy a rebuild's finish placed whose completion's handler has
    *  not yet run (finishInFlight): the handler records it. Returns the stores registered */
@@ -243,23 +240,24 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     attach(sds, listing)
 
   /** A load (StoreLoader.tryLoadStore) read the copy at `storePath`, whose config names `storeId`, in `phase`. A copy
-   *  with no record is registered and reported as learned; an Unread record takes the phase; a record in another
-   *  phase is a miswired site: recorded, and the record takes what the load read */
+   *  with no record is registered and reported as learned; a record of another copy or phase is a miswired site:
+   *  recorded, and the record takes where the copy is */
   def readAtLoad(sds: LocalStorageDeviceState, storePath: os.Path, storeId: StoreId, phase: Phase): Unit =
     fact("readAtLoad"):
-      if HostCopies.storeIdOf(storePath).contains(storeId) && storePath / os.up == sds.devicePath then
-        copiesOf(sds).foreach: copies =>
-          copies.copies.get(storeId).map(_.phase) match
-            case None =>
-              logger.warn(s"The copy of store $storeId at $storePath was not known to the copy registry. Learned " +
-                          s"at its load, $phase")
-              learnedCopy(s"device ${sds.storageDeviceId}: $storeId learned at load, $phase")
-              copies.register(storeId, phase)
-            case Some(Phase.Unread) => copies.setPhase(storeId, phase)
-            case Some(p) if p == phase => ()
-            case Some(p) =>
-              violation("readAtLoad", s"record of $storeId is $p, its load read $phase at $storePath; recorded $phase")
-              copies.applyPhase(storeId, phase, phase)
+      CopyLayout.nameOf(storePath).filter(_._1 == storeId && storePath / os.up / os.up == sds.devicePath)
+        .foreach: (_, copyId) =>
+          copiesOf(sds).foreach: copies =>
+            copies.copies.get(storeId) match
+              case None =>
+                logger.warn(s"The copy of store $storeId at $storePath was not known to the copy registry. Learned " +
+                            s"at its load, $phase")
+                learnedCopy(s"device ${sds.storageDeviceId}: $storeId learned at load, $phase")
+                copies.register(storeId, phase, copyId)
+              case Some(r) if r.phase == phase && r.copyId == copyId => ()
+              case Some(r) =>
+                violation("readAtLoad", s"record of $storeId is ${r.phase} as ${r.copyId}, its load read $phase at " +
+                                        s"$storePath")
+                copies.applyPhase(storeId, phase, diskPhase(copies.devicePath, r, phase))
 
   // ---- Activity: what the host is doing with each copy's open store ----
 
@@ -272,16 +270,20 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def transferOutWork(sds: LocalStorageDeviceState, storeId: StoreId): Option[Work.TransferOut] =
     copiesOf(sds).flatMap(_.work.get(storeId)).collect { case w: Work.TransferOut => w }
 
-  /** StoreLoader.startOpen began open `openId` of the copy at `storeId`'s path on `sds`: its record is Opening until
+  /** StoreLoader.startOpen began open `openId` of the copy at `storePath` on `sds`: its record is Opening until
    *  the open is served or ends, taking the loader's retry if it was AwaitingRetry. A create has no record yet: one is
-   *  registered Live, for the copy its create places at the path before the open (StoreCreation), and unregistered
-   *  if the create fails leaving nothing there (createFailed). A claim: false when refused (a record Closing,
-   *  Retiring or not Live, TransferOut work), and then the caller opens nothing */
-  def opening(sds: LocalStorageDeviceState, storeId: StoreId, openId: Long, create: Boolean): Boolean =
+   *  registered Live under the copy id `storePath` names (its fresh `live/<copy>`), for the copy its create places
+   *  there before the open (StoreCreation), and unregistered if the create fails leaving nothing there
+   *  (createFailed). A claim: false when refused (a record Closing, Retiring or not Live, TransferOut work, a create
+   *  over a record or at a path naming no copy), and then the caller opens nothing */
+  def opening(sds: LocalStorageDeviceState, storeId: StoreId, openId: Long, create: Boolean,
+              storePath: os.Path): Boolean =
     claim("startOpen"):
       copiesOf(sds).foreach: copies =>
-        if create && !copies.copies.contains(storeId) then
-          copies.register(storeId, Phase.Live)
+        if create then
+          val copyId = CopyLayout.nameOf(storePath).filter(_._1 == storeId).map(_._2).getOrElse(
+            throw IllegalArgumentException(s"The create of $storeId targets $storePath, which names no copy of it"))
+          copies.register(storeId, Phase.Live, copyId)
         copies.setActivity(storeId, Activity.Opening(openId))
         heldForSync -= copies.deviceId -> storeId
 
@@ -306,8 +308,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         if copies.copies.get(storeId).exists(_.activity.isInstanceOf[Activity.Opening]) then
           activityFact(site, copies, storeId, Activity.Idle)
 
-  /** The loader records `retry` for `storeId`: its copy's record is AwaitingRetry(retry), learned Unread if it has
-   *  none. A record Closing or Retiring parks it until it is Idle again (closeEnded, retireEnded). A claim: refused
+  /** The loader records `retry` for `storeId`: its copy's record is AwaitingRetry(retry), learned at the retry's
+   *  path if it has none. A record Closing or Retiring parks it until it is Idle again (closeEnded, retireEnded). A claim: refused
    *  (false) for a record Served, which needs no retry */
   def awaitingRetry(site: String, storeId: StoreId, retry: LoadRetry): Boolean =
     claim(site):
@@ -315,10 +317,12 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         copies.copies.get(storeId) match
           case None =>
             // Put at its path after the device's load (by hand or by a test): learned, as readAtLoad learns one
+            val copyId = CopyLayout.nameOf(retry.storePath).filter(_._1 == storeId).map(_._2).getOrElse(
+              throw IllegalArgumentException(s"A load retry of $storeId names ${retry.storePath}, no copy of it"))
             logger.warn(s"The copy of store $storeId at ${retry.storePath} was not known to the copy registry. " +
-                        "Learned awaiting a load retry, Unread")
-            learnedCopy(s"device ${retry.sds.storageDeviceId}: $storeId learned awaiting a retry, Unread")
-            copies.register(storeId, Phase.Unread)
+                        "Learned awaiting a load retry, Live")
+            learnedCopy(s"device ${retry.sds.storageDeviceId}: $storeId learned awaiting a retry, Live")
+            copies.register(storeId, Phase.Live, copyId)
             copies.setActivity(storeId, Activity.AwaitingRetry(retry))
           case Some(r) => r.activity match
             case Activity.Closing(_) | Activity.Retiring => parkedRetries += (copies.deviceId, storeId) -> retry
@@ -356,47 +360,46 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
       sds.copies.copies.values.toList.sortBy(r => (r.storeId.poolId.uuid, r.storeId.poolIndex)).collect:
         case CopyRecord(storeId, _, _, _, Activity.AwaitingRetry(r)) => storeId -> r
 
-  /** The router installed `storeId`, loaded from device `id` (StoreRouter.install): its record (`known`) is Served */
-  def installed(id: StorageDeviceId, storeId: StoreId): Unit =
+  /** The router installed `storeId`, loaded from device `id` at `storePath` (StoreRouter.install): its record
+   *  (`known`) is Served */
+  def installed(id: StorageDeviceId, storeId: StoreId, storePath: os.Path): Unit =
     fact("install"):
-      known("install", id, storeId)
+      known("install", id, storeId, storePath)
       // Served -> Served: a reload over the served store (StoreRouter.install replacing an entry)
       device(id).foreach: copies =>
         heldForSync -= copies.deviceId -> storeId
         if copies.copies.contains(storeId) then
           activityFact("install", copies, storeId, Activity.Served)
 
-  /** A copy of `storeId` found at its flat path on `sds` with no record, about to be moved (StoreRebuilds.moveToLost:
-   *  a copy put at the path by hand after the device's load): learned, as readAtLoad learns one */
-  def learn(site: String, sds: LocalStorageDeviceState, storeId: StoreId): Unit =
-    fact(site)(known(site, sds.storageDeviceId, storeId))
-
-  /** A LoadStore of `storeId` onto device `id` is handled (StoreLoader.handleLoad): its copy has a record before the
-   *  load's outcome, whatever it is (see `known`) */
-  def loadHandled(id: StorageDeviceId, storeId: StoreId): Unit =
-    fact("LoadStore")(known("LoadStore", id, storeId))
+  /** A LoadStore of `storeId` onto device `id`, its backend at `storePath`, is handled (StoreLoader.handleLoad): its
+   *  copy has a record before the load's outcome, whatever it is (see `known`) */
+  def loadHandled(id: StorageDeviceId, storeId: StoreId, storePath: os.Path): Unit =
+    fact("LoadStore")(known("LoadStore", id, storeId, storePath))
 
   /** Gives the copy of `storeId` loaded onto device `id` a record if it has none. A store loaded onto a device this
    *  host has not loaded, through the unloaded-device CRL seam (tests), gets an untracked record (Live), kept until
    *  the host goes, as a copy's record is kept on a loaded device. A copy a loaded device holds with no record was put
-   *  at its path after the device's load and loaded without tryLoadStore (Host.loadStore, tests): learned, as
-   *  readAtLoad learns one. A device neither loaded nor seamed (a test's stand-in) has no records */
-  private def known(site: String, id: StorageDeviceId, storeId: StoreId): Unit =
+   *  at its path after the device's load and loaded without tryLoadStore (Host.loadStore, tests): learned at its
+   *  backend's path `storePath`, as readAtLoad learns one; a path naming no copy of the store is a violation. A device
+   *  neither loaded nor seamed (a test's stand-in) has no records */
+  private def known(site: String, id: StorageDeviceId, storeId: StoreId, storePath: os.Path): Unit =
     if !attached.contains(id) && !ctx.devices.devices.contains(id) && ctx.unloadedDeviceCrl.isDefined then
       val copies = untracked.getOrElse(id, new DeviceCopies(id, os.root, s =>
         onChange(s)
         observer(untracked(id), s)))
       untracked += id -> copies
       if !copies.copies.contains(storeId) then
-        copies.register(storeId, Phase.Live)
+        copies.register(storeId, Phase.Live, CopyLayout.nameOf(storePath).map(_._2).getOrElse(UUID(0, 0)))
     attached.get(id).foreach: sds =>
       if !sds.copies.copies.contains(storeId) then
-        val path = CopyLayout.path(sds.devicePath, storeId, None, Phase.Live)
-        val phase = CopyPhase.known(path).getOrElse(Phase.Live)
-        logger.warn(s"The copy of store $storeId at $path was not known to the copy registry. Learned at its " +
+        val copyId = CopyLayout.nameOf(storePath).filter(_._1 == storeId).map(_._2).getOrElse(
+          throw IllegalStateException(s"Store $storeId at $storePath on device $id has no copy record, and its path " +
+                                      "names no copy of it"))
+        val phase = Try(CopyLayout.phaseAt(storePath)).toOption.flatten.getOrElse(Phase.Live)
+        logger.warn(s"The copy of store $storeId at $storePath was not known to the copy registry. Learned at its " +
                     s"$site, $phase")
         learnedCopy(s"device $id: $storeId learned at $site, $phase")
-        sds.copies.register(storeId, phase)
+        sds.copies.register(storeId, phase, copyId)
 
   /** The close of `storeId` about to be asked for is for `purpose` (DeviceShutdown, StoreLoader.handleClose): taken
    *  by the router's removal of the store */
@@ -660,16 +663,12 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     attached.get(sds.storageDeviceId).filter(_ eq sds).map(_.copies)
 
   /** The registry of the attached device holding the copy at `storePath`, with its store: the record whose path it is
-   *  (pathOf), or else, for a flat store path, the device whose directory holds it (a copy with no record yet) */
+   *  (pathOf) */
   private def copiesAt(storePath: os.Path): Option[(DeviceCopies, StoreId)] =
     val devices = attached.values.toList.sortBy(_.storageDeviceId.uuid)
     devices.iterator.flatMap(sds => sds.copies.copies.values.collectFirst {
       case r if recordPath(sds.devicePath, r) == storePath => (sds.copies, r.storeId)
-    }).nextOption().orElse:
-      for
-        storeId <- HostCopies.storeIdOf(storePath)
-        sds <- devices.find(_.devicePath == storePath / os.up)
-      yield (sds.copies, storeId)
+    }).nextOption()
 
   private def recordPath(devicePath: os.Path, r: CopyRecord): os.Path =
     CopyLayout.path(devicePath, r.storeId, r.copyId, r.phase)
@@ -678,10 +677,12 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def pathOf(sds: LocalStorageDeviceState, storeId: StoreId): Option[os.Path] =
     copiesOf(sds).flatMap(_.pathOf(storeId))
 
-  /** The path of the copy of `storeId` on `sds`: its record's, or else where a Live copy not recorded would be (a site
-   *  that tells a copy's presence by its path's stat) */
-  def pathOrLive(sds: LocalStorageDeviceState, storeId: StoreId): os.Path =
-    pathOf(sds, storeId).getOrElse(CopyLayout.path(sds.devicePath, storeId, None, Phase.Live))
+  /** Whether the copy of `storeId` on `sds` holds `file` (its directory itself for None), as FileStat.existence: a
+   *  store with no record has no copy (Some(false)); None where the stat fails */
+  def existence(sds: LocalStorageDeviceState, storeId: StoreId, file: Option[String] = None): Option[Boolean] =
+    pathOf(sds, storeId) match
+      case None => Some(false)
+      case Some(p) => FileStat.existence(file.fold(p)(p / _))
 
   /** A fact: CopyMoves moved the copy of `storeId` on `sds` to `to`, as `copyId`, durably unless `unsynced` (then held
    *  for its load, as any unsynced copy is; a copy unsynced before stays so). A move to Retired that leaves
@@ -700,7 +701,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
           case Activity.AwaitingRetry(r) =>
             if to == Phase.Live then
               activityFact(site, copies, storeId,
-                Activity.AwaitingRetry(r.copy(storePath = CopyLayout.path(sds.devicePath, storeId, Some(copyId), to))))
+                Activity.AwaitingRetry(r.copy(storePath = CopyLayout.path(sds.devicePath, storeId, copyId, to))))
             else
               logger.info(s"Dropping the load retry of store $storeId on device ${sds.storageDeviceId}: its copy " +
                           s"moved to $to ($site)")
@@ -713,10 +714,9 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
 
   // ---- Updates from the disk mutation sites, right after each durable step: facts, but a new record's claim ----
 
-  /** A new copy at `storeId`'s path on `sds`, as `copyId` (a copy in a phase directory has one). A claim: refused
-   *  (false) where a record exists */
+  /** A new copy of `storeId` on `sds` in `phase`, as `copyId`. A claim: refused (false) where a record exists */
   def registered(site: String, sds: LocalStorageDeviceState, storeId: StoreId, phase: Phase,
-                 copyId: Option[java.util.UUID] = None): Boolean =
+                 copyId: java.util.UUID): Boolean =
     claim(site):
       copiesOf(sds).foreach(_.register(storeId, phase, copyId))
 
@@ -729,8 +729,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     fact(site):
       copiesOf(sds).foreach: copies =>
         copies.copies.get(storeId) match
-          case None => copies.register(storeId, phase, Some(copyId))
-          case Some(r) if r.phase == phase && r.copyId.contains(copyId) => ()
+          case None => copies.register(storeId, phase, copyId)
+          case Some(r) if r.phase == phase && r.copyId == copyId => ()
           case Some(r) =>
             violation(site, s"record of $storeId is ${r.phase} as ${r.copyId}, its rebuild placed $phase as $copyId")
             copies.applyMove(storeId, phase, copyId, unsynced = false): Unit
@@ -785,7 +785,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     fact(site):
       copiesOf(sds).foreach: copies =>
         copies.copies.get(storeId) match
-          case None => copies.register(storeId, phase, Some(copyId), unsynced)
+          case None => copies.register(storeId, phase, copyId, unsynced)
           case Some(r) =>
             violation(site, s"record of $storeId is ${r.phase} as ${r.copyId}, $site placed $phase as $copyId")
             copies.applyMove(storeId, phase, copyId, unsynced): Unit
@@ -800,9 +800,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         copies.unregister(storeId)
 
   /** Test-only. For every loaded device, where its records and its disk disagree:
-   *   - a record's phase is not the phase its directory's markers read, for records neither Unread nor unsynced;
-   *   - a store directory with a config has no record;
-   *   - a record has no directory, but one whose create is still placing it (Work.Create).
+   *   - a copy with a config has no record at its path (its phase and copy id), Retired copies aside;
+   *   - a record has no directory at its path, but one whose create is still placing it (Work.Create).
    *  Stats and reads that fail are skipped: they say nothing. A store path holding the copy a running rebuild's
    *  finish placed, its directory reading that rebuild's Rebuilt phase while its completion's handler has not yet run
    *  (finishInFlight), is skipped: finish places the copy off the control thread, ahead of the handler. A device a test
@@ -836,16 +835,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         val unrecorded = onDisk
           .filterNot(f => records.get(f.storeId).exists(r => recordPath(sds.devicePath, r) == f.path))
           .map(f => s"device $id: directory ${f.path} (${f.phase}) has no record")
-        val wrongPhase = records.values.toList.sortBy(_.storeId.directoryName).flatMap: r =>
-          val path = recordPath(sds.devicePath, r)
-          if r.phase == Phase.Unread || r.unsynced || CopyLayout.dirOf(r.phase).isDefined then
-            Nil
-          else
-            CopyPhase.known(path) match
-              case Some(p) if p != r.phase && Try(FileStat.isDir(path)).toOption.contains(true) =>
-                List(s"device $id: record of ${r.storeId} is ${r.phase}, its directory reads $p")
-              case _ => Nil
-        dirMissing ++ unrecorded ++ wrongPhase
+        dirMissing ++ unrecorded
 
 /** Why a store the router does not serve is silent (HostCopies.silence) */
 enum SilenceReason:
@@ -869,10 +859,6 @@ object HostCopies:
     case (Work.TransferIn(Some(t), _, _), Work.TransferIn(None, stage, attempt)) => Work.TransferIn(Some(t), stage, attempt)
     case (Work.TransferOut(Some(t), _), Work.TransferOut(None, stage)) => Work.TransferOut(Some(t), stage)
     case _ => w
-
-  /** The store a directory's name identifies, if it is a store directory name */
-  def storeIdOf(path: os.Path): Option[StoreId] =
-    Try(StoreId(path.last)).toOption.filter(_.directoryName == path.last)
 
 /** A throw of the copy registry's silence path (HostCopies.onChange) when `strict`: never swallowed by `fact` or `claim` */
 final class SilenceFailure(message: String, cause: Throwable) extends RuntimeException(message, cause)

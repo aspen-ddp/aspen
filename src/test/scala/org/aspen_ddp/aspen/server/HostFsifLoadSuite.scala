@@ -182,13 +182,13 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
 
   /** Creates the empty FSIF store on the device, as the host's create does (StoreCreation) */
   private def writeFsifStoreConfig(deviceDir: os.Path): os.Path =
-    val storeDir = CopyLayout.path(deviceDir, storeId, Some(UUID.randomUUID()), Phase.Live)
+    val storeDir = CopyFixtures.freshCopyPath(deviceDir, storeId)
     DefaultBackendOpener.createStore(fsifStoreCfg, storeDir, deviceDir / StoreCreation.CreatingDirectory)
     storeDir
 
   /** A store directory holding only its config: a store whose backend files are gone */
   private def writeConfigOnly(deviceDir: os.Path): os.Path =
-    val storeDir = CopyLayout.path(deviceDir, storeId, Some(UUID.randomUUID()), Phase.Live)
+    val storeDir = CopyFixtures.freshCopyPath(deviceDir, storeId)
     os.makeDir.all(storeDir)
     os.write.over(storeDir / StoreConfig.configFilename, fsifStoreCfg.yamlConfig)
     storeDir
@@ -844,9 +844,9 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
-    val storeDir = CopyLayout.path(deviceDir, storeId, Some(UUID.randomUUID()), Phase.Live)
+    val storeDir = CopyFixtures.freshCopyPath(deviceDir, storeId)
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
-      storeDir / os.up / StoreCreation.CreatingDirectory)
+      storeDir / os.up / os.up / StoreCreation.CreatingDirectory)
     CopyFixtures.markCopy(deviceDir, storeId, Phase.Outbound(""))
     load(host) // skipped in outbound/: offline
     host.control.router.silentStores should contain(storeId)
@@ -901,9 +901,9 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
-    val storeDir = CopyLayout.path(deviceDir, storeId, Some(UUID.randomUUID()), Phase.Live)
+    val storeDir = CopyFixtures.freshCopyPath(deviceDir, storeId)
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
-      storeDir / os.up / StoreCreation.CreatingDirectory)
+      storeDir / os.up / os.up / StoreCreation.CreatingDirectory)
     val outboundDir = CopyFixtures.markCopy(deviceDir, storeId, Phase.Outbound(""))
     load(host) // skipped in outbound/: offline
     val cfg = os.read.bytes(outboundDir / StoreConfig.configFilename)
@@ -912,7 +912,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
     host.control.reconciler.checkAll()
     yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).flatMap: _ =>
-      // Moved back to Live at its flat path (T7), so only the retry can take the store up again
+      // Moved back to Live in live/ (T7), so only the retry can take the store up again
       CopyFixtures.phaseOf(deviceDir, storeId).exists(_.isInstanceOf[Phase.Outbound]) should be(false)
       CopyFixtures.copyPath(deviceDir, storeId) should be(Some(storeDir))
       host.control.router.silentStores should contain(storeId)

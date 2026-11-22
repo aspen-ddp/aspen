@@ -524,14 +524,35 @@ class MainSuite extends AnyFunSuite with Matchers:
       val devDir = hostDir / StorageDeviceManager.StorageDevicesDirName / "bootstrap-device"
       for i <- 0 until 3 do
         val storeId = StoreId(PoolId.InitialMetadataPoolId, i.toByte)
-        val cfg = StoreConfig.loadStoreConfig(devDir / storeId.toString / StoreConfig.configFilename)
+        val cfg = StoreConfig.loadStoreConfig(liveCopy(devDir, storeId) / StoreConfig.configFilename)
         cfg.storeId shouldBe storeId
         // Its admission lane reserves room for its marker batches above data traffic (CrlAdmission, crash-recovery-log
         // 6)
         cfg.admissionTier shouldBe AdmissionTier.Metadata
         val bootstrapId = StoreId(PoolId.BootstrapPoolId, i.toByte)
-        StoreConfig.loadStoreConfig(devDir / bootstrapId.toString / StoreConfig.configFilename)
+        StoreConfig.loadStoreConfig(liveCopy(devDir, bootstrapId) / StoreConfig.configFilename)
           .admissionTier shouldBe AdmissionTier.Bootstrap
+
+  test("bootstrap creates its stores under live"):
+    withTempDir("aspen-bootstrap"): tmp =>
+      val hostDir = tmp / "host"
+      val result = Console.withOut(java.io.ByteArrayOutputStream()):
+        Main.bootstrap(Replication(3, 2), hostDir, "bootstrap-host", "10.0.0.5", 4750, 4751, 4752,
+                       tmp / "aspen-client-config.yaml")
+      result shouldBe 0
+      val devDir = hostDir / StorageDeviceManager.StorageDevicesDirName / "bootstrap-device"
+      val listing = org.aspen_ddp.aspen.server.host.CopyLayout.list(devDir)
+      val expected = (0 until 3).flatMap(i =>
+        List(StoreId(PoolId.BootstrapPoolId, i.toByte), StoreId(PoolId.InitialMetadataPoolId, i.toByte))).toSet
+      listing.copies.map(_.storeId).toSet shouldBe expected
+      listing.copies.size shouldBe expected.size
+      listing.copies.foreach: f =>
+        f.phase shouldBe org.aspen_ddp.aspen.server.host.Phase.Live
+        (f.path / os.up) shouldBe devDir / org.aspen_ddp.aspen.server.host.CopyLayout.LiveDirectory
+        StoreConfig.loadStoreConfig(f.path / StoreConfig.configFilename).storeId shouldBe f.storeId
+      listing.strays shouldBe Nil
+      // Nothing is left at a flat store path
+      expected.foreach(s => os.exists(devDir / s.directoryName) shouldBe false)
 
   test("bootstrap writes an owner-only client config caching the bootstrap host"):
     withTempDir("aspen-bootstrap"): tmp =>
@@ -557,6 +578,11 @@ class MainSuite extends AnyFunSuite with Matchers:
       val ca = Pem.decodeCertificate(bsCfg.caCertificate)
       noException should be thrownBy
         CertificateVerifier.verify(Pem.decodeCertificate(clientCfg.credentials.certificate), ca)
+
+  /** The one Live copy of `storeId` on the device at `devDir` */
+  private def liveCopy(devDir: os.Path, storeId: StoreId): os.Path =
+    val List(f) = org.aspen_ddp.aspen.server.host.CopyLayout.list(devDir).copies.filter(_.storeId == storeId): @unchecked
+    f.path
 
   private def bootstrapInto(hostDir: os.Path, clientCfgDir: os.Path): Int =
     Main.bootstrap(Replication(3, 2), hostDir, "bootstrap-host", "10.0.0.5", 4750, 4751, 4752,

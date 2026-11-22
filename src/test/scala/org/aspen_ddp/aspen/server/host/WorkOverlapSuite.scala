@@ -46,7 +46,7 @@ private class HeldRebuildFactory extends StoreRebuildFactory:
 
   def createRebuild(client: AspenClient, storeId: StoreId, storageDeviceId: StorageDeviceId, devicePath: os.Path,
                     backends: BackendOpener, episode: Option[UUID],
-                    existingCopy: () => Option[(Phase, os.Path)]): StoreRebuild =
+                    existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
     val r = new HeldRebuild(storeId, episode, devicePath)
     synchronized(created += r)
     r
@@ -276,7 +276,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       host.control.rebuilds.createFlipsPending should not contain creating
       recorded(host).loadStoreRequests.toList should be(List((deviceA, creating)))
 
-  /** Ship x discard (audit review Minor 1): a lost copy (rebuild-required, offline, its entry Active again after its
+  /** Ship x discard (audit review Minor 1): a lost copy (in lost/, offline, its entry Active again after its
    *  transfer was aborted) whose ship is still registered is neither flipped to Rebuilding nor retired until the ship
    *  ends: the retire would move the directory the archiver may still be reading. */
   atest("a lost copy still being shipped is not retired until the ship ends"):
@@ -499,7 +499,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newHost(hostRoot)
     val local = loadedDevices(host)(deviceA)
-    val storePath = CopyLayout.path(deviceDir, moving, Some(UUID.randomUUID()), Phase.Live)
+    val storePath = CopyFixtures.freshCopyPath(deviceDir, moving)
     DefaultBackendOpener.createStore(StoreConfig(moving, StoreConfig.RocksDB(None), None, Replication(3, 2)),
       storePath, deviceDir / StoreCreation.CreatingDirectory)
     host.testingOnlyRescan(deviceA)
@@ -543,7 +543,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val factory = new HeldRebuildFactory
     val sends = new StagedSendService
     val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = factory)
-    // After the host's device load, which marks a store directory it finds beside no CRL state rebuild-required
+    // After the host's device load, which moves a store copy it finds beside no CRL state to lost/
     writeStoreConfig(deviceDir, shipped)
     placedCopies(host, loadedDevices(host)(source), shipped)
     val rebuilding = Map(shipped -> rebuildingIn(UUID.randomUUID()))
@@ -592,7 +592,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
       val host = newHost(hostRoot)
       val local = loadedDevices(host)(deviceA)
-      val storePath = CopyLayout.path(deviceDir, moving, Some(UUID.randomUUID()), Phase.Live)
+      val storePath = CopyFixtures.freshCopyPath(deviceDir, moving)
       DefaultBackendOpener.createStore(StoreConfig(moving, StoreConfig.RocksDB(None), None, Replication(3, 2)),
         storePath, deviceDir / StoreCreation.CreatingDirectory)
       host.testingOnlyRescan(deviceA)

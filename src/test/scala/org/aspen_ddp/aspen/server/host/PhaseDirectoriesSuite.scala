@@ -30,7 +30,11 @@ import scala.util.{Failure, Success, Try}
  *
  *  Task 4: Rebuilt is rebuilt/ and Parked is parked/. A rebuild's finish renames its staging into rebuilt/ (T2); its
  *  flip moves the copy Live (T3) or to parked/ (T4), or deletes it (T13); a parked copy goes Live (T5) or is shipped
- *  (T6). */
+ *  (T6).
+ *
+ *  Task 6: Live is live/. Every copy is in a phase directory under a copy id; the loader is offered only live/ copies,
+ *  a device holding a store in two copy directories retires both (P2), and an unreadable phase directory or
+ *  phase-param leaves the device unloaded (P6). */
 class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
 
   private val s = storeId
@@ -90,7 +94,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
 
   /** A real RocksDB store of `sid`, Live on the device */
   private def rocksCopy(dev: os.Path, sid: StoreId): os.Path =
-    val dir = CopyLayout.path(dev, sid, None, Phase.Live)
+    val dir = CopyFixtures.freshCopyPath(dev, sid)
     DefaultBackendOpener.createStore(StoreConfig(sid, StoreConfig.RocksDB(None), None, ida), dir,
       dev / StoreCreation.CreatingDirectory)
     dir
@@ -120,7 +124,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
 
   private def lostDir(dev: os.Path): os.Path = dev / CopyLayout.LostDirectory
 
-  /** The copy of `sid` is in lost/ under a copy name, and nothing is left at its flat path */
+  /** The copy of `sid` is in lost/ under a copy name, and nothing is left at its live/ path */
   private def inLost(dev: os.Path, sid: StoreId, flat: os.Path): org.scalatest.compatible.Assertion =
     CopyFixtures.phaseOf(dev, sid) should be(Some(Phase.Lost))
     val path = CopyFixtures.copyPath(dev, sid).get
@@ -150,7 +154,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       _ = opener.onFatals.head(new java.io.IOException("injected"))
       _ <- pump(host, !host.control.router.loaded.contains(s))
       _ <- pump(host, false, rounds = 20)
-      // The close is held: the copy is still Live at its flat path, its backend's directory never moved while open
+      // The close is held: the copy is still Live in live/, its backend's directory never moved while open
       heldPhase = CopyFixtures.phaseOf(dev, s)
       heldPath = CopyFixtures.copyPath(dev, s)
       _ = gate.success(())
@@ -175,7 +179,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     loop(0)
 
   /** A real host serving a RocksDB copy of `s` on device A, whose backend has failed with its FailStop close held by
-   *  the returned gate: the copy is Closing, still Live at its flat path */
+   *  the returned gate: the copy is Closing, still Live in live/ */
   private def heldFailStop(hostRoot: os.Path, dev: os.Path): Future[(Host, os.Path, Promise[Unit])] =
     given ExecutionContext = executionContext
     val flat = rocksCopy(dev, s)
@@ -373,7 +377,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       _ <- check(host)
       _ <- pump(host, CopyFixtures.retiredCopies(dev, s).nonEmpty)
     yield
-      registered.map(r => (r.phase, r.copyId)) should be(Some((Phase.Lost, Some(copyId))))
+      registered.map(r => (r.phase, r.copyId)) should be(Some((Phase.Lost, copyId)))
       val retired = CopyFixtures.retiredCopies(dev, s)
       retired.map(_.last) should be(List(CopyLayout.copyName(s, copyId)))
       os.exists(retired.head / RebuildingStore.LostCrlStateFile) should be(true)
@@ -533,7 +537,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     val sends = new StagedSendService
     for
       (host, local, dev, tid) <- transferring(dev => writeStoreConfig(dev, shipped): Unit, sends)
-      flat = CopyLayout.path(dev, shipped, None, Phase.Live)
+      flat = CopyFixtures.livePathOf(dev, shipped)
       started <- askAndSettle(host)
     yield
       started should be(Success(()))
@@ -578,7 +582,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     for
       (host, local, dev, tid) <- transferring(dev => CopyFixtures.placeCopy(dev, shipped, Phase.Rebuilt("ep")): Unit,
                                               sends)
-      flat = CopyLayout.path(dev, shipped, None, Phase.Live)
+      flat = CopyFixtures.livePathOf(dev, shipped)
       started <- askAndSettle(host)
       outbound = CopyFixtures.phaseOf(dev, shipped)
       shippedFrom = sends.sources.head._2
@@ -704,7 +708,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     for
       (host, local, dev, tid) <- transferring(placeOutbound("old"), sends)
       before = CopyFixtures.copyPath(dev, shipped).get
-      flat = CopyLayout.path(dev, shipped, None, Phase.Live)
+      flat = CopyFixtures.livePathOf(dev, shipped)
       renames = recordRenames(host)
       started <- askAndSettle(host)
     yield
@@ -722,7 +726,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     @volatile var failOut = true
     for
       (host, local, dev, tid) <- transferring(placeOutbound("old"), sends)
-      flat = CopyLayout.path(dev, shipped, None, Phase.Live)
+      flat = CopyFixtures.livePathOf(dev, shipped)
       _ = recordRenames(host, (_, to) => failOut && (to / os.up).last == CopyLayout.OutboundDirectory)
       first <- askAndSettle(host)
       shippedAfterFirst = sends.sources
@@ -774,7 +778,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     val sends = new StagedSendService
     for
       (host, local, dev, tid) <- transferring(dev => writeStoreConfig(dev, shipped): Unit, sends)
-      flat = CopyLayout.path(dev, shipped, None, Phase.Live)
+      flat = CopyFixtures.livePathOf(dev, shipped)
       claimed = host.control.copyRegistry.awaitingRetry("test", shipped, Host.LoadRetry(local, flat, 1, 1))
       started <- askAndSettle(host)
       afterShip = (recordOf(host, local, shipped).map(_.activity), host.control.copyRegistry.retryOn(local, shipped))
@@ -799,7 +803,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
   private class PlacingRebuilds(real: Boolean) extends StoreRebuildFactory:
     def createRebuild(client: org.aspen_ddp.aspen.client.AspenClient, storeId: StoreId, deviceId: StorageDeviceId,
                       devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener,
-                      episode: Option[UUID], existingCopy: () => Option[(Phase, os.Path)]): StoreRebuild =
+                      episode: Option[UUID], existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
       val id = storeId
       val rebuilt = Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode))
       val copy =
@@ -840,7 +844,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     val host = realHost(hostRoot, opener, rebuilds = new PlacingRebuilds(real = true))
     host.testingOnlyHandleEvents()
     val renames = recordRenames(host)
-    val flat = CopyLayout.path(dev, s, None, Phase.Live)
+    def flat = CopyFixtures.livePathOf(dev, s)
     for
       outcome <- rebuildAndFlip(host, UUID.randomUUID())
       _ <- pump(host, host.control.router.loaded.contains(s))
@@ -921,7 +925,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       recordOf(host, local, s) should be(None)
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
-  atest("a shipped rebuilt copy arrives and goes live with no rebuild-complete step"):
+  atest("a shipped rebuilt copy arrives and goes live as any arrival"):
     given ExecutionContext = executionContext
     val moving = StoreId(PoolId.BootstrapPoolId, 1)
     val hostRoot = newHostDir()
@@ -956,8 +960,8 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       seen.map { case Phase.Arrived(_) => "Arrived"; case p => p.toString } should be(Vector("Arrived", "Live"))
       CopyFixtures.phaseOf(dev, moving) should be(Some(Phase.Live))
       val live = CopyFixtures.copyPath(dev, moving).get
-      live should be(CopyLayout.path(dev, moving, None, Phase.Live))
-      // Inert here: the copy is Live at the flat path and served
+      live should be(CopyFixtures.livePathOf(dev, moving))
+      // Inert here: the copy is Live in live/ and served
       CopyLayout.paramFile(Phase.Rebuilt("")).forall(f => os.exists(live / f)) should be(true)
       host.control.router.loaded.contains(moving) should be(true)
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
@@ -1050,7 +1054,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       CopyLayout.readParam(arrived, Phase.Arrived("")) should be(tid.toString)
       // The attempt's staging went with it
       os.exists(staging) should be(false)
-      recordOf(host, loadedDevices(host)(net.secondDeviceId), moving).flatMap(_.copyId) should be(
+      recordOf(host, loadedDevices(host)(net.secondDeviceId), moving).map(_.copyId) should be(
         Some(CopyFixtures.copyIdOf(arrived)))
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
@@ -1076,7 +1080,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpTx(host, host.control.router.loaded.contains(moving))
     yield
       recorded(host).transferOutcomes.get(moving) should be(Some(TransferOutcome.PoolRepointed))
-      val flat = CopyLayout.path(dev, moving, None, Phase.Live)
+      val flat = CopyFixtures.livePathOf(dev, moving)
       renames.map((from, to, withArrival) => ((from / os.up).last, to, withArrival)).last should be(
         (CopyLayout.ArrivedDirectory, flat, true))
       CopyFixtures.phaseOf(dev, moving) should be(Some(Phase.Live))
@@ -1194,7 +1198,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       claimed should be(Some(Work.TransferIn(None, TransferInStage.RetiringEarlierTenancy)))
       st.stores(moving).status should be(StorageDeviceState.StoreStatus.Active)
       CopyFixtures.phaseOf(dev, moving) should be(Some(Phase.Live))
-      CopyFixtures.copyPath(dev, moving) should be(Some(CopyLayout.path(dev, moving, None, Phase.Live)))
+      CopyFixtures.copyPath(dev, moving) should be(Some(CopyFixtures.livePathOf(dev, moving)))
       CopyFixtures.retiredCopies(dev, moving) should be(Nil)
       inDir(dev, CopyLayout.LostDirectory) should be(Nil)
       transfers.transfersIn.size should be(1)
@@ -1233,7 +1237,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       host.control.transfers.receiving.keySet should be(Set(moving))
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
-  atest("a transfer in waits while an earlier tenancy's Live copy is opening"):
+  atest("a transfer in waits while an earlier tenancy's Live copy is opening, and its recheck resumes it"):
     given ExecutionContext = executionContext
     val (hostRoot, dev) = receivingDevice(dev => rocksCopy(dev, moving): Unit)
     val transfers = new SnapshotTransfers(dev)
@@ -1245,17 +1249,22 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     val local = loadedDevices(host)(net.secondDeviceId)
     for
       _ <- startMoving(host)
+      // The wait asks for its own recheck: the open's end checks nothing
+      _ <- pumpTx(host, scheduler(host).pending.contains(Host.TransferOutRecheckDelay))
+      recheckWhileOpening = scheduler(host).pending.contains(Host.TransferOutRecheckDelay)
       _ <- pumpTx(host, transfers.transfersIn.nonEmpty, rounds = 10)
       begunWhileOpening = transfers.transfersIn.size
       whileOpening = recordOf(host, local, moving).map(r => (r.phase, r.activity.isInstanceOf[Activity.Opening]))
       _ = gate.success(())
-      _ <- awaitLoudly("the transfer in to begin once the open ended"):
-             host.testingOnlyHandleEvents()
-             host.control.reconciler.checkAll()
+      // No periodic check: the wait scheduled its own device recheck (M5.8), which takes the served copy out of
+      // service, and the close's end and the retire's end check the device again
+      _ <- awaitLoudly("the transfer in to begin once the open ended, through the scheduled recheck alone"):
+             runDeviceRechecks(host)
              transfers.transfersIn.nonEmpty
     yield
       begunWhileOpening should be(0)
       whileOpening should be(Some((Phase.Live, true)))
+      recheckWhileOpening should be(true)
       transfers.atBegin.head.map(_._2) should be(List(true))
       CopyFixtures.copyPath(dev, moving) should be(None)
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
@@ -1293,7 +1302,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       arrivedAtWritten should be(true)
       st.stores(moving).status should be(StorageDeviceState.StoreStatus.Active)
       // The Completed Transfers In pass moved it and offered it to the loader at its Live path
-      val flat = CopyLayout.path(dev, moving, None, Phase.Live)
+      val flat = CopyFixtures.livePathOf(dev, moving)
       CopyFixtures.phaseOf(dev, moving) should be(Some(Phase.Live))
       renames().count((from, to) => to == flat) should be(2)
       recorded(host).storeLoadAttempts.toList.drop(before) should be(List((net.secondDeviceId, flat)))
@@ -1345,3 +1354,197 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     host.control.reconciler.checkStorageDevice(net.secondDeviceId)
     armed.success(state)
     pump(host, host.control.reconciler.activeDeviceChecks.isEmpty)
+
+  // ---- Task 6: Live is live/; every copy has a copy id ----
+
+  /** A rebuild that never completes, recording the stores it is started for */
+  private class HeldRebuilds extends StoreRebuildFactory:
+    val created = new java.util.concurrent.ConcurrentLinkedQueue[StoreId]()
+    def createRebuild(client: org.aspen_ddp.aspen.client.AspenClient, storeId: StoreId, deviceId: StorageDeviceId,
+                      devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener,
+                      episode: Option[UUID], existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
+      created.add(storeId)
+      val id = storeId
+      new StoreRebuild:
+        val storeId: StoreId = id
+        def complete: Future[UUID] = Promise[UUID]().future
+        def cancel(): Unit = ()
+
+  /** The copy directories of `sid` on `dev`, in every phase directory */
+  private def copyDirs(dev: os.Path, sid: StoreId): List[os.Path] =
+    List(CopyLayout.LiveDirectory, CopyLayout.ArrivedDirectory, CopyLayout.OutboundDirectory,
+      CopyLayout.RebuiltDirectory, CopyLayout.ParkedDirectory, CopyLayout.LostDirectory,
+      RebuildingStore.PendingDeleteDirectory).flatMap(d => inDir(dev, d))
+      .filter(p => CopyLayout.parseName(p.last).exists(_._1 == sid)).toList
+
+  atest("a new store is created into live under a fresh copy name"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val host = realHost(hostRoot, new TestOpener)
+    host.testingOnlyHandleEvents()
+    // A real pool, so the create reads its config
+    val created = StoreId(PoolId.BootstrapPoolId, 0)
+    val initializing = Map(created -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Initializing, None))
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.copy(stores = initializing))
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpTx(host, host.control.router.loaded.contains(created) && !host.control.copyRegistry.isCreating(created))
+    yield
+      val listing = CopyLayout.list(dev)
+      listing.copies.map(f => (f.storeId, f.phase)) should be(List((created, Phase.Live)))
+      val copy = listing.copies.head.path
+      copy / os.up should be(dev / CopyLayout.LiveDirectory)
+      recordOf(host, loadedDevices(host)(deviceA), created).map(r => (r.phase, r.copyId)) should be(
+        Some((Phase.Live, CopyFixtures.copyIdOf(copy))))
+      host.control.router.loaded(created).backend.path should be(copy)
+      inDir(dev, StoreCreation.CreatingDirectory) should be(Nil)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("only live copies are offered to the loader"):
+    val (hostRoot, dev) = device()
+    val phases = List(Phase.Live, Phase.Arrived("t"), Phase.Outbound("t"), Phase.Rebuilt("e"), Phase.Parked,
+      Phase.Lost, Phase.Retired)
+    val placed = phases.zipWithIndex.map((phase, i) =>
+      (StoreId(s.poolId, i.toByte), phase, CopyFixtures.placeCopy(dev, StoreId(s.poolId, i.toByte), phase)))
+    val host = newHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    Future.successful:
+      recorded(host).storeLoadAttempts.toList should be(List((deviceA, placed.head._3)))
+      // Every copy but the Retired one is registered in its phase, under its copy id
+      placed.filter(_._2 != Phase.Retired).foreach: (sid, phase, path) =>
+        recordOf(host, local, sid).map(r => (r.phase, r.copyId)) should be(Some((phase, CopyFixtures.copyIdOf(path))))
+      recordOf(host, local, placed.last._1) should be(None)
+
+  // Review Focus 3 (P2): neither copy is served, every copy directory of the store ends in lost/ or pending-delete/
+  // with its files, and the store is rebuilt
+  atest("two copies of one store at load are both retired and the store rebuilt"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val live = rocksCopy(dev, s)
+    os.write(live / "data-live", "live")
+    val outbound = CopyFixtures.placeCopy(dev, s, Phase.Outbound("t-1"))
+    RebuildingStore.writeEmptyCrlState(outbound, s)
+    os.write(outbound / "data-outbound", "outbound")
+    val ids = Set(CopyFixtures.copyIdOf(live), CopyFixtures.copyIdOf(outbound))
+    val rebuilds = new HeldRebuilds
+    val opener = new TestOpener
+    val host = realHost(hostRoot, opener, rebuilds = rebuilds)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    val atLoad = recordOf(host, local, s).map(r => (r.phase, r.copyId))
+    val inLostAtLoad = inDir(dev, CopyLayout.LostDirectory).toList
+    val retiredAtLoad = CopyFixtures.retiredCopies(dev, s)
+    val active = Map(s -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.copy(stores = active))
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.reconciler.checkAll()
+      _ <- awaitLoudly("the store's rebuild to start"):
+             host.testingOnlyHandleEvents()
+             !rebuilds.created.isEmpty
+      st <- client.getStorageDeviceState(deviceA)
+    yield
+      // At the load: the least copy id kept in lost/ and registered Lost, the other moved on into pending-delete/
+      atLoad should be(Some((Phase.Lost, ids.min)))
+      inLostAtLoad.map(CopyFixtures.copyIdOf) should be(List(ids.min))
+      retiredAtLoad.map(CopyFixtures.copyIdOf) should be(List(ids.max))
+      // Never served
+      opener.opens.get should be(0)
+      host.control.router.loaded.contains(s) should be(false)
+      st.stores(s).status should be(StorageDeviceState.StoreStatus.Rebuilding)
+      rebuilds.created.toArray.toList should be(List(s))
+      // Each copy directory of the store, under its own name, in lost/ or pending-delete/, its files inside it
+      val dirs = copyDirs(dev, s)
+      dirs.map(CopyFixtures.copyIdOf).toSet should be(ids)
+      dirs.foreach: d =>
+        Set(CopyLayout.LostDirectory, RebuildingStore.PendingDeleteDirectory) should contain((d / os.up).last)
+      dirs.exists(d => os.exists(d / "data-live") && os.exists(d / StoreConfig.configFilename)) should be(true)
+      // The outbound copy's save file stays inside it: as crl_save.log, or as its retire's lost-crl-state.log
+      dirs.exists(d => os.exists(d / "data-outbound") && (os.exists(Backend.crlSaveFile(d)) ||
+        os.exists(d / RebuildingStore.LostCrlStateFile))) should be(true)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  // Spec I1
+  atest("two Live copies of one store at load are both retired"):
+    val (hostRoot, dev) = device()
+    val first = CopyFixtures.placeCopy(dev, s)
+    val second = CopyFixtures.placeCopy(dev, s)
+    val ids = List(first, second).map(CopyFixtures.copyIdOf)
+    val host = newHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    Future.successful:
+      recorded(host).storeLoadAttempts.toList should be(Nil)
+      recordOf(host, local, s).map(r => (r.phase, r.copyId)) should be(Some((Phase.Lost, ids.min)))
+      inDir(dev, CopyLayout.LiveDirectory) should be(Nil)
+      inDir(dev, CopyLayout.LostDirectory).map(CopyFixtures.copyIdOf) should be(List(ids.min))
+      CopyFixtures.retiredCopies(dev, s).map(CopyFixtures.copyIdOf) should be(List(ids.max))
+      copyDirs(dev, s).forall(d => os.exists(d / StoreConfig.configFilename)) should be(true)
+
+  // Review Focus 4 (P6): the device stays unloaded with nothing on it moved, and the next scan loads it once the read
+  // succeeds
+  for (what, unreadable) <- List[(String, (os.Path, os.Path) => os.Path)](
+      // The phase directory cannot be listed
+      "phase directory" -> ((dev, _) => dev / CopyLayout.LiveDirectory),
+      // An outbound copy's phase-param.outbound cannot be read
+      "phase-param" -> ((_, sending) => sending / CopyLayout.paramFile(Phase.Outbound("")).get))
+  do
+    atest(s"an unreadable phase directory or phase-param leaves the device unloaded until a scan can read it ($what)"):
+      val (hostRoot, dev) = device()
+      val live = CopyFixtures.placeCopy(dev, s)
+      val sending = CopyFixtures.placeCopy(dev, StoreId(s.poolId, 1), Phase.Outbound("t-1"))
+      val before = CopyLayout.list(dev).copies.toSet
+      val target = unreadable(dev, sending)
+      val perms = os.perms(target)
+      os.perms.set(target, if os.isDir(target) then "-wx------" else "---------")
+      val host =
+        try
+          val h = newHost(hostRoot)
+          h.testingOnlyHandleEvents()
+          h
+        finally os.perms.set(target, perms)
+      val loadedWhileUnreadable = loadedDevices(host).contains(deviceA)
+      val attemptsWhileUnreadable = recorded(host).storeLoadAttempts.toList
+      val afterFailure = CopyLayout.list(dev).copies.toSet
+      host.control.discovery.checkForNewDevices()
+      host.testingOnlyHandleEvents()
+      Future.successful:
+        loadedWhileUnreadable should be(false)
+        attemptsWhileUnreadable should be(Nil)
+        afterFailure should be(before)
+        loadedDevices(host).contains(deviceA) should be(true)
+        recorded(host).storeLoadAttempts.toList should be(List((deviceA, live)))
+        recordOf(host, loadedDevices(host)(deviceA), StoreId(s.poolId, 1)).map(_.phase) should be(
+          Some(Phase.Outbound("t-1")))
+
+  // M5.8: a fresh read that fails is retried by the device recheck it schedules, not only by the periodic check
+  atest("a transfer in whose fresh read of its device fails resumes at its scheduled recheck"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = receivingDevice(dev => CopyFixtures.placeCopy(dev, moving, Phase.Lost): Unit)
+    val transfers = new SnapshotTransfers(dev)
+    val host = newHost(hostRoot, transferService = transfers)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(net.secondDeviceId)
+    for
+      _ <- startMoving(host)
+      // The next lookup of the device is the earlier tenancy's fresh read
+      _ = recorded(host).armLookupThrow(net.secondDeviceId, new java.io.IOException("injected fresh read failure"))
+      _ <- awaitLoudly("the earlier tenancy's retire to end on its failed fresh read"):
+             host.testingOnlyHandleEvents()
+             host.control.copyRegistry.copiesOf(local).flatMap(_.work.get(moving)).isEmpty &&
+               host.control.reconciler.activeDeviceChecks.isEmpty
+      _ <- pump(host, false, rounds = 20)
+      begunBeforeRecheck = transfers.transfersIn.size
+      phaseBeforeRecheck = CopyFixtures.phaseOf(dev, moving)
+      _ <- awaitLoudly("the transfer in to begin through the scheduled recheck alone"):
+             runDeviceRechecks(host)
+             transfers.transfersIn.nonEmpty
+    yield
+      begunBeforeRecheck should be(0)
+      phaseBeforeRecheck should be(Some(Phase.Lost))
+      transfers.atBegin.head.map(_._2) should be(List(true))
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())

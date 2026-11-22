@@ -90,13 +90,15 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   private def extractUnloaded(storeId: StoreId, sds: LocalStorageDeviceState): Future[Unit] =
     // A stat that fails says nothing (FileStat): taken for an absence, the CRL's entries would be written over a save
     // file, or nothing extracted from a directory that ships
-    Try(FileStat.isDir(ctx.copyRegistry.pathOrLive(sds, storeId))) match
+    // A store with no record has no copy on the device: nothing to extract
+    Try(ctx.copyRegistry.pathOf(sds, storeId).exists(FileStat.isDir(_))) match
       case Failure(err) => Future.failed(err)
       case Success(false) => Future.unit
       case Success(true) => extractFromDirectory(storeId, sds)
 
   private def extractFromDirectory(storeId: StoreId, sds: LocalStorageDeviceState): Future[Unit] =
-    val saveFile = Backend.crlSaveFile(ctx.copyRegistry.pathOrLive(sds, storeId))
+    val saveFile = Backend.crlSaveFile(ctx.copyRegistry.pathOf(sds, storeId).getOrElse(
+      throw IllegalStateException(s"No copy record of store $storeId on device ${sds.storageDeviceId}")))
     // Read before anything is, so the release below covers only the entries the extraction takes
     val charge = sds.admission.retainedCharge(storeId)
     def released(): Future[Unit] =
@@ -405,6 +407,6 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
     // not forced leaves it unsynced, which the next check of the device forces and loads (DeviceReconciler)
     ctx.moves.move("reinstate abandoned transfer out", local, storeId, Phase.Live) match
       case MoveResult.Durable =>
-        ctx.tryLoadStore(local, ctx.copyRegistry.pathOrLive(local, storeId),
-          Some(() => ctx.gossipStoreOnline(storeId)))
+        ctx.copyRegistry.pathOf(local, storeId).foreach(path =>
+          ctx.tryLoadStore(local, path, Some(() => ctx.gossipStoreOnline(storeId))))
       case MoveResult.Unsynced(_) | MoveResult.NotMoved(_) => ()

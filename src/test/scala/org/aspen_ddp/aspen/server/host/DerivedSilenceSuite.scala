@@ -32,7 +32,7 @@ class DerivedSilenceSuite extends IntegrationTestSuite with ControlFixture:
 
   /** A complete RocksDB store at its path on `dev`, as a create leaves it */
   private def realStore(dev: os.Path, storeId: StoreId): os.Path =
-    val storePath = CopyLayout.path(dev, storeId, Some(UUID.randomUUID()), Phase.Live)
+    val storePath = CopyFixtures.freshCopyPath(dev, storeId)
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, Replication(3, 2)),
       storePath, dev / StoreCreation.CreatingDirectory)
     storePath

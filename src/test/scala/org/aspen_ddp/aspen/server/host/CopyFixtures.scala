@@ -8,62 +8,64 @@ import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import java.util.UUID
 
 /** How tests place, find and read store copies on a device, wherever the layout puts each phase (CopyLayout). Tests
- *  never build a copy's path or touch a marker by hand: each later stage of the layout changes only these bodies. */
+ *  never build a copy's path by hand: each later stage of the layout changes only these bodies. */
 object CopyFixtures:
 
-  /** Places a configured copy of `storeId` in `phase` on the device at `deviceDir`, returning its path. Writes the
-   *  store config (as ControlFixture.writeStoreConfig), unless not `configured` (a copy holding nothing: a test's
-   *  stand-in for a landed rebuild, or a copy that lost its config), and the phase's representation (marker or
-   *  directory and the phase's parameter file) */
+  /** Places a configured copy of `storeId` in `phase` on the device at `deviceDir`, under a fresh copy id, returning
+   *  its path. Writes the store config (as ControlFixture.writeStoreConfig), unless not `configured` (a copy holding
+   *  nothing: a test's stand-in for a landed rebuild, or a copy that lost its config), and the phase's parameter
+   *  file */
   def placeCopy(deviceDir: os.Path, storeId: StoreId, phase: Phase = Phase.Live, configured: Boolean = true): os.Path =
-    val dir = CopyLayout.dirOf(phase) match
-      case None => deviceDir / storeId.directoryName
-      case Some(_) => CopyLayout.path(deviceDir, storeId, Some(UUID.randomUUID()), phase)
+    val dir = freshCopyPath(deviceDir, storeId, phase)
     os.makeDir.all(dir)
     if configured then
       os.write.over(dir / StoreConfig.configFilename,
         StoreConfig(storeId, StoreConfig.RocksDB(None), None, Replication(3, 2)).yamlConfig)
-    if CopyLayout.dirOf(phase).isDefined then
-      for
-        file <- CopyLayout.paramFile(phase)
-        p <- CopyLayout.param(phase)
-      do os.write.over(dir / file, p)
-    else
-      marker(phase).foreach((file, content) => os.write.over(dir / file, content))
+    for
+      file <- CopyLayout.paramFile(phase)
+      p <- CopyLayout.param(phase)
+    do os.write.over(dir / file, p)
     dir
 
-  /** Puts the copy of `storeId` already on the device in `phase`, keeping its files, as something outside the host
-   *  would (a crash's leftovers, a hand edit, a stand-in for a host site): returns its path. Throws if it has none. A
-   *  phase directory's copy is moved there (with the phase's parameter file), so on a loaded device the host's record
-   *  does not follow: use it before the device's load, or move through the host */
+  /** A fresh path for a copy of `storeId` in `phase` on the device (nothing made there): where a test builds a copy
+   *  itself (a real backend's files) before its device's load */
+  def freshCopyPath(deviceDir: os.Path, storeId: StoreId, phase: Phase = Phase.Live): os.Path =
+    CopyLayout.path(deviceDir, storeId, UUID.randomUUID(), phase)
+
+  /** Puts the copy of `storeId` already on the device in `phase`, keeping its files and its copy id, as something
+   *  outside the host would (a crash's leftovers, a hand edit, a stand-in for a host site): returns its path. Throws
+   *  if it has none. The copy is moved there (with the phase's parameter file), so on a loaded device the host's
+   *  record does not follow: use it before the device's load, or move through the host */
   def markCopy(deviceDir: os.Path, storeId: StoreId, phase: Phase): os.Path =
-    val dir = copyPath(deviceDir, storeId).getOrElse(
+    val found = one(deviceDir, storeId).getOrElse(
       throw IllegalStateException(s"$storeId has no copy on $deviceDir to mark"))
-    if CopyLayout.dirOf(phase).isDefined then
-      val target = CopyLayout.path(deviceDir, storeId, Some(UUID.randomUUID()), phase)
+    val target = CopyLayout.path(deviceDir, storeId, found.copyId, phase)
+    if target != found.path then
       os.makeDir.all(target / os.up)
-      os.move(dir, target)
-      for
-        file <- CopyLayout.paramFile(phase)
-        p <- CopyLayout.param(phase)
-      do os.write.over(target / file, p)
-      target
-    else
-      marker(phase).foreach((file, content) => os.write.over(dir / file, content))
-      dir
+      os.move(found.path, target)
+    for
+      file <- CopyLayout.paramFile(phase)
+      p <- CopyLayout.param(phase)
+    do os.write.over(target / file, p)
+    target
 
-  /** The marker file and content a flat copy in `phase` carries */
-  private def marker(phase: Phase): Option[(String, String)] = phase match
-    case Phase.Live => None
-    case p => throw IllegalArgumentException(s"No copy can be placed in $p")
-
-  /** The copy id in the name of the copy at `path`, in a phase directory */
+  /** The copy id in the name of the copy at `path` */
   def copyIdOf(path: os.Path): UUID =
     CopyLayout.parseName(path.last).map(_._2).getOrElse(throw IllegalArgumentException(s"$path is no copy name"))
 
-  /** The copy id of the one copy of `storeId` on the device, a fresh one if it has none (absent, or flat) */
+  /** The copy id of the one copy of `storeId` on the device, a fresh one if it has none */
   def copyIdOn(deviceDir: os.Path, storeId: StoreId): UUID =
-    one(deviceDir, storeId).flatMap(_.copyId).getOrElse(UUID.randomUUID())
+    one(deviceDir, storeId).map(_.copyId).getOrElse(UUID.randomUUID())
+
+  /** Where the one copy of `storeId` on the device is, or will be once moved, in live/: its copy id keeps across
+   *  moves. Call it once the copy is there (absent, it names a fresh copy id) */
+  def livePathOf(deviceDir: os.Path, storeId: StoreId): os.Path =
+    CopyLayout.path(deviceDir, storeId, copyIdOn(deviceDir, storeId), Phase.Live)
+
+  /** The copy of `storeId` on the device outside pending-delete/, with its phase and path, as a rebuild's start is
+   *  given it (StoreRebuilds.startRebuild reads it from the copy registry) */
+  def existingCopy(deviceDir: os.Path, storeId: StoreId): Option[(Phase, os.Path)] =
+    copies(deviceDir, storeId).headOption.map(f => (f.phase, f.path))
 
   /** The copies of `storeId` on the device, outside pending-delete/ */
   private def copies(deviceDir: os.Path, storeId: StoreId): List[CopyLayout.Found] =

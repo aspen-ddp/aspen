@@ -52,7 +52,9 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
    *  of the store is already running, while the copy is unsynced (a move a crash could undo; the
    *  next device check forces it), or while its move to lost/ awaits its retry (CopyMoves.pendingLost). */
   def retire(local: LocalStorageDeviceState, storeId: StoreId): Future[Boolean] =
-    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
+    // A store with no record has no copy on the device: its path is clear
+    val recorded = ctx.copyRegistry.pathOf(local, storeId)
+    val storePath = recorded.getOrElse(local.devicePath)
     if isRetiring(storeId) then
       Future.successful(false)
     else if ctx.copyRegistry.isUnsynced(local, storeId) then
@@ -64,7 +66,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
     else
       // A stat that fails is no absence (FileStat): the retire fails, to be retried, rather than report a clear path
       val present =
-        try Success(FileStat.exists(storePath))
+        try Success(recorded.isDefined && FileStat.exists(storePath))
         catch case NonFatal(t) => Failure(t)
       present match
         case Failure(t) =>
@@ -125,7 +127,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
    *  the copy left the registry (P3). One not forced stays recorded, Retired and unsynced, until a device check
    *  forces it; one that failed leaves the copy in lost/ for the next retire */
   private def moveToPendingDelete(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
-    val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
+    val storePath = ctx.copyRegistry.pathOf(local, storeId).getOrElse(local.devicePath)
     logger.warn(s"Retiring the copy of store $storeId at $storePath to pending-delete. It is deleted once the store " +
                 s"is Active on the device its pool names")
     ctx.moves.move("moveToPendingDelete", local, storeId, Phase.Retired) == MoveResult.Durable
@@ -133,6 +135,8 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
   /** Deletes each copy in the device's pending-delete directory whose store is Active on its owner device: this
    *  device by its own entry, or else the device the pool names, by that device's state. Anything else keeps the
    *  copy for a later check: an entry not Active, a failed read, or a name that does not identify a store (logged).
+   *  An Active entry here over a Lost copy of the store here (one about to be flipped to Rebuilding: a device load
+   *  that found two copies of the store, P2, or a copy that failed since) is no owner's copy yet: kept too.
    *  The store is identified by the copy's name, never by parsing anything inside it. Also finishes any delete an
    *  earlier attempt left in the device's deleting directory. */
   def release(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
@@ -157,7 +161,9 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
         case Some(storeId) =>
           remote.stores.get(storeId) match
             case Some(entry) =>
-              if entry.status == StorageDeviceState.StoreStatus.Active then
+              val lostHere = ctx.moves.isPendingLost(local, storeId) ||
+                ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase == Phase.Lost)
+              if entry.status == StorageDeviceState.StoreStatus.Active && !lostHere then
                 delete(copy, s"store $storeId is Active again on this device")
             case None =>
               releaseLookups += copy
@@ -199,7 +205,7 @@ object StoreCopies extends Logging:
 
   /** Deletes the directory `dir` on the device at `devicePath`, rename-first: it is renamed into the device's
    *  deleting directory, durably, then removed. A crash or failure mid-removal leaves the remains there, never at
-   *  `dir`: an interrupted delete cannot strip a marker from a store copy and leave the rest loadable, nor leave a
+   *  `dir`: an interrupted delete cannot leave part of a store copy in a phase directory, loadable, nor leave a
    *  partial copy in pending-delete. Used for every delete of a copy outside the device's scratch areas
    *  (`creating/`, `rebuilding/`, transfer staging), which are never loaded and are swept whole at device load.
    *  Returns whether `dir` is gone; a failed rename is logged and leaves it in place. So is a stat of `dir` that fails

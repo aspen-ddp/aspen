@@ -526,8 +526,8 @@ class FailedStorageDeviceDurableTask(
                     src.kvos.contents(StorageDeviceState.StateKey).revision)),
                   List(Insert(StorageDeviceState.StateKey, restored.encode())))
 
-                // The restore is metadata only. The source's own copy is still offline behind
-                // the transfer-out marker startStoreTransferOut wrote, and the pool never
+                // The restore is metadata only. The source's own copy is still offline in
+                // outbound/, where its transfer out moved it, and the pool never
                 // stopped naming the source, so until that host reinstates it every message for
                 // the slice is dropped. Its poll is the guarantee; this shortens the outage from
                 // up to Main.CheckStorageDevicesPeriod to the next event loop pass.

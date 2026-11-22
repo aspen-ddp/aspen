@@ -14,7 +14,9 @@ import org.aspen_ddp.aspen.server.crl.StoreRecoveryState
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.RebuildOutcome
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
-import org.aspen_ddp.aspen.server.store.backend.BackendOpener
+import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.server.StoreConfig
+import org.aspen_ddp.aspen.server.store.backend.{BackendOpener, DefaultBackendOpener, StoreCreation}
 
 import java.util.UUID
 import scala.collection.mutable
@@ -96,6 +98,26 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
         _ <- waitForTransactionsToComplete()
         _ <- pumpUntil(condition, rounds - 1, drain)
       yield ()
+
+  /** As pumpUntil, bounded by time rather than rounds, for waits on the client's real-time retry backoff: pumps until
+   *  `condition` or 10 s, sleeping a millisecond a round past the first 50 so a long wait does not spin a core.
+   *  Silent on the deadline; the caller asserts */
+  private def pumpFor(condition: => Boolean, drain: Option[Host] = None): Future[Unit] =
+    given ExecutionContext = executionContext
+    val deadline = System.nanoTime() + 10_000_000_000L
+    def loop(round: Int): Future[Unit] =
+      drain.foreach(_.testingOnlyHandleEvents())
+      if condition || System.nanoTime() - deadline > 0 then
+        Future.unit
+      else
+        if round >= 50 then
+          Thread.sleep(1)
+        for
+          _ <- yieldUntil(condition, 20)
+          _ <- waitForTransactionsToComplete()
+          _ <- loop(round + 1)
+        yield ()
+    loop(0)
 
   /** C1: deviceA's entry was Rebuilding (e1) with its rebuild running here. The store was re-placed away, the nudge to
    *  this host was lost, and the store was transferred back: deviceA's next check reads TransferringIn. The rebuild is
@@ -250,7 +272,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
             createWorkWhileQueued = host.control.rebuilds.isCreating(creating)
         case _ => Future.unit
       _ = host.control.reconciler.checkStorageDevice(deviceA)
-      _ <- pumpUntil(hooked && !host.control.rebuilds.createFlipsPending.contains(creating), drain = Some(host))
+      _ <- pumpFor(hooked && !host.control.rebuilds.createFlipsPending.contains(creating), drain = Some(host))
       _ = tclient.beforeRetry = _ => Future.unit
     yield
       hooked should be(true)
@@ -390,13 +412,13 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
         _ <- client.transferStore(shipped, net.secondDeviceId)
         _ <- waitForTransactionsToComplete()
         first = ask(host)
-        _ <- yieldUntil(firstCloseRunning)
+        _ <- pumpFor(firstCloseRunning)
         second <- ask(host)
         closesWhileFirstRuns = recorded(host).transferOutCloses.toList
         queuedWhileFirstRuns = queuedCloses(host).size
         readsWhileFirstRuns = crl.synchronized(crl.readCount.getOrElse(shipped, 0))
         _ = finishFirstClose()
-        _ <- yieldUntil(sends.isTransferringOut(shipped))
+        _ <- pumpFor(sends.isTransferringOut(shipped))
         _ <- first
       yield
         closesWhileFirstRuns should be(List(shipped))
@@ -457,12 +479,12 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
             Map(shipped -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut,
               Some(net.secondDeviceId), Some(UUID.randomUUID()))))))
       _ = factory.created.head.promise.success(())
-      _ <- pumpUntil(hooked && !host.control.rebuilds.rebuildingStoreIds.contains(shipped), drain = Some(host))
+      _ <- pumpFor(hooked && !host.control.rebuilds.rebuildingStoreIds.contains(shipped), drain = Some(host))
       _ = tclient.beforeRetry = _ => Future.unit
       outcome = recorded(host).rebuildOutcomes.get((source, shipped))
       // The receiver's retransmit
       retransmit <- ask(host)
-      _ <- pumpUntil(sends.isTransferringOut(shipped), drain = Some(host))
+      _ <- pumpFor(sends.isTransferringOut(shipped), drain = Some(host))
     yield
       hooked should be(true)
       registeredAtRequest should be(true)
@@ -473,3 +495,42 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).transferOutCloses.toList should be(List(shipped))
       sends.transfersOut.map(_._1) should be(Vector(shipped))
       FileStat.exists(storePath / StoreTransfer.TransferOutMarkerFile) should be(true)
+
+  /** Double open (audit Step 4): a store's backend has opened and its LoadStore is queued, not yet handled. A second
+   *  load offer meanwhile (a duplicate LoadStoreById, say) finds the store still opening and starts no second open,
+   *  which would fail on the backend's lock and drop the store, served once the LoadStore installs it, from its
+   *  device's loadedStores: the device's shutdown would then never close it */
+  atest("a second load offer between open and install starts no second open, and the device's shutdown closes the served store"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newHost(hostRoot)
+    val local = loadedDevices(host)(deviceA)
+    val storePath = deviceDir / moving.directoryName
+    DefaultBackendOpener.createStore(StoreConfig(moving, StoreConfig.RocksDB(None), None, Replication(3, 2)),
+      storePath, deviceDir / StoreCreation.CreatingDirectory)
+
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.setStoreEntry(moving, StorageDeviceState.StoreStatus.Active, None))
+      _ <- waitForTransactionsToComplete()
+      // RocksDB opens inline: the LoadStore is queued on return
+      _ = host.control.loader.tryLoadStore(local, storePath)
+      queued = recorded(host).loadStoreRequests.toList
+      _ = host.control.loader.tryLoadStore(local, storePath)
+      opens = host.control.loader.opensStarted(moving)
+      _ = host.testingOnlyHandleEvents()
+      _ <- yieldUntil(host.control.router.loaded.contains(moving))
+      served = host.control.router.loaded.get(moving)
+      listed = local.loadedStores.contains(moving)
+      _ <- client.shutdownStorageDevice(deviceA)
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpFor(!loadedDevices(host).contains(deviceA), drain = Some(host))
+      _ <- served.map(_.backend.close()).getOrElse(Future.unit)
+    yield
+      queued should be(List((deviceA, moving)))
+      opens should be(1)
+      served should be(defined)
+      listed should be(true)
+      recorded(host).shutdownCloses.toList should be(List(moving))

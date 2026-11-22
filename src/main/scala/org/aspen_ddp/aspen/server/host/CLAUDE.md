@@ -43,7 +43,10 @@
   `offlineStores`; `StoreRouter.clearOfflineUnlessHeld`)
 - Backend opens are backend-neutral: `BackendOpener.open` (`server.store.backend`) returns a Future and decides where
   the open runs (RocksDB inline, FSIF on `FsifOpenEc`); `StoreLoader.startOpen` handles an already-completed one
-  inline and otherwise posts `BackendOpened`. A rebuild's staging store opens through the same opener (passed by
+  inline and otherwise posts `BackendOpened`. A store stays opening (`StoreLoader.isOpening`) from `startOpen` until
+  its open fails or the LoadStore `serveOpened` queued is handled (`handleLoad` installs it or gives up in that one
+  task), so a second load offer in between (a duplicate `LoadStoreById`) starts no second open, and a ShutdownStore
+  then waits for the install and closes the served store. A rebuild's staging store opens through the same opener (passed by
   `StoreRebuildFactory.createRebuild`). The host and the rebuild see only `Backend.hasFailed`/`isWriteFrozen`,
   `BackendStateLost` and `Backend.isOutOfSpace`; only `DefaultBackendOpener` names concrete backends
 - Store creation is atomic (`BackendOpener.create`, `server.store.backend.StoreCreation`,

@@ -47,11 +47,17 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // (handleLoad, crash-recovery-log 6.1) waits here too, retried at every scan: its CRL frees room as transactions
   // conclude.
   private var storesAwaitingRetry: Map[StoreId, LoadRetry] = Map()
-  // Stores whose backend open (recovery) or create is in progress (startOpen), each with the ShutdownStore
-  // events that arrived meanwhile, newest first. Such a store is in its device's loadedStores, so a
-  // shutdown closes it; its ShutdownStore is put again once the open's outcome is handled, after
-  // the LoadStore that serves it, so it is closed like any served store.
+  // Stores being opened (startOpen), each with the ShutdownStore events that arrived meanwhile, newest first: from
+  // startOpen until the open fails or, for one opened, until the LoadStore that serveOpened queues is handled
+  // (handleLoad, which installs it or gives up within that one control task). Kept through that LoadStore's wait in
+  // the queue, when the router has no entry for the store yet, so a second load offer then (a duplicate
+  // LoadStoreById) starts no second open: one would fail on the backend's lock and leave the store, served once the
+  // first LoadStore installs it, out of its device's loadedStores, where its device's shutdown never closes it. Such
+  // a store is in its device's loadedStores, so a shutdown closes it; its ShutdownStore is put again once the open
+  // fails or its LoadStore is handled, so it is closed like any served store.
   private var opening: Map[StoreId, List[ShutdownStore]] = Map()
+  // The backend each store opened by startOpen awaits the install of: from serveOpened until its LoadStore is handled
+  private var awaitingInstall: Map[StoreId, Backend] = Map()
   // How many opens each store has started in this process (startOpen). Compared across an asynchronous step, it
   // says whether the store was opened at any point in between, even if closed again since
   private var openCounts: Map[StoreId, Long] = Map()
@@ -193,7 +199,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       case (Some(w), Some(c)) => Some(() => { w(); c() })
       case _ => waiting.orElse(current)
 
-  /** Whether the store's backend is being opened or created (startOpen) */
+  /** Whether the store's backend is being opened or created (startOpen), or, opened, awaits its install (handleLoad) */
   private[host] def isOpening(storeId: StoreId): Boolean = opening.contains(storeId)
 
   /** How many opens of the store have started in this process */
@@ -260,6 +266,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val storeId = storeCfg.storeId
     val deferred = opening.getOrElse(storeId, Nil)
     opening -= storeId
+    // Set when the store is served: it stays opening until its LoadStore is handled, which puts `deferred` again
+    var installing = false
     val registered = ctx.devices.isLoaded(sds)
     def leaveOffline(): Unit =
       router.markOffline(storeId)
@@ -281,6 +289,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       case Success(backend) =>
         if create then
           newStores += storeId
+        installing = true
+        opening += storeId -> deferred
+        awaitingInstall += storeId -> backend
         val served = serveOpened(sds, storeCfg, storePath, backend)
         created.foreach(_.completeWith(served))
         onServed.foreach(awaitServed(storeId, served, _))
@@ -321,7 +332,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         leaveOffline()
         storesAwaitingRetry += storeId -> LoadRetry(sds, storePath, waitScans, waitScans, onServed)
         created.foreach(_.tryFailure(e))
-    deferred.reverse.foreach(ctx.post)
+    if !installing then
+      deferred.reverse.foreach(ctx.post)
 
   /** Runs a load's onServed `callback` on the control thread once its LoadStore has served the store (`served`
    *  succeeds). A LoadStore that leaves the store offline with its data intact puts it in storesAwaitingRetry
@@ -410,6 +422,13 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   def handleLoad(e: LoadStore): Unit =
     val LoadStore(storageDeviceId, backend, maxSliceSize, p, poolIDA, admissionTier) = e
+    // The open that queued this LoadStore ends here: this task installs the store or gives up. Its deferred
+    // ShutdownStores run after it, so a store installed is closed like any served one. A LoadStore queued by no
+    // startOpen (Host.loadStore, a test's reload) leaves an open in progress alone
+    if awaitingInstall.get(backend.storeId).exists(_ eq backend) then
+      awaitingInstall -= backend.storeId
+      opening.get(backend.storeId).foreach(_.reverse.foreach(ctx.post))
+      opening -= backend.storeId
     // Taken whatever this load's outcome: a later load of the store is not its first
     val isNew = newStores.contains(backend.storeId)
     newStores -= backend.storeId

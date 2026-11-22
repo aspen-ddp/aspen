@@ -212,15 +212,22 @@ class ClientTransactionDriverSuite extends AnyFunSuite with Matchers:
       d.result.value shouldBe Some(scala.util.Success(ClientOutcome.Committed))
     finally f.done()
 
-  /** The log lines, at Info or above, that name `txid`, with their levels */
+  /** The log lines, at Info or above, that name `txid`, with their levels.
+    *
+    * The handler goes on the driver's own logger (`scribe.Logging` names it by class), not the root: suites run in
+    * parallel in one JVM and several swap root handlers with an unsynchronized read-modify-write
+    * (`root.withHandler(h).replace()`), so a concurrent swap overwrites a root handler added here and its lines are
+    * lost. No other suite replaces the driver's logger, and this suite's tests run sequentially.
+    */
   private def logNaming(txid: TransactionId)(f: => Unit): List[(scribe.Level, String)] =
     val lines = new java.util.concurrent.LinkedBlockingQueue[(scribe.Level, String)]()
     val handler = scribe.handler.LogHandler(scribe.Level.Info): r =>
       val text = r.logOutput.plainText
       if text.contains(txid.toString) then lines.add((r.level, text))
-    scribe.Logger.root.withHandler(handler).replace()
+    def driverLogger = scribe.Logger(classOf[SimpleClientTransactionDriver].getName)
+    driverLogger.withHandler(handler).replace()
     try f
-    finally scribe.Logger.root.withoutHandler(handler).replace()
+    finally driverLogger.withoutHandler(handler).replace()
     lines.toArray(Array.empty[(scribe.Level, String)]).toList
 
   test("a leader abort after a vote commit is logged as a split, and the result stays Committed"):

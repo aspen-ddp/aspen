@@ -908,7 +908,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     registry.removedFromRouter(deviceA, sid(0))
     // Lost -> Live is not in the table: the disk reads Live, so Live is recorded
     copies.setPhase(sid(1), Phase.Lost)
-    registry.moved("test", local, sid(1), Phase.Live)
+    registry.placed("test", local, sid(1), Phase.Live)
     val errors = registry.takeRegistryErrors()
     copies.copies(sid(0)).activity should be(Activity.Closing(ClosePurpose.FailStop))
     copies.copies(sid(1)).phase should be(Phase.Live)

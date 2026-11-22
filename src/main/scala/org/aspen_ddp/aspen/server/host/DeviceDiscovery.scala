@@ -313,8 +313,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *    holds it either: refusing the device would not bring it back, so it is CrlLost and adopted as
    *    Rebuilding. The save file is parsed, not just found: loadValidStoreState rejects a file cut
    *    short, and one whose header names another store. One it cannot read (CrashRecoveryLog.isUnreadable)
-   *    throws, failing the adoption for the next scan to retry, rather than be taken for lost. A store rebuilt
-   *    during or after the shutdown (keepRebuiltStoreOffline) is parked in outbound/ with an empty save file: Clean.
+   *    throws, failing the adoption for the next scan to retry, rather than be taken for lost.
+   *  - In rebuilt/ or parked/: Clean. A finished rebuild awaiting its flip, or one whose flip wrote its entry Offline
+   *    (keepRebuiltStoreOffline): it has never served, and its empty save file is its whole state.
    *  - Any other directory: Clean. The shutdown closed it, or a crash or a pulled drive stopped it,
    *    with its state in the device CRL, which the adopting host opens before loading it.
    *
@@ -326,8 +327,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       case Some(found) if CopyLayout.dirOf(found.phase).isEmpty && !FileStat.isDir(found.path) =>
         AdoptionClass.Unclean
       case Some(found) =>
-        // A flat copy is read again: its listing's Unread is no phase. A failed read throws. Outbound and Lost are
-        // known by their location
+        // A flat copy is read again: its listing's Unread is no phase. A failed read throws. A copy in a phase
+        // directory is known by its location
         CopyLayout.readPhase(found.path) match
           case Phase.Lost =>
             AdoptionClass.CrlLost
@@ -436,14 +437,20 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                    s"stores ${unclean.mkString(", ")}. Not adopting it. It may have been " +
                    s"removed too early: return it to that host to finish the shutdown")
 
+  /** Whether a copy in the phase directory of `phase` may go Live once its device is in service: outbound/ (T7),
+   *  rebuilt/ (T3) and parked/ (T5) */
+  private def mayGoLive(phase: Phase): Boolean = phase match
+    case Phase.Outbound(_) | Phase.Rebuilt(_) | Phase.Parked => true
+    case _ => false
+
   /** The local half of a restart or adoption, once `state` -- Operational and owned by this host
    *  -- has committed. Each step is idempotent, so a crash between any two of them is finished by
    *  the next scan, which finds shutdown.state still present and lands here again:
    *  1. `owning-host` is rewritten to name this host (adoption only), so once shutdown.state is
    *     gone the device loads here on its own. Each store's arrival (StoreLoader.ArrivedAtFile) is
-   *     recorded just before, for its load floor, in its flat or outbound/ copy.
-   *  2. A copy in outbound/ (a rebuilt store parked, keepRebuiltStoreOffline, or an abandoned
-   *     transfer's) is moved back to Live (T7, CopyMoves.moveUnattached) for every store now Active,
+   *     recorded just before, for its load floor, in its flat, outbound/, rebuilt/ or parked/ copy.
+   *  2. A copy in outbound/ (an abandoned transfer's, T7) or parked/ (a rebuilt store kept offline,
+   *     keepRebuiltStoreOffline, T5) is moved to Live (CopyMoves.moveUnattached) for every store now Active,
    *     except one whose entry still names a transfer or that this process is sending: there it
    *     belongs to a transfer. Offline entries -- none are expected -- keep theirs and stay
    *     unloaded. The shutdown itself leaves none. A transferred-in marker is left alone: the
@@ -473,23 +480,24 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       // Each store arrives from another host, whose clock may lead this one's: its load floor must cover that. Before
       // the owner is rewritten, so that a crash between the two finds the adoption still to finish. Each flat copy of
       // a store the device lists, and each in outbound/, which step 2 may reinstate. A directory stat that fails
-      // throws (FileStat), leaving the owner unwritten and the adoption to the next scan
-      listing.filter(f => state.stores.contains(f.storeId) &&
-          (CopyLayout.dirOf(f.phase).isEmpty || f.phase.isInstanceOf[Phase.Outbound]))
+      // throws (FileStat), leaving the owner unwritten and the adoption to the next scan. A rebuilt/ copy goes Live at
+      // the Completed Rebuilds pass
+      listing.filter(f => state.stores.contains(f.storeId) && (CopyLayout.dirOf(f.phase).isEmpty || mayGoLive(f.phase)))
         .map(_.path).filter(FileStat.isDir(_)).foreach(StoreLoader.writeArrivedAt)
       DeviceMarkers.writeOwningHost(path, ctx.hostId)
 
     val active = state.stores.collect {
       case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Active => storeId -> entry
     }
-    val outbound = listing.filter(_.phase.isInstanceOf[Phase.Outbound])
+    val offline = listing.filter(f => f.phase.isInstanceOf[Phase.Outbound] || f.phase == Phase.Parked)
     active.foreach: (storeId, entry) =>
       if ctx.copyRegistry.mayReinstateOut(entry, storeId) then
-        // T7. A move that fails keeps the store offline in outbound/, until a later check of its device (logged by
+        // T7, T5. A move that fails keeps the store offline where it is, until a later check of its device (logged by
         // the move); one not forced leaves the copy unsynced, which its attach takes and the device's check forces
         // and loads
-        outbound.filter(_.storeId == storeId).foreach: found =>
-          ctx.moves.moveUnattached("adoption reinstates outbound", found.path, storeId, found.copyId, Phase.Live): Unit
+        offline.filter(_.storeId == storeId).foreach: found =>
+          ctx.moves.moveUnattached(s"adoption brings ${found.phase} into service", found.path, storeId, found.copyId,
+            Phase.Live): Unit
 
     announceOnLoad += path -> active.keySet
     DeviceMarkers.removeShutdownState(path)
@@ -693,7 +701,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  for it and loads the file (StoreLoader.awaitCrlLoad). A directory whose config cannot be read, or whose file is
    *  missing, cut short or another store's, does not hold its state that way; one whose config or save file could
    *  not be read (CrashRecoveryLog.isUnreadable) is not known either way, so the read's error is thrown, leaving the
-   *  device unloaded for the next scan before any store is marked. Or it carries rebuild-complete: a
+   *  device unloaded for the next scan before any store is marked. Or it is in rebuilt/: a
    *  finished rebuild awaiting its flip, which has never served (StoreLoader.tryLoadStore leaves it offline), so its
    *  transaction state is empty. Its rebuild or the reconcile's Completed Rebuilds pass flips and loads it as it
    *  would have over the old CRL; one finished for an earlier episode is retired by retireForeignCopy as before. A
@@ -709,8 +717,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     def ownSaveFile: Boolean =
       FileStat.exists(saveFile) && configuredStoreId.exists: storeId =>
         CrashRecoveryLog.loadValidStoreState(saveFile, storeId).isRight
-    val phase = if CopyLayout.dirOf(copy.phase).isDefined then copy.phase else CopyPhase.read(storeDir)
-    phase match
+    // By location: a flat copy is never Rebuilt
+    copy.phase match
       case Phase.Rebuilt(_) => true
       case _ => ownSaveFile
 

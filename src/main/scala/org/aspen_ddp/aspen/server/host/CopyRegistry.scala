@@ -59,15 +59,15 @@ object Transitions:
     case (_, Phase.Unread) => true
     // T6 from Live, T10
     case (Phase.Live, Phase.Lost | Phase.Outbound(_)) => true
-    // T7 (an aborted or abandoned transfer out reinstated), T10. Never back to Rebuilt or Arrived: only Live, Rebuilt
-    // and parked copies are T6 sources (P10), and a reinstated one is Live (P8)
+    // T7 (an aborted or abandoned transfer out reinstated), T10. Never back to Rebuilt, Parked or Arrived: only Live,
+    // Rebuilt and Parked copies are T6 sources (P10), and a reinstated one is Live (P8)
     case (Phase.Outbound(_), Phase.Live | Phase.Lost) => true
-    // Outbound("") -> Outbound(tid): a parked copy (an AdoptOffline rebuild's, in outbound/ with no transfer id)
-    // transferred out (T6)
-    case (Phase.Outbound(""), Phase.Outbound(tid)) => tid.nonEmpty
-    case (Phase.Arrived(_), Phase.Rebuilt(_) | Phase.Live | Phase.Lost) => true
-    // T3, T6 (an Unconfirmed rebuilt copy shipped; Outbound(""): an AdoptOffline rebuild parked, T4), T10
-    case (Phase.Rebuilt(_), Phase.Live | Phase.Outbound(_) | Phase.Lost) => true
+    // T9, T10
+    case (Phase.Arrived(_), Phase.Live | Phase.Lost) => true
+    // T3, T4, T6 (an Unconfirmed rebuilt copy shipped), T10
+    case (Phase.Rebuilt(_), Phase.Live | Phase.Parked | Phase.Outbound(_) | Phase.Lost) => true
+    // T5, T6 (a parked copy shipped), T10
+    case (Phase.Parked, Phase.Live | Phase.Outbound(_) | Phase.Lost) => true
     case _ => false
 
   def activityLegal(phase: Phase, from: Activity, to: Activity): Boolean = (from, to) match

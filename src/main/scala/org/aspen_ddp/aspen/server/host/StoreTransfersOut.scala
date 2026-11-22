@@ -260,16 +260,16 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   private def sourcePhase(sds: LocalStorageDeviceState, storeId: StoreId): Option[Phase] =
     ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(storeId)).map(_.phase)
 
-  /** Whether a copy in `phase` may be shipped (P10): Live, Rebuilt (an Unconfirmed rebuild's), parked (Outbound(""))
-   *  or already Outbound (a retransmit's) */
+  /** Whether a copy in `phase` may be shipped (P10): Live, Rebuilt (an Unconfirmed rebuild's), Parked (an AdoptOffline
+   *  rebuild's) or already Outbound (a retransmit's) */
   private def isSource(phase: Phase): Boolean = phase match
-    case Phase.Live | Phase.Rebuilt(_) | Phase.Outbound(_) => true
+    case Phase.Live | Phase.Rebuilt(_) | Phase.Parked | Phase.Outbound(_) => true
     case _ => false
 
   /** The transfer id a transfer out of `devEntry` moves its copy to Outbound with ("" for none) */
   private def tidOf(devEntry: StorageDeviceState.StoreEntry): String = devEntry.transferId.map(_.toString).getOrElse("")
 
-  /** Whether a copy in `phase` must change place or parameter to be Outbound(tid) */
+  /** Whether a copy in `phase` must move to be Outbound(tid) */
   private def needsMove(phase: Phase, tid: String): Boolean = phase != Phase.Outbound(tid)
 
   /** T6: moves the closed copy of `storeId` on `sds` into outbound/ with transfer id `tid`, returning the copy's path
@@ -288,7 +288,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
         // startOut refused this; a send registered since (none starts but here) would have its directory moved
         logger.warn(s"Not shipping store $storeId: a send of it is registered, and its copy ($phase) must move")
         false
-      case Some(Phase.Outbound(t)) if t.nonEmpty => moveTo(Phase.Live) && moveTo(Phase.Outbound(tid))
+      case Some(Phase.Outbound(_)) => moveTo(Phase.Live) && moveTo(Phase.Outbound(tid))
       case Some(phase) if isSource(phase) => moveTo(Phase.Outbound(tid))
       case other =>
         logger.warn(s"Not shipping store $storeId: its copy on device ${sds.storageDeviceId} is now $other")
@@ -396,7 +396,7 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
    */
   def reinstateAbandonedOut(local: LocalStorageDeviceState,
                             storeId: StoreId): Unit =
-    logger.warn(s"Store $storeId on device ${local.storageDeviceId} is offline in outbound/, but the " +
+    logger.warn(s"Store $storeId on device ${local.storageDeviceId} is offline in outbound/ or parked/, but the " +
                 s"storage-devices tree records it as Active with no transfer outstanding. Clearing the abandoned " +
                 s"transfer and loading the store")
 

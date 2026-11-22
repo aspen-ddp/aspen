@@ -62,8 +62,8 @@ class LocalDevices extends Logging:
   /** Deletes a copy that never was its store's owner copy and holds nothing its source lacks, so it needs no retiring
    *  (StoreCopies): the copy a transfer delivered onto a device that turned out to be tombstoned
    *  (TransferOutcome.SourceRestored: the pool still names the source, which still holds the data), or one a rebuild
-   *  built from its peers on a device the tree does not say owns it (RebuildOutcome.Discard). Its transferred-in or
-   *  rebuild-complete marker keeps tryLoadStore from loading it, but nothing else would ever reclaim it, since
+   *  built from its peers on a device the tree does not say owns it (RebuildOutcome.Discard). Its transferred-in marker,
+   *  or its place in rebuilt/, keeps tryLoadStore from loading it, but nothing else would ever reclaim it, since
    *  reconcileDeviceState ignores a failed device outright. Were it loaded, and the source happened to live on this
    *  same host, the load would replace the source's entry in `stores`, which is keyed by StoreId alone.
    *
@@ -86,7 +86,7 @@ class LocalDevices extends Logging:
         if !FileStat.existence(storePath).contains(false) then
           logger.warn(s"Discarding the copy of store $storeId on device $deviceId. " +
                       s"$reason: $storePath")
-          // Rename-first: a failure leaves the copy whole, its marker included, so a restart never loads it.
+          // Rename-first: a failure leaves the copy whole where it is, so a restart never loads it.
           // The store is not loaded, so nothing serves it now
           if StoreCopies.delete(sds.devicePath, storePath, reason) then Some(sds) else None
         else

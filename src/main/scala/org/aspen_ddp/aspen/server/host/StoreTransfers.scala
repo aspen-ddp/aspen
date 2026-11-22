@@ -10,7 +10,6 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.TransferOutcome
 import org.aspen_ddp.aspen.server.{DurableFiles, FileStat}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
-import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
@@ -346,20 +345,12 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         outcome match
           case Success(TransferOutcome.PoolRepointed) =>
             ctx.devices.devices.get(toDeviceid).foreach: sds =>
-              val storePath = ctx.copyRegistry.pathOrLive(sds, storeId)
+              // A shipped Rebuilt copy (an Unconfirmed flip's) arrives as any other: its phase-param files are inert
+              // here, and it goes Live with its transferred-in marker's removal (T9)
               if clearTransferredInMarker(sds, storeId) then
-                // A rebuilt copy whose flip was Unconfirmed ships with its rebuild-complete marker
-                // (rebuild-process 5.7). The flip committed before the source's entry could become
-                // TransferringOut, and this entry is Active now, which is all the Completed Rebuilds
-                // pass checks: cleared here, or tryLoadStore keeps the pool's only owner copy offline
-                // until this device's next check. A failed removal is left to that pass, as there.
-                // A marker whose stat fails is removed as a present one is
-                if FileStat.existence(storePath / RebuildingStore.RebuildCompleteMarkerFile).contains(false) ||
-                   ctx.rebuilds.clearRebuildCompleteMarker(sds, storeId)
-                then
-                  ctx.loadStoreById(toDeviceid, storeId)
+                ctx.loadStoreById(toDeviceid, storeId)
               // Otherwise its copy stays offline on its device, as a restart's scan would leave it, which is what
-              // the transferred-in and Completed Rebuilds passes key off
+              // the Completed Transfers In pass keys off
 
           case Success(TransferOutcome.PoolRepointedOffline) =>
             // Left exactly as it arrived, behind its transferred-in marker, offline as a restart's scan
@@ -483,10 +474,10 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                           s"pool update")
               recordTransferIn(storeId, transferUUID, fromDeviceId, toDeviceid)
 
-          // A finished rebuild awaiting its flip, a lost copy, or a copy marked for transfer out, left by an earlier
+          // A finished rebuild awaiting its flip, a parked copy, a lost copy, or an outbound copy, left by an earlier
           // tenancy of the store on this device (rebuild-process; a store transferred back onto its old source): never
           // the owner's, so retired, and the transfer starts at the check that follows
-          case Some(Phase.Lost | Phase.Rebuilt(_) | Phase.Outbound(_)) =>
+          case Some(Phase.Lost | Phase.Rebuilt(_) | Phase.Parked | Phase.Outbound(_)) =>
             retireEarlierTenancy(toDevice, storeId)
 
           // Promotion moves the arrived copy here and would fail on an existing directory, after
@@ -608,7 +599,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
             ctx.client.sendHostMessage(msg)
 
   /** Clears the path of a store transferring onto `local` that holds a copy of an earlier tenancy of the store there:
-   *  a finished rebuild awaiting its flip (`rebuild-complete`) or a lost copy (in `lost/`), left when the
+   *  a finished rebuild awaiting its flip (in `rebuilt/`), a parked or outbound copy, or a lost copy (in `lost/`), left when the
    *  store was re-placed away (AspenClient.replaceRebuild) while this host was down. No other pass clears it while
    *  the entry is TransferringIn. The copy is retired (StoreCopies.retire), not deleted: it is not the owner's, and
    *  the source still is. Once the path is clear the device is checked again, which starts the transfer.

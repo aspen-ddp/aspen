@@ -9,7 +9,9 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{DurableFiles, Host, StorageDeviceConfig, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, StoreRecoveryState}
-import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
+import org.aspen_ddp.aspen.server.host.DeviceMetadata.{RebuildOutcome, TransferOutcome}
+import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
+import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendStateLost, DefaultBackendOpener, StoreCreation}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 
@@ -24,7 +26,11 @@ import scala.util.{Failure, Success, Try}
  *  move to lost/ fails is held offline until a device check moves it.
  *
  *  Task 3: Outbound is the outbound/ directory. A transfer out moves the closed copy there with its transfer id (T6)
- *  and ships it from there; an aborted or abandoned one moves it back to Live (T7). */
+ *  and ships it from there; an aborted or abandoned one moves it back to Live (T7).
+ *
+ *  Task 4: Rebuilt is rebuilt/ and Parked is parked/. A rebuild's finish renames its staging into rebuilt/ (T2); its
+ *  flip moves the copy Live (T3) or to parked/ (T4), or deletes it (T13); a parked copy goes Live (T5) or is shipped
+ *  (T6). */
 class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
 
   private val s = storeId
@@ -86,9 +92,12 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
   /** A ControlFixture host that loads its stores for real, through `opener` (its recording load seams, which reach the
    *  host only once it is built, left out: its device load opens and loads its stores) */
   private def realHost(hostRoot: os.Path, opener: TestOpener,
-                       rename: Option[(os.Path, os.Path) => Unit] = None): Host =
-    newHost(hostRoot, adjustSeams = _.copy(tryLoadStore = None, loadStore = None, loadStoreById = None,
-      backends = Some(opener), copyRename = rename))
+                       rename: Option[(os.Path, os.Path) => Unit] = None,
+                       rebuilds: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
+                       transfers: StoreTransferService = StoreTransferService.Disabled): Host =
+    newHost(hostRoot, storeRebuildFactory = rebuilds, transferService = transfers,
+      adjustSeams = _.copy(tryLoadStore = None, loadStore = None, loadStoreById = None, backends = Some(opener),
+        copyRename = rename))
 
   /** Drains `host` and yields until `condition`, `rounds` drains (when not negative) or 10 s. The caller asserts */
   private def pump(host: Host, condition: => Boolean, rounds: Int = -1): Future[Unit] =
@@ -557,7 +566,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       host.control.router.loaded.contains(s) should be(true)
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
-  atest("an Unconfirmed rebuilt copy transferred out and then reinstated ends Live, loads, and carries no rebuild-complete marker"):
+  atest("an Unconfirmed rebuilt copy transferred out and then reinstated ends Live and loads"):
     given ExecutionContext = executionContext
     val sends = new StagedSendService
     for
@@ -566,7 +575,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       flat = CopyLayout.path(dev, shipped, None, Phase.Live)
       started <- askAndSettle(host)
       outbound = CopyFixtures.phaseOf(dev, shipped)
-      markerWhileOutbound = os.exists(sends.sources.head._2 / RebuildingStore.RebuildCompleteMarkerFile)
+      shippedFrom = sends.sources.head._2
       _ <- client.abortStoreTransfer(shipped)
       _ <- waitForTransactionsToComplete()
       _ = sends.endTransferOut(shipped)
@@ -575,10 +584,9 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
     yield
       started should be(Success(()))
       outbound should be(Some(Phase.Outbound(tid)))
-      markerWhileOutbound should be(false)
+      shippedFrom / os.up should be(dev / CopyLayout.OutboundDirectory)
       CopyFixtures.phaseOf(dev, shipped) should be(Some(Phase.Live))
       CopyFixtures.copyPath(dev, shipped) should be(Some(flat))
-      os.exists(flat / RebuildingStore.RebuildCompleteMarkerFile) should be(false)
       recordOf(host, local, shipped).map(_.phase) should be(Some(Phase.Live))
       recorded(host).storeLoadAttempts.toList should contain((source, flat))
 
@@ -646,20 +654,24 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       sends.sources should be(Vector())
       CopyFixtures.phaseOf(dev, shipped).exists(_.isInstanceOf[Phase.Outbound]) should be(false)
 
-  // While Parked shares outbound/ as Outbound("") (Tasks 3-4), its T6 changes only its parameter, in place
-  atest("a parked copy is shipped from where it is, with the transfer's id"):
+  atest("a parked copy can be transferred out"):
     given ExecutionContext = executionContext
     val sends = new StagedSendService
     for
-      (host, local, dev, tid) <- transferring(dev => CopyFixtures.placeCopy(dev, shipped, Phase.Outbound("")): Unit,
-                                              sends)
+      (host, local, dev, tid) <- transferring(dev => CopyFixtures.placeCopy(dev, shipped, Phase.Parked): Unit, sends)
       parkedAt = CopyFixtures.copyPath(dev, shipped).get
       started <- askAndSettle(host)
     yield
+      parkedAt / os.up should be(dev / CopyLayout.ParkedDirectory)
       started should be(Success(()))
-      sends.sources should be(Vector(shipped -> parkedAt))
-      CopyLayout.readParam(parkedAt, Phase.Outbound("")) should be(tid)
+      sends.sources.map(_._1) should be(Vector(shipped))
+      val from = sends.sources.head._2
+      from / os.up should be(dev / CopyLayout.OutboundDirectory)
+      // One copy, moved: the same copy id
+      from.last should be(parkedAt.last)
+      CopyLayout.readParam(from, Phase.Outbound("")) should be(tid)
       CopyFixtures.phaseOf(dev, shipped) should be(Some(Phase.Outbound(tid)))
+      os.list(dev / CopyLayout.ParkedDirectory) should be(Nil)
       recordOf(host, local, shipped).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Outbound(tid), false)))
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
@@ -773,3 +785,191 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       host.control.copyRegistry.retryOn(local, shipped).map(_.storePath) should be(Some(flat))
       CopyFixtures.copyPath(dev, shipped) should be(Some(flat))
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  // ---- Task 4: Rebuilt is rebuilt/, Parked is parked/ ----
+
+  /** A rebuild that, once started, places its copy in rebuilt/ with its episode as RebuildingStore.finish does (a
+   *  real RocksDB store with its empty save file when `real`, else a config only), and completes with its copy id */
+  private class PlacingRebuilds(real: Boolean) extends StoreRebuildFactory:
+    def createRebuild(client: org.aspen_ddp.aspen.client.AspenClient, storeId: StoreId, deviceId: StorageDeviceId,
+                      devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener,
+                      episode: Option[UUID], existingCopy: () => Option[(Phase, os.Path)]): StoreRebuild =
+      val id = storeId
+      val rebuilt = Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode))
+      val copy =
+        if real then
+          val flat = rocksCopy(devicePath, id)
+          RebuildingStore.writeEmptyCrlState(flat, id)
+          CopyFixtures.markCopy(devicePath, id, rebuilt)
+        else
+          CopyFixtures.placeCopy(devicePath, id, rebuilt)
+      new StoreRebuild:
+        val storeId: StoreId = id
+        def complete: Future[UUID] = Future.successful(CopyFixtures.copyIdOf(copy))
+        def cancel(): Unit = ()
+
+  /** The children of the phase directory `name` on `dev`, none if it is absent */
+  private def inDir(dev: os.Path, name: String): Seq[os.Path] =
+    if os.isDir(dev / name) then os.list(dev / name) else Nil
+
+  /** Starts the rebuild of `s` on device A of `host` for `episode`, its entry Rebuilding for it in the tree with the
+   *  device in `status`, and waits for the rebuild's work to end */
+  private def rebuildAndFlip(host: Host, episode: UUID,
+                             status: StorageDeviceState.DeviceStatus = StorageDeviceState.DeviceStatus.Operational)
+      : Future[RebuildOutcome] =
+    given ExecutionContext = executionContext
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.setRebuilding(s, episode).copy(status = status))
+      _ <- waitForTransactionsToComplete()
+      _ = host.control.rebuilds.startRebuild(loadedDevices(host)(deviceA), s, Some(episode), acceptLoss = false)
+      _ <- pumpTx(host, recorded(host).rebuildOutcomes.contains((deviceA, s)) &&
+                        !host.control.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(s))
+    yield recorded(host).rebuildOutcomes((deviceA, s))
+
+  atest("an Adopt flip moves the rebuilt copy to live and serves it"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val opener = new TestOpener
+    val host = realHost(hostRoot, opener, rebuilds = new PlacingRebuilds(real = true))
+    host.testingOnlyHandleEvents()
+    val renames = recordRenames(host)
+    val flat = CopyLayout.path(dev, s, None, Phase.Live)
+    for
+      outcome <- rebuildAndFlip(host, UUID.randomUUID())
+      _ <- pump(host, host.control.router.loaded.contains(s))
+    yield
+      outcome should be(RebuildOutcome.Adopt)
+      renames().map((from, to) => ((from / os.up).last, to)) should be(Vector(CopyLayout.RebuiltDirectory -> flat))
+      CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Live))
+      CopyFixtures.copyPath(dev, s) should be(Some(flat))
+      inDir(dev, CopyLayout.RebuiltDirectory) should be(Nil)
+      host.control.router.loaded.contains(s) should be(true)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("an AdoptOffline flip moves the rebuilt copy to parked in one move"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val host = newHost(hostRoot, storeRebuildFactory = new PlacingRebuilds(real = false))
+    host.testingOnlyHandleEvents()
+    val renames = recordRenames(host)
+    for
+      outcome <- rebuildAndFlip(host, UUID.randomUUID(), StorageDeviceState.DeviceStatus.ShuttingDown)
+    yield
+      outcome should be(RebuildOutcome.AdoptOffline)
+      renames().map((from, to) => ((from / os.up).last, (to / os.up).last)) should be(
+        Vector(CopyLayout.RebuiltDirectory -> CopyLayout.ParkedDirectory))
+      CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Parked))
+      inDir(dev, CopyLayout.RebuiltDirectory) should be(Nil)
+      inDir(dev, CopyLayout.OutboundDirectory) should be(Nil)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("a parked copy goes live when its entry is Active with no transfer device"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val flat = rocksCopy(dev, s)
+    RebuildingStore.writeEmptyCrlState(flat, s)
+    CopyFixtures.markCopy(dev, s, Phase.Parked)
+    val opener = new TestOpener
+    val host = realHost(hostRoot, opener)
+    host.testingOnlyHandleEvents()
+    val parkedAtLoad = CopyFixtures.phaseOf(dev, s)
+    val opensAtLoad = opener.opens.get
+    val active = Map(s -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))
+    for
+      _ <- check(host, active)
+      _ <- pump(host, host.control.router.loaded.contains(s))
+    yield
+      parkedAtLoad should be(Some(Phase.Parked))
+      opensAtLoad should be(0)
+      CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Live))
+      CopyFixtures.copyPath(dev, s) should be(Some(flat))
+      inDir(dev, CopyLayout.ParkedDirectory) should be(Nil)
+      host.control.router.loaded.contains(s) should be(true)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("a Discard deletes the rebuilt copy rename-first"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    // The bootstrap device's entry does not list the store, so its flip discards the copy
+    val dev = writeDevice(hostRoot, "dev0", source)
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(dev))
+    val host = newHost(hostRoot, storeRebuildFactory = new PlacingRebuilds(real = false))
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(source)
+    @volatile var placedAt: Option[os.Path] = None
+    host.control.rebuilds.startRebuild(local, s, Some(UUID.randomUUID()), acceptLoss = false)
+    placedAt = CopyFixtures.copyPath(dev, s)
+    for
+      _ <- pumpTx(host, recorded(host).rebuildOutcomes.contains((source, s)) &&
+                        !host.control.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(s))
+    yield
+      placedAt.map(_ / os.up) should be(Some(dev / CopyLayout.RebuiltDirectory))
+      recorded(host).rebuildOutcomes((source, s)) should be(RebuildOutcome.Discard)
+      CopyFixtures.copyPath(dev, s) should be(None)
+      inDir(dev, CopyLayout.RebuiltDirectory) should be(Nil)
+      inDir(dev, RebuildingStore.PendingDeleteDirectory) should be(Nil)
+      // Renamed into deleting/ first, then removed there
+      os.isDir(dev / StoreCopies.DeletingDirectory) should be(true)
+      os.list(dev / StoreCopies.DeletingDirectory) should be(Nil)
+      recordOf(host, local, s) should be(None)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("a shipped rebuilt copy arrives and goes live with no rebuild-complete step"):
+    given ExecutionContext = executionContext
+    val moving = StoreId(PoolId.BootstrapPoolId, 1)
+    val hostRoot = newHostDir()
+    val dev = writeDevice(hostRoot, "dev0", net.secondDeviceId)
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(dev))
+    val transfers = new StagedTransferService
+    val opener = new TestOpener
+    val host = realHost(hostRoot, opener, transfers = transfers)
+    host.testingOnlyHandleEvents()
+    @volatile var seen = Vector.empty[Phase]
+    host.control.copyRegistry.observer = (copies, sid) =>
+      if sid == moving && copies.deviceId == net.secondDeviceId then
+        copies.copies.get(sid).map(_.phase).foreach(p => if !seen.lastOption.contains(p) then seen :+= p)
+    val tid = UUID.randomUUID().toString
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(moving, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      pstate <- client.getStoragePoolState(moving.poolId)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpTx(host, transfers.startedTransfersIn.contains(moving))
+      // The source's copy as it ships from outbound/ after a rebuild whose flip was Unconfirmed: a real store, its
+      // Outbound transfer id and its episode in their phase-param files, and its empty save file
+      _ = transfers.finishTransferIn(moving, extraFiles = CopyLayout.paramFile(Phase.Rebuilt("")).toList,
+            prepare = staged =>
+              DefaultBackendOpener.createStore(StoreConfig.forPool(moving, pstate), staged,
+                staged / os.up / StoreCreation.CreatingDirectory))
+      _ <- pumpTx(host, host.control.router.loaded.contains(moving))
+    yield
+      recorded(host).transferOutcomes.get(moving) should be(Some(TransferOutcome.PoolRepointed))
+      seen.map { case Phase.Arrived(_) => "Arrived"; case p => p.toString } should be(Vector("Arrived", "Live"))
+      CopyFixtures.phaseOf(dev, moving) should be(Some(Phase.Live))
+      val live = CopyFixtures.copyPath(dev, moving).get
+      live should be(CopyLayout.path(dev, moving, None, Phase.Live))
+      // Inert here: the copy is Live at the flat path and served
+      CopyLayout.paramFile(Phase.Rebuilt("")).forall(f => os.exists(live / f)) should be(true)
+      host.control.router.loaded.contains(moving) should be(true)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("a lost device CRL leaves a rebuilt copy alone"):
+    val (hostRoot, dev) = device(withCrl = false)
+    val episode = UUID.randomUUID().toString
+    val s1 = StoreId(s.poolId, 1)
+    val s2 = StoreId(s.poolId, 2)
+    CopyFixtures.placeCopy(dev, s, Phase.Rebuilt(episode))
+    // A parked copy holds its own state only in a valid save file
+    val parked = CopyFixtures.placeCopy(dev, s1, Phase.Parked)
+    CrashRecoveryLog.saveStoreState(s1, StoreRecoveryState.Empty, Backend.crlSaveFile(parked))
+    CopyFixtures.placeCopy(dev, s2, Phase.Parked)
+    val host = newHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    loadedDevices(host).keySet should be(Set(deviceA))
+    CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Rebuilt(episode)))
+    CopyFixtures.phaseOf(dev, s1) should be(Some(Phase.Parked))
+    CopyFixtures.phaseOf(dev, s2) should be(Some(Phase.Lost))
+    Future.successful(succeed)

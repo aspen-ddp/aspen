@@ -32,7 +32,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
 
     def rebuild(failKeys: Set[Key], episode: Option[java.util.UUID],
                 outOfSpaceKeys: Set[Key] = Set()): RebuildingStore =
-      new RebuildingStore(client, storeId, net.secondDeviceId, dev, backends, episode,
+      new RebuildingStore(client, storeId, net.secondDeviceId, dev, backends, RebuildingStore.copyOnDisk(dev, storeId), episode,
                           testingOnlyFailKeys = failKeys, testingOnlyOutOfSpaceKeys = outOfSpaceKeys)
     val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
 
@@ -97,7 +97,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       fullLostEntry should be(None)
       fullLeft should be(Some(Set(ids.head, ids(1))))
       // With it the rebuild finishes, and the lost object, only that one, is recorded for repair
-      accepted should be(Success(()))
+      accepted.isSuccess should be(true)
       CopyFixtures.copyPath(dev, storeId).exists(p => os.exists(p / StoreConfig.configFilename)) should be(true)
       lostEntry should be(defined)
       restoredEntry should be(None)
@@ -167,7 +167,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       earlier = first.stores(storeId).rebuildEpisode
 
       // The first episode's rebuild walks the whole tree, checkpointing, and is stopped (its host goes down)
-      stopped = new RebuildingStore(client, storeId, from, dev, backends, earlier, checkpointInterval = 1,
+      stopped = new RebuildingStore(client, storeId, from, dev, backends, RebuildingStore.copyOnDisk(dev, storeId), earlier, checkpointInterval = 1,
                                     testingOnlyAfterWalk = () => Future.failed(new Exception("host down")))
       _ <- stopped.complete.transform(Success(_))
       staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
@@ -181,7 +181,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       back <- client.getStorageDeviceState(from)
       current = back.stores(storeId).rebuildEpisode
 
-      resumed = new RebuildingStore(client, storeId, from, dev, backends, current,
+      resumed = new RebuildingStore(client, storeId, from, dev, backends, RebuildingStore.copyOnDisk(dev, storeId), current,
                                     testingOnlyTrackRestoredKeys = true)
       outcome <- resumed.complete.transform(Success(_))
     yield
@@ -190,7 +190,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       checkpoint.flatMap(_.lastRestoredKey) should be(defined)
       current should not be(None)
       current should not be(earlier)
-      outcome should be(Success(()))
+      outcome.isSuccess should be(true)
       // Every object restored again, none taken from the earlier episode's copy
       val restored = resumed.testingOnlyRestoredKeys.map(_.bytes.toList).toSet
       ids.map(id => Key(id.toBytes).bytes.toList).toSet.subsetOf(restored) should be(true)

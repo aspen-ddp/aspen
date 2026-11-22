@@ -25,9 +25,19 @@ import scala.util.{Success, Try}
 
 /** A rebuild that does nothing until the test resolves it, and ignores its cancel: a rebuild winding down, or one past
  *  finish's latch re-check */
-private class HeldRebuild(val storeId: StoreId, val episode: Option[UUID]) extends StoreRebuild:
-  val promise: Promise[Unit] = Promise()
-  def complete: Future[Unit] = promise.future
+private class HeldRebuild(val storeId: StoreId, val episode: Option[UUID], devicePath: os.Path) extends StoreRebuild:
+  val promise: Promise[UUID] = Promise()
+  def complete: Future[UUID] = promise.future
+
+  /** Completes it with the id of the copy of its store on its device, as a test placed it (a fresh id if none) */
+  def completeFromDisk(): Unit =
+    promise.success(CopyFixtures.copyIdOn(devicePath, storeId))
+
+  /** Completes it as a finish past its latch does: its copy placed in rebuilt/ with its episode first */
+  def placeAndComplete(): Unit =
+    val placed = CopyFixtures.placeCopy(devicePath, storeId, Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)),
+      configured = false)
+    promise.success(CopyFixtures.copyIdOf(placed))
   @volatile var cancelled: Boolean = false
   def cancel(): Unit = cancelled = true
 
@@ -35,8 +45,9 @@ private class HeldRebuildFactory extends StoreRebuildFactory:
   val created: mutable.ListBuffer[HeldRebuild] = mutable.ListBuffer()
 
   def createRebuild(client: AspenClient, storeId: StoreId, storageDeviceId: StorageDeviceId, devicePath: os.Path,
-                    backends: BackendOpener, episode: Option[UUID]): StoreRebuild =
-    val r = new HeldRebuild(storeId, episode)
+                    backends: BackendOpener, episode: Option[UUID],
+                    existingCopy: () => Option[(Phase, os.Path)]): StoreRebuild =
+    val r = new HeldRebuild(storeId, episode, devicePath)
     synchronized(created += r)
     r
 
@@ -105,7 +116,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
    *  for it to end. */
   for (variant, end) <- List[(String, HeldRebuild => Unit)](
         "running" -> (r => r.promise.failure(RebuildingStore.RebuildCancelled(r.storeId))),
-        "cancelled past finish's latch" -> (r => r.promise.success(())))
+        "cancelled past finish's latch" -> (r => r.placeAndComplete()))
   do
     atest(s"a transfer in waits while a rebuild of the store is registered on the device ($variant, C1)"):
       given ExecutionContext = executionContext
@@ -439,7 +450,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- check(host, source, rebuilding)
       _ <- yieldUntil(factory.created.nonEmpty)
-      // Where the rebuild placed its copy, with the rebuild-complete marker of its episode as finish places it
+      // Where the rebuild placed its copy, in rebuilt/ with its episode as finish places it
       _ = CopyFixtures.placeCopy(deviceDir, shipped,
         Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(Some(episode))))
       devPtr <- client.getStorageDevicePointer(source)
@@ -459,7 +470,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ = List(1, 2).foreach(_ => recorded(host).armLookup(source).success(deviceState(source,
             Map(shipped -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut,
               Some(net.secondDeviceId), Some(UUID.randomUUID()))))))
-      _ = factory.created.head.promise.success(())
+      _ = factory.created.head.completeFromDisk()
       _ <- pumpUntil(hooked && !host.control.copyRegistry.rebuilding(HostCopies.RebuildReads).contains(shipped), drain = Some(host))
       _ = tclient.beforeRetry = _ => Future.unit
       outcome = recorded(host).rebuildOutcomes.get((source, shipped))

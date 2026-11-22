@@ -23,9 +23,9 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 
 /** A StoreRebuild that runs until cancelled, then fails the way RebuildingStore does. */
 private class CancellableRebuild(val storeId: StoreId) extends StoreRebuild:
-  private val promise: Promise[Unit] = Promise()
+  private val promise: Promise[UUID] = Promise()
   @volatile var cancelled: Boolean = false
-  def complete: Future[Unit] = promise.future
+  def complete: Future[UUID] = promise.future
   def cancel(): Unit =
     cancelled = true
     promise.tryFailure(RebuildingStore.RebuildCancelled(storeId))
@@ -38,7 +38,8 @@ private class CancellableRebuildFactory extends StoreRebuildFactory:
                     storageDeviceId: StorageDeviceId,
                     devicePath: os.Path,
                     backends: BackendOpener,
-                    episode: Option[UUID]): StoreRebuild = synchronized:
+                    episode: Option[UUID],
+                    existingCopy: () => Option[(Phase, os.Path)]): StoreRebuild = synchronized:
     val r = new CancellableRebuild(storeId)
     created += r
     r
@@ -136,6 +137,14 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
   /** A copy of `s` holding nothing, not even its config */
   private def bareCopy(deviceDir: os.Path, s: StoreId): os.Path =
     CopyFixtures.placeCopy(deviceDir, s, configured = false)
+
+  /** Where a rebuild's finish places the copy of `s`: in rebuilt/, with no episode, holding nothing else */
+  private def rebuiltCopy(deviceDir: os.Path, s: StoreId): os.Path =
+    CopyFixtures.placeCopy(deviceDir, s, Phase.Rebuilt(""), configured = false)
+
+  /** Whether the copy of `s` is parked (an AdoptOffline rebuild's) */
+  private def parked(deviceDir: os.Path, s: StoreId): Boolean =
+    CopyFixtures.phaseOf(deviceDir, s).contains(Phase.Parked)
 
   /** The path of the copy of `s` */
   private def copyAt(deviceDir: os.Path, s: StoreId): os.Path = CopyFixtures.copyPath(deviceDir, s).get
@@ -459,10 +468,10 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(rebuilds.created.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      // The rebuilt store lands at its final path, with the empty save file finish writes.
-      _ = bareCopy(deviceDir, s0)
+      // The rebuilt store lands in rebuilt/, with the empty save file finish writes.
+      _ = rebuiltCopy(deviceDir, s0)
       _ = RebuildingStore.writeEmptyCrlState(copyAt(deviceDir, s0), s0)
-      _ = rebuilds.created.head.promise.success(())
+      _ = rebuilds.created.head.completeFromDisk()
       _ <- pumpUntil(recorded(host).rebuildFlipSeq.contains((deviceA, s0)))
       entryAfterFlip <- state(deviceA).map(_.stores.get(s0))
       _ = host.control.reconciler.checkAll()
@@ -471,7 +480,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     yield
       entryAfterFlip.map(_.status) should be(Some(StoreStatus.Offline))
       recorded(host).loadStoreByIdRequests.toList should be(Nil)
-      outbound(deviceDir, s0) should be(true)
+      parked(deviceDir, s0) should be(true)
       // Kept beside the marker, so an adopter accepts it.
       os.exists(Backend.crlSaveFile(copyAt(deviceDir, s0))) should be(true)
       host.control.router.silentStores should contain(s0)
@@ -562,8 +571,8 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(rebuilds.created.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- setDeviceState(deviceA)(_.copy(hostId = otherHostId))
-      _ = bareCopy(deviceDir, s0)
-      _ = rebuilds.created.head.promise.success(())
+      _ = rebuiltCopy(deviceDir, s0)
+      _ = rebuilds.created.head.completeFromDisk()
       _ <- pumpUntil(recorded(host).rebuildOutcomes.contains((deviceA, s0)))
       st <- state(deviceA)
     yield
@@ -573,7 +582,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).loadStoreByIdRequests.toList should be(Nil)
       // Left for the owner, whose rebuild finds the store in place and only flips it.
       CopyFixtures.copyPath(deviceDir, s0) should be(defined)
-      outbound(deviceDir, s0) should be(false)
+      CopyFixtures.phaseOf(deviceDir, s0) should be(Some(Phase.Rebuilt("")))
 
   /** setUp with s0 Rebuilding under a RecordedRebuild, which ignores cancel() as a rebuild whose
    *  walk is still reading does, and s1 Active and open. The shutdown is requested and checked,
@@ -598,8 +607,8 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       closesWhileWaiting = recorded(host).shutdownCloses.toList
       outcomesWhileWaiting = recorded(host).shutdownOutcomes.toList
       // The walk ends and the rebuilt store lands, after the shutdown request.
-      _ = bareCopy(deviceDir, s0)
-      _ = rebuilds.created.head.promise.success(())
+      _ = rebuiltCopy(deviceDir, s0)
+      _ = rebuilds.created.head.completeFromDisk()
       _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
       st <- state(deviceA)
     yield
@@ -610,7 +619,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).shutdownCloses.toList should be(List(s1))
       recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
       // Kept offline as the shutdown's own closes are, before Shutdown committed.
-      outbound(deviceDir, s0) should be(true)
+      parked(deviceDir, s0) should be(true)
       st.stores(s0).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
 

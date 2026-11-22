@@ -290,13 +290,14 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
           ctx.rebuilds.requestRebuild(local.storageDeviceId, storeId)
     lostCrl
 
-  /** Reinstates stores left offline in outbound/ whose transfer was abandoned (T7). */
+  /** Reinstates stores left offline in outbound/ whose transfer was abandoned (T7), and parked stores (T5). */
   private def reinstateAbandonedTransfersOut(local: LocalStorageDeviceState, remote: StorageDeviceState, lostCrl: Set[StoreId]): Unit =
     // Nothing else ever moves an Outbound copy back to Live at the source, and a transfer that
     // completes normally has the source's copy retired by the pass above. So a transfer that ends
     // without completing, which is what a destination declared failed mid-flight produces, strands
     // the copy in outbound/ forever, and every restart keeps it offline there.
-    // A parked copy (an AdoptOffline rebuild's, Outbound("")) is reinstated the same way.
+    // A parked copy (an AdoptOffline rebuild's, in parked/) is brought into service the same way (T5) once its entry
+    // is Active with no transfer device.
     //
     // That pairs badly with the metadata repair for the same event. That repair puts this
     // entry back to Active and leaves the pool naming this device, so afterwards the metadata
@@ -320,7 +321,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // receive) with nothing to prompt another check for a full checkStorageDevicePeriod.
     val (abandonedOut, stillSending) = (ctx.copyRegistry.offlineCopies(local) -- lostCrl).filter(storeId =>
       remote.stores.get(storeId).exists(ctx.copyRegistry.noTransferOut) &&
-      ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase.isInstanceOf[Phase.Outbound])
+      ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(r =>
+        r.phase.isInstanceOf[Phase.Outbound] || r.phase == Phase.Parked)
     ).partition(storeId => remote.stores.get(storeId).exists(ctx.copyRegistry.mayReinstateOut(_, storeId)))
     abandonedOut.foreach: storeId =>
       ctx.transfersOut.reinstateAbandonedOut(local, storeId)
@@ -346,23 +348,22 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       if ctx.transfers.clearTransferredInMarker(local, storeId) then
         ctx.tryLoadStore(local, storePath, None)
 
-  /** Completes a rebuild whose flip committed but whose marker removal did not, and loads the store. */
+  /** Completes a rebuild whose flip committed but whose copy did not move Live, and loads the store (T3). */
   private def completeRebuilds(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
-    // A crash between a rebuild's flip committing and the removal of its rebuild-complete marker leaves an Active
-    // entry over a copy that tryLoadStore skips; the rebuild's completion, which would remove the marker, is gone.
-    // Active is the tree's word that the flip committed, so the copy is ours to load. A rebuild still running here
-    // removes its own marker once its flip commits. An unlink that failed here or in the rebuild's completion is
-    // retried too; one whose directory sync failed left the copy unsynced, which loadResynced loads once forced.
+    // A crash between a rebuild's flip committing and its copy's move out of rebuilt/ leaves an Active entry over a
+    // copy that tryLoadStore skips; the rebuild's completion, which would move it, is gone. Active is the tree's word
+    // that the flip committed, so the copy is ours to load. A rebuild still running here moves its own copy once its
+    // flip commits. A move that failed here or in the rebuild's completion is retried too; one not forced left the
+    // copy Live and unsynced, which loadResynced loads once forced.
     ctx.copyRegistry.offlineCopies(local).filter(storeId =>
       !ctx.copyRegistry.rebuilding(HostCopies.RebuildReads).contains(storeId) &&
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
-      hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildComplete)
+      ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase.isInstanceOf[Phase.Rebuilt])
     ).foreach: storeId =>
-      val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
-      logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but its rebuild-complete marker " +
-                  s"is not durably removed. Completing the rebuild and loading the store")
-      if ctx.rebuilds.clearRebuildCompleteMarker(local, storeId) then
-        ctx.tryLoadStore(local, storePath, None)
+      logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but its copy is still in rebuilt/. " +
+                  s"Completing the rebuild and loading the store")
+      if ctx.rebuilds.bringRebuiltLive(local, storeId) == MoveResult.Durable then
+        ctx.tryLoadStore(local, ctx.copyRegistry.pathOrLive(local, storeId), None)
 
   /** Loads each copy held back from loading for a marker change whose sync failed (HostCopies.heldForSyncOn), once it
    *  is synced again (CopyMoves.resync): the removal's own load was held back (an unsynced copy is never loaded),

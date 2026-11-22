@@ -41,20 +41,8 @@ object RebuildingStore:
    *  Host.tryLoadStore for the same reason as RebuildDirectory. */
   val PendingDeleteDirectory = "pending-delete"
 
-  /** In a store directory a rebuild produced, from just before its move into place until its tree entry leaves
-   *  Rebuilding. Written durably by finish in staging, so it is at the store's path the moment the directory is. Its
-   *  content is the rebuild's episode (StoreEntry.rebuildEpisode; empty for None). It says two things. The directory is
-   *  this rebuild's output: start() takes a directory at the store's path for a finished rebuild only when it carries
-   *  the marker of the current episode (any other one, a copy finished for an earlier Rebuilding episode included, is
-   *  retired as a lost copy by StoreRebuilds.startRebuild, rebuild-process 2.2). And the store is not in service yet:
-   *  StoreLoader.tryLoadStore leaves it offline, so a crash between the move and the flip cannot have a restart serve
-   *  it as a blank acceptor while the tree still says Rebuilding (rebuild-process 2.2). Removed once the flip commits
-   *  (StoreRebuilds), or by the reconcile for an Active entry after a crash between the flip and the removal
-   *  (DeviceReconciler) */
-  val RebuildCompleteMarkerFile = "rebuild-complete"
-
   /** Writes the rebuilt store's whole transaction state, which is empty, as the crl_save.log of the store directory
-   *  at `storePath` (finish, in staging before the rebuild-complete marker). A rebuilt store has never served, so
+   *  at `storePath` (finish, in staging before its episode's phase-param.rebuilt). A rebuilt store has never served, so
    *  whatever the device CRL holds under its id was left by an earlier copy of the store on this device whose
    *  directory left its path without a retire (removed by hand, or a fail-stopped copy's close saving behind the
    *  retire's drop). Its first load, wherever it comes from (the flip, the Completed Rebuilds pass, a restart, a
@@ -65,15 +53,18 @@ object RebuildingStore:
   def writeEmptyCrlState(storePath: os.Path, storeId: StoreId): Unit =
     CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, Backend.crlSaveFile(storePath))
 
-  /** The content of the rebuild-complete marker of `episode` */
+  /** The parameter a Rebuilt copy of `episode` carries (phase-param.rebuilt): the episode, "" for None */
   def rebuildCompleteContent(episode: Option[UUID]): String = episode.map(_.toString).getOrElse("")
 
-  /** Whether `storePath` carries the rebuild-complete marker of `episode`. A marker whose stat or read fails throws
-   *  (FileStat): its episode is unknown, and the caller waits for a later check rather than take a finished copy for
-   *  a foreign one */
-  def isRebuildCompleteFor(storePath: os.Path, episode: Option[UUID]): Boolean =
-    val marker = storePath / RebuildCompleteMarkerFile
-    FileStat.exists(marker) && os.read(marker).trim == rebuildCompleteContent(episode)
+  /** Whether a copy in `phase` is the finished rebuild of `episode`: Rebuilt (in rebuilt/), with that episode */
+  def isRebuiltFor(phase: Phase, episode: Option[UUID]): Boolean = phase == Phase.Rebuilt(rebuildCompleteContent(episode))
+
+  /** The copy of `storeId` on the device at `devicePath`, outside pending-delete/, with its phase, read from the disk
+   *  (CopyLayout.list), which a rebuild's start (off the control thread's state) asks for. Throws a failed listing or
+   *  phase read. A device holding more than one (P2) answers the first listed: none is this rebuild's to take */
+  def copyOnDisk(devicePath: os.Path, storeId: StoreId): () => Option[(Phase, os.Path)] = () =>
+    CopyLayout.list(devicePath).copies.find(f => f.storeId == storeId && f.phase != Phase.Retired)
+      .map(f => (f.phase, f.path))
 
   /** In a store directory being discarded: the store's device-CRL entries, saved by CrashRecoveryLog.saveStoreState
    *  before they are dropped from the device CRL, which a rebuild onto the same device would otherwise recover */
@@ -204,6 +195,10 @@ class RebuildingStore(client: AspenClient,
                       storageDeviceId: StorageDeviceId,
                       devicePath: os.Path,
                       backends: BackendOpener,
+                      /** The copy of the store on the device outside pending-delete/, if any, with its phase: asked by
+                        * start, which takes a Rebuilt copy of its own episode for done and fails on any other
+                        * (copyOnDisk) */
+                      existingCopy: () => Option[(Phase, os.Path)],
                       /** The Rebuilding episode this rebuild runs for (StoreEntry.rebuildEpisode) */
                       episode: Option[UUID] = None,
                       checkpointInterval: Int = RebuildingStore.CheckpointInterval,
@@ -237,11 +232,11 @@ class RebuildingStore(client: AspenClient,
   private val reader = client.withReadTimeout(objectReadTimeout)
 
   private val stagingPath = devicePath / RebuildDirectory / storeId.directoryName
-  // The rebuilt copy's final path: it is not recorded until its completion's handler runs
-  private val finalPath = CopyLayout.path(devicePath, storeId, None, Phase.Live)
 
-  private val completionPromise: Promise[Unit] = Promise()
-  def complete: Future[Unit] = completionPromise.future
+  // The copy id of the Rebuilt copy, once finish has placed it (or start found it placed): `complete` reports it, and
+  // the completion's handler records the copy with it
+  private val completionPromise: Promise[UUID] = Promise()
+  def complete: Future[UUID] = completionPromise.future
 
   /** Keys handed to rebuildWrite, in walk order. Test hook, and off unless a test asks for it:
    *  a real store holds millions of objects, and accumulating a Key per object for the life of
@@ -307,22 +302,25 @@ class RebuildingStore(client: AspenClient,
   start()
 
   private def start(): Unit =
-    val f =
+    val f: Future[UUID] =
       try
-        if isRebuildCompleteFor(finalPath, episode) then
-          // A crash between the move and the flip. The store is already whole; there is nothing to
-          // rebuild, only the flip left, and that is Host's job on completion.
-          logger.info(s"Rebuild of $storeId: store already in place at $finalPath")
-          cleanupStaging()
-          Future.unit
-        else if FileStat.exists(finalPath) then
-          // Not this rebuild's output (no marker, or one of an earlier Rebuilding episode). StoreRebuilds.startRebuild
-          // retires such a directory before it starts a rebuild, so this is only a defence: the directory is left
-          // alone and the rebuild fails
-          Future.failed(new IllegalStateException(
-            s"Rebuild of $storeId: $finalPath holds a store directory that no rebuild finished"))
-        else
-          runPass()
+        existingCopy() match
+          case Some((phase, path)) if isRebuiltFor(phase, episode) =>
+            // A crash between the move and the flip. The store is already whole; there is nothing to
+            // rebuild, only the flip left, and that is Host's job on completion.
+            logger.info(s"Rebuild of $storeId: store already in place at $path")
+            cleanupStaging()
+            CopyLayout.parseName(path.last) match
+              case Some((_, copyId)) => Future.successful(copyId)
+              case None => Future.failed(new IllegalStateException(s"Rebuild of $storeId: $path is no copy name"))
+          case Some((phase, path)) =>
+            // Not this rebuild's output (any other phase, or Rebuilt for an earlier Rebuilding episode).
+            // StoreRebuilds.startRebuild retires such a copy before it starts a rebuild, so this is only a defence:
+            // the copy is left alone and the rebuild fails
+            Future.failed(new IllegalStateException(
+              s"Rebuild of $storeId: $path ($phase) holds a store directory that no rebuild finished"))
+          case None =>
+            runPass()
       catch
         case err: Throwable => Future.failed(err)
 
@@ -352,7 +350,7 @@ class RebuildingStore(client: AspenClient,
   @volatile private var passStartMillis: Long = System.currentTimeMillis()
 
   /** One full pass: open (or reopen) the staging area, walk, retry failures, complete. */
-  private def runPass(): Future[Unit] =
+  private def runPass(): Future[UUID] =
     passStartMillis = System.currentTimeMillis()
     // The checkpoint is never deleted on restart -- reading it is what makes a restart a
     // resume.
@@ -407,8 +405,8 @@ class RebuildingStore(client: AspenClient,
              case Some(cause) => Future.failed(cause)
              case None => Future.unit
       _ <- retryFailures()
-      _ <- finish()
-    yield ()
+      copyId <- finish()
+    yield copyId
 
   /** Creates an empty staging store for a first pass, through the BackendOpener (StoreCreation: scratch under the
    *  device's `creating/`, then renamed to the staging path), after discarding whatever a pass that never
@@ -762,12 +760,13 @@ class RebuildingStore(client: AspenClient,
         checkpointBestEffort("after a failed loss record")
         Future.failed(new Exception(s"Rebuild of $storeId: failed to record its accepted losses: $t", t))
 
-  /** Flush, close, write the completion files, drop the checkpoint, move into place.
+  /** Flush, close, write the completion files (its episode's phase-param.rebuilt last), drop the checkpoint, rename
+   *  staging into rebuilt/ as a fresh copy id (T2), which the completion reports.
    *
    *  The flush and the file writes touch the disk as the walk's writes do, so a full device here is classified the
    *  same way (latchOutOfSpace): the operator alert, and a failed pass. The checkpoint is dropped only after the last
    *  write, so a pass failing on any of them resumes from it rather than walking the pool again. */
-  private def finish(): Future[Unit] =
+  private def finish(): Future[UUID] =
     val done =
       try
         backend.rebuildFlush()
@@ -779,8 +778,8 @@ class RebuildingStore(client: AspenClient,
         scala.util.Failure(err)
       case other => other
 
-  /** finish's work once the staging backend is closed */
-  private def completeStaging(): Unit =
+  /** finish's work once the staging backend is closed. Returns the fresh copy id the copy took in rebuilt/ */
+  private def completeStaging(): UUID =
     testingOnlyOnFinishClosed()
     // An abort latched while the backend closed (a fail-stop of the staging store's last I/O, a cancel)
     // means the staging copy must not become the live store: the pass fails with the checkpoint left in place
@@ -794,12 +793,25 @@ class RebuildingStore(client: AspenClient,
     StoreIncarnationFile.writeFresh(stagingPath)
     // Its whole transaction state: its first load drops whatever the device CRL holds under its id
     writeEmptyCrlState(stagingPath, storeId)
-    // Last write before the move: the directory is a finished rebuild, kept out of service until its flip commits
-    DurableFiles.write(stagingPath / RebuildCompleteMarkerFile, rebuildCompleteContent(episode))
+    // Last write before the move: the copy's episode, which its location in rebuilt/ reads (T2). Kept out of service
+    // there until its flip commits
+    val rebuilt = Phase.Rebuilt(rebuildCompleteContent(episode))
+    for
+      file <- CopyLayout.paramFile(rebuilt)
+      p <- CopyLayout.param(rebuilt)
+    do DurableFiles.write(stagingPath / file, p)
     // The checkpoint, and a temp file a crash caught between its write and its rename, are kept out of the
     // directory that is about to become a live store
     RebuildState.removeAll(stagingPath)
-    // Durable before the store is reported in place: a device shut down and moved after this
-    // must come back with the store at finalPath, or an adopting host refuses it.
+    // A fresh copy id, as every copy takes when it first enters a phase directory (P4)
+    val copyId = UUID.randomUUID()
+    val finalPath = CopyLayout.path(devicePath, storeId, Some(copyId), rebuilt)
+    val dir = finalPath / os.up
+    if !FileStat.exists(dir) then
+      os.makeDir.all(dir)
+      DurableFiles.syncDirectory(devicePath)
+    // Durable before the store is reported in place: a device shut down and moved after this must come back with the
+    // store in rebuilt/, or an adopting host refuses it. A failed rename leaves staging whole for the next pass
     DurableFiles.move(stagingPath, finalPath)
     logger.info(s"Rebuild of $storeId: store in place at $finalPath")
+    copyId

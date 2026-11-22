@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{DurableFiles, Host}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
+import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 
 import java.util.UUID
 import scala.concurrent.Future
@@ -84,7 +85,7 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     val tdir = scratch()
     val copy = tdir / "a" / "copy"
     os.makeDir.all(copy)
-    os.write(copy / RebuildingStore.RebuildCompleteMarkerFile, "")
+    os.write(copy / StoreTransfer.TransferredInMarkerFile, "")
     host.control.moves.syncDirectory = d => if d == copy then throw injected()
     host.control.moves.relocate(copy, tdir / "flat", fromFlat = false, toFlat = true, Phase.Live) shouldBe
       a[MoveResult.NotMoved]

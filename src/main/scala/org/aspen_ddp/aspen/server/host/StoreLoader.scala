@@ -123,8 +123,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 // retires this copy before writing a fresh one.
                 logger.warn(s"Not loading store $storeId: it is in lost/ and awaits a rebuild. $potentialStoreFile")
               case Phase.Outbound(_) =>
-                logger.info(s"Skipping load of offline store in outbound/ (a transfer out, or parked). StoreId " +
+                logger.info(s"Skipping load of offline store in outbound/ (a transfer out). StoreId " +
                             s"$storeId. $potentialStoreFile")
+              case Phase.Parked =>
+                // An AdoptOffline rebuild's copy: it goes Live once its entry is Active with no transfer device (T5)
+                logger.info(s"Skipping load of offline store in parked/. StoreId $storeId. $potentialStoreFile")
               case Phase.Arrived(_) =>
                 // Arrived, but the pool may still name the source. StoreTransfers.startIn resumes the
                 // metadata step for it, and reconcileDeviceState loads it if that step already committed.
@@ -132,8 +135,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                             s"StoreId $storeId. $potentialStoreFile")
               case Phase.Rebuilt(_) =>
                 // A finished rebuild whose flip may not have committed (a crash between the move and the flip,
-                // rebuild-process 5.7). The rebuild's completion removes the marker and loads it once the flip
-                // commits; for an entry already Active, the reconcile does (DeviceReconciler)
+                // rebuild-process 5.7). The rebuild's completion moves it Live and loads it once the flip commits;
+                // for an entry already Active, the reconcile does (DeviceReconciler)
                 logger.info("Skipping load of rebuilt store awaiting its device entry's flip out of Rebuilding. " +
                             s"StoreId $storeId. $potentialStoreFile")
               case _ => ()

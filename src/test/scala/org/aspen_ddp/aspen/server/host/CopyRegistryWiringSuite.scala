@@ -20,21 +20,22 @@ import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Success, Try}
 
-/** A rebuild that finishes at once, its copy placed at the store's path as RebuildingStore.finish places it: a store
- *  config and the rebuild-complete marker of its episode */
+/** A rebuild that finishes at once, its copy placed in rebuilt/ as RebuildingStore.finish places it: a store config
+ *  and its episode's phase-param.rebuilt */
 private class PlacingRebuildFactory(writeConfig: (os.Path, StoreId) => os.Path)(using ec: ExecutionContext)
     extends StoreRebuildFactory:
   def createRebuild(client: AspenClient, storeId: StoreId, storageDeviceId: StorageDeviceId, devicePath: os.Path,
-                    backends: BackendOpener, episode: Option[UUID]): StoreRebuild =
+                    backends: BackendOpener, episode: Option[UUID],
+                    existingCopy: () => Option[(Phase, os.Path)]): StoreRebuild =
     val id = storeId
-    // Placed off the control thread, as finish's move is, and completed right after it
+    // Placed off the control thread, as finish's move is, and completed right after it with the copy's id
     val placed = Future:
       writeConfig(devicePath, id)
-      CopyFixtures.markCopy(devicePath, id, Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)))
-      ()
+      CopyFixtures.copyIdOf(
+        CopyFixtures.markCopy(devicePath, id, Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode))))
     new StoreRebuild:
       val storeId: StoreId = id
-      def complete: Future[Unit] = placed
+      def complete: Future[UUID] = placed
       def cancel(): Unit = ()
 
 /** A device CRL whose deleteTransactions waits for the test once `hold` is set (an extraction's final deletion held
@@ -219,7 +220,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
   test("an Unread copy that later reads cleanly is refreshed at its load"):
     val hostRoot = newHostDir()
     val dev = device(hostRoot, deviceA)
-    val dir = CopyFixtures.placeCopy(dev, sid(0), Phase.Rebuilt("ep"))
+    val dir = CopyFixtures.placeCopy(dev, sid(0), Phase.Arrived("ep"))
     os.perms.set(dir, "rw-------")
     val (host, waiting) =
       try
@@ -235,7 +236,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     waiting should be(defined)
     phases(host, deviceA) should be(Map(sid(0) -> Phase.Unread))
     host.control.loader.tryLoadStore(local, dir)
-    phases(host, deviceA) should be(Map(sid(0) -> Phase.Rebuilt("ep")))
+    phases(host, deviceA) should be(Map(sid(0) -> Phase.Arrived("ep")))
     consistent(host)
 
   test("a copy placed after its device's load is learned when a load offers it"):
@@ -244,10 +245,10 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
     val local = loadedDevices(host)(deviceA)
-    val dir = CopyFixtures.placeCopy(dev, sid(0), Phase.Rebuilt("t"))
+    val dir = CopyFixtures.placeCopy(dev, sid(0), Phase.Arrived("t"))
     host.control.copyRegistry.verifyAgainstDisk().size should be(1)
     host.control.loader.tryLoadStore(local, dir)
-    phases(host, deviceA) should be(Map(sid(0) -> Phase.Rebuilt("t")))
+    phases(host, deviceA) should be(Map(sid(0) -> Phase.Arrived("t")))
     host.control.copyRegistry.takeLearned().size should be(1)
     host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
     host.control.copyRegistry.takeRegistryErrors() should be(Vector())
@@ -295,7 +296,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
 
   for (variant, deviceStatus, expected) <- List(
         ("Adopt", StorageDeviceState.DeviceStatus.Operational, Phase.Live),
-        ("AdoptOffline", StorageDeviceState.DeviceStatus.ShuttingDown, Phase.Outbound("")))
+        ("AdoptOffline", StorageDeviceState.DeviceStatus.ShuttingDown, Phase.Parked))
   do
     atest(s"a rebuild's finish registers Rebuilt and its flip moves the copy ($variant)"):
       given ExecutionContext = executionContext
@@ -424,12 +425,13 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       yield
         started should be(Success(()))
         outbound should be(a[Phase.Outbound])
-        // Reinstated to Live either way: the move into outbound/ stripped an Unconfirmed copy's rebuild-complete
-        // marker, and the Active entry says its flip committed (P8)
+        // Reinstated to Live either way: an Unconfirmed copy's episode is inert in outbound/, and the Active entry says
+        // its flip committed (P8)
         phases(host, source) should be(Map(shipped -> Phase.Live))
         consistent(host)
 
-  for (variant, extra) <- List(("arrived copy", Nil), ("shipped rebuilt copy", List(RebuildingStore.RebuildCompleteMarkerFile)))
+  // A shipped rebuilt copy carries its source's phase-param.rebuilt, inert here
+  for (variant, extra) <- List(("arrived copy", Nil), ("shipped rebuilt copy", CopyLayout.paramFile(Phase.Rebuilt("")).toList))
   do
     atest(s"a transfer in registers its promoted copy Arrived and its pool update makes it Live ($variant)"):
       given ExecutionContext = executionContext
@@ -1177,7 +1179,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
   // A rebuild's finish places its copy off the control thread, ahead of its completion's handler: a drain in between
   // finds a directory with no record. Only that copy is exempt, recognised by its disk signature (the Rebuilt phase
   // of the running rebuild's episode), and only until the handler records it. Any other copy at the rebuilding
-  // store's path meanwhile is reported, as is a copy placed by hand at another store's path, until a rescan
+  // store's path or in rebuilt/ meanwhile is reported, as is a copy placed by hand at another store's path, until a rescan
   // registers it
   atest("a rebuild's copy placed ahead of its completion's handler is exempt from the disk check until recorded"):
     given ExecutionContext = executionContext
@@ -1199,9 +1201,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       // another episode. Neither is the rebuild's own, so both are reported (checked without draining)
       wrong = writeStoreConfig(dev, sid(0))
       liveCopy = mismatches()
-      _ = CopyFixtures.markCopy(dev, sid(0), Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(Some(UUID.randomUUID()))))
+      other = CopyFixtures.markCopy(dev, sid(0), Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(Some(UUID.randomUUID()))))
       otherEpisode = mismatches()
-      _ = os.remove.all(wrong)
+      _ = os.remove.all(other)
       // Where finish places the copy, before its future completes
       _ = CopyFixtures.placeCopy(dev, sid(0), Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(Some(episode))))
       placingPhase = host.control.rebuilds.finishPlacing(deviceA, sid(0))
@@ -1212,7 +1214,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       _ = writeStoreConfig(dev, sid(1))
       handPlaced = mismatches()
       rescanned = host.testingOnlyRescan(deviceA)
-      _ = factory.created.head.promise.success(())
+      _ = factory.created.head.completeFromDisk()
       _ <- awaitRebuild(host, deviceA, sid(0))
       recordedAfterFinish = host.control.rebuilds.finishPlacing(deviceA, sid(0))
     yield

@@ -703,12 +703,14 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       _ = recorded(oldHost).fireShutdownWorkTimeouts()
       _ <- pumpUntil(!loadedDevices(oldHost).contains(deviceA))
       // The rebuild, past its last read, lands its store and finishes on the unloaded device.
-      d0Old = writeStoreConfig(oldDir, s0)
-      _ = RebuildingStore.writeEmptyCrlState(d0Old, s0)
-      _ = rebuilds.created.head.promise.success(())
-      _ <- pumpUntil(outbound(oldDir, s0))
+      flatOld = writeStoreConfig(oldDir, s0)
+      _ = RebuildingStore.writeEmptyCrlState(flatOld, s0)
+      _ = CopyFixtures.markCopy(oldDir, s0,
+            Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(rebuilds.created.head.episode)))
+      _ = rebuilds.created.head.completeFromDisk()
+      _ <- pumpUntil(CopyFixtures.phaseOf(oldDir, s0).contains(Phase.Parked))
       entryAfterRebuild <- state(deviceA).map(_.stores(s0))
-      parked = outbound(oldDir, s0)
+      parked = CopyFixtures.phaseOf(oldDir, s0).contains(Phase.Parked)
       crlWritten = CopyFixtures.copyPath(oldDir, s0).exists(p => os.exists(Backend.crlSaveFile(p)))
       // Carried to the new host.
       newRoot = newHostDir()
@@ -725,7 +727,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       st.status should be(DeviceStatus.Operational)
       st.hostId should be(HostId.BootstrapHostId)
       st.stores(s0).status should be(StoreStatus.Active)
-      outbound(newDir, s0) should be(false)
+      CopyFixtures.phaseOf(newDir, s0) should be(Some(Phase.Live))
       recorded(host).storeLoadAttempts.map(_._2) should contain(CopyFixtures.copyPath(newDir, s0).get)
 
   private val destHostId = HostId(UUID.fromString("0a0a0a0a-0000-0000-0000-000000000002"))

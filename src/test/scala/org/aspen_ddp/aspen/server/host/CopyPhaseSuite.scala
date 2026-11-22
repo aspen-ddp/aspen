@@ -2,7 +2,6 @@ package org.aspen_ddp.aspen.server.host
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -10,7 +9,7 @@ import org.scalatest.matchers.should.Matchers
 class CopyPhaseSuite extends AnyFunSuite with Matchers:
 
   private val TI = StoreTransfer.TransferredInMarkerFile
-  private val RC = RebuildingStore.RebuildCompleteMarkerFile
+  private val RC = "rebuild-complete"
 
   private def withStore(markers: (String, String)*)(f: os.Path => Unit): Unit =
     val dir = os.temp.dir()
@@ -26,28 +25,25 @@ class CopyPhaseSuite extends AnyFunSuite with Matchers:
       CopyPhase.read(dir) should be(Phase.Live)
       CopyPhase.known(dir) should be(Some(Phase.Live))
 
-  test("each single marker maps to its phase with its content"):
-    val u = UUID.randomUUID()
+  test("the transferred-in marker maps to Arrived with its content"):
     withStore(TI -> " t1\n")(dir => CopyPhase.read(dir) should be(Phase.Arrived("t1")))
-    withStore(RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Rebuilt(u.toString)))
-    withStore(RC -> "")(dir => CopyPhase.read(dir) should be(Phase.Rebuilt("")))
+    withStore(TI -> "")(dir => CopyPhase.read(dir) should be(Phase.Arrived("")))
 
   test("content is kept verbatim: garbage is distinct from empty"):
     withStore(TI -> " xyz\n")(dir => CopyPhase.read(dir) should be(Phase.Arrived("xyz")))
-    withStore(RC -> "xyz")(dir => CopyPhase.read(dir) should be(Phase.Rebuilt("xyz")))
-    CopyPhase.read(os.temp.dir()) should not be(Phase.Rebuilt("xyz"))
+    Phase.Arrived("xyz") should not be(Phase.Arrived(""))
     Phase.Rebuilt("xyz") should not be(Phase.Rebuilt(""))
     Phase.Outbound("xyz") should not be(Phase.Outbound(""))
 
-  test("precedence is TI > RC, and Lost and Outbound are never read from markers"):
+  test("Lost, Outbound, Rebuilt and Parked are never read from markers"):
     val u = UUID.randomUUID()
     withStore("rebuild-required" -> "")(dir => CopyPhase.read(dir) should be(Phase.Live))
     withStore("transferring-out" -> "t")(dir => CopyPhase.read(dir) should be(Phase.Live))
+    withStore(RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Live))
     withStore(TI -> "t1", RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Arrived("t1")))
-    withStore("transferring-out" -> "", RC -> u.toString)(dir => CopyPhase.read(dir) should be(Phase.Rebuilt(u.toString)))
 
   test("a failed stat throws and known answers None"):
-    withStore(RC -> ""): dir =>
+    withStore(TI -> ""): dir =>
       os.perms.set(dir, "rw-------")
       an[java.io.IOException] should be thrownBy CopyPhase.read(dir)
       CopyPhase.known(dir) should be(None)

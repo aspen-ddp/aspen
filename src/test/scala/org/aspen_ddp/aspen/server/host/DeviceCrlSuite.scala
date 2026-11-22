@@ -837,7 +837,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       def createCRL(devicePath: os.Path, config: StorageDeviceConfig, dir: os.Path): Unit =
         inner.createCRL(devicePath, config, dir)
 
-  /** A finished rebuild of `storeId` carrying the rebuild-complete marker of `episode`, on a device whose entry for
+  /** A finished rebuild of `storeId` in rebuilt/ for `episode`, on a device whose entry for
    *  it is `entry` and whose CRL is lost at the host's start. Returns the store's directory, the host and its
    *  recorded rebuilds once the host's first check of the device has settled, with the device's directory first. */
   private def finishedRebuildOnLostCrl(entry: StorageDeviceState.StoreEntry,
@@ -888,7 +888,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       retired = pendingDeletes(storeDir)
       _ = rebuilds.created.map(r => (r.storeId, r.episode)).toList should be(List((storeId, Some(episode))))
       // The copy is the finished rebuild: start() takes it for done
-      _ = rebuilds.created.head.promise.success(())
+      _ = rebuilds.created.head.completeFromDisk()
       _ <- pumpWithTx(host, host.control.router.loaded.contains(storeId))
       served = host.control.router.loaded.get(storeId).map(_.backend.path)
       _ <- host.control.router.loaded.get(storeId).fold(Future.unit)(_.backend.close())
@@ -1167,7 +1167,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       leftInCrl = held(host.control.devices.devices(deviceA).crl, storeId)
       _ <- writeRocksStore(deviceDir, storeId)
       _ = landRebuiltCopy(deviceDir, rebuilds.created.head.episode)
-      _ = rebuilds.created.head.promise.success(())
+      _ = rebuilds.created.head.completeFromDisk()
       _ <- pumpWithTx(host, host.control.router.loaded.contains(storeId))
     yield (discarded, leftInCrl)
 
@@ -1259,7 +1259,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
       _ <- writeRocksStore(deviceDir, storeId)
       _ = landRebuiltCopy(deviceDir, Some(episode))
-      _ = rebuilds.created.head.promise.success(())
+      _ = rebuilds.created.head.completeFromDisk()
       _ <- pumpWithTx(restarted, restarted.control.router.loaded.contains(storeId) &&
                                  !os.exists(Backend.crlSaveFile(storeDir)))
       rebuilt = restarted.control.router.loaded(storeId)
@@ -1304,7 +1304,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       keptWhileRebuilding = copies.forall(os.exists(_))
       _ <- writeRocksStore(deviceDir, storeId)
       _ = landRebuiltCopy(deviceDir, rebuilds.created.head.episode)
-      _ = rebuilds.created.head.promise.success(())
+      _ = rebuilds.created.head.completeFromDisk()
       _ <- pumpWithTx(restarted, restarted.control.router.loaded.contains(storeId) && copies.forall(!os.exists(_)))
       deletedOnceActive = copies.forall(!os.exists(_))
       _ <- restarted.control.router.loaded(storeId).backend.close()

@@ -13,13 +13,14 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
 
   private val Live = Phase.Live
   private val phases: List[Phase] = List(Phase.Live, Phase.Arrived("a"), Phase.Arrived("b"), Phase.Outbound("a"),
-    Phase.Outbound("b"), Phase.Outbound(""), Phase.Rebuilt("e"), Phase.Rebuilt(""), Phase.Lost, Phase.Unread)
+    Phase.Outbound("b"), Phase.Outbound(""), Phase.Rebuilt("e"), Phase.Rebuilt(""), Phase.Parked, Phase.Lost, Phase.Unread)
 
   private def kind(p: Phase): String = p match
     case Phase.Live => "Live"
     case Phase.Arrived(_) => "Arrived"
     case Phase.Outbound(_) => "Outbound"
     case Phase.Rebuilt(_) => "Rebuilt"
+    case Phase.Parked => "Parked"
     case Phase.Lost => "Lost"
     case Phase.Unread => "Unread"
 
@@ -28,13 +29,12 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
       "Live" -> "Lost", "Live" -> "Outbound",
       // Only Live, Rebuilt and parked copies are T6 sources, and a reinstated one is Live (P8, P10)
       "Outbound" -> "Live", "Outbound" -> "Lost",
-      "Arrived" -> "Rebuilt", "Arrived" -> "Live", "Arrived" -> "Lost",
-      "Rebuilt" -> "Live", "Rebuilt" -> "Outbound", "Rebuilt" -> "Lost")
+      "Arrived" -> "Live", "Arrived" -> "Lost",
+      "Rebuilt" -> "Live", "Rebuilt" -> "Parked", "Rebuilt" -> "Outbound", "Rebuilt" -> "Lost",
+      "Parked" -> "Live", "Parked" -> "Outbound", "Parked" -> "Lost")
     kind(from) match
       case "Unread" => true
       case "Lost" => false
-      // A parked copy (Outbound(""), AdoptOffline) transferred out: Outbound("") -> Outbound(tid), tid non-empty (R14)
-      case _ if from == Phase.Outbound("") && kind(to) == "Outbound" => to != Phase.Outbound("")
       case f => kind(to) == "Unread" || legal.contains(f -> kind(to))
 
   private val retry = LoadRetry(null.asInstanceOf[LocalStorageDeviceState], os.root / "x", 1, 1)
@@ -98,8 +98,12 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
     Transitions.phaseLegal(Phase.Outbound("a"), Phase.Outbound("")) should be(false)
     Transitions.phaseLegal(Phase.Outbound(""), Phase.Outbound("")) should be(false)
 
-  test("a parked copy (Outbound(\"\")) may be transferred out (R14)"):
-    Transitions.phaseLegal(Phase.Outbound(""), Phase.Outbound("t")) should be(true)
+  test("a parked copy may be transferred out, rebuilt or parked copies never go Arrived, and Outbound(\"\") is no park"):
+    Transitions.phaseLegal(Phase.Parked, Phase.Outbound("t")) should be(true)
+    Transitions.phaseLegal(Phase.Rebuilt("e"), Phase.Parked) should be(true)
+    Transitions.phaseLegal(Phase.Outbound(""), Phase.Outbound("t")) should be(false)
+    Transitions.phaseLegal(Phase.Arrived("t"), Phase.Rebuilt("e")) should be(false)
+    Transitions.phaseLegal(Phase.Parked, Phase.Rebuilt("e")) should be(false)
 
   // Retiring is only ever entered from Idle while Lost, so it is no starting point under another phase
   private def reachable(phase: Phase, from: Activity): Boolean = from != Activity.Retiring || phase == Phase.Lost

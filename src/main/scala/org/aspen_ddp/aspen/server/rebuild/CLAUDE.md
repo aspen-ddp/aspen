@@ -1,5 +1,5 @@
 ### Store rebuilds
-- Files: `RebuildingStore.scala` (the pass: walk, restore, retry, finish; the on-disk marker files), `PendingAllocationSweep.scala` (the peer query for allocations held unfinalized and the direct restore of those objects, reaching the pass through callbacks), `RebuildState.scala` (checkpoint), `StoreRebuild.scala`. `RebuildingStore.missMark` builds the ErrorTree mark (missed at `HLCTimestamp.Zero`) every rebuild record uses
+- Files: `RebuildingStore.scala` (the pass: walk, restore, retry, finish; the files a rebuilt copy carries), `PendingAllocationSweep.scala` (the peer query for allocations held unfinalized and the direct restore of those objects, reaching the pass through callbacks), `RebuildState.scala` (checkpoint), `StoreRebuild.scala`. `RebuildingStore.missMark` builds the ErrorTree mark (missed at `HLCTimestamp.Zero`) every rebuild record uses
 - A rebuilt store lost its Paxos acceptor state. `RebuildingStore.finish` writes `acceptor-since` (finish time plus
   `AcceptorSinceMargin`, 10 s) into its directory; how the Frontend enforces it: `server/store/CLAUDE.md`. The
   margin covers `Frontend.MaxStartLead` (2 s) plus host-to-host clock skew; client clocks do not enter into it.
@@ -13,8 +13,8 @@
   old incarnation voted for, and guards them against growth until repaired (Inherited growth, same guide); the
   rebuild itself does nothing for it
 - `finish` also writes a fresh `incarnation` file (`StoreIncarnationFile.writeFresh`) into staging, overwriting any
-  present, after `acceptor-since` and before the marker: a rebuilt store is a new incarnation
-- `finish` also writes an empty `crl_save.log` (`RebuildingStore.writeEmptyCrlState`) before the marker: the rebuilt
+  present, after `acceptor-since` and before `phase-param.rebuilt`: a rebuilt store is a new incarnation
+- `finish` also writes an empty `crl_save.log` (`RebuildingStore.writeEmptyCrlState`) before `phase-param.rebuilt`: the rebuilt
   store's whole transaction state. Its first load, by any path, is then a save-file load, which drops whatever the
   device CRL holds under its id (an earlier copy's leftovers: one removed without a retire, or a fail-stopped copy's
   close saving behind its retire's drop) before loading it (`server/host/CLAUDE.md`). `keepRebuiltStoreOffline`
@@ -24,15 +24,20 @@
   runs for the episode the reconcile read (`StoreRebuildFactory.createRebuild`'s `episode`). The checkpoint carries
   it (`RebuildState.episode`); `runPass` treats one of another episode as no checkpoint, so staging is discarded
   and the walk starts over. `lossAccepted` honours `acceptLoss` only on an entry of its episode
-- Completion identity (rebuild-process 2.2, 5.6): `finish` writes a durable `rebuild-complete` marker in staging just
-  before the move; its content is the episode (empty for None). A store directory carrying it is a finished rebuild
-  awaiting its flip: `start()` takes the final path for done only with the marker of its own episode
-  (`RebuildingStore.isRebuildCompleteFor`), `StoreLoader.tryLoadStore` leaves it offline, and `StoreRebuilds` removes it
-  once the flip commits (before the load; for `AdoptOffline` the move into `outbound/`, `Outbound("")`, strips it,
-  stage 2 R-P2); the reconcile's Completed
-  Rebuilds pass removes it for an Active entry after a crash. A directory at a Rebuilding store's path without this
-  episode's marker (a copy finished for an earlier episode included) is retired as a lost copy
-  (`StoreRebuilds.retireForeignCopy`: moved to `lost/`, then retired into `pending-delete/`, rebuilt). Such a copy, or
+- Completion identity (rebuild-process 2.2, 5.6): `finish` writes the episode (empty for None) durably as
+  `phase-param.rebuilt` in staging, the last write, then renames staging into `<device>/rebuilt/` under a fresh copy
+  id (T2; `rebuild-complete` is never written), and `complete` reports that id (`StoreRebuild.complete:
+  Future[UUID]`), with which the host records the copy. A copy in `rebuilt/` is a finished rebuild awaiting its
+  flip: `start()` asks its `existingCopy` lookup (`StoreRebuildFactory.createRebuild`'s; `copyOnDisk`, over
+  `CopyLayout.list`, since the rebuild must not read the control thread's registry) and takes a copy for done only
+  when it is Rebuilt for its own episode (`RebuildingStore.isRebuiltFor`), failing on any other copy of the store
+  outside `pending-delete/`. `StoreLoader.tryLoadStore` leaves a Rebuilt copy offline, and `StoreRebuilds` moves it
+  once the flip commits: `Adopt` to Live before the load (`bringRebuiltLive`, T3), `AdoptOffline` to `parked/` in one
+  move (`keepRebuiltStoreOffline`, T4), `Discard` deletes it rename-first (T13). The reconcile's Completed Rebuilds
+  pass moves an offline Rebuilt copy of an Active entry Live after a crash. A copy of a Rebuilding store that is not
+  this episode's Rebuilt copy (a copy finished for an earlier episode included), told by its record's phase, is
+  retired as a lost copy (`StoreRebuilds.retireForeignCopy`: moved to `lost/`, then retired into `pending-delete/`,
+  rebuilt). Such a copy, or
   one already in `lost/`, may have served since the first pass began, so the store's staging checkpoint is first removed durably
   (`dropStagingCheckpoint`) and the next pass is a first pass: a resume would leave the walked objects' updates stale
 - Pending allocations (rebuild-process 5.3): before each pass's walk, `queryPeers` asks the pool's other stores
@@ -90,7 +95,7 @@
   Work went with the device's records) blocks a second rebuild of the store until it releases its slot. Slots (`maxConcurrentRebuilds`) count running rebuilds by handle and discards by
   work; a discard hands its slot to the rebuild with no gap (`startRebuild(handoff = true)`: DiscardingLost goes
   straight to Running, the discard's own slot not counted), and a rebuild that does not start leaves the work Queued.
-  An outcome that ends the work ends it at the slot's release, after the outcome's steps (an Adopt's marker removal
+  An outcome that ends the work ends it at the slot's release, after the outcome's steps (an Adopt's move to Live
   and load), so the store stays Rebuilding-silent throughout
 - Silence (rebuild-process 6.2): `StoreRebuilds.startRebuild` registers the store's Rebuild work on its device at the
   first reconcile that sees its Rebuilding entry, and the work keeps the store silent

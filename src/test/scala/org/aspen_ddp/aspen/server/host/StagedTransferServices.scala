@@ -39,10 +39,13 @@ class StagedTransferService extends StoreTransferService:
    *  extraction would have: `<dir>/<storeId.directoryName>`, still carrying the source's
    *  phase-param.outbound and the CRL save file its close wrote, for Host's promotion step to
    *  move into place. `crlValid = false` leaves a truncated save file instead. `extraFiles` are written into the
-   *  copy too, as files the source's copy carried (a rebuild-complete marker, say). */
-  def finishTransferIn(storeId: StoreId, crlValid: Boolean = true, extraFiles: List[String] = Nil): Unit =
+   *  copy too, as files the source's copy carried (a rebuilt copy's phase-param.rebuilt, say). */
+  def finishTransferIn(storeId: StoreId, crlValid: Boolean = true, extraFiles: List[String] = Nil,
+                       prepare: os.Path => Unit = _ => ()): Unit =
     latest(storeId).foreach: (sid, _, dir, p) =>
       val staged = dir / sid.directoryName
+      // What the shipped copy held besides the files below (a real store, say), made at the staged path first
+      prepare(staged)
       os.makeDir.all(staged)
       os.write.over(staged / CopyLayout.paramFile(Phase.Outbound("")).get, "")
       extraFiles.foreach(f => os.write.over(staged / f, ""))

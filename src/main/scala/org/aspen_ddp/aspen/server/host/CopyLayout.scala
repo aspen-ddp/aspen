@@ -17,8 +17,8 @@ import scala.util.Try
  *  itself: it asks here, or the registry (HostCopies.pathOf).
  *
  *  Stage 2 converts the phases one task at a time; so far Outbound (`outbound/`, its transfer id in
- *  `phase-param.outbound`; a parked copy is `Outbound("")` until Parked is converted), Lost (`lost/`) and Retired
- *  (`pending-delete/`) are directories. */
+ *  `phase-param.outbound`), Rebuilt (`rebuilt/`, its episode in `phase-param.rebuilt`), Parked (`parked/`), Lost
+ *  (`lost/`) and Retired (`pending-delete/`) are directories. */
 object CopyLayout:
   /** The directory of Lost copies: their CRL state is gone or unusable, and they await their retire */
   val LostDirectory = "lost"
@@ -26,10 +26,18 @@ object CopyLayout:
   /** The directory of Outbound copies: closed for a transfer out, their state in crl_save.log (T6) */
   val OutboundDirectory = "outbound"
 
+  /** The directory of Rebuilt copies: finished rebuilds awaiting their entry's flip out of Rebuilding (T2) */
+  val RebuiltDirectory = "rebuilt"
+
+  /** The directory of Parked copies: complete copies whose entry is Offline (an AdoptOffline rebuild's, T4) */
+  val ParkedDirectory = "parked"
+
   /** The converted phase directories, by name, each with the phase of a child copy there (reading that phase's own
    *  parameter file, readParam, for a phase that carries one). Each task that converts a phase adds its row */
   private val phaseDirectories: List[(String, os.Path => Phase)] = List(
     OutboundDirectory -> (p => Phase.Outbound(readParam(p, Phase.Outbound("")))),
+    RebuiltDirectory -> (p => Phase.Rebuilt(readParam(p, Phase.Rebuilt("")))),
+    ParkedDirectory -> (_ => Phase.Parked),
     LostDirectory -> (_ => Phase.Lost),
     RebuildingStore.PendingDeleteDirectory -> (_ => Phase.Retired))
 
@@ -39,6 +47,8 @@ object CopyLayout:
   /** The directory of `phase` under the device root, None while the phase is still a flat marker copy */
   def dirOf(phase: Phase): Option[String] = phase match
     case Phase.Outbound(_) => Some(OutboundDirectory)
+    case Phase.Rebuilt(_) => Some(RebuiltDirectory)
+    case Phase.Parked => Some(ParkedDirectory)
     case Phase.Lost => Some(LostDirectory)
     case Phase.Retired => Some(RebuildingStore.PendingDeleteDirectory)
     case _ => None

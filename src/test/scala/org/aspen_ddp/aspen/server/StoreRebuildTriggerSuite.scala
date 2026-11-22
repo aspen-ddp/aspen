@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.server.host.{CopyFixtures, Phase}
+import org.aspen_ddp.aspen.server.host.{CopyFixtures, CopyLayout, Phase}
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
@@ -25,16 +25,21 @@ private class RecordedRebuild(val storeId: StoreId,
                               val storageDeviceId: StorageDeviceId,
                               val episode: Option[UUID] = None,
                               val devicePath: Option[os.Path] = None) extends StoreRebuild:
-  val promise: Promise[Unit] = Promise()
-  def complete: Future[Unit] = promise.future
+  val promise: Promise[UUID] = Promise()
+  def complete: Future[UUID] = promise.future
   @volatile var cancelled: Boolean = false
   def cancel(): Unit = cancelled = true
 
-  /** Completes it as RebuildingStore.finish does: its copy placed at the store's path first, a store config and the
-   *  rebuild-complete marker of its episode */
+  /** Completes it as RebuildingStore.finish does: its copy placed in rebuilt/ first, a store config and its
+   *  episode's phase-param.rebuilt, then the completion with the copy's id */
   def placeAndComplete(): Unit =
-    CopyFixtures.placeCopy(devicePath.get, storeId, Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)))
-    promise.success(())
+    val placed = CopyFixtures.placeCopy(devicePath.get, storeId,
+      Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)))
+    promise.success(CopyFixtures.copyIdOf(placed))
+
+  /** Completes it with the id of the copy of its store on its device, as a test placed it (a fresh id if none) */
+  def completeFromDisk(): Unit =
+    promise.success(CopyFixtures.copyIdOn(devicePath.get, storeId))
 
 private class RecordingRebuildFactory extends StoreRebuildFactory:
   val created: mutable.ListBuffer[RecordedRebuild] = mutable.ListBuffer()
@@ -44,7 +49,8 @@ private class RecordingRebuildFactory extends StoreRebuildFactory:
                     storageDeviceId: StorageDeviceId,
                     devicePath: os.Path,
                     backends: BackendOpener,
-                    episode: Option[UUID]): StoreRebuild =
+                    episode: Option[UUID],
+                    existingCopy: () => Option[(Phase, os.Path)]): StoreRebuild =
     val r = new RecordedRebuild(storeId, storageDeviceId, episode, Some(devicePath))
     synchronized:
       created += r
@@ -362,9 +368,9 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       readState = deviceState(realDeviceId, Map(rebuilding(rebuilt)))
       _ = armed.success(readState)
       _ <- yieldUntil(factory.created.nonEmpty)
-      // As finish leaves the copy: in place, carrying its rebuild-complete marker
+      // As finish leaves the copy: in rebuilt/, with its episode
       _ = CopyFixtures.placeCopy(deviceDir, rebuilt, Phase.Rebuilt(""), configured = false)
-      _ = factory.created.head.promise.success(())
+      _ = factory.created.head.completeFromDisk()
       _ <- waitForTransactionsToComplete()
       _ <- yieldUntil(recorded(host).loadStoreByIdRequests.contains((realDeviceId, rebuilt)))
       // Verify the entry was flipped to Active
@@ -391,16 +397,19 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       moved.head.onlineTimestamp should be > offline.head.timestamp
 
   // RB-W12: a store rebuilt on a device that never held it has a copy there only once the rebuild places it, and that
-  // copy must stay offline on the device, or a failed marker removal would leave it unserved, with its entry Active,
+  // copy must stay offline on the device, or a failed move to Live would leave it unserved, with its entry Active,
   // until a restart
-  atest("a flipped rebuild whose rebuild-complete marker cannot be removed stays offline, and a later check loads it"):
+  atest("a flipped rebuild whose move to live fails stays offline, and a later check loads it"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
     val rebuilt = StoreId(PoolId.BootstrapPoolId, 0)
-    val storeDir = deviceDir / rebuilt.directoryName
-    val marker = storeDir / RebuildingStore.RebuildCompleteMarkerFile
+    val storeDir = CopyLayout.path(deviceDir, rebuilt, None, Phase.Live)
+    var failRename = true
+    host.control.moves.rename = (from, to) =>
+      if failRename then throw new java.io.IOException("injected rename failure")
+      else org.aspen_ddp.aspen.server.DurableFiles.atomicRename(from, to)
 
     for
       deviceSetId <- client.createStorageDeviceSet("test-set", 0, None)
@@ -422,10 +431,8 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = host.control.reconciler.checkAll()
       _ = armed.success(deviceState(realDeviceId, Map(rebuilding(rebuilt))))
       _ <- yieldUntil(factory.created.nonEmpty)
-      // The marker's removal fails: a non-empty directory in its place
-      _ = os.makeDir.all(marker)
-      _ = os.write.over(marker / "held", "")
-      _ = factory.created.head.promise.success(())
+      _ = CopyFixtures.placeCopy(deviceDir, rebuilt, Phase.Rebuilt(""), configured = false)
+      _ = factory.created.head.completeFromDisk()
       _ <- waitForTransactionsToComplete()
       _ <- yieldUntil(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
       _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(realDeviceId))
@@ -433,19 +440,20 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = recorded(host).loadStoreByIdRequests should not contain ((realDeviceId, rebuilt))
       _ = offlineCopies(host, local) should contain(rebuilt)
       _ = host.control.router.silentStores should contain(rebuilt)
-      // The removal can succeed now: the next check of the device removes the marker and loads the store
-      _ = os.remove.all(marker)
-      _ = os.write.over(marker, "")
+      _ = CopyFixtures.phaseOf(deviceDir, rebuilt) should be(Some(Phase.Rebuilt("")))
+      // The move can succeed now: the next check of the device moves the copy Live and loads it
+      _ = failRename = false
       before = recorded(host).storeLoadAttempts.size
       _ = host.control.reconciler.checkAll()
       _ <- yieldUntil(recorded(host).storeLoadAttempts.size > before)
     yield
-      os.exists(marker) should be(false)
+      CopyFixtures.phaseOf(deviceDir, rebuilt) should be(Some(Phase.Live))
       recorded(host).storeLoadAttempts.toList.drop(before) should contain((realDeviceId, storeDir))
 
-  // RB-W14: the unlink succeeds but the directory sync fails, so no marker is left for the Completed Rebuilds pass to
-  // select the store by. The copy is left unsynced (CopyMarkers), and the next check forces its directory and loads it
-  atest("a flipped rebuild whose marker unlink succeeded but whose directory sync failed is loaded by a later check"):
+  // RB-W14: the move to Live renames but a directory sync fails, so the copy is no longer Rebuilt for the Completed
+  // Rebuilds pass to select it by. The copy is left Live and unsynced (CopyMoves), and the next check forces it and
+  // loads it
+  atest("a flipped rebuild whose move to live landed but whose directory sync failed is loaded by a later check"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
@@ -477,13 +485,14 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = host.control.reconciler.checkAll()
       _ = armed.success(deviceState(realDeviceId, Map(rebuilding(rebuilt))))
       _ <- yieldUntil(factory.created.nonEmpty)
-      storeDir = CopyFixtures.placeCopy(deviceDir, rebuilt, Phase.Rebuilt(""), configured = false)
-      _ = factory.created.head.promise.success(())
+      _ = CopyFixtures.placeCopy(deviceDir, rebuilt, Phase.Rebuilt(""), configured = false)
+      storeDir = CopyLayout.path(deviceDir, rebuilt, None, Phase.Live)
+      _ = factory.created.head.completeFromDisk()
       _ <- waitForTransactionsToComplete()
       _ <- yieldUntil(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
       _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(realDeviceId))
       _ = recorded(host).rebuildOutcomes((realDeviceId, rebuilt)) should be(RebuildOutcome.Adopt)
-      // Unlinked, but not durably: kept offline, its removal pending
+      // Moved, but not durably: kept offline, its sync pending
       _ = CopyFixtures.phaseOf(deviceDir, rebuilt) should be(Some(Phase.Live))
       _ = recorded(host).loadStoreByIdRequests should not contain ((realDeviceId, rebuilt))
       _ = offlineCopies(host, local) should contain(rebuilt)
@@ -748,11 +757,12 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     // current episode stays where it is, for the rebuild to flip
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    val factory = new RecordingRebuildFactory
-    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 2)
     val current = UUID.randomUUID()
+    // Placed before the host's load, which registers them: a copy in rebuilt/ is known by its record
     CopyFixtures.placeCopy(deviceDir, storeN(0), Phase.Rebuilt(UUID.randomUUID().toString), configured = false)
     CopyFixtures.placeCopy(deviceDir, storeN(1), Phase.Rebuilt(current.toString), configured = false)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 2)
 
     val armed = recorded(host).armLookup(deviceA)
     host.control.reconciler.checkAll()
@@ -769,39 +779,38 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       os.exists(pending.head / RebuildingStore.LostCrlStateFile) should be(true)
       CopyFixtures.phaseOf(deviceDir, storeN(1)) should be(Some(Phase.Rebuilt(current.toString)))
 
-  atest("a finished copy whose rebuild-complete marker cannot be read is kept, and its rebuild waits (RB-W22)"):
-    // Taken for a foreign copy it would be retired, and the store rebuilt from scratch
+  atest("a finished copy whose phase-param cannot be read is kept, its device unloaded, and its rebuild waits (RB-W22)"):
+    // Taken for a foreign copy it would be retired, and the store rebuilt from scratch. An unreadable phase-param
+    // leaves the device unloaded until a scan can read it (P6)
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val current = UUID.randomUUID()
+    val copy = CopyFixtures.placeCopy(deviceDir, storeN(0), Phase.Rebuilt(current.toString), configured = false)
+    val param = copy / CopyLayout.paramFile(Phase.Rebuilt("")).get
+    // Its stat succeeds and its open fails (EACCES)
+    os.perms.set(param, "---------")
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
-    val current = UUID.randomUUID()
-    val storeDir = deviceDir / storeN(0).directoryName
-    os.makeDir.all(storeDir)
-    val marker = storeDir / RebuildingStore.RebuildCompleteMarkerFile
-    os.write.over(marker, current.toString)
-    // Its stat succeeds and its open fails (EACCES)
-    os.perms.set(marker, "---------")
 
     def check(): Unit =
       val armed = recorded(host).armLookup(deviceA)
       host.control.reconciler.checkAll()
       armed.success(deviceState(deviceA, Map(rebuildingIn(storeN(0), current))))
 
+    val loadedWhileUnreadable = loadedDevices(host).contains(deviceA)
+    val createdWhileUnreadable = factory.created.size
+    os.perms.set(param, "rw-------")
+    host.control.discovery.checkForNewDevices()
     check()
     for
-      _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
-      createdWhileUnreadable = factory.created.size
-      pendingWhileUnreadable = os.exists(deviceDir / RebuildingStore.PendingDeleteDirectory) &&
-                               os.list(deviceDir / RebuildingStore.PendingDeleteDirectory).nonEmpty
-      _ = os.perms.set(marker, "rw-------")
-      _ = check()
       _ <- yieldUntil(factory.created.nonEmpty)
     yield
+      loadedWhileUnreadable should be(false)
       createdWhileUnreadable should be(0)
-      pendingWhileUnreadable should be(false)
+      loadedDevices(host).contains(deviceA) should be(true)
       factory.created.map(_.storeId).toList should be(List(storeN(0)))
-      os.read(marker) should be(current.toString)
+      CopyFixtures.phaseOf(deviceDir, storeN(0)) should be(Some(Phase.Rebuilt(current.toString)))
+      CopyFixtures.retiredCopies(deviceDir, storeN(0)) should be(Nil)
 
   atest("a rebuild that finishes after its entry moved to a new Rebuilding episode is not promoted (RB-W3)"):
     val hostRoot = newHostDir()
@@ -837,7 +846,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       // Re-placed away and back before any check of this device saw it
       _ <- setEntry(realDeviceId, current)
       _ = CopyFixtures.placeCopy(deviceDir, rebuilt, Phase.Rebuilt(earlier.toString), configured = false)
-      _ = factory.created.head.promise.success(())
+      _ = factory.created.head.completeFromDisk()
       _ <- waitForTransactionsToComplete()
       _ <- yieldUntil(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
       finalState <- client.getStorageDeviceState(realDeviceId)
@@ -894,7 +903,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       // The check the Superseded outcome asks for finds the entry re-placed to another device, before the current
       // episode's rebuild could start here
       _ = recorded(host).armLookup(realDeviceId).success(deviceState(realDeviceId, Map()))
-      _ = factory.created.head.promise.success(())
+      _ = factory.created.head.completeFromDisk()
       _ <- waitForTransactionsToComplete()
       _ <- awaitLoudly("the flip's outcome")(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
       // Retired into pending-delete, its record gone with it
@@ -929,7 +938,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     for
       _ <- awaitLoudly("the rebuild to start")(factory.created.size == 1)
       _ = CopyFixtures.placeCopy(deviceDir, storeN(0), Phase.Rebuilt(""), configured = false)
-      _ = factory.created.head.promise.success(())
+      _ = factory.created.head.completeFromDisk()
       _ <- awaitLoudly("the flip's failure and its backoff")(
              scheduler(host).pending.contains(Host.RebuildRetryInitialDelay))
       // Re-placed during the backoff: its retry's check finds no entry here
@@ -967,7 +976,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ <- awaitLoudly("the rebuild to start")(factory.created.size == 1)
       _ = installServedElsewhere(host, storeN(0))
       _ = CopyFixtures.placeCopy(deviceDir, storeN(0), Phase.Rebuilt(""), configured = false)
-      _ = factory.created.head.promise.success(())
+      _ = factory.created.head.completeFromDisk()
       // The finished copy registered, its flip failed for good and its backoff scheduled
       _ <- awaitLoudly("the flip's failure and its backoff")(
              host.control.copyRegistry.heldOffline(local, storeN(0)) &&
@@ -1076,7 +1085,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       readState = deviceState(realDeviceId, Map(rebuilding(storeN(0))))
       _ = armed.success(readState)
       _ <- yieldUntil(factory.created.nonEmpty)
-      _ = factory.created.head.promise.success(())
+      _ = factory.created.head.completeFromDisk()
       _ <- waitForTransactionsToComplete()
       _ <- yieldUntil(CopyFixtures.copyPath(deviceDir, storeN(0)).isEmpty, 200)
     yield
@@ -1118,7 +1127,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ <- yieldUntil(factory.created.size == 1)
       // Arm a second lookup for syntheticB before completing the first rebuild
       second = recorded(host).armLookup(syntheticB)
-      _ = factory.created.head.promise.success(())
+      _ = factory.created.head.completeFromDisk()
       _ <- waitForTransactionsToComplete()
       // The flip transaction will fail with NoSuchElementException (syntheticA not in tree)
       // which should be logged, and the slot should be released so syntheticB's rebuild can start

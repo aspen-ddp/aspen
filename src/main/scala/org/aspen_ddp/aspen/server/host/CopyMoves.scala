@@ -153,29 +153,13 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
    *  markers stripped when leaving a phase directory for the flat path, `to`'s own parameter file placed durably (the
    *  source phase's file is never touched, so a failed move leaves the source reading what it read), the rename
    *  forced, then the markers stripped when the copy left the flat path for a phase directory and the move is
-   *  durable */
+   *  durable. A move onto the copy's own path is no move: NotMoved */
   private[host] def relocate(from: os.Path, target: os.Path, fromFlat: Boolean, toFlat: Boolean,
                              to: Phase): MoveResult =
-    if from == target then reparameter(from, to) else renameCopy(from, target, fromFlat, toFlat, to)
-
-  /** A change of parameter only, the copy staying where it is: a parked copy (Outbound("")) taking its transfer id
-   *  (T6) while Parked shares outbound/ (stage 2 Tasks 3-4). `to`'s parameter file is replaced atomically, then the
-   *  copy's directory forced: a failed placement changes nothing, a failed sync leaves the copy unsynced (it reads the
-   *  new parameter, which a crash could undo) */
-  private def reparameter(path: os.Path, to: Phase): MoveResult =
-    val placed =
-      try
-        for
-          file <- CopyLayout.paramFile(to)
-          p <- CopyLayout.param(to)
-        do DurableFiles.place(path / file, p)
-        None
-      catch case NonFatal(t) => Some(MoveResult.NotMoved(t))
-    placed.getOrElse:
-      try
-        syncDirectory(path)
-        MoveResult.Durable
-      catch case NonFatal(t) => MoveResult.Unsynced(t)
+    if from == target then
+      MoveResult.NotMoved(IllegalArgumentException(s"$to is the path $from, where the copy already is"))
+    else
+      renameCopy(from, target, fromFlat, toFlat, to)
 
   private def renameCopy(from: os.Path, target: os.Path, fromFlat: Boolean, toFlat: Boolean, to: Phase): MoveResult =
     val prepared =

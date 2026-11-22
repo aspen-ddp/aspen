@@ -90,12 +90,12 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def skipDiskCheck(id: StorageDeviceId): Unit =
     diskCheckSkipped += id
 
-  /** Test-only: whether the copy at `storeId`'s path on device `id` is the one a running rebuild's finish placed
+  /** Test-only: whether device `id` holds in rebuilt/ a copy of `storeId` that a running rebuild's finish placed
    *  there, its completion's handler not yet run: the handler records it (StoreRebuilds.finishPlacing). Its
-   *  directory reads that rebuild's Rebuilt phase */
+   *  phase-param.rebuilt reads that rebuild's episode */
   private def finishInFlight(id: StorageDeviceId, devicePath: os.Path, storeId: StoreId): Boolean =
-    ctx.rebuilds.finishPlacing(id, storeId).exists(p =>
-      CopyPhase.known(CopyLayout.path(devicePath, storeId, None, p)).contains(p))
+    ctx.rebuilds.finishPlacing(id, storeId).exists: p =>
+      Try(CopyLayout.list(devicePath).copies.exists(f => f.storeId == storeId && f.phase == p)).getOrElse(false)
 
   /** The unloaded devices' stores, by device */
   def unloadedEntries: Map[StorageDeviceId, Set[StoreId]] = unloaded
@@ -720,10 +720,20 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
     claim(site):
       copiesOf(sds).foreach(_.register(storeId, phase, copyId))
 
-  /** A copy a rebuild produced at `storeId`'s path on `sds`: registered, unless the rebuild found its own finished
-   *  copy there, which is already registered in `phase` */
-  def rebuilt(site: String, sds: LocalStorageDeviceState, storeId: StoreId, phase: Phase): Unit =
-    placed(site, sds, storeId, phase)
+  /** A copy a rebuild produced in rebuilt/ on `sds` as `copyId` (T2), in `phase`: registered, unless the rebuild found
+   *  its own finished copy there, which is already registered so. A fact: the copy is there whatever the registry
+   *  held, so a record of another copy or phase (a bug: P2 keeps one copy of a store per device) is recorded as a
+   *  violation and takes this copy */
+  def rebuilt(site: String, sds: LocalStorageDeviceState, storeId: StoreId, phase: Phase,
+              copyId: java.util.UUID): Unit =
+    fact(site):
+      copiesOf(sds).foreach: copies =>
+        copies.copies.get(storeId) match
+          case None => copies.register(storeId, phase, Some(copyId))
+          case Some(r) if r.phase == phase && r.copyId.contains(copyId) => ()
+          case Some(r) =>
+            violation(site, s"record of $storeId is ${r.phase} as ${r.copyId}, its rebuild placed $phase as $copyId")
+            copies.applyMove(storeId, phase, copyId, unsynced = false): Unit
 
   /** A marker was written to or removed from the copy at `storePath` (CopyMarkers): its phase is what its markers
    *  say now (CopyPhase), Unread where they cannot be read */

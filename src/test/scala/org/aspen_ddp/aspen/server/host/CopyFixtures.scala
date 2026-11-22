@@ -57,8 +57,15 @@ object CopyFixtures:
   private def marker(phase: Phase): Option[(String, String)] = phase match
     case Phase.Live => None
     case Phase.Arrived(t) => Some(StoreTransfer.TransferredInMarkerFile -> t)
-    case Phase.Rebuilt(e) => Some(RebuildingStore.RebuildCompleteMarkerFile -> e)
     case p => throw IllegalArgumentException(s"No copy can be placed in $p")
+
+  /** The copy id in the name of the copy at `path`, in a phase directory */
+  def copyIdOf(path: os.Path): UUID =
+    CopyLayout.parseName(path.last).map(_._2).getOrElse(throw IllegalArgumentException(s"$path is no copy name"))
+
+  /** The copy id of the one copy of `storeId` on the device, a fresh one if it has none (absent, or flat) */
+  def copyIdOn(deviceDir: os.Path, storeId: StoreId): UUID =
+    one(deviceDir, storeId).flatMap(_.copyId).getOrElse(UUID.randomUUID())
 
   /** The copies of `storeId` on the device, outside pending-delete/ */
   private def copies(deviceDir: os.Path, storeId: StoreId): List[CopyLayout.Found] =

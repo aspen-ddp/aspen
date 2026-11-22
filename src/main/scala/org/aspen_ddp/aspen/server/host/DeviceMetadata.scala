@@ -101,8 +101,8 @@ object DeviceMetadata:
 
     /** The device is shutting down or shut down, so the entry was written Offline rather than
      *  Active (or was found Offline already). The rebuilt store is the device's, but must not be
-     *  served: it is kept offline, parked in outbound/ (keepRebuiltStoreOffline) until a
-     *  restart or adoption brings it back. */
+     *  served: it is kept offline, moved to parked/ (keepRebuiltStoreOffline, T4) until its entry
+     *  is Active again with no transfer device (T5). */
     case AdoptOffline
 
     /** The tree does not say this device owns a rebuilt store: the device was tombstoned,
@@ -112,13 +112,13 @@ object DeviceMetadata:
 
     /** The device now names another host: it was shut down and adopted while the rebuild was
      *  finishing. Nothing was written and the rebuilt copy is left in place. The owner's
-     *  reconcile restarts the rebuild, which finds the store already at its final path and only
+     *  reconcile restarts the rebuild, which finds the store already in rebuilt/ and only
      *  flips the entry. */
     case NotOwned
 
     /** The entry is Rebuilding on this device under another episode than the rebuild's (StoreEntry.rebuildEpisode):
-     *  the store was re-placed away and back while it ran. Nothing was written; the copy, whose rebuild-complete
-     *  marker names the earlier episode, is never promoted, and the current episode's rebuild retires it. */
+     *  the store was re-placed away and back while it ran. Nothing was written; the copy, Rebuilt for the earlier
+     *  episode (phase-param.rebuilt), is never promoted, and the current episode's rebuild retires it. */
     case Superseded
 
     /** An earlier attempt of this flip was reported TransactionOutcomeUnknown, so it may have made the entry Active

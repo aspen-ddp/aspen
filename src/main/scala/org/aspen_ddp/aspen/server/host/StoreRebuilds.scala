@@ -76,7 +76,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
   /** Whether rebuild work for `storeId` is registered on `deviceId`, any stage: queued for a slot, discarding its lost
    *  copy, or running, one cancelled (abandonUnlisted) included until its slot is released, since a rebuild past
-   *  finish's latch re-check ignores the cancel and can still move a copy into the store's path. A transfer in of the
+   *  finish's latch re-check ignores the cancel and can still move a copy into rebuilt/. A transfer in of the
    *  store onto the device waits while it holds (StoreTransfers.startIn): one piece of work per (device, store) */
   private[host] def hasRebuildWork(storeId: StoreId, deviceId: StorageDeviceId): Boolean =
     registry.rebuildWorkOn(deviceId, storeId).isDefined
@@ -96,9 +96,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     runningRebuilds.size + registry.discards(except)
 
   /** Test-only (HostCopies.verifyAgainstDisk): the phase a copy placed by the running rebuild of `storeId` on device
-   *  `deviceId` reads (Rebuilt, with its episode's marker), while its completion's handler has not yet recorded it.
-   *  RebuildingStore.finish places the copy off the control thread, before the handler runs, so the store's path may
-   *  meanwhile hold a copy in that phase that the registry does not know yet. None outside that rebuild */
+   *  `deviceId` reads (Rebuilt, with its episode in phase-param.rebuilt), while its completion's handler has not yet
+   *  recorded it. RebuildingStore.finish places the copy in rebuilt/ off the control thread, before the handler runs,
+   *  so rebuilt/ may meanwhile hold a copy in that phase that the registry does not know yet. None outside that
+   *  rebuild */
   private[server] def finishPlacing(deviceId: StorageDeviceId, storeId: StoreId): Option[Phase] =
     runningRebuilds.get(storeId).filter(r => r.deviceId == deviceId && !r.finishRecorded)
       .map(r => Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(r.episode)))
@@ -233,7 +234,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  Runs on the control thread, so it does no more than construct the rebuild and register
    *  its continuation; the walk itself runs on the client's execution context.
    *
-   *  On success the walk places the rebuilt store at `<device>/<storeId.directoryName>`. Loading
+   *  On success the walk places the rebuilt store in `<device>/rebuilt/` (T2), and its completion reports the copy id,
+   *  with which the handler records it. Loading
    *  is downstream of the metadata decision: markRebuiltStoreActive decides whether the device is
    *  allowed to adopt the copy (reading the tree state inside a transaction to guard against
    *  concurrent tombstone), then the completion handler loads if adopted or discards if the device
@@ -303,13 +305,15 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
        slotsTaken(Option.when(handoff)((deviceId, storeId))) < ctx.maxConcurrentRebuilds &&
        ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId, episode) &&
        discardLostStore(local, storeId, episode, held) then
+      // The rebuild's start asks the disk, not the registry, for a copy already there: it may run off the control thread
       val sr = ctx.storeRebuildFactory.createRebuild(
-        ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends, episode)
+        ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends, episode,
+        RebuildingStore.copyOnDisk(local.devicePath, storeId))
 
       val settled = Promise[Unit]()
 
       // Set by an outcome that ends the store's Rebuild work (rebuild-process 6.2). The work stays Running through the
-      // outcome's steps (the marker removal and load an Adopt makes) and ends at the release
+      // outcome's steps (the move to Live and load an Adopt makes) and ends at the release
       var workEnds = false
 
       // Every completion branch runs it. The work ends here if its outcome ended it; otherwise (a failure retried after
@@ -378,12 +382,13 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
 
       completeFuture.onComplete:
-        case Success(_) =>
-          // The rebuild placed its finished copy at the store's path (RebuildingStore.finish, off the control thread)
+        case Success(copyId) =>
+          // The rebuild placed its finished copy in rebuilt/ as `copyId` (RebuildingStore.finish, off the control
+          // thread, T2), or found it there
           runningRebuilds.get(storeId).filter(_.settled eq settled).foreach: r =>
             runningRebuilds += storeId -> r.copy(finishRecorded = true)
           ctx.copyRegistry.rebuilt("rebuild finish", local, storeId,
-            Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)))
+            Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)), copyId)
           // Loading is downstream of the metadata decision, not ahead of it. An unconditional
           // load hands a live copy to a device that markRebuiltStoreActive may be about to
           // decide must not own it (because the device was tombstoned mid-rebuild), and nothing
@@ -391,13 +396,13 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           ctx.metadata.markRebuiltStoreActive(local.storageDeviceId, storeId, episode, ctx.gossipStoreOnline).onComplete:
             case Success(RebuildOutcome.Adopt) =>
               try
-                // Loaded only once the marker is gone, or tryLoadStore leaves it offline. Its copy keeps it silent
-                // until the load's install serves it
+                // Loaded only once it is Live, or tryLoadStore leaves it offline. Its copy keeps it silent until the
+                // load's install serves it
                 workEnds = true
-                // Otherwise its copy is offline on its device: a failed unlink leaves the marker for the Completed
-                // Rebuilds pass, and a failed sync leaves the copy unsynced, which the next check of the device
-                // forces and loads (CopyMarkers, rebuild-process 5.7)
-                if clearRebuildCompleteMarker(local, storeId) then
+                // Otherwise its copy is offline on its device: a failed move leaves it Rebuilt for the Completed
+                // Rebuilds pass, and one not forced leaves it Live and unsynced, which the next check of the device
+                // forces and loads (CopyMoves, rebuild-process 5.7)
+                if bringRebuiltLive(local, storeId) == MoveResult.Durable then
                   ctx.loadStoreById(local.storageDeviceId, storeId)
               finally
                 finishSettled(recheckAll())
@@ -405,7 +410,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             case Success(RebuildOutcome.AdoptOffline) =>
               try
                 workEnds = true
-                keepRebuiltStoreOffline(local, storeId)
+                keepRebuiltStoreOffline(local, storeId, copyId)
               finally
                 finishSettled(recheckAll())
 
@@ -420,9 +425,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
             case Success(RebuildOutcome.Superseded) =>
               // The entry is Rebuilding here under a later episode: the store was re-placed away and back while this
-              // rebuild ran. Its copy stays at the store's path, offline; its rebuild-complete marker names this
-              // episode, so the next rebuild retires it (retireForeignCopy) and starts over, or the Deleted Stores
-              // pass does if the entry leaves the device first
+              // rebuild ran. Its copy stays in rebuilt/, offline, Rebuilt for this episode, so the next rebuild retires
+              // it (retireForeignCopy) and starts over, or the Deleted Stores pass does if the entry leaves the device
+              // first
               try
                 logger.info(s"Rebuild of store $storeId on device ${local.storageDeviceId} finished for an earlier " +
                             "Rebuilding episode. Not promoting it; the store is rebuilt again")
@@ -584,78 +589,80 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           scheduledRebuildRetries -= storeId
           ctx.reconciler.checkStorageDevice(latest.deviceId)
 
-  /** Keeps a rebuilt store whose entry was written Offline (RebuildOutcome.AdoptOffline) out of
-   *  service: it is not loaded, and its copy is parked, moved from its flat Rebuilt path into
-   *  outbound/ with no transfer id (`Outbound("")`, T4 until Parked is a phase of its own) in one
-   *  move, beside the empty CRL save file the rebuild wrote (RebuildingStore.writeEmptyCrlState).
-   *  Its rebuild-complete marker, inert there, is stripped once the move is durable (CopyMoves). A
-   *  restart keeps it offline there until the reconcile or bringIntoService finds its entry Active,
-   *  and an adoption classes it Clean (outbound/ with a valid save file).
+  /** Keeps a rebuilt store whose entry was written Offline (RebuildOutcome.AdoptOffline) out of service: it is not
+   *  loaded, and its copy is parked, moved from rebuilt/ to parked/ in one move (T4), beside the empty CRL save file
+   *  the rebuild wrote (RebuildingStore.writeEmptyCrlState). A restart keeps it offline there until the reconcile
+   *  (the Abandoned Transfers Out pass) or bringIntoService finds its entry Active with no transfer device and moves it
+   *  Live (T5), and an adoption classes it Clean.
    *
-   *  Moved even when the device has already been unloaded (its shutdown finished first): the
-   *  device path is still known, and without the move an adopting host would find a Rebuilt copy
-   *  whose entry is no longer Rebuilding. A disk already pulled makes the move fail, which is
-   *  logged; the copy then stays Rebuilt, offline.
+   *  Moved even when the device has already been unloaded (its shutdown finished first), at its rebuilt/ path as
+   *  `copyId`: the device path is still known, and without the move an adopting host would find a Rebuilt copy whose
+   *  entry is no longer Rebuilding. A disk already pulled makes the move fail, which is logged; the copy then stays
+   *  Rebuilt, offline.
    */
-  private def keepRebuiltStoreOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit =
+  private def keepRebuiltStoreOffline(local: LocalStorageDeviceState, storeId: StoreId, copyId: UUID): Unit =
     val site = "keep rebuilt store offline"
     val result = ctx.devices.devices.get(local.storageDeviceId) match
       case Some(sds) if ctx.copyRegistry.copiesOf(sds).isDefined =>
-        ctx.moves.move(site, sds, storeId, Phase.Outbound(""))
+        ctx.moves.move(site, sds, storeId, Phase.Parked)
       case _ =>
-        // Unloaded: its copy is where its rebuild finished it, at the flat path
-        ctx.moves.moveUnattached(site, CopyLayout.path(local.devicePath, storeId, None, Phase.Live), storeId, None,
-          Phase.Outbound(""))._1
+        // Unloaded: its copy is where its rebuild finished it, in rebuilt/
+        val rebuilt = CopyLayout.path(local.devicePath, storeId, Some(copyId), Phase.Rebuilt(""))
+        ctx.moves.moveUnattached(site, rebuilt, storeId, Some(copyId), Phase.Parked)._1
     result match
       case MoveResult.NotMoved(_) =>
-        // Logged by the move. Offline either way: a Rebuilt copy loads only once its entry is Active (the Completed
-        // Rebuilds pass)
+        // Logged by the move. Offline either way: a Rebuilt copy goes Live only once its entry is Active (the
+        // Completed Rebuilds pass)
         logger.error(s"Failed to park rebuilt store $storeId on device ${local.storageDeviceId}: it stays offline, " +
                      "Rebuilt")
       case _ => ()
 
-  /** Removes the rebuild-complete marker of a rebuilt store whose entry has left Rebuilding, durably, so it can be
-   *  loaded. Returns whether its removal is durable; a failure is logged and leaves its copy offline on its device: a
-   *  failed unlink keeps the marker, which the Completed Rebuilds pass (DeviceReconciler) removes at a later check, and
-   *  a failed sync after the unlink leaves the copy unsynced, which the next check forces and loads (CopyMarkers) */
-  def clearRebuildCompleteMarker(sds: LocalStorageDeviceState, storeId: StoreId): Boolean =
-    ctx.markers.remove(sds, storeId, StoreDirMarkers.Marker.RebuildComplete)
+  /** T3: moves the Rebuilt copy of `storeId` on `sds`, whose entry has left Rebuilding for Active, to Live, so it can be
+   *  loaded. Durable once it may be loaded. A failed move is logged and leaves the copy Rebuilt and offline, for the
+   *  Completed Rebuilds pass (DeviceReconciler) at a later check; one not forced leaves it Live and unsynced, which the
+   *  next check forces and loads (CopyMoves). A device no longer attached moves nothing: its next load lists the copy
+   *  Rebuilt, and that pass moves it */
+  def bringRebuiltLive(sds: LocalStorageDeviceState, storeId: StoreId): MoveResult =
+    if ctx.copyRegistry.copiesOf(sds).isEmpty then
+      logger.info(s"Not moving the rebuilt copy of store $storeId Live: device ${sds.storageDeviceId} is unloaded")
+      MoveResult.NotMoved(IllegalStateException(s"Device ${sds.storageDeviceId} is unloaded"))
+    else
+      ctx.moves.move("rebuilt copy goes live", sds, storeId, Phase.Live)
 
-  /** A directory at the path of a store being rebuilt here that carries neither the rebuild-complete
-   *  marker of this `episode` (a finished rebuild awaiting its flip), and is not Lost (in lost/, which
-   *  discardLostStore clears), was not produced by this rebuild: a leftover of an earlier tenancy of the store on this
-   *  device (a transferred-away copy whose delete failed and whose marker was lost, or a copy finished for an earlier
-   *  Rebuilding episode, superseded by a re-placement away and back), or a copy put there by hand. Nothing ties it to the store's
-   *  current state, so it is retired as a lost copy: moved to lost/, and then kept in pending-delete by
-   *  discardLostStore like any other. A served one is first taken out of service as a failed backend is, and its
-   *  rebuild waits for a later check. A stat that fails is no absence (FileStat): the rebuild waits for a later
-   *  check, neither starting over a copy it cannot see nor retiring a finished one whose marker it cannot see.
+  /** A copy of a store being rebuilt here that is neither this `episode`'s finished rebuild (Rebuilt for it, awaiting
+   *  its flip) nor Lost (in lost/, which discardLostStore clears) was not produced by this rebuild: a leftover of an
+   *  earlier tenancy of the store on this device (a transferred-away copy whose delete failed, or a copy finished for
+   *  an earlier Rebuilding episode, superseded by a re-placement away and back), or a copy put there by hand. Nothing
+   *  ties it to the store's current state, so it is retired as a lost copy: moved to lost/, and then kept in
+   *  pending-delete by discardLostStore like any other. A served one is first taken out of service as a failed backend
+   *  is, and its rebuild waits for a later check. The copy is told by its record's phase; with no record, a copy at the
+   *  flat path (put there by hand after the device's load) by its stat. A stat that fails is no absence (FileStat), nor
+   *  is an Unread record known: the rebuild waits for a later check, neither starting over a copy it cannot see nor
+   *  retiring a finished one it cannot read.
    *
-   *  Any copy at the path other than this episode's finished one, a foreign or a Lost one, may have served
-   *  since the rebuild's first pass began: a restart's device load serves an unmarked copy until the device's first
-   *  reconcile, and a served copy that fails is moved to lost/. A resumed walk would leave its acknowledged
-   *  updates on the objects walked before the checkpoint stale with no mark, so the store's staging checkpoint is
-   *  first removed durably, making the next pass a first pass (dropStagingCheckpoint). No rebuild of the store runs
-   *  here when this is called. Returns whether the rebuild may go on now. */
+   *  Any copy other than this episode's finished one, a foreign or a Lost one, may have served since the rebuild's
+   *  first pass began: a restart's device load serves a Live copy until the device's first reconcile, and a served
+   *  copy that fails is moved to lost/. A resumed walk would leave its acknowledged updates on the objects walked
+   *  before the checkpoint stale with no mark, so the store's staging checkpoint is first removed durably, making the
+   *  next pass a first pass (dropStagingCheckpoint). No rebuild of the store runs here when this is called. Returns
+   *  whether the rebuild may go on now. */
   private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
     val storePath = ctx.copyRegistry.pathOrLive(local, storeId)
-    val lost = registry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase == Phase.Lost)
-    // Some(None): nothing at the path or this episode's finished copy; Some(Some(lost)): another copy, Lost (in
-    // lost/) or not
-    val found =
-      if lost then
-        Some(Some(true))
-      else
-        try
-          if !FileStat.exists(storePath) ||
-             StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildComplete) &&
-               RebuildingStore.isRebuildCompleteFor(storePath, episode) then
-            Some(None)
-          else
-            Some(Some(false))
-        catch case NonFatal(t) =>
-          logger.error(s"Failed to stat the path of store $storeId at $storePath. Not rebuilding it yet: $t")
+    // Some(None): no copy or this episode's finished copy; Some(Some(lost)): another copy, Lost (in lost/) or not
+    val found: Option[Option[Boolean]] =
+      registry.copiesOf(local).flatMap(_.copies.get(storeId)).map(_.phase) match
+        case Some(Phase.Lost) => Some(Some(true))
+        case Some(Phase.Unread) =>
+          logger.error(s"The copy of store $storeId at $storePath could not be read. Not rebuilding it yet")
           None
+        case Some(phase) if RebuildingStore.isRebuiltFor(phase, episode) => Some(None)
+        case Some(_) => Some(Some(false))
+        case None =>
+          try
+            if FileStat.exists(storePath) then Some(Some(false)) else Some(None)
+          catch case NonFatal(t) =>
+            logger.error(s"Failed to stat the path of store $storeId at $storePath. Not rebuilding it yet: $t")
+            None
     if ctx.moves.isPendingLost(local, storeId) then
       // Its move to lost/ failed: held offline until a device check moves it
       false
@@ -951,8 +958,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             logger.warn(s"Failed to mark store $storeId on device $storageDeviceId for rebuild. " +
                         s"Will retry on a later check. Error: $t")
 
-  /** Clears the path of a store whose CRL state was lost, before its rebuild starts: a rebuild refuses to start
-   *  over a directory at the store's path that is not a finished rebuild (RebuildingStore.start). Returns whether
+  /** Clears the device of a store whose CRL state was lost, before its rebuild starts: a rebuild refuses to start
+   *  while the device holds any copy of the store that is not its finished rebuild (RebuildingStore.start). Returns whether
    *  the path is clear now, so the rebuild may start.
    *
    *  The copy is retired (StoreCopies.retire: marker, CRL state saved into the copy, device-CRL entries dropped,

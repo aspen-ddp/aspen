@@ -49,7 +49,7 @@ object StorageDeviceState:
    *  finish past objects the pool cannot supply, recording each in the ErrorTree (rebuild-process 5.5). Every write of
    *  an entry by setStoreEntry clears it, so an acceptance covers one rebuild. */
   /** On a Rebuilding entry `transferId` is the rebuild episode instead: a fresh UUID written by every transition
-   *  into Rebuilding (setRebuilding). The rebuild records it in its checkpoint and its rebuild-complete marker, so
+   *  into Rebuilding (setRebuilding). The rebuild records it in its checkpoint and its finished copy (phase-param.rebuilt in rebuilt/), so
    *  staging or a finished copy left by an earlier Rebuilding episode of the store is never resumed or promoted
    *  (rebuild-process.md 2.1, 5.1). */
   case class StoreEntry(status: StoreStatus,

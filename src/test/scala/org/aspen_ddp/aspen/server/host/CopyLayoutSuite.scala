@@ -23,7 +23,8 @@ class CopyLayoutSuite extends FileBasedTests:
       (Phase.Live, "live", false),
       (Phase.Arrived("t"), "arrived", false),
       (Phase.Outbound("t"), "outbound", true),
-      (Phase.Rebuilt("e"), "rebuilt", false),
+      (Phase.Rebuilt("e"), "rebuilt", true),
+      (Phase.Parked, "parked", true),
       (Phase.Lost, "lost", true),
       (Phase.Retired, "pending-delete", true))
     table.foreach: (phase, name, converted) =>
@@ -33,7 +34,8 @@ class CopyLayoutSuite extends FileBasedTests:
     CopyLayout.path(tdir, s, Some(u), Phase.Retired) should be(tdir / "pending-delete" / CopyLayout.copyName(s, u))
     CopyLayout.path(tdir, s, Some(u), Phase.Lost) should be(tdir / "lost" / CopyLayout.copyName(s, u))
     CopyLayout.path(tdir, s, Some(u), Phase.Outbound("t")) should be(tdir / "outbound" / CopyLayout.copyName(s, u))
-    CopyLayout.path(tdir, s, None, Phase.Rebuilt("e")) should be(tdir / s.directoryName)
+    CopyLayout.path(tdir, s, Some(u), Phase.Rebuilt("e")) should be(tdir / "rebuilt" / CopyLayout.copyName(s, u))
+    CopyLayout.path(tdir, s, Some(u), Phase.Parked) should be(tdir / "parked" / CopyLayout.copyName(s, u))
     CopyLayout.path(tdir, s, Some(u), Phase.Live) should be(tdir / s.directoryName)
 
   test("param is the phase's parameter"):
@@ -42,12 +44,13 @@ class CopyLayoutSuite extends FileBasedTests:
     CopyLayout.param(Phase.Rebuilt("e")) should be(Some("e"))
     CopyLayout.param(Phase.Live) should be(None)
     CopyLayout.param(Phase.Lost) should be(None)
+    CopyLayout.param(Phase.Parked) should be(None)
 
   test("each phase's parameter has its own file"):
     CopyLayout.paramFile(Phase.Arrived("t")) should be(Some("phase-param.arrived"))
     CopyLayout.paramFile(Phase.Outbound("t")) should be(Some("phase-param.outbound"))
     CopyLayout.paramFile(Phase.Rebuilt("e")) should be(Some("phase-param.rebuilt"))
-    List(Phase.Live, Phase.Lost, Phase.Retired).map(CopyLayout.paramFile) should be(List(None, None, None))
+    List(Phase.Live, Phase.Parked, Phase.Lost, Phase.Retired).map(CopyLayout.paramFile) should be(List(None, None, None, None))
 
   test("readParam reads an absent file as empty and throws a failed stat"):
     val copy = tdir / "copy"
@@ -100,11 +103,31 @@ class CopyLayoutSuite extends FileBasedTests:
     try an[java.io.IOException] should be thrownBy CopyLayout.list(dev)
     finally os.perms.set(dir, "rwx------")
 
+  test("a rebuilt copy's episode is read from its own parameter file, and a parked copy's phase is its location"):
+    val dev = tdir / "dev-rebuilt"
+    val rebuilt = CopyFixtures.placeCopy(dev, s, Phase.Rebuilt("e-1"))
+    val parked = CopyFixtures.placeCopy(dev, StoreId(s.poolId, 7), Phase.Parked)
+    // Another phase's parameter file is inert in each
+    os.write(rebuilt / CopyLayout.paramFile(Phase.Outbound("")).get, "t-other")
+    os.write(parked / CopyLayout.paramFile(Phase.Rebuilt("")).get, "e-other")
+    os.write(parked / "rebuild-complete", "e-other")
+    CopyLayout.list(dev).copies.map(f => (f.storeId, f.phase, f.path)).toSet should be(Set(
+      (s, Phase.Rebuilt("e-1"), rebuilt),
+      (StoreId(s.poolId, 7), Phase.Parked, parked)))
+    rebuilt / os.up should be(dev / "rebuilt")
+    parked / os.up should be(dev / "parked")
+    CopyLayout.phaseAt(rebuilt) should be(Some(Phase.Rebuilt("e-1")))
+    os.perms.set(rebuilt, "rw-------")
+    try
+      an[java.io.IOException] should be thrownBy CopyLayout.list(dev)
+      CopyLayout.knownPhase(rebuilt) should be(None)
+    finally os.perms.set(rebuilt, "rwx------")
+
   test("an outbound copy's phase is read from its own parameter file, and a failed read throws"):
     val dev = tdir / "dev"
     val sending = CopyFixtures.placeCopy(dev, s, Phase.Outbound("t-1"))
     val parked = CopyFixtures.placeCopy(dev, StoreId(s.poolId, 7), Phase.Outbound(""))
-    // Another phase's parameter file is inert there, and a parked copy may have none
+    // Another phase's parameter file is inert there, and an outbound copy may have none
     os.write(sending / CopyLayout.paramFile(Phase.Arrived("")).get, "t-other")
     os.remove(parked / CopyLayout.paramFile(Phase.Outbound("")).get)
     CopyLayout.list(dev).copies.map(f => (f.storeId, f.phase, f.path)).toSet should be(Set(

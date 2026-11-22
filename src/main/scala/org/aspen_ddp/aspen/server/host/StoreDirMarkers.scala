@@ -1,7 +1,6 @@
 package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.server.FileStat
-import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 
 /** The marker files a store directory can carry. Every test is FileStat's: a stat that fails is never taken for an
@@ -9,11 +8,9 @@ import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 object StoreDirMarkers:
 
   /** A marker that keeps a store from being loaded:
-   *   - TransferredIn: it arrived from another host and awaits its pool update
-   *   - RebuildComplete: a finished rebuild whose entry flip may not have committed */
+   *   - TransferredIn: it arrived from another host and awaits its pool update */
   enum Marker(val fileName: String):
     case TransferredIn extends Marker(StoreTransfer.TransferredInMarkerFile)
-    case RebuildComplete extends Marker(RebuildingStore.RebuildCompleteMarkerFile)
 
   /** Whether `storePath` carries `marker`. Throws the stat's error when that cannot be told */
   def has(storePath: os.Path, marker: Marker): Boolean =

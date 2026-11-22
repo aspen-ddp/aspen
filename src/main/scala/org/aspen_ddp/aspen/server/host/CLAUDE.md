@@ -32,7 +32,8 @@
   phase by location (`CopyLayout.phaseAt` for a path; `locate(devicePath, storeId, copyId)` finds which phase
   directory holds a copy id, the fallback of a refused phase fact; `isLivePath`). `CopyLayout.list` is the one listing
   of a device's copies (device load, its CRL-lost decision and P2, `storesIn`, `HostCopies.attach`/`rescan`/
-  `verifyAgainstDisk`): each phase directory's children (config or not); a child that is no copy name is a stray,
+  `verifyAgainstDisk`): each phase directory's children (config or not); a child that is no directory named as a copy
+  (a stat that fails counts as a copy) is a stray,
   logged at warn at the device's load and never touched, and anything at the device root (a stage-1 store-named
   directory included) is no copy. Code never builds a copy's path: it asks `HostCopies.pathOf` (the record's,
   `CopyLayout.path(device, storeId, copyId, phase)`; a store with no record has no copy on the device:
@@ -296,8 +297,10 @@
   store in `<device>/creating/` and renames it to its target, a fresh `live/<copy>` (`CopyLayout.freshLivePath`; its
   record registered under that copy id by the create's open), before opening it, so a store directory exists only
   complete and `open` never creates. A store whose Initializing entry already has a Live record here (a create that
-  crashed before its flip) is taken as created; one with a record in any other phase is not created (T1), its flip
-  failed for a later check. The create's work (`Work.Create`) ends when its copy is served, its open
+  crashed before its flip) is taken as created, and so is one with a Lost record (the create's copy fail-stopped
+  before its flip, or a lost device CRL at a restart: it may have served, so it is flipped out of Initializing and the
+  Lost CRL pass has it rebuilt, never created afresh); one with a record in any other phase is not created (T1), its
+  flip failed for a later check. The create's work (`Work.Create`) ends when its copy is served, its open
   fails or the create is skipped, not at the flip out of Initializing, which touches no copy: once the flip commits,
   a rebuild or transfer out of the served store may start, and must not overlap the create (I3). The pending flip
   is tracked apart (`pendingCreateFlips`), so a check meanwhile does not create the store again.

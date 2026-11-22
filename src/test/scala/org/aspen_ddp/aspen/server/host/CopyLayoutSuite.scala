@@ -111,6 +111,23 @@ class CopyLayoutSuite extends FileBasedTests:
       (s, Phase.Live, live), (StoreId(s.poolId, 5), Phase.Live, unconfigured)))
     listing.strays should be(Nil)
 
+  test("a file named like a copy is a stray, never a copy, and a child whose stat fails is listed"):
+    val dev = tdir / "dev-files"
+    val real = CopyFixtures.placeCopy(dev, s)
+    val file = CopyFixtures.freshCopyPath(dev, s)
+    os.write(file, "")
+    // A copy name linking into a directory without search permission: its stat fails (EACCES)
+    val closed = tdir / "closed-files"
+    os.makeDir.all(closed / "inside")
+    val unstat = CopyFixtures.freshCopyPath(dev, StoreId(s.poolId, 9))
+    os.symlink(unstat, closed / "inside")
+    os.perms.set(closed, "rw-------")
+    try
+      val listing = CopyLayout.list(dev)
+      listing.strays should be(List(file))
+      listing.copies.map(_.path).toSet should be(Set(real, unstat))
+    finally os.perms.set(closed, "rwx------")
+
   test("no phase is read from a former marker file: a live/ copy is Live whatever it carries"):
     val dev = tdir / "dev-markers"
     val copies = List("rebuild-required" -> "", "transferring-out" -> "t", "rebuild-complete" -> UUID.randomUUID().toString,

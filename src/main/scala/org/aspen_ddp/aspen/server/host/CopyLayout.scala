@@ -76,7 +76,7 @@ object CopyLayout:
   def locate(devicePath: os.Path, storeId: StoreId, copyId: UUID): Option[Phase] =
     val name = copyName(storeId, copyId)
     phaseDirectories.collectFirst:
-      case (dir, phaseOf) if FileStat.exists(devicePath / dir / name) => phaseOf(devicePath / dir / name)
+      case (dir, phaseOf) if FileStat.isDir(devicePath / dir / name) => phaseOf(devicePath / dir / name)
 
   def copyName(storeId: StoreId, copyId: UUID): String = s"${storeId.directoryName}.$copyId"
 
@@ -131,8 +131,8 @@ object CopyLayout:
   final case class Listing(copies: List[Found], strays: List[os.Path])
 
   /** Every copy on the device: the children of each phase directory. Throws a failed listing, stat or parameter
-   *  read (P6: the device then stays unloaded for the next scan). A child whose name is not a copy name is skipped,
-   *  and returned in `strays`. A copy without a `config.yaml` is listed all the same (a copy that lost it, which the
+   *  read (P6: the device then stays unloaded for the next scan). A child that is not a directory named as a copy (copyName) is
+   *  skipped, and returned in `strays`; one whose stat fails is listed. A copy without a `config.yaml` is listed all the same (a copy that lost it, which the
    *  Missing Stores pass rebuilds and a retire takes); whoever needs a configured store (the CRL-lost decision, the
    *  drain's disk check) tests the config itself. A device path that is not a directory lists nothing */
   def list(devicePath: os.Path): Listing =
@@ -144,8 +144,10 @@ object CopyLayout:
         if !FileStat.isDir(dir) then
           (Nil, Nil)
         else
+          // A copy is a directory named as one; a stat that fails counts as a copy, never as an absence (a store may
+          // be there). Anything else is a stray
           os.list(dir).toList.partitionMap: child =>
-            parseName(child.last) match
+            parseName(child.last).filter(_ => Try(FileStat.isDir(child)).getOrElse(true)) match
               case Some((storeId, copyId)) => Left(Found(storeId, copyId, phaseOf(child), child))
               case None => Right(child)
       Listing(inPhases.flatMap(_._1), inPhases.flatMap(_._2))

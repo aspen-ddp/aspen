@@ -1548,3 +1548,112 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with ControlFixture:
       phaseBeforeRecheck should be(Some(Phase.Lost))
       transfers.atBegin.head.map(_._2) should be(List(true))
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  // ---- Task 6 fix round 1: an Initializing store with a Lost copy is created over it, then rebuilt ----
+
+  private val creating = StoreId(PoolId.BootstrapPoolId, 0)
+  private val initializing = Map(creating -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Initializing,
+    None))
+
+  /** With device A's tree entry of `creating` Initializing, checks `host`'s devices until its rebuild starts: the create
+   *  takes the Lost copy for created and flips the entry, the Lost CRL pass flips it to Rebuilding, and the rebuild's
+   *  discard retires the lost copy. Asserts that end */
+  private def rebuildsOverLostCopy(host: Host, dev: os.Path, rebuilds: HeldRebuilds,
+                                   createDevice: Boolean): Future[org.scalatest.compatible.Assertion] =
+    given ExecutionContext = executionContext
+    val lost = CopyFixtures.copyPath(dev, creating)
+    for
+      _ <- if createDevice then net.createDevice(deviceA) else Future.unit
+      _ <- setDeviceState(deviceA)(_.copy(stores = initializing))
+      _ <- waitForTransactionsToComplete()
+      _ <- pumpTx(host, {
+             if host.control.reconciler.activeDeviceChecks.isEmpty then host.control.reconciler.checkAll()
+             !rebuilds.created.isEmpty && !host.control.copies.isRetiring(creating)
+           })
+      st <- client.getStorageDeviceState(deviceA)
+    yield
+      lost.map(p => (p / os.up).last) should be(Some(CopyLayout.LostDirectory))
+      st.stores(creating).status should be(StorageDeviceState.StoreStatus.Rebuilding)
+      rebuilds.created.toArray.toList should be(List(creating))
+      // The lost copy is retired under its own name, its CRL state saved; no copy of the store is left outside
+      // pending-delete/
+      val retired = CopyFixtures.retiredCopies(dev, creating)
+      retired.map(_.last) should be(lost.map(_.last).toList)
+      os.exists(retired.head / RebuildingStore.LostCrlStateFile) should be(true)
+      CopyFixtures.copyPath(dev, creating) should be(None)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  /** A real host on device A, its tree entry absent, whose check reads `creating` Initializing: the create's copy is
+   *  served, and its flip fails (the device is not in the tree). Then the served copy fail-stops, and its close moves
+   *  it to lost/. Yields the host and its opener */
+  private def createdThenFailStopped(hostRoot: os.Path, dev: os.Path, rebuilds: StoreRebuildFactory)
+      : Future[(Host, TestOpener)] =
+    given ExecutionContext = executionContext
+    val opener = new TestOpener
+    val host = realHost(hostRoot, opener, rebuilds = rebuilds)
+    host.testingOnlyHandleEvents()
+    for
+      _ <- check(host, initializing)
+      _ <- pumpTx(host, host.control.router.loaded.contains(creating) && !host.control.copyRegistry.isCreating(creating))
+      served = host.control.router.loaded.contains(creating)
+      _ = opener.onFatals.head(new java.io.IOException("injected fail-stop before the flip"))
+      _ <- pumpTx(host, CopyFixtures.phaseOf(dev, creating).contains(Phase.Lost))
+    yield
+      served should be(true)
+      CopyFixtures.phaseOf(dev, creating) should be(Some(Phase.Lost))
+      (host, opener)
+
+  atest("a create whose served copy fail-stops before its failed flip is flipped and rebuilt"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val rebuilds = new HeldRebuilds
+    for
+      (host, _) <- createdThenFailStopped(hostRoot, dev, rebuilds)
+      done <- rebuildsOverLostCopy(host, dev, rebuilds, createDevice = true)
+    yield done
+
+  atest("a create whose served copy fail-stops before its flip, then a restart, is flipped and rebuilt"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val rebuilds = new HeldRebuilds
+    for
+      _ <- createdThenFailStopped(hostRoot, dev, new HeldRebuilds)
+      // The host crashes: a new one starts over its directory, and its device load registers the copy Lost
+      restarted = newHost(hostRoot, storeRebuildFactory = rebuilds)
+      _ = restarted.testingOnlyHandleEvents()
+      atLoad = recordOf(restarted, loadedDevices(restarted)(deviceA), creating).map(_.phase)
+      done <- rebuildsOverLostCopy(restarted, dev, rebuilds, createDevice = true)
+    yield
+      atLoad should be(Some(Phase.Lost))
+      done
+
+  atest("a create that crashed before its flip, then a lost device CRL, is flipped and rebuilt"):
+    given ExecutionContext = executionContext
+    // The create's complete copy, in live/ beside no CRL: the device's load declares its CRL lost and moves it to lost/
+    val (hostRoot, dev) = device(withCrl = false)
+    rocksCopy(dev, creating)
+    val rebuilds = new HeldRebuilds
+    val host = newHost(hostRoot, storeRebuildFactory = rebuilds)
+    host.testingOnlyHandleEvents()
+    val atLoad = recordOf(host, loadedDevices(host)(deviceA), creating).map(_.phase)
+    for
+      done <- rebuildsOverLostCopy(host, dev, rebuilds, createDevice = true)
+    yield
+      atLoad should be(Some(Phase.Lost))
+      done
+
+  // Review Focus 5: a file is never a copy, whatever its name
+  atest("a file named like a copy beside a real copy in live is a stray: the copy loads and nothing is retired"):
+    val (hostRoot, dev) = device()
+    val real = CopyFixtures.placeCopy(dev, s)
+    val stray = CopyFixtures.freshCopyPath(dev, s)
+    os.write(stray, "an operator's file")
+    val host = newHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    Future.successful:
+      recorded(host).storeLoadAttempts.toList should be(List((deviceA, real)))
+      recordOf(host, loadedDevices(host)(deviceA), s).map(r => (r.phase, r.copyId)) should be(
+        Some((Phase.Live, CopyFixtures.copyIdOf(real))))
+      os.isFile(stray) should be(true)
+      inDir(dev, CopyLayout.LostDirectory) should be(Nil)
+      CopyFixtures.retiredCopies(dev, s) should be(Nil)

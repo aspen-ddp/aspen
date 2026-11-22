@@ -170,12 +170,15 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       pendingCreateFlips += storeId
 
       // True when the store exists on disk (created here, or by an attempt that crashed before its flip, whose Live
-      // copy the device's load registered), false when the create was skipped for a shutdown. A copy in any other
-      // phase fails the flip, which the next check tries again: never a create beside a copy of the store (T1), nor a
-      // flip of one that is not Live.
+      // copy the device's load registered), false when the create was skipped for a shutdown. A Lost copy counts as
+      // created too: an earlier create's copy that may have served before its flip, then fail-stopped (moved to
+      // lost/ when its close ended, P5) or lost the device CRL at a restart. A fresh empty copy could drop what it
+      // acknowledged, so the entry is flipped out of Initializing over it, and the Lost CRL pass then has the store
+      // rebuilt from its peers. A copy in any other phase fails the flip, which the next check tries again: never a
+      // create beside a copy of the store (T1).
       val existing = registry.copiesOf(local).flatMap(_.copies.get(storeId))
       val fcreate: Future[Boolean] = existing match
-        case Some(r) if r.phase == Phase.Live => Future.successful(true)
+        case Some(r) if r.phase == Phase.Live || r.phase == Phase.Lost => Future.successful(true)
         case Some(r) =>
           Future.failed(IllegalStateException(s"Store $storeId, Initializing on device $deviceId, has a copy there in " +
                                               s"${r.phase}: not creating it"))

@@ -1129,7 +1129,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       os.exists(arrived / RebuildingStore.RebuildCompleteMarkerFile) should be(false)
       os.exists(arrived / StoreTransfer.TransferredInMarkerFile) should be(false)
       recorded(host).loadStoreByIdRequests.toList should be(List((net.secondDeviceId, movingStore)))
-      host.control.rebuilds.markerRemovalsPending should not contain movingStore
+      host.control.devices.devices.values.exists(host.control.copyRegistry.isUnsynced(_, movingStore)) should be(false)
 
   atest("a committed transfer broadcasts StoreMoved with the new host and the pool config's timestamp"):
     given ExecutionContext = executionContext
@@ -1323,7 +1323,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ = t.host.control.transfers.retransmitPendingStarts(force = true)
     yield
       t.transfers.transfersIn.size should be(1)
-      t.host.control.transfers.transferringIn.keySet should contain(t.movingStore)
+      t.host.control.transfers.receiving.keySet should contain(t.movingStore)
       t.host.control.transfers.transferInRetries.keySet should contain(t.movingStore)
       // The failed attempt's request is no longer retransmitted while the retry waits
       takeStartTransfers(t.movingStore) should be(Nil)
@@ -1337,7 +1337,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       promoted = t.deviceDir / t.movingStore.directoryName
       _ = t.transfers.finishTransferIn(t.movingStore)
       _ <- pumpUntil(os.exists(promoted))
-      heldTransferringIn = t.host.control.transfers.transferringIn.keySet
+      heldTransferringIn = t.host.control.transfers.receiving.keySet
 
       // With the outcome still pending, a device check must neither start a second attempt nor
       // (once promoted) report the arrived copy as a conflicting store directory
@@ -1347,14 +1347,14 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       _ = gate.success(())
       _ <- pumpUntil(recorded(t.host).transferOutcomes.contains(t.movingStore) &&
-                     !t.host.control.transfers.transferringIn.keySet.contains(t.movingStore))
+                     !t.host.control.transfers.receiving.keySet.contains(t.movingStore))
     yield
       os.exists(promoted) should be(true)
       heldTransferringIn should contain(t.movingStore)
       attemptsWhileHeld should be(1)
       recorded(t.host).transferOutcomes.get(t.movingStore) should be(Some(DeviceMetadata.TransferOutcome.PoolRepointed))
       recorded(t.host).loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
-      t.host.control.transfers.transferringIn.keySet should not contain t.movingStore
+      t.host.control.transfers.receiving.keySet should not contain t.movingStore
 
   /** Removes `sid`'s entry from `deviceId` in the storage-devices tree, as an abandon running
    *  elsewhere would, without this host's own abandon path. */
@@ -1381,7 +1381,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- tombstoneDevice(StorageDeviceId.BootstrapStorageDeviceId)
       _ <- waitForTransactionsToComplete()
       _ = t.host.control.reconciler.checkAll()
-      _ <- pumpUntil(!t.host.control.transfers.transferringIn.keySet.contains(t.movingStore))
+      _ <- pumpUntil(!t.host.control.transfers.receiving.keySet.contains(t.movingStore))
       // The cancellation fails the attempt's future, which must not schedule a restart.
       _ <- pumpUntil(t.host.control.transfers.transferInRetries.keySet.nonEmpty, rounds = 3)
 
@@ -1390,7 +1390,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       dest <- client.getStorageDeviceState(net.secondDeviceId)
     yield
       dest.stores.contains(t.movingStore) should be(false)
-      t.host.control.transfers.transferringIn.keySet should not contain t.movingStore
+      t.host.control.transfers.receiving.keySet should not contain t.movingStore
       t.transfers.cancelledTransfersIn should be(Vector((t.movingStore, registered)))
       t.host.control.transfers.transferInRetries.keySet should be(Set())
       takeStartTransfers(t.movingStore) should be(Nil)
@@ -1441,14 +1441,14 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- tombstoneDevice(StorageDeviceId.BootstrapStorageDeviceId)
       _ <- waitForTransactionsToComplete()
       _ = t.host.control.reconciler.checkAll()
-      _ <- pumpUntil(!t.host.control.transfers.transferringIn.keySet.contains(t.movingStore))
+      _ <- pumpUntil(!t.host.control.transfers.receiving.keySet.contains(t.movingStore))
 
       _ = retryTransferIns(t.host)
       _ <- pumpUntil(t.transfers.transfersIn.size > 1, rounds = 3)
       _ = takeStartTransfers(t.movingStore)
       _ = t.host.control.transfers.retransmitPendingStarts(force = true)
     yield
-      t.host.control.transfers.transferringIn.keySet should not contain t.movingStore
+      t.host.control.transfers.receiving.keySet should not contain t.movingStore
       t.host.control.transfers.transferInRetries.keySet should be(Set())
       t.transfers.transfersIn.size should be(1)
       os.exists(staged) should be(false)
@@ -1467,9 +1467,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ = takeStartTransfers(t.movingStore)
       _ = retryTransferIns(t.host)
-      _ <- pumpUntil(!t.host.control.transfers.transferringIn.keySet.contains(t.movingStore))
+      _ <- pumpUntil(!t.host.control.transfers.receiving.keySet.contains(t.movingStore))
     yield
-      t.host.control.transfers.transferringIn.keySet should not contain t.movingStore
+      t.host.control.transfers.receiving.keySet should not contain t.movingStore
       t.host.control.transfers.transferInRetries.keySet should be(Set())
       t.transfers.transfersIn.size should be(1)
       takeStartTransfers(t.movingStore) should be(Nil)
@@ -1488,14 +1488,14 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.abortStoreTransfer(t.movingStore)
       _ <- waitForTransactionsToComplete()
       _ = t.host.control.reconciler.checkAll()
-      _ <- pumpUntil(!t.host.control.transfers.transferringIn.keySet.contains(t.movingStore))
+      _ <- pumpUntil(!t.host.control.transfers.receiving.keySet.contains(t.movingStore))
       // The cancellation fails the attempt's future, which must not schedule a restart.
       _ <- pumpUntil(t.host.control.transfers.transferInRetries.keySet.nonEmpty, rounds = 3)
 
       _ = takeStartTransfers(t.movingStore)
       _ = t.host.control.transfers.retransmitPendingStarts(force = true)
     yield
-      t.host.control.transfers.transferringIn.keySet should not contain t.movingStore
+      t.host.control.transfers.receiving.keySet should not contain t.movingStore
       t.transfers.cancelledTransfersIn should be(Vector((t.movingStore, registered)))
       t.host.control.transfers.transferInRetries.keySet should be(Set())
       takeStartTransfers(t.movingStore) should be(Nil)
@@ -1514,14 +1514,14 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.abortStoreTransfer(t.movingStore)
       _ <- waitForTransactionsToComplete()
       _ = t.host.control.reconciler.checkAll()
-      _ <- pumpUntil(!t.host.control.transfers.transferringIn.keySet.contains(t.movingStore))
+      _ <- pumpUntil(!t.host.control.transfers.receiving.keySet.contains(t.movingStore))
 
       _ = retryTransferIns(t.host)
       _ <- pumpUntil(t.transfers.transfersIn.size > 1, rounds = 3)
       _ = takeStartTransfers(t.movingStore)
       _ = t.host.control.transfers.retransmitPendingStarts(force = true)
     yield
-      t.host.control.transfers.transferringIn.keySet should not contain t.movingStore
+      t.host.control.transfers.receiving.keySet should not contain t.movingStore
       t.host.control.transfers.transferInRetries.keySet should be(Set())
       t.transfers.transfersIn.size should be(1)
       os.exists(staged) should be(false)
@@ -1542,7 +1542,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ = t.transfers.finishTransferIn(t.movingStore)
       _ <- pumpUntil(recorded(t.host).transferOutcomes.contains(t.movingStore) &&
-                     !t.host.control.transfers.transferringIn.keySet.contains(t.movingStore))
+                     !t.host.control.transfers.receiving.keySet.contains(t.movingStore))
       _ <- pumpUntil(!os.exists(arrived))
 
       source <- client.getStorageDeviceState(sourceId)
@@ -1560,7 +1560,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       recorded(t.host).loadStoreByIdRequests.toList should be(Nil)
       os.exists(arrived) should be(false)
-      t.host.control.transfers.transferringIn.keySet should not contain t.movingStore
+      t.host.control.transfers.receiving.keySet should not contain t.movingStore
 
   atest("a store can be transferred again after its transfer was aborted"):
     given ExecutionContext = executionContext
@@ -1570,7 +1570,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.abortStoreTransfer(t.movingStore)
       _ <- waitForTransactionsToComplete()
       _ = t.host.control.reconciler.checkAll()
-      _ <- pumpUntil(!t.host.control.transfers.transferringIn.keySet.contains(t.movingStore))
+      _ <- pumpUntil(!t.host.control.transfers.receiving.keySet.contains(t.movingStore))
 
       _ <- client.transferStore(t.movingStore, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
@@ -1785,7 +1785,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       host2 = newHost(t.hostRoot, transferService = transfers2)
       _ = host2.control.reconciler.checkAll()
       _ <- pumpUntil(recorded(host2).transferOutcomes.contains(t.movingStore) &&
-                     !host2.control.transfers.transferringIn.keySet.contains(t.movingStore))
+                     !host2.control.transfers.receiving.keySet.contains(t.movingStore))
 
       poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
     yield
@@ -1969,7 +1969,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         retired.map(_.last.startsWith(movingStore.directoryName)) should be(List(true))
         os.exists(retired.head / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
         os.exists(retired.head / RebuildingStore.LostCrlStateFile) should be(true)
-        host.control.transfers.transferringIn.keySet should be(Set(movingStore))
+        host.control.transfers.receiving.keySet should be(Set(movingStore))
 
   // rebuild-process FS17, for a transfer between two devices of one host: the source is served here until the
   // StartStoreTransfer the destination sends once its path is clear, so the retire waits only for a copy served from
@@ -2097,7 +2097,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       os.exists(rebuildingDir / RebuildingStore.RebuildCompleteMarkerFile) should be(true)
       recorded(host).storeLoadAttempts.toList.drop(before) should be(List((deviceA, activeDir)))
       // The Rebuilding one's rebuild started over its finished copy, not over a retired one
-      host.control.rebuilds.rebuildingStoreIds should contain(storeIdB)
+      host.control.copyRegistry.rebuilding(org.aspen_ddp.aspen.server.host.HostCopies.RebuildReads) should contain(storeIdB)
       os.exists(rebuildingDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
 
   atest("an Active store still carrying the transferred-in marker is loaded; a TransferringIn one is not"):

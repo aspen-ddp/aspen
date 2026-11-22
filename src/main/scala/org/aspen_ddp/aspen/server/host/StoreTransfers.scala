@@ -50,49 +50,65 @@ import StoreTransfers.*
 class StoreTransfers(ctx: DeviceControl) extends Logging:
   import ctx.given
 
-  // The pool updates of transfers in now running (recordTransferIn), with the device receiving
-  // each, completed once its outcome has been acted on. A shutdown of that device waits on them.
+  // A transfer in's work is its store's Work.TransferIn on the receiving device (the copy registry): its receive
+  // attempt (`attempt`, the transfer UUID of the attempt this host is running: from its start until its pool update is
+  // done, it is forgotten or it is restarted; stores being shipped out are tracked by storeTransferService, which is
+  // what knows when a send has ended), and its stage: RetiringEarlierTenancy, Receiving, Recording (its pool update)
+  // or Abandoning (the source failed). An abandon overlays a receive or a pool update and ends back at whichever
+  // still runs.
+  //
+  // The pool updates of transfers in now running (recordTransferIn), with the device receiving each, completed once
+  // its outcome has been acted on: a shutdown of that device waits on them. Work cannot hold the promise, and an
+  // abandon's stage may overlay the Recording stage, so it is kept here
   private var recordingTransfersIn: Map[StoreId, (StorageDeviceId, Promise[Unit])] = Map()
-  // The transfer UUID of each store this host is currently receiving. Stores being shipped out
-  // are tracked by storeTransferService, which is what knows when a send has ended.
-  private[server] var transferringIn: Map[StoreId, UUID] = Map()
-  private var abandoningTransferIns: Set[StoreId] = Set()
   private[host] var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
-  // The restart of each failed transfer in that is waiting out TransferInRetryDelay. Its store
-  // stays in transferringIn meanwhile, so device checks do not start a parallel attempt.
+  // The restart of each failed transfer in that is waiting out TransferInRetryDelay. Its attempt stays meanwhile, so
+  // device checks do not start a parallel one.
   private[server] var transferInRetries: Map[StoreId, TransferInRetry] = Map()
-  // Shadow bookkeeping (copy registry, Work.TransferIn): the device each store in transferringIn and
-  // abandoningTransferIns is received on or abandoned from, and the stores whose earlier tenancy's copy
-  // retireEarlierTenancy is retiring, by device
-  private var transferInDevices: Map[StoreId, StorageDeviceId] = Map()
-  private var abandonDevices: Map[StoreId, StorageDeviceId] = Map()
-  private var retiringEarlier: Map[StoreId, StorageDeviceId] = Map()
 
-  /** The store's TransferIn work on `deviceId`, staged as the sets above and recordingTransfersIn say */
-  private def syncWork(storeId: StoreId, deviceId: StorageDeviceId, transferId: Option[UUID] = None): Unit =
-    val stage =
-      if recordingTransfersIn.get(storeId).exists(_._1 == deviceId) then
-        Some(TransferInStage.Recording)
-      else if abandoningTransferIns.contains(storeId) && abandonDevices.get(storeId).contains(deviceId) then
-        Some(TransferInStage.Abandoning)
-      else if transferringIn.contains(storeId) && transferInDevices.get(storeId).contains(deviceId) then
-        Some(TransferInStage.Receiving)
-      else if retiringEarlier.get(storeId).contains(deviceId) then
-        Some(TransferInStage.RetiringEarlierTenancy)
-      else
-        None
-    ctx.copyRegistry.work("transfer in", deviceId, storeId, _.isInstanceOf[Work.TransferIn],
-      stage.map(Work.TransferIn(transferId, _))): Unit
+  private def registry: HostCopies = ctx.copyRegistry
 
-  /** Claims the store's TransferIn work on `deviceId` at `stage` before a transfer in's step starts (I3): false if
-   *  other work holds the (device, store) (recorded), and then nothing starts; a later check asks again */
-  private def claimWork(storeId: StoreId, deviceId: StorageDeviceId, stage: TransferInStage,
-                        transferId: Option[UUID] = None): Boolean =
-    val claimed = ctx.copyRegistry.work("transfer in", deviceId, storeId, _.isInstanceOf[Work.TransferIn],
-      Some(Work.TransferIn(transferId, stage)))
+  /** The receive attempts this host holds, by store: the attempt's transfer UUID (Work.TransferIn's attempt) */
+  private[server] def receiving: Map[StoreId, UUID] = registry.receiveAttempts.view.mapValues(_._2).toMap
+
+  /** The receive attempt of `storeId`, on any device of the host */
+  private def attemptOf(storeId: StoreId): Option[UUID] = registry.receiveAttempts.get(storeId).map(_._2)
+
+  private def inWork(storeId: StoreId, deviceId: StorageDeviceId): Option[Work.TransferIn] =
+    registry.transferInOn(deviceId, storeId)
+
+  /** Sets the store's TransferIn work on `deviceId` to exactly `w` (None ends it). A claim: false where other work
+   *  holds the (device, store), recorded */
+  private def setWork(storeId: StoreId, deviceId: StorageDeviceId, w: Option[Work.TransferIn]): Boolean =
+    registry.work("transfer in", deviceId, storeId, _.isInstanceOf[Work.TransferIn], w, exact = true)
+
+  /** Claims the store's TransferIn work on `deviceId` as `w` before a transfer in's step starts (I3). False if other
+   *  work holds it (recorded), and then nothing starts; a later check asks again */
+  private def claimWork(storeId: StoreId, deviceId: StorageDeviceId, w: Work.TransferIn): Boolean =
+    val claimed = setWork(storeId, deviceId, Some(w))
     if !claimed then
       logger.error(s"Not transferring store $storeId onto device $deviceId yet: the copy registry refused its work")
     claimed
+
+  /** The store's TransferIn work on `deviceId` after one of its steps ended, `w` its work with that step taken out:
+   *  an abandon stays while it runs (`abandoning`), then a pool update still running (Recording), then the receive
+   *  attempt still held (Receiving); otherwise it ends */
+  private def restage(storeId: StoreId, deviceId: StorageDeviceId, w: Work.TransferIn, abandoning: Boolean): Unit =
+    val stage =
+      if abandoning then Some(TransferInStage.Abandoning)
+      else if recordingTransfersIn.get(storeId).exists(_._1 == deviceId) then Some(TransferInStage.Recording)
+      else if w.attempt.isDefined then Some(TransferInStage.Receiving)
+      else None
+    val next: Option[Work.TransferIn] = stage.map(s => new Work.TransferIn(w.transferId, s, w.attempt))
+    if inWork(storeId, deviceId) != next then
+      setWork(storeId, deviceId, next): Unit
+
+  /** The receive attempt `attempt` of `storeId`, on whichever device holds it, is forgotten (None: whichever it is) */
+  private def dropAttempt(storeId: StoreId, attempt: Option[UUID] = None): Unit =
+    registry.receiveAttempts.get(storeId).foreach: (deviceId, held) =>
+      if attempt.forall(_ == held) then
+        inWork(storeId, deviceId).foreach: w =>
+          restage(storeId, deviceId, Work.TransferIn(w.transferId, w.stage, None), w.stage == TransferInStage.Abandoning)
 
   /** The transfer-in work on `deviceId` that a shutdown of it must stop or wait for. `ingStores` are the stores
    *  the device's tree entry records as TransferringIn.
@@ -118,9 +134,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         pendingStartTransfers -= storeId
       if transferInRetries.get(storeId).exists(_.toDeviceId == deviceId) then
         transferInRetries -= storeId
-      val uuid = transferringIn.get(storeId)
-      transferringIn -= storeId
-      syncWork(storeId, deviceId)
+      val uuid = attemptOf(storeId)
+      dropAttempt(storeId)
       uuid.map(storeId -> _)
 
     (ins, recording)
@@ -131,8 +146,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  Each re-send also re-reads the source device, and if the device now names another host the
    *  request is re-addressed and sent again there: a source shut down and adopted elsewhere
    *  would otherwise be asked for at its old host for as long as the attempt lives, since the
-   *  reconcile's TransferringIn pass never starts a second attempt while this one holds the store
-   *  in transferringIn. The re-send itself stays synchronous and goes to the address already
+   *  reconcile's TransferringIn pass never starts a second attempt while this one holds the store's
+   *  attempt. The re-send itself stays synchronous and goes to the address already
    *  held, so a failed or slow read costs nothing over not reading at all.
    */
   def retransmitPendingStarts(force: Boolean = false): Unit =
@@ -176,7 +191,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  failure (the sender's archiver exiting non-zero, a full disk here) would otherwise loop hot,
    *  re-shipping the store each time, since every restart supersedes the sender's attempt at once.
    *
-   *  The store stays in transferringIn until the retry fires, so device checks in the meantime
+   *  The store's attempt stays until the retry fires, so device checks in the meantime
    *  do not start a parallel attempt. `transferUUID` is the failed attempt's: the retry does
    *  nothing if that attempt is no longer the store's current one.
    *
@@ -191,13 +206,12 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                                       toDeviceid: StorageDeviceId,
                                       transferId: Option[UUID]): Unit =
     def current: Boolean =
-      transferInRetries.contains(storeId) && transferringIn.get(storeId).contains(transferUUID)
+      transferInRetries.contains(storeId) && attemptOf(storeId).contains(transferUUID)
 
     def restart(entryState: scala.util.Try[StorageDeviceState], sourceHostId: HostId): Unit =
       if current then
         transferInRetries -= storeId
-        transferringIn -= storeId
-        syncWork(storeId, toDeviceid)
+        dropAttempt(storeId, Some(transferUUID))
         val stillWanted = entryState match
           case Success(state) =>
             state.stores.get(storeId).exists: entry =>
@@ -250,13 +264,12 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     val cancelled =
       val pending = pendingStartTransfers.get(storeId).filter(_.msg.fromDevice == fromDeviceId)
       val retry = transferInRetries.get(storeId).filter(_.fromDeviceId == fromDeviceId)
-      transferringIn.get(storeId) match
+      attemptOf(storeId) match
         case Some(transferUUID) if pending.nonEmpty || retry.nonEmpty =>
           logger.info(s"Dropping the abandoned transfer in of store $storeId from device $fromDeviceId")
           pendingStartTransfers -= storeId
           transferInRetries -= storeId
-          transferringIn -= storeId
-          syncWork(storeId, toDeviceId)
+          dropAttempt(storeId, Some(transferUUID))
           // A retry waiting on a failed promotion still has the extracted copy in staging, which
           // the service no longer owns. Nothing else can be receiving this store now.
           if retry.nonEmpty then
@@ -276,23 +289,24 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  first, while the marker still keeps it from loading: it came from another host, whose clock
    *  may lead this one's, and its load floor must cover that.
    */
-  private[host] def clearTransferredInMarker(storeId: StoreId, storePath: os.Path): Boolean =
+  private[host] def clearTransferredInMarker(sds: LocalStorageDeviceState, storeId: StoreId): Boolean =
+    val storePath = sds.devicePath / storeId.directoryName
     try
       StoreLoader.writeArrivedAt(storePath)
-      os.remove(storePath / StoreTransfer.TransferredInMarkerFile)
-      ctx.copyRegistry.markerRemoved("clearTransferredInMarker", storePath)
-      true
+      // A failed unlink keeps the marker, for the transferred-in pass; a failed sync after it leaves the copy unsynced,
+      // which the next check of the device forces and loads (CopyMarkers)
+      ctx.markers.remove(sds, storeId, StoreDirMarkers.Marker.TransferredIn)
     catch
       case t: Throwable =>
-        logger.error(s"Failed to remove the transferred-in marker for store $storeId at " +
-                     s"$storePath. The store stays offline. Error: $t")
+        logger.error(s"Failed to record the arrival of store $storeId at $storePath before removing its " +
+                     s"transferred-in marker. The store stays offline. Error: $t")
         false
 
   /** Runs the metadata step for a transferred store that has been promoted to its final path,
    *  then loads or discards the arrived copy according to the outcome. Reached both straight
    *  after promotion and, via startIn, for a copy promoted before a crash.
    *
-   *  `transferUUID` is the attempt's entry in transferringIn, which is dropped only once nothing
+   *  `transferUUID` is the store's receive attempt, which is dropped only once nothing
    *  more can happen to the arrived copy. Dropped any earlier, a device check could start a
    *  second attempt that re-ships the whole store, or resume this step a second time in parallel.
    */
@@ -304,14 +318,17 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     // from here on finds it and waits for it.
     val settled = Promise[Unit]()
     recordingTransfersIn += storeId -> (toDeviceid, settled)
-    syncWork(storeId, toDeviceid)
+    // Recording, unless an abandon overlays it (its end comes back to Recording while this runs)
+    inWork(storeId, toDeviceid).foreach: w =>
+      if w.stage != TransferInStage.Abandoning then
+        setWork(storeId, toDeviceid, Some(Work.TransferIn(w.transferId, TransferInStage.Recording, w.attempt)))
 
     def finished(): Unit =
-      if transferringIn.get(storeId).contains(transferUUID) then
-        transferringIn -= storeId
       if recordingTransfersIn.get(storeId).exists(_._2 eq settled) then
         recordingTransfersIn -= storeId
-      syncWork(storeId, toDeviceid)
+      inWork(storeId, toDeviceid).foreach: w =>
+        val attempt = if w.attempt.contains(transferUUID) then None else w.attempt
+        restage(storeId, toDeviceid, Work.TransferIn(w.transferId, w.stage, attempt), w.stage == TransferInStage.Abandoning)
       settled.trySuccess(())
 
     // Loading is downstream of the metadata decision, not ahead of it. An unconditional load
@@ -330,7 +347,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           case Success(TransferOutcome.PoolRepointed) =>
             ctx.devices.devices.get(toDeviceid).foreach: sds =>
               val storePath = sds.devicePath / storeId.directoryName
-              if clearTransferredInMarker(storeId, storePath) then
+              if clearTransferredInMarker(sds, storeId) then
                 // A rebuilt copy whose flip was Unconfirmed ships with its rebuild-complete marker
                 // (rebuild-process 5.7). The flip committed before the source's entry could become
                 // TransferringOut, and this entry is Active now, which is all the Completed Rebuilds
@@ -338,7 +355,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                 // until this device's next check. A failed removal is left to that pass, as there.
                 // A marker whose stat fails is removed as a present one is
                 if FileStat.existence(storePath / RebuildingStore.RebuildCompleteMarkerFile).contains(false) ||
-                   ctx.rebuilds.clearRebuildCompleteMarker(storeId, storePath)
+                   ctx.rebuilds.clearRebuildCompleteMarker(sds, storeId)
                 then
                   ctx.loadStoreById(toDeviceid, storeId)
               // Otherwise its copy stays offline on its device, as a restart's scan would leave it, which is what
@@ -392,7 +409,13 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     // The shutdown guard covers a source read issued before this device's shutdown began, and a
     // retry whose delay ran out during it: the shutdown has already cancelled this device's
     // transfers in and would not see a new one.
-    else if ! transferringIn.contains(storeId) && ! ctx.shutdown.isShuttingDown(toDeviceid) then
+    // Nor while an abandon or an earlier tenancy's retire of the store runs on the device: its end checks the device
+    // again (an abandon is for a failed source, which never sends)
+    else if inWork(storeId, toDeviceid).nonEmpty then
+      logger.debug(s"Not transferring store $storeId onto device $toDeviceid yet: other transfer-in work of the store " +
+                   "is still running there")
+
+    else if attemptOf(storeId).isEmpty && ! ctx.shutdown.isShuttingDown(toDeviceid) then
       ctx.devices.devices.get(toDeviceid).foreach: toDevice =>
         val devicePath = toDevice.devicePath
         val finalPath = devicePath / storeId.directoryName
@@ -440,23 +463,23 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                   None
           case other => other
 
+        // The attempt's id, fresh per attempt. The sender ignores a request whose timestamp is not newer than the last
+        // one it acted on, and the service accepts a connection only for the UUID it is currently registered with, so
+        // a retry after a failure needs both to be new.
+        val transferUUID = UUID.randomUUID()
+
         phase match
           case None | Some(Phase.Unread) =>
             ()
 
           // A copy promoted by an earlier attempt -- normally one that crashed before its metadata
           // step finished -- needs no bytes, only that step.
-          case Some(Phase.Arrived(_)) if !claimWork(storeId, toDeviceid, TransferInStage.Receiving, transferId) =>
-            ()
-
           case Some(Phase.Arrived(_)) =>
-            logger.info(s"Store $storeId has already arrived on device $toDeviceid. Resuming its " +
-                        s"pool update")
-            val transferUUID = UUID.randomUUID()
-            transferringIn += storeId -> transferUUID
-            transferInDevices += storeId -> toDeviceid
-            syncWork(storeId, toDeviceid, transferId)
-            recordTransferIn(storeId, transferUUID, fromDeviceId, toDeviceid)
+            if claimWork(storeId, toDeviceid,
+                         Work.TransferIn(transferId, TransferInStage.Receiving, Some(transferUUID))) then
+              logger.info(s"Store $storeId has already arrived on device $toDeviceid. Resuming its " +
+                          s"pool update")
+              recordTransferIn(storeId, transferUUID, fromDeviceId, toDeviceid)
 
           // A finished rebuild awaiting its flip, a lost copy, or a copy marked for transfer out, left by an earlier
           // tenancy of the store on this device (rebuild-process; a store transferred back onto its old source): never
@@ -472,22 +495,15 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
             logger.error(s"Cannot transfer store $storeId onto device $toDeviceid: store path " +
                          s"already exists or cannot be stat'd. $finalPath")
 
-          case Some(Phase.Live) if !claimWork(storeId, toDeviceid, TransferInStage.Receiving, transferId) =>
+          case Some(Phase.Live) if !claimWork(storeId, toDeviceid,
+                                     Work.TransferIn(transferId, TransferInStage.Receiving, Some(transferUUID))) =>
             ()
 
           case Some(Phase.Live) =>
-            // Fresh per attempt. The sender ignores a request whose timestamp is not newer than the
-            // last one it acted on, and the service accepts a connection only for the UUID it is
-            // currently registered with, so a retry after a failure needs both to be new.
-            val transferUUID = UUID.randomUUID()
             val timestamp = HLCTimestamp.now
 
             val fcomplete = ctx.storeTransferService.beginTransferIn(
               storeId, transferUUID, devicePath / StoreTransfer.StagingDirectory)
-
-            transferringIn += storeId -> transferUUID
-            transferInDevices += storeId -> toDeviceid
-            syncWork(storeId, toDeviceid, transferId)
 
             // Retransmission stops on completion, success or failure, not on first data: the
             // sender needs the request until it has finished, and a failure restarts with a new
@@ -498,14 +514,14 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
 
             // False once the attempt has been dropped by dropAbandonedTransferIn, whose cancellation
             // is what completed the future, or by a supersession.
-            def isCurrent: Boolean = transferringIn.get(storeId).contains(transferUUID)
+            def isCurrent: Boolean = attemptOf(storeId).contains(transferUUID)
 
             fcomplete.onComplete:
               case Success(_) if ! isCurrent =>
                 // The bytes landed as the transfer was abandoned. Nobody owns the staged copy now,
-                // and nothing can be receiving this store, since a new attempt needs the
-                // transferringIn entry that dropping this one removed.
-                if ! transferringIn.contains(storeId) then
+                // and nothing can be receiving this store, since a new attempt needs the store to
+                // have no attempt, as dropping this one left it.
+                if attemptOf(storeId).isEmpty then
                   val stagedPath = devicePath / StoreTransfer.StagingDirectory / storeId.directoryName
                   try os.remove.all(stagedPath)
                   catch case t: Throwable =>
@@ -553,7 +569,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                       DurableFiles.write(stagedPath / StoreTransfer.TransferredInMarkerFile,
                                          transferId.map(_.toString).getOrElse(""))
                       DurableFiles.move(stagedPath, finalPath)
-                      ctx.copyRegistry.registered("transfer-in promotion", toDevice, storeId,
+                      // A fact: the copy is at its path now, whatever the registry held
+                      ctx.copyRegistry.placed("transfer-in promotion", toDevice, storeId,
                         Phase.Arrived(transferId.map(_.toString).getOrElse("")))
                       true
                     catch
@@ -603,18 +620,16 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
   private def retireEarlierTenancy(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     val storePath = local.devicePath / storeId.directoryName
     val servedHere = ctx.router.entry(storeId).exists(_.store.backend.path == storePath)
-    if ctx.rebuilds.rebuildingStoreIds.contains(storeId) || servedHere || ctx.loader.isOpening(storeId) then
+    if registry.rebuilding(HostCopies.RebuildReads).contains(storeId) || servedHere || ctx.loader.isOpening(storeId) then
       logger.info(s"Not transferring store $storeId onto device ${local.storageDeviceId} yet: its path holds a copy " +
                   s"of an earlier tenancy, which waits for a rebuild, an open or a close of the store here to end")
-    else if !ctx.copies.isRetiring(storeId) &&
-            claimWork(storeId, local.storageDeviceId, TransferInStage.RetiringEarlierTenancy) then
+    else if !ctx.copies.isRetiring(storeId) && inWork(storeId, local.storageDeviceId).isEmpty &&
+            claimWork(storeId, local.storageDeviceId, Work.TransferIn(None, TransferInStage.RetiringEarlierTenancy)) then
       logger.warn(s"Retiring the copy of an earlier tenancy of store $storeId at its path on device " +
                   s"${local.storageDeviceId} before transferring the store onto it")
-      retiringEarlier += storeId -> local.storageDeviceId
-      syncWork(storeId, local.storageDeviceId)
       ctx.copies.retire(local, storeId).foreach: clear =>
-        retiringEarlier -= storeId
-        syncWork(storeId, local.storageDeviceId)
+        if inWork(storeId, local.storageDeviceId).exists(_.stage == TransferInStage.RetiringEarlierTenancy) then
+          setWork(storeId, local.storageDeviceId, None)
         if clear then
           ctx.reconciler.checkStorageDevice(local.storageDeviceId)
 
@@ -636,11 +651,13 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     // The entry that triggers this stands until the transaction commits, so every device check
     // in the meantime calls here again. Without the guard each one starts its own retry loop,
     // all writing the same key and losing to each other on KeyRevision. Same shape as
-    // createNewStore's creatingStores and startIn's transferringIn.
-    if ! abandoningTransferIns.contains(storeId) && claimWork(storeId, toDeviceId, TransferInStage.Abandoning) then
-      abandoningTransferIns += storeId
-      abandonDevices += storeId -> toDeviceId
-      syncWork(storeId, toDeviceId)
+    // createNewStore's Work.Create and startIn's attempt. The abandon overlays a receive or a pool update running
+    // there; an earlier tenancy's retire it waits out, as its end checks the device again
+    val current = inWork(storeId, toDeviceId)
+    if ! registry.transferringIn(storeId, TransferInStage.Abandoning) &&
+       ! current.exists(_.stage == TransferInStage.RetiringEarlierTenancy) &&
+       claimWork(storeId, toDeviceId, Work.TransferIn(current.flatMap(_.transferId), TransferInStage.Abandoning,
+         current.flatMap(_.attempt))) then
 
       logger.warn(s"Abandoning transfer of store $storeId onto device $toDeviceId: source " +
                   s"device $fromDeviceId has been declared failed")
@@ -673,8 +690,9 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
       // next device check -- an hour out, and possibly after whatever made the read fail has been
       // repaired -- should be free to try again rather than find the flag stuck forever.
       fabandon.onComplete: result =>
-        abandoningTransferIns -= storeId
-        syncWork(storeId, toDeviceId)
+        inWork(storeId, toDeviceId).foreach: w =>
+          if w.stage == TransferInStage.Abandoning then
+            restage(storeId, toDeviceId, w, abandoning = false)
         // Whether or not this transaction was the one to remove the entry, it is gone (or has
         // moved on to Rebuilding), so nothing will complete this host's attempt. Its registration
         // has no timeout of its own and its retransmits go to a host that does not exist.

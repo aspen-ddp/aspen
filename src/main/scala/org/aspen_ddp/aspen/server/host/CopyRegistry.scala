@@ -25,12 +25,21 @@ enum RebuildStage:
 enum TransferInStage:
   case RetiringEarlierTenancy, Receiving, Recording, Abandoning
 
+enum TransferOutStage:
+  /** From startOut's close (and CRL extraction) until the control task that writes its marker has run */
+  case Closing
+  /** returnLostTransferToRebuild is aborting the transfer of a copy marked rebuild-required */
+  case AbortingLost
+
 /** The long-running work a copy is in the middle of. Ids come from tree entries, so they may be absent */
 enum Work:
   case Create
   case Rebuild(episode: Option[UUID], stage: RebuildStage)
-  case TransferIn(transferId: Option[UUID], stage: TransferInStage)
-  case TransferOut(transferId: Option[UUID])
+  /** `attempt`: the receive attempt this host holds for the store (StoreTransfers.startIn's transfer UUID), from its
+   *  start until its pool update is done, it is forgotten (a shutdown, an abandon) or it is restarted. A stage may
+   *  outlive it (Recording past a shutdown's forget) or overlay it (Abandoning while it waits on bytes) */
+  case TransferIn(transferId: Option[UUID], stage: TransferInStage, attempt: Option[UUID] = None)
+  case TransferOut(transferId: Option[UUID], stage: TransferOutStage = TransferOutStage.Closing)
 
 /** The one in-memory record of a store copy on a device */
 final case class CopyRecord(storeId: StoreId, phase: Phase, unsynced: Boolean, activity: Activity)

@@ -133,7 +133,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       yield
         cancelled should be(true)
         receivedWhileRegistered should be(Vector())
-        host.control.rebuilds.rebuildingStoreIds should not contain moving
+        host.control.copyRegistry.rebuilding(HostCopies.RebuildReads) should not contain moving
         transfers.transfersIn.map(_._1) should be(Vector(moving))
         factory.created.size should be(1)
 
@@ -158,7 +158,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     for
       _ <- check(host, deviceA, Map(moving -> rebuildingIn(e1)))
       _ <- yieldUntil(crl.synchronized(crl.drops.contains(moving)))
-      discarding = host.control.rebuilds.isRebuilding(moving)
+      discarding = host.control.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(moving)
       _ <- check(host, deviceA, Map(moving -> rebuildingIn(e2)))
       next = recorded(host).armLookup(deviceA)
       _ = next.success(deviceState(deviceA, Map(moving -> rebuildingIn(e2))))
@@ -194,7 +194,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(recorded(host).transferSourceReads.nonEmpty)
       heldBack = transfers.transfersIn.isEmpty
       _ = crl.synchronized(crl.drops(moving)).failure(new Exception("CRL drop failed"))
-      _ <- yieldUntil(!host.control.rebuilds.isRebuilding(moving))
+      _ <- yieldUntil(!host.control.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(moving))
       retryScheduled = host.control.rebuilds.rebuildRetriesScheduled.contains(moving)
       // The retry's check retires the copy as an earlier tenancy, and the check that follows starts the receive
       _ = List(1, 2).foreach(_ =>
@@ -322,7 +322,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       // Long enough for a discard to have moved the copy
       _ <- yieldUntil(!os.exists(storePath))
       keptWhileShipping = os.exists(storePath)
-      discardingWhileShipping = host.control.rebuilds.isRebuilding(moving)
+      discardingWhileShipping = host.control.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(moving)
       _ = sends.endTransferOut(moving)
       _ = recorded(host).armLookup(deviceA).success(deviceState(deviceA, rebuilding))
       _ = runDeviceRechecks(host)
@@ -452,7 +452,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
           hooked = true
           for
             _ <- client.transferStore(shipped, net.secondDeviceId)
-            _ = registeredAtRequest = host.control.rebuilds.rebuildingStoreIds.contains(shipped)
+            _ = registeredAtRequest = host.control.copyRegistry.rebuilding(HostCopies.RebuildReads).contains(shipped)
             r <- ask(host)
           yield
             requestWhileRegistered = Some(r)
@@ -463,7 +463,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
             Map(shipped -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut,
               Some(net.secondDeviceId), Some(UUID.randomUUID()))))))
       _ = factory.created.head.promise.success(())
-      _ <- pumpUntil(hooked && !host.control.rebuilds.rebuildingStoreIds.contains(shipped), drain = Some(host))
+      _ <- pumpUntil(hooked && !host.control.copyRegistry.rebuilding(HostCopies.RebuildReads).contains(shipped), drain = Some(host))
       _ = tclient.beforeRetry = _ => Future.unit
       outcome = recorded(host).rebuildOutcomes.get((source, shipped))
       // The receiver's retransmit
@@ -551,7 +551,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.write.over(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
       _ = host.control.copyRegistry.markedLost("failedOnClose", storePath)
       _ <- check(host, source, rebuilding)
-      startedWhileClosing = factory.created.nonEmpty || host.control.rebuilds.isRebuilding(shipped)
+      startedWhileClosing = factory.created.nonEmpty || host.control.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(shipped)
       // Not even queued (silenced): the close's TransferOut work holds the (device, store) (I3)
       queuedWhileClosing = host.control.rebuilds.hasRebuildWork(shipped, source)
       keptWhileClosing = FileStat.exists(storePath)

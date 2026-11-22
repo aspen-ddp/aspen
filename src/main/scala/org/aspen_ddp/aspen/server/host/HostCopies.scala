@@ -55,6 +55,9 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   private var parkedRetries: Map[(StorageDeviceId, StoreId), LoadRetry] = Map()
   // Throws of the silence path (onChange), for the drain check
   private var silenceErrors: Vector[String] = Vector()
+  // Store paths whose marker change could not be synced before their device was attached (unsynced): its attach
+  // marks their records
+  private var unsyncedPaths: Set[os.Path] = Set()
 
   /** Tests: a throw of the silence path propagates rather than leaving the store silent (Host.Seams) */
   var strict: Boolean = false
@@ -172,6 +175,9 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
             case scala.util.Success(true) =>
               sds.copies.register(storeId, CopyPhase.known(path).getOrElse(Phase.Unread))
             case scala.util.Failure(_) => sds.copies.register(storeId, Phase.Unread)
+          if unsyncedPaths.contains(path) && sds.copies.copies.contains(storeId) then
+            unsyncedPaths -= path
+            sds.copies.setUnsynced(storeId, true)
 
   /** As attach, listing the device itself (ControlFixture.injectLoadedDevice). A listing that fails registers none */
   def attach(sds: LocalStorageDeviceState): Unit =
@@ -386,10 +392,11 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   // ---- Work: the long-running work a (device, store) is in the middle of ----
 
   /** The work of `storeId` on device `id` of the kind `kind` is now `desired`: started, updated or ended to match.
-   *  An id `desired` lacks is kept from the current work (a stage change made where the id is not known). A claim:
-   *  work of another kind already there is a second piece of work for the (device, store) (I3), refused (false), and
-   *  a caller starting work backs off. An end never is */
-  def work(site: String, id: StorageDeviceId, storeId: StoreId, kind: Work => Boolean, desired: Option[Work]): Boolean =
+   *  An id `desired` lacks is kept from the current work (a stage change made where the id is not known), unless
+   *  `exact`. A claim: work of another kind already there is a second piece of work for the (device, store) (I3),
+   *  refused (false), and a caller starting work backs off. An end never is */
+  def work(site: String, id: StorageDeviceId, storeId: StoreId, kind: Work => Boolean, desired: Option[Work],
+           exact: Boolean = false): Boolean =
     claim(site):
       device(id).foreach: copies =>
         val current = copies.work.get(storeId)
@@ -400,10 +407,80 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
           case Some(w) =>
             current match
               case Some(c) if kind(c) =>
-                val next = HostCopies.keepIds(c, w)
+                val next = if exact then w else HostCopies.keepIds(c, w)
                 if next != c then
                   copies.updateWork(storeId, next)
               case _ => copies.startWork(storeId, w)
+
+  /** The stores with Rebuild work in one of `stages` on any device of the host. The one "is a rebuild of the store
+   *  registered here" predicate; each caller names the stages it means (R20): RebuildReads where the rebuild reading
+   *  the pool matters (repairable, the Completed Rebuilds pass, an earlier tenancy's retire, a second start),
+   *  RebuildHolds where a rebuild holding its copy does (a load retry, a transfer out's start), all stages for any
+   *  rebuild work (silence) */
+  def rebuilding(stages: Set[RebuildStage] = RebuildStage.values.toSet): Set[StoreId] =
+    allCopies.flatMap(_.work.collect { case (s, Work.Rebuild(_, stage)) if stages.contains(stage) => s }).toSet
+
+  /** The Rebuild work of `storeId` on device `id`, if any */
+  def rebuildWorkOn(id: StorageDeviceId, storeId: StoreId): Option[Work.Rebuild] =
+    device(id).flatMap(_.work.get(storeId)).collect { case w: Work.Rebuild => w }
+
+  /** The Rebuild work on device `id`, by store */
+  def rebuildWorks(id: StorageDeviceId): Map[StoreId, Work.Rebuild] =
+    device(id).map(_.work.collect { case (s, w: Work.Rebuild) => s -> w }).getOrElse(Map())
+
+  /** How many (device, store) pairs hold discard work (RebuildStage.DiscardingLost), but `except`'s: each takes a
+   *  rebuild slot, as a running rebuild does */
+  def discards(except: Option[(StorageDeviceId, StoreId)] = None): Int =
+    attached.toList.map: (id, sds) =>
+      sds.copies.work.count:
+        case (s, Work.Rebuild(_, RebuildStage.DiscardingLost)) => !except.contains((id, s))
+        case _ => false
+    .sum
+
+  /** Whether a create of `storeId` runs on any device of the host (Work.Create) */
+  def isCreating(storeId: StoreId): Boolean = allCopies.exists(_.work.get(storeId).contains(Work.Create))
+
+  /** The TransferOut work of `storeId` on device `id`, if any */
+  def transferOutOn(id: StorageDeviceId, storeId: StoreId): Option[Work.TransferOut] =
+    device(id).flatMap(_.work.get(storeId)).collect { case w: Work.TransferOut => w }
+
+  /** Whether TransferOut work of `storeId` in `stage` exists on any device of the host */
+  def transferringOut(storeId: StoreId, stage: TransferOutStage): Boolean =
+    allCopies.exists(_.work.get(storeId).exists:
+      case Work.TransferOut(_, s) => s == stage
+      case _ => false)
+
+  /** The TransferIn work of `storeId` on device `id`, if any */
+  def transferInOn(id: StorageDeviceId, storeId: StoreId): Option[Work.TransferIn] =
+    device(id).flatMap(_.work.get(storeId)).collect { case w: Work.TransferIn => w }
+
+  /** Whether TransferIn work of `storeId` in `stage` exists on any device of the host */
+  def transferringIn(storeId: StoreId, stage: TransferInStage): Boolean =
+    allCopies.exists(_.work.get(storeId).exists:
+      case w: Work.TransferIn => w.stage == stage
+      case _ => false)
+
+  /** The receive attempts the host holds (Work.TransferIn's attempt), by store: the device and the attempt's id */
+  def receiveAttempts: Map[StoreId, (StorageDeviceId, java.util.UUID)] =
+    allCopies.toList.sortBy(_.deviceId.uuid).flatMap: c =>
+      c.work.collect { case (s, Work.TransferIn(_, _, Some(a))) => s -> (c.deviceId, a) }
+    .toMap
+
+  /** Whether a copy of `storeId` is being retired on any device of the host (its Retiring activity) */
+  def isRetiring(storeId: StoreId): Boolean =
+    allCopies.exists(_.copies.get(storeId).exists(_.activity == Activity.Retiring))
+
+  /** Whether an entry says no transfer out of its store is outstanding: Active, no destination named. A copy behind a
+   *  transfer-out marker under it was left by a transfer that ended without completing */
+  def noTransferOut(entry: StorageDeviceState.StoreEntry): Boolean =
+    entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
+
+  /** Whether a copy of `storeId` left offline by a transfer out may be put back in service under `entry`: the tree says
+   *  no transfer is outstanding (noTransferOut), and this process is not sending it (a drain may restore the entry
+   *  while the bytes still go). The Abandoned Transfers Out pass, an adoption's bringIntoService and
+   *  reloadClosedStores ask it */
+  def mayReinstateOut(entry: StorageDeviceState.StoreEntry, storeId: StoreId): Boolean =
+    noTransferOut(entry) && !ctx.storeTransferService.isTransferringOut(storeId)
 
   /** The stores `local`'s Missing Stores pass declares (LocalStorageDeviceState.declaredMissing), mirrored */
   def missingIs(local: LocalStorageDeviceState): Unit =
@@ -447,14 +524,14 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
 
   /** Whether a repair scan may run against `storeId` here: Served, not Closing, with no Rebuild work Running or
    *  Abandoned (cancelled, still running past finish's latch until its slot is released) and no TransferOut work on
-   *  any device, and not being sent out (storeTransferService), as `rebuildingStoreIds` decided. A running rebuild
+   *  any device, and not being sent out (storeTransferService): `rebuilding(RebuildReads)`. A running rebuild
    *  reads everything; one queued or discarding its lost copy reads nothing yet, and a flip that keeps failing keeps
    *  its work queued, so it must not stop the served copy's repair scans (R20) */
   def repairable(storeId: StoreId): Boolean =
     silence(storeId) == Silence.Served &&
       !allCopies.exists(_.copies.get(storeId).exists(_.activity.isInstanceOf[Activity.Closing])) &&
       !allCopies.exists(_.work.get(storeId).exists:
-        case Work.Rebuild(_, RebuildStage.Running | RebuildStage.Abandoned) | Work.TransferOut(_) => true
+        case Work.Rebuild(_, RebuildStage.Running | RebuildStage.Abandoned) | Work.TransferOut(_, _) => true
         case _ => false) &&
       !ctx.storeTransferService.transferringOutStores.contains(storeId)
 
@@ -513,11 +590,13 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def copiesOf(sds: LocalStorageDeviceState): Option[DeviceCopies] =
     attached.get(sds.storageDeviceId).filter(_ eq sds).map(_.copies)
 
-  /** The registry of the attached device whose directory holds the store directory `storePath`, with its store */
+  /** The registry of the attached device whose directory holds the store directory `storePath`, with its store: the
+   *  one with a record of it, where two attached states name the directory (a test's injected device) */
   private def copiesAt(storePath: os.Path): Option[(DeviceCopies, StoreId)] =
     for
       storeId <- HostCopies.storeIdOf(storePath)
-      sds <- attached.valuesIterator.find(_.devicePath == storePath / os.up)
+      candidates = attached.values.toList.sortBy(_.storageDeviceId.uuid).filter(_.devicePath == storePath / os.up)
+      sds <- candidates.find(_.copies.copies.contains(storeId)).orElse(candidates.headOption)
     yield (sds.copies, storeId)
 
   // ---- Updates from the disk mutation sites, right after each durable step: facts, but a new record's claim ----
@@ -530,17 +609,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   /** A copy a rebuild produced at `storeId`'s path on `sds`: registered, unless the rebuild found its own finished
    *  copy there, which is already registered in `phase` */
   def rebuilt(site: String, sds: LocalStorageDeviceState, storeId: StoreId, phase: Phase): Unit =
-    fact(site):
-      copiesOf(sds).foreach: copies =>
-        copies.copies.get(storeId) match
-          case Some(r) if r.phase == phase => ()
-          case Some(_) => phaseFact(site, copies, storeId, phase)
-          case None => copies.register(storeId, phase)
-
-  /** The copy at `storeId`'s path on `sds` moved to `phase` */
-  def moved(site: String, sds: LocalStorageDeviceState, storeId: StoreId, phase: Phase): Unit =
-    fact(site):
-      copiesOf(sds).foreach(phaseFact(site, _, storeId, phase))
+    placed(site, sds, storeId, phase)
 
   /** The copy at `storePath` was marked rebuild-required: Lost, unless it already was */
   def markedLost(site: String, storePath: os.Path): Unit =
@@ -556,14 +625,55 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
           case Some(r) if r.phase != Phase.Lost => phaseFact(site, copies, storeId, Phase.Lost)
           case Some(_) => ()
 
-  /** A marker below the copy's phase marker, or its phase marker, was removed from the copy at `storePath`: its phase
-   *  is what its remaining markers say (CopyPhase), Unread where they cannot be read */
-  def markerRemoved(site: String, storePath: os.Path): Unit =
+  /** A marker was written to or removed from the copy at `storePath` (CopyMarkers): its phase is what its markers
+   *  say now (CopyPhase), Unread where they cannot be read */
+  def markersChanged(site: String, storePath: os.Path): Unit =
     fact(site):
       copiesAt(storePath).foreach: (copies, storeId) =>
         val now = CopyPhase.known(storePath).getOrElse(Phase.Unread)
         if !copies.copies.get(storeId).exists(_.phase == now) then
           copies.applyPhase(storeId, now, now).foreach(violation(site, _))
+
+  /** A marker write or removal at `storePath` reached the directory but its sync failed (CopyMarkers): its copy is
+   *  unsynced, never loaded, shipped or retired until a device check forces the directory again. A copy of a device
+   *  not attached yet (an adoption, a lost CRL's marks) is held here until its attach */
+  def unsynced(site: String, storePath: os.Path): Unit =
+    fact(site):
+      copiesAt(storePath) match
+        case Some((copies, storeId)) if copies.copies.contains(storeId) => copies.setUnsynced(storeId, true)
+        case _ => unsyncedPaths += storePath
+
+  /** The directory at `storePath` was forced: its copy is synced */
+  def synced(storePath: os.Path): Unit =
+    unsyncedPaths -= storePath
+    fact("synced"):
+      copiesAt(storePath).foreach: (copies, storeId) =>
+        if copies.copies.get(storeId).exists(_.unsynced) then
+          copies.setUnsynced(storeId, false)
+
+  /** Whether the copy at `storePath` is unsynced, on an attached device or awaiting its attach */
+  def isUnsyncedAt(storePath: os.Path): Boolean =
+    unsyncedPaths.contains(storePath) ||
+      copiesAt(storePath).exists((copies, storeId) => copies.copies.get(storeId).exists(_.unsynced))
+
+  /** Whether the copy of `storeId` on `sds` is unsynced */
+  def isUnsynced(sds: LocalStorageDeviceState, storeId: StoreId): Boolean =
+    copiesOf(sds).exists(_.copies.get(storeId).exists(_.unsynced))
+
+  /** The unsynced copies of `local`, in store order */
+  def unsyncedCopies(local: LocalStorageDeviceState): List[StoreId] =
+    copiesOf(local).toList.flatMap(_.copies.values.filter(_.unsynced).map(_.storeId))
+      .sortBy(s => (s.poolId.uuid, s.poolIndex))
+
+  /** A copy now at `storeId`'s path on `sds`, in `phase`: registered, or, where a record is there already, moved to
+   *  `phase`. A fact: the copy is at the path whatever the registry held */
+  def placed(site: String, sds: LocalStorageDeviceState, storeId: StoreId, phase: Phase): Unit =
+    fact(site):
+      copiesOf(sds).foreach: copies =>
+        copies.copies.get(storeId) match
+          case Some(r) if r.phase == phase => ()
+          case Some(_) => phaseFact(site, copies, storeId, phase)
+          case None => copies.register(storeId, phase)
 
   /** The copy at `storeId`'s path on `sds` left it: retired into pending-delete, or deleted */
   def removed(site: String, sds: LocalStorageDeviceState, storeId: StoreId): Unit =
@@ -630,11 +740,16 @@ enum Silence:
   case Unknown
 
 object HostCopies:
+  /** A rebuild holds its copy: it discards its lost copy or runs (the former StoreRebuilds.isRebuilding) */
+  val RebuildHolds: Set[RebuildStage] = Set(RebuildStage.DiscardingLost, RebuildStage.Running, RebuildStage.Abandoned)
+  /** A rebuild reads its pool: it runs, a cancelled one included until its slot is released (the former rebuildingStoreIds) */
+  val RebuildReads: Set[RebuildStage] = Set(RebuildStage.Running, RebuildStage.Abandoned)
+
   /** `w`, with any id it lacks taken from `current`, of the same kind */
   private def keepIds(current: Work, w: Work): Work = (current, w) match
     case (Work.Rebuild(Some(e), _), Work.Rebuild(None, stage)) => Work.Rebuild(Some(e), stage)
-    case (Work.TransferIn(Some(t), _), Work.TransferIn(None, stage)) => Work.TransferIn(Some(t), stage)
-    case (Work.TransferOut(Some(t)), Work.TransferOut(None)) => Work.TransferOut(Some(t))
+    case (Work.TransferIn(Some(t), _, _), Work.TransferIn(None, stage, attempt)) => Work.TransferIn(Some(t), stage, attempt)
+    case (Work.TransferOut(Some(t), _), Work.TransferOut(None, stage)) => Work.TransferOut(Some(t), stage)
     case _ => w
 
   /** The store a directory's name identifies, if it is a store directory name */

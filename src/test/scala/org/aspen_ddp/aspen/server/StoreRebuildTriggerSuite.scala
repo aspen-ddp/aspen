@@ -260,7 +260,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ <- yieldUntil(factory.created.size == 2)
       // A failure with the loss accepted holds back the accepted entry in turn
       _ = factory.created(1).promise.failure(new Exception("pool below r"))
-      _ <- yieldUntil(!host.control.rebuilds.rebuildingStoreIds.contains(storeN(0)))
+      _ <- yieldUntil(!host.control.copyRegistry.rebuilding(org.aspen_ddp.aspen.server.host.HostCopies.RebuildReads).contains(storeN(0)))
       _ <- check(accepted)
     yield
       heldBack should be(1)
@@ -287,7 +287,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       // between the check starting and the test completing it.
       _ = recorded(host).armLookup(deviceB).success(deviceState(deviceB, Map(rebuilding(storeN(1)))))
       _ = factory.created.head.promise.failure(new Exception("disk on fire"))
-      // rebuildingStores is host-wide, so the freed slot is what deviceB was waiting on. Without
+      // The rebuild slots are host-wide, so the freed slot is what deviceB was waiting on. Without
       // this re-check it would wait for the hourly sweep with data under-replicated.
       _ <- yieldUntil(factory.created.size == 2)
     yield
@@ -411,7 +411,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).storeLoadAttempts.toList.drop(before) should contain((realDeviceId, storeDir))
 
   // RB-W14: the unlink succeeds but the directory sync fails, so no marker is left for the Completed Rebuilds pass to
-  // select the store by. The pending removal selects it, and the retry syncs the directory with the marker absent
+  // select the store by. The copy is left unsynced (CopyMarkers), and the next check forces its directory and loads it
   atest("a flipped rebuild whose marker unlink succeeded but whose directory sync failed is loaded by a later check"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
@@ -422,7 +422,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val marker = storeDir / RebuildingStore.RebuildCompleteMarkerFile
     var syncs = List.empty[os.Path]
     var failSync = true
-    host.control.rebuilds.syncMarkerDirectory = dir =>
+    host.control.markers.syncDirectory = dir =>
       syncs = dir :: syncs
       if failSync then throw new java.io.IOException("injected directory sync failure")
 
@@ -457,7 +457,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.exists(marker) should be(false)
       _ = recorded(host).loadStoreByIdRequests should not contain ((realDeviceId, rebuilt))
       _ = offlineCopies(host, local) should contain(rebuilt)
-      _ = host.control.rebuilds.markerRemovalsPending should contain(rebuilt)
+      _ = host.control.copyRegistry.isUnsynced(local, rebuilt) should be(true)
       // The sync can succeed now: the next check syncs the directory and loads the store
       _ = failSync = false
       _ = syncs = Nil
@@ -466,7 +466,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ <- yieldUntil(recorded(host).storeLoadAttempts.size > before)
     yield
       syncs should contain(storeDir)
-      host.control.rebuilds.markerRemovalsPending should not contain (rebuilt)
+      host.control.copyRegistry.isUnsynced(local, rebuilt) should be(false)
       recorded(host).storeLoadAttempts.toList.drop(before) should contain((realDeviceId, storeDir))
 
   atest("an Active store marked rebuild-required is flipped to Rebuilding, discarded and rebuilt"):
@@ -706,7 +706,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ <- check(e2)
       _ <- yieldUntil(factory.created.head.cancelled)
       _ = factory.created.head.promise.failure(new Exception("out of space"))
-      _ <- yieldUntil(!host.control.rebuilds.rebuildingStoreIds.contains(storeN(0)))
+      _ <- yieldUntil(!host.control.copyRegistry.rebuilding(org.aspen_ddp.aspen.server.host.HostCopies.RebuildReads).contains(storeN(0)))
       _ <- check(e2)
       _ <- yieldUntil(factory.created.size == 2)
       _ <- check(e3)
@@ -954,7 +954,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
              host.control.copyRegistry.heldOffline(local, storeN(0)) &&
              scheduler(host).pending.contains(Host.RebuildRetryInitialDelay))
     yield
-      // Offline on its own device, held for its rebuild's retry (heldWork)
+      // Offline on its own device, held for its rebuild's retry (its Rebuild work, Queued)
       host.control.copyRegistry.heldOffline(local, storeN(0)) should be(true)
       host.control.router.get(storeN(0)).isDefined should be(true)
       host.control.router.isOffline(storeN(0)) should be(false)

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, RebuildStage, StagedSendService, StagedTransferService, Work}
+import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, RebuildStage, StagedSendService, StagedTransferService, TransferInStage, Work}
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState}
@@ -207,7 +207,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       transfers.startedTransfersIn should be(Set(s0))
       transfers.cancelledTransfersIn.map(_._1) should be(Vector(s0))
       transfers.cancelledTransfersOut should be(Vector(s1))
-      host.control.transfers.transferringIn.keySet should be(Set())
+      host.control.transfers.receiving.keySet should be(Set())
       st.stores should be(Map(s0 -> inEntry, s1 -> outEntry))
       st.status should be(DeviceStatus.Shutdown)
 
@@ -279,10 +279,12 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
                                                                   deviceDir / s1.directoryName)
 
   // A closed copy that other work holds when the cancelled shutdown's reconcile runs is left to that work (I3), and
-  // kept among the closed stores, so a later reconcile loads it once the work has ended rather than dropping it
+  // kept among the closed stores, so a later reconcile loads it once the work has ended rather than dropping it. The
+  // work is an earlier tenancy's retire, which no pass of an Active entry ends (a queued rebuild's would be ended by
+  // the reconcile's endUnlistedWork, the entry not Rebuilding)
   atest("a cancelled shutdown's closed store held by other work is loaded once the work ends"):
     given ExecutionContext = executionContext
-    val rebuildWork = Some(Work.Rebuild(None, RebuildStage.Queued))
+    val heldWork = Some(Work.TransferIn(None, TransferInStage.RetiringEarlierTenancy))
     for
       (host, deviceDir) <- setUp(Map(s0 -> active, s1 -> active), loaded = Set(s0, s1))
       gate = recorded(host).holdShutdownCloses()
@@ -292,14 +294,14 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- client.restartStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.copyRegistry.work("test", deviceA, s1, _.isInstanceOf[Work.Rebuild], rebuildWork)
+      _ = host.control.copyRegistry.work("test", deviceA, s1, _.isInstanceOf[Work.TransferIn], heldWork)
       _ = gate.success(())
       paths = List(s0, s1).map(s => deviceDir / s.directoryName)
       attempts = () => recorded(host).storeLoadAttempts.map(_._2).toList
       _ <- awaitLoudly("the cancelled shutdown to reload s0")(recorded(host).shutdownOutcomes.nonEmpty &&
              host.control.reconciler.activeDeviceChecks.isEmpty && attempts().contains(paths(0)))
       heldBack = !attempts().contains(paths(1))
-      _ = host.control.copyRegistry.work("test", deviceA, s1, _.isInstanceOf[Work.Rebuild], None)
+      _ = host.control.copyRegistry.work("test", deviceA, s1, _.isInstanceOf[Work.TransferIn], None)
       _ = host.control.reconciler.checkAll()
       _ <- awaitLoudly("the next reconcile to reload s1")(attempts().contains(paths(1)))
     yield

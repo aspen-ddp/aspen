@@ -33,6 +33,15 @@ object DurableFiles extends Logging:
 
   /** As `write`, with the content produced by `fill` writing to a buffered stream. */
   def writeWith(file: os.Path)(fill: OutputStream => Unit): Unit =
+    placeWith(file)(fill)
+    syncDirectory(file / os.up)
+
+  /** `write`'s first half: `file` replaced by `content`, forced and renamed into place, its directory not forced. For
+   *  a caller that forces the directory itself and must tell a failed sync from a failed write (host.CopyMarkers) */
+  def place(file: os.Path, content: String): Unit =
+    placeWith(file)(_.write(content.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+
+  private def placeWith(file: os.Path)(fill: OutputStream => Unit): Unit =
     val tmp = file / os.up / s".${file.last}.tmp"
     try
       val channel = FileChannel.open(tmp.toNIO,
@@ -52,7 +61,6 @@ object DurableFiles extends Logging:
         try os.remove(tmp)
         catch case r: Throwable => e.addSuppressed(r)
         throw e
-    syncDirectory(file / os.up)
 
   /** Removes `file` if present, then forces its directory so the removal is durable too. A failure to remove it, or to
    *  tell whether it is there, throws. */

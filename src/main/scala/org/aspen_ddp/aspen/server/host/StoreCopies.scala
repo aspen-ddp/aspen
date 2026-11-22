@@ -25,12 +25,11 @@ import scala.util.control.NonFatal
 class StoreCopies(ctx: DeviceControl) extends Logging:
   import ctx.given
 
-  // Stores whose copy is being retired
-  private var retiring: Set[StoreId] = Set()
   // Pending-delete copies whose store's owner state is being read (release)
   private var releaseLookups: Set[os.Path] = Set()
 
-  def isRetiring(storeId: StoreId): Boolean = retiring.contains(storeId)
+  /** Whether a copy of the store is being retired on any device of the host: its copy's Retiring activity */
+  def isRetiring(storeId: StoreId): Boolean = ctx.copyRegistry.isRetiring(storeId)
 
   private[server] def releaseLookupsInFlight: Set[os.Path] = releaseLookups
 
@@ -48,11 +47,15 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
    *  served meanwhile, so its entries cannot change.
    *
    *  The result is whether the store's path is clear: true once the copy is in pending-delete, or if there was none.
-   *  False on a failure (logged, everything left for a later call), for a device unloaded meanwhile, or while a retire
-   *  of the store is already running. */
+   *  False on a failure (logged, everything left for a later call), for a device unloaded meanwhile, while a retire
+   *  of the store is already running, or while the copy is unsynced (CopyMarkers: a marker change a crash could undo;
+   *  the next device check forces it). */
   def retire(local: LocalStorageDeviceState, storeId: StoreId): Future[Boolean] =
     val storePath = local.devicePath / storeId.directoryName
-    if retiring.contains(storeId) then
+    if isRetiring(storeId) then
+      Future.successful(false)
+    else if ctx.copyRegistry.isUnsynced(local, storeId) then
+      logger.info(s"Not retiring the copy of store $storeId at $storePath yet: a marker change to it is not durable")
       Future.successful(false)
     else
       // A stat that fails is no absence (FileStat): the retire fails, to be retried, rather than report a clear path
@@ -69,12 +72,11 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
 
   /** retire's steps for a copy known to be at `storePath` */
   private def retirePresent(local: LocalStorageDeviceState, storeId: StoreId, storePath: os.Path): Future[Boolean] =
-    retiring += storeId
     val dropped =
       try
         if !StoreDirMarkers.has(storePath, StoreDirMarkers.Marker.RebuildRequired) then
-          ctx.writeRebuildRequiredMarker(storePath)
-          ctx.copyRegistry.markedLost("retire", storePath)
+          ctx.markers.writeAt(storePath, StoreDirMarkers.Marker.RebuildRequired, "")
+        // Retiring from here until it ends: isRetiring, and a second retire does nothing
         ctx.copyRegistry.retiring(local, storeId)
         val lostState = storePath / RebuildingStore.LostCrlStateFile
         val saveFile = Backend.crlSaveFile(storePath)
@@ -94,7 +96,6 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
         saved.flatMap(_ => local.crl.dropStore(storeId))
       catch case NonFatal(t) => Future.failed(t)
     dropped.transform: result =>
-      retiring -= storeId
       ctx.copyRegistry.retireEnded(local, storeId)
       result match
         case Failure(t) =>

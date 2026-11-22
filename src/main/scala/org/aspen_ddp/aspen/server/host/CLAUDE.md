@@ -11,6 +11,21 @@
 - `StoreDirMarkers` is the single source for the marker files a store directory carries (`rebuild-required`,
   `transferred-in`, `transferring-out`, `rebuild-complete`). Its tests are FileStat's: `has` throws on a failed stat,
   `knownPresent` answers false for a pass that waits for a later one
+- `CopyMarkers` (`DeviceControl.markers`) makes every marker write and removal at a store path (R6): the marker is
+  placed (`DurableFiles.place`; rebuild-required through the `writeRebuildRequiredMarker` seam, which only places it)
+  or unlinked, the copy's phase recorded (`markedLost` / `markersChanged`), then the store directory forced
+  (`CopyMarkers.syncDirectory`, a test seam). A write or unlink that lands but whose sync fails sets the record's
+  `unsynced` (`HostCopies.unsynced`; a copy of a device not attached yet, an adoption's or a lost CRL's marks, is held
+  in `unsyncedPaths` until its attach): a write then throws, a removal returns false. An unsynced copy is never loaded
+  (`tryLoadStore`), shipped (`startOut` refuses) or retired (`StoreCopies.retire` answers false). Each device check
+  first forces every unsynced copy again (`CopyMarkers.resync`, at the top of `reconcileDeviceState`), and the
+  operational passes then load each one now synced that is Live, offline, free of work and Active
+  (`DeviceReconciler.loadResynced`, with its online gossip): the pass that removed its marker keys off that marker and
+  will not see it again. A removal that finds the marker absent forces the directory only if the copy is unsynced.
+  The sites: `clearRebuildCompleteMarker`, `clearTransferredInMarker`, `reinstateAbandonedOut`, `bringIntoService`'s
+  transfer-out removal, `keepRebuiltStoreOffline`, `closedForTransfer`'s transfer-out marker, `markRebuildRequired`
+  and `StoreCopies.retire`'s rebuild-required marker. Markers in staging (a transfer's, a rebuild's) travel with the
+  move that places the copy, which `DurableFiles.move` forces
 - `CopyPhase` (`Phase`: Live, Arrived, Outbound, Rebuilt, Lost) is the one reader of a copy's markers and the one
   place that ranks them: RR > TO > TI > RC, first present wins (`read` throws a failed stat or read, `known`
   answers None for a pass that waits). `tryLoadStore`, `adoptionClass` (Outbound needs a valid save file, else
@@ -41,13 +56,19 @@
   Shutdown / Relinquish; `handleClose` with `extractCrl`: TransferOut; else FailStop), until
   `handleClose`/`closeUnloaded` end it (Idle, or AwaitingRetry when a retry was parked while it closed; a
   transfer-out close ends once the store is closed, before the extraction's deletion);
-  `StoreCopies.retire` Retiring. Work is
-  synced from each owner's sets at every write: Create (`creatingStores`), Rebuild (`StoreRebuilds.heldWork` Queued,
-  from the first reconcile that sees the Rebuilding entry until its outcome or the entry's leaving ends it;
-  `droppingCrlState` DiscardingLost; `rebuildDevices` Running / Abandoned), TransferIn (`transferringIn` Receiving,
-  `recordingTransfersIn` Recording, `abandoningTransferIns` Abandoning, `retireEarlierTenancy`
-  RetiringEarlierTenancy), TransferOut (`closingForTransfer`, `abortingLostTransfers`); a second Work for a (device,
-  store) is a refused claim (I3), so `startRebuild` does not even queue a store a transfer out is closing.
+  `StoreCopies.retire` Retiring (`isRetiring`, host-wide: a second retire of the store does nothing). Work is the
+  only record of each owner's work, set where it starts and ends: Create (`createNewStore`, until the copy is served,
+  its open fails or the create is skipped; the flip that follows touches no copy and is kept apart,
+  `pendingCreateFlips`), Rebuild (`server/rebuild/CLAUDE.md`: Queued, DiscardingLost, Running, Abandoned; the running
+  rebuild's handle and settled promise stay in `StoreRebuilds.runningRebuilds`), TransferIn (RetiringEarlierTenancy,
+  Receiving, Recording, Abandoning, and `attempt`, the receive attempt's transfer UUID: `StoreTransfers.receiving`; an
+  abandon overlays a receive or a pool update and ends back at whichever still runs; the pool update's settled promise
+  a shutdown waits on stays in `recordingTransfersIn`; a receive, a resume or an earlier tenancy's retire starts only
+  where the device has no TransferIn work, and an abandon waits out a retire), TransferOut (stage Closing from
+  `startOut`'s close until its marker task, AbortingLost while `returnLostTransferToRebuild` aborts; an abort claimed
+  during the close takes its work over, and each end ends only its own stage). A second Work for a (device, store) is
+  a refused claim (I3), so `startRebuild` does not even queue a store a transfer out is closing. The transfer-in
+  promotion's record is a fact (`HostCopies.placed`), as the copy is at its path whatever the registry held.
   `declaredMissing` is mirrored as `missing`. An open of a copy with TransferOut work on its device is refused (R12):
   `DeviceCopies.setActivity` throws on the move to Opening, and `StoreLoader.startOpen` asks first
   (`HostCopies.transferOutWork`), logs at debug and opens nothing. Any refused open (that, or an Opening claim the
@@ -71,8 +92,8 @@
   device here. A reloaded device keeps its unloaded listing until its first reconcile writes `reconciledEntries`
   (`LocalStorageDeviceState.onReconciled`). `StoreRouter.remove` marks the store silent before it leaves the map;
   `answersUnknown` is `ready`, not installed, not silent. The view's `repairable` is `HostCopies.repairable`
-  (Served, not Closing, no Rebuild work Running or Abandoned and no TransferOut work on any device, not being sent:
-  R20, as `rebuildingStoreIds` decided; a queued or discarding rebuild reads nothing, and a flip that keeps failing
+  (Served, not Closing, no Rebuild work Running or Abandoned, `HostCopies.rebuilding(RebuildReads)`, and no TransferOut
+  work on any device, not being sent: R20; a queued or discarding rebuild reads nothing, and a flip that keeps failing
   keeps its work queued). `reloadClosedStores` keeps a closed copy still closing, retiring or held by other work for
   a later reconcile. A throw of the
   silence path is a bug: in production it is logged at error and the store left silent (clients retransmit); with
@@ -93,7 +114,10 @@
   `closeUnloaded` (fail-stop, failed CRL load, failed save-file removal) checks it once the close ends, and the
   reconcile first ends the queued Rebuild work of stores no longer Rebuilding there (`StoreRebuilds.endUnlistedWork`).
   `retryFailedLoads` keeps a retry while its copy is neither served nor opening, whatever work holds it
-  (`heldOffline`). A shutdown or relinquish closes the device's
+  (`heldOffline`). Whether a copy a transfer out left offline may go back in service is one predicate,
+  `HostCopies.mayReinstateOut(entry, storeId)` (Active, no destination named, not being sent), asked by the
+  Abandoned Transfers Out pass (which re-checks the device for one still sending), `bringIntoService` and
+  `reloadClosedStores`. A shutdown or relinquish closes the device's
   copies that are Served or Opening (`openCopies`, plus a create's open, whose copy has no record yet;
   `DeviceShutdown.storesToClose`). Tests place copies after a device's load with `ControlFixture.placedCopies`, and
   fake a served copy with `servedHere` (the recording shutdown close ends it); `ControlFixture.awaitLoudly` waits on
@@ -131,7 +155,7 @@
 - Store creation is atomic (`BackendOpener.create`, `server.store.backend.StoreCreation`,
   systemic-loss-protection 4.1): `startOpen` with `create` (only `StoreRebuilds.createNewStore`) builds the
   store in `<device>/creating/` and renames it to its path before opening it, so a store directory exists only
-  complete and `open` never creates. The create's work (`creatingStores`) ends when its copy is served, its open
+  complete and `open` never creates. The create's work (`Work.Create`) ends when its copy is served, its open
   fails or the create is skipped, not at the flip out of Initializing, which touches no copy: once the flip commits,
   a rebuild or transfer out of the served store may start, and must not overlap the create (I3). The pending flip
   is tracked apart (`pendingCreateFlips`), so a check meanwhile does not create the store again.
@@ -147,7 +171,8 @@
   per failure in a row) are left offline and retried the same way. `tryLoadStore` reads no tree, so a retry is held
   to the entries the device's latest reconcile read (`LocalStorageDeviceState.reconciledEntries`, set by
   `reconcileDeviceState`) and to the host's own work: it waits while that entry is neither Active nor Offline, the
-  store is `declaredMissing` or `StoreRebuilds.isRebuilding`, its open is refused while the store has TransferOut
+  store is `declaredMissing` or a rebuild of it discards or runs (`HostCopies.rebuilding(RebuildHolds)`), its copy is
+  unsynced (CopyMarkers), its open is refused while the store has TransferOut
   work on the device (from `startOut`'s close until its marker task has run), and it is dropped once the entry has
   left the device (before a first reconcile only the host-work checks apply). A retry
   keeps the waiting load's `onServed` (e.g. its `StoreMoved` gossip) for the open that serves it. A load's `onServed`
@@ -340,9 +365,9 @@
 
   A crash at any step leaves the marker, so the next retire redoes what remains. Three passes retire:
   - The Rebuilding pass, for a `rebuild-required` copy at the path of a store rebuilt here
-    (`StoreRebuilds.discardLostStore`). It holds a rebuild slot from its start (`maxConcurrentRebuilds` counts
-    `droppingCrlState`), and the slot passes straight to the rebuild in the same callback, so one reconcile cannot
-    retire every marked store at once. The handoff re-reads `reconciledEntries`: the rebuild starts only if the entry
+    (`StoreRebuilds.discardLostStore`). It holds a rebuild slot from its start (`maxConcurrentRebuilds` counts its
+    Rebuild work's DiscardingLost stage), and the slot passes straight to the rebuild in the same callback
+    (DiscardingLost -> Running), so one reconcile cannot retire every marked store at once. The handoff re-reads `reconciledEntries`: the rebuild starts only if the entry
     is still Rebuilding under the episode the discard began for; otherwise the slot is released and the device checked
     again (a retire held up by a slow CRL can outlast a re-placement). A failed retire is a failed pass: it re-checks
     the other devices and schedules this device's backoff re-check (`scheduleRebuildRetry`), which also starts a
@@ -352,7 +377,7 @@
     the discard would move the directory the send may still read. Each schedules a device re-check instead, as the
     Abandoned Transfers Out pass does; `startRebuild` asks only when no rebuild of the store is registered, since a
     registered one's end re-checks the device anyway. `startRebuild` also waits while a transfer out is still closing
-    the store (`StoreTransfersOut.deferRebuildUntilClosed`, i.e. `closingForTransfer`): the close's end, whatever its outcome,
+    the store (`StoreTransfersOut.deferRebuildUntilClosed`: TransferOut work Closing on any device): the close's end, whatever its outcome,
     checks the device again, which starts the rebuild.
   - `StoreTransfers.startIn`, for a `rebuild-complete` or `rebuild-required` copy an earlier tenancy left at the
     path of a store transferring onto the device (re-placed away while the host was down, then transferred back;
@@ -399,7 +424,7 @@
   queues its saves behind a device CRL's earlier deletions (its empty `dropStore` is a CRL barrier,
   `server/crl/CLAUDE.md`), so they create records rather than being skipped. The extraction releases only the charge retained when it began
   (`releaseRetained(storeId, charge)`). `startOut` is single flight per store (I3): a request (a retransmit, a
-  readdress) that arrives while `closingForTransfer` holds the store, its close or `extractUnloaded` still running,
+  readdress) that arrives while TransferOut work Closing holds the store (any device), its close or `extractUnloaded` still running,
   does nothing (logged at debug); the receiver's retransmit tries again if the first fails (`WorkOverlapSuite`).
   `DeviceReconciler.dropLeftoverCrlState` drops the entries of a store with no entry on the device, no directory
   (a stat that answers absent) and no retire running, as a safety net for a directory removed by hand; a store its
@@ -409,11 +434,10 @@
   remove, and its recovery releases the whole charge
 - A rebuilt store's directory carries `rebuild-complete` from its move into place until its entry leaves
   Rebuilding; `tryLoadStore` leaves such a store offline (`server/rebuild/CLAUDE.md`). An `Adopt` whose marker
-  removal fails leaves the copy offline on its device (its Rebuilt record) and records it in
-  `StoreRebuilds.pendingMarkerRemovals`, so the Completed Rebuilds pass retries the removal and the load at each device
-  check. The pass selects by the pending record as well as the marker, and `clearRebuildCompleteMarker` forces the
-  directory even with the marker absent: an unlink whose directory sync failed leaves no marker to select by. Tests
-  fail the sync through `StoreRebuilds.syncMarkerDirectory`
+  unlink fails leaves the copy offline on its device (its Rebuilt record) with the marker, so the Completed Rebuilds
+  pass retries the removal and the load at each device check. An unlink whose directory sync failed leaves no marker
+  to select by: the copy is unsynced (CopyMarkers) and the next device check forces it and loads it
+  (`loadResynced`). Tests fail the sync through `CopyMarkers.syncDirectory`
 - A failed rebuild pass or a permanently failed flip never re-checks its own device at once, which would restart the
   same store in a spin: it re-checks the other devices (the slot is host-wide) and schedules a backoff re-check of its
   own (`StoreRebuilds.scheduleRebuildRetry`: `Host.RebuildRetryInitialDelay` 30 s, doubled per failure of the store in
@@ -425,12 +449,12 @@
 - Re-placement (rebuild-process 4.2): `AspenClient.replaceRebuild` (`transfer-store` on a Rebuilding store) moves a
   Rebuilding entry to another device and repoints the pool, under a new rebuild episode
   (`server/rebuild/CLAUDE.md`). The reconcile's `StoreRebuilds.abandonUnlisted` cancels a rebuild running for a store
-  no longer Rebuilding on its device, or Rebuilding there under another episode (`rebuildEpisodes`; its completion
-  checks the device again; the slot release clears its `abandonedRebuilds` mark whatever the outcome, since a rebuild
-  past finish's latch re-check ignores the cancel), and deletes a `rebuilding/<id>` staging copy only when no rebuild of it is running.
+  no longer Rebuilding on its device, or Rebuilding there under another episode (its Running work's episode; its
+  completion checks the device again; the slot release clears its Abandoned stage whatever the outcome, since a
+  rebuild past finish's latch re-check ignores the cancel), and deletes a `rebuilding/<id>` staging copy only when no rebuild of it is running.
   The reconcile runs it before the transfers-in pass, and `StoreTransfers.startIn` receives nothing while rebuild work
-  of the store is registered on the device (`StoreRebuilds.hasRebuildWork`: queued in `heldWork`, discarding in
-  `droppingCrlState`, or running, a cancelled one included until its slot is released): the store re-placed away and
+  of the store is registered on the device (`StoreRebuilds.hasRebuildWork`: its Rebuild work in any stage, queued,
+  discarding, or running, a cancelled one included until its slot is released): the store re-placed away and
   transferred back must not be received while its earlier rebuild still runs here. The rebuild's end checks the device
   again, which starts the receive (I3, `WorkOverlapSuite`). A
   flip of a rebuild whose entry has since moved to another episode is `RebuildOutcome.Superseded`: nothing is
@@ -443,8 +467,8 @@
   or Deleted Stores pass (rebuild-process 5.7). A transfer ships it with its `rebuild-complete`, which the destination
   removes (`clearRebuildCompleteMarker`) when its pool update commits, before `loadStoreById`
   (`StoreTransfers.recordTransferIn`); a failed removal keeps it offline for the destination's Completed Rebuilds pass.
-  `StoreTransfersOut.startOut` refuses (logged at debug) while a rebuild of the store is registered
-  (`StoreRebuilds.isRebuilding`, the flip's retry after an Unknown attempt included), so a transfer made meanwhile
+  `StoreTransfersOut.startOut` refuses (logged at debug) while a rebuild of the store discards or runs
+  (`HostCopies.rebuilding(RebuildHolds)`, the flip's retry after an Unknown attempt included), so a transfer made meanwhile
   never closes or ships the copy under it (I3); the receiver's retransmit (`StoreTransfers.retransmitPendingStarts`,
   every 30 s) starts it once the flip settles. Tests run a write between an Unknown attempt and its retry with
   `TestNetwork.TClient.beforeRetry`, and `TClient.immediateRetries` fires the retry without its real-time backoff

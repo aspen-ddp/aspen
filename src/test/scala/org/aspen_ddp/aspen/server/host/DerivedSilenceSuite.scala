@@ -93,7 +93,7 @@ class DerivedSilenceSuite extends IntegrationTestSuite with ControlFixture:
       repairableQueued = host.isRepairable(s)
       _ = host.control.copyRegistry.work("test", deviceB, s, _.isInstanceOf[Work.Rebuild],
             Some(Work.Rebuild(None, RebuildStage.Running)))
-      // Running on B: the rebuild reads everything, as rebuildingStoreIds kept the old view from repairing it
+      // Running on B: the rebuild reads everything, as rebuilding(RebuildReads) keeps the view from repairing it
       repairableRunning = host.isRepairable(s)
       // Abandoned on B: cancelled but still running past finish's latch, its slot not yet released
       _ = host.control.copyRegistry.work("test", deviceB, s, _.isInstanceOf[Work.Rebuild],

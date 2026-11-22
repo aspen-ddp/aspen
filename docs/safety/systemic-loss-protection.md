@@ -99,7 +99,7 @@ These are facts about the current code. They define the problem; none of them is
   after one failed CRL open, except one whose valid `crl_save.log` is its whole state (`holdsOwnState`). A host restart
   reopens every device's CRL, so it can do this to every device of the host in one event.
 * **S3 Pacing applies to rebuild work, per host.** `StoreRebuilds.startRebuild` admits a store only while
-  `rebuildingStores.size + droppingCrlState.size < maxConcurrentRebuilds`. A store holds its slot from the start of its
+  its running rebuilds plus discards (Rebuild work `DiscardingLost`) `< maxConcurrentRebuilds`. A store holds its slot from the start of its
   discard (`discardLostStore`, whose retire saves and drops its CRL entries) and passes it straight to its rebuild in
   the same callback. So at most `maxConcurrentRebuilds` stores per host are being discarded or rebuilt at once. The cap
   is per host, not per pool, and nothing coordinates it across hosts. Retires of copies that are not the owner's (X5,

@@ -348,8 +348,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
       val free = ctx.copyRegistry.offlineCopies(local)
       val held = closed.filter(storeId => !free.contains(storeId) && ctx.copyRegistry.heldOffline(local, storeId))
       val (ready, notActive) = closed.filter(free.contains).partition: storeId =>
-        remote.stores.get(storeId).exists(entry =>
-          entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty)
+        remote.stores.get(storeId).exists(ctx.copyRegistry.mayReinstateOut(_, storeId))
       val notYet = notActive ++ held
       if notYet.isEmpty then
         closedForShutdown -= deviceId

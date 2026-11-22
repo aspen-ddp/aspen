@@ -94,7 +94,7 @@ else it carries.
 | Served | `<store>/config.yaml`, no markers | installed | handled |
 | Opening/loading | `startOpen` ran | `loading` | dropped |
 | Lost, awaiting rebuild | `<store>/rebuild-required` | offline | dropped |
-| Discarding | marker present, CRL entries being saved and dropped (`droppingCrlState`) | offline | dropped |
+| Discarding | marker present, CRL entries being saved and dropped (Rebuild work `DiscardingLost`) | offline | dropped |
 | Discarded | directory moved to `pending-delete/` | offline (silenced) | dropped |
 | Staging | `rebuilding/<id>/` with config, backend files, checkpoint | not installed; silenced (`StoreRebuilds.silenced`) | dropped |
 | Finished, awaiting flip | final path with `rebuild-complete` (content: the episode) | offline | dropped |
@@ -223,7 +223,7 @@ design; automating it is in `Backlog.txt` ("Automate re-placement of a rebuild w
 ### 4.3 The discard of a marked store (nothing destroyed)
 
 `StoreRebuilds.startRebuild` first silences the store (section 6.2), then proceeds only if all hold, in order: the
-store is not already rebuilding here; `rebuildingStores.size + droppingCrlState.size < maxConcurrentRebuilds`
+store is not already rebuilding here; running rebuilds plus discards (Rebuild work `DiscardingLost`) `< maxConcurrentRebuilds`
 (default 2, `Host`); the device is not shutting down; `retireForeignCopy` clears the path (T12; it waits, returning
 false, while the store's backend is opening, `StoreLoader.isOpening`, after fail-stopping a copy served from the path,
 and when a stat fails); and `discardLostStore` reports the path clear (a failed stat of the marker waits too). The
@@ -247,7 +247,7 @@ and then starts the rebuild in the same control-thread callback, for the episode
 without reading the tree again. An entry that left the device or changed episode during the retire is harmless: the
 next reconcile's `abandonUnlisted` cancels the rebuild, and a flip it still reaches is `Discard` or `Superseded`.
 
-While the retire runs, the store holds a rebuild slot through `droppingCrlState`, and the slot passes straight to the
+While the retire runs, the store holds a rebuild slot through its Rebuild work's `DiscardingLost` stage, and the slot passes straight to the
 rebuild, so one reconcile cannot discard every marked store on a device at once. `StoreCopies.retire` always completes
 with whether the path is clear (a failure, a device unloaded meanwhile, or a retire of the store already running
 answers false), so the slot is always freed. A failure at any step frees the slot
@@ -322,7 +322,7 @@ ErrorTree entries there, so the earlier episode's copy of every object is stale 
 * A per-object read failure is recorded in `failed` and the checkpoint advances past it. A read that gets no answer
   (its pool below `r` with the missing stores silent, an allocation a commit voter parks, `Frontend.parkAllocationRead`)
   fails with `ReadTimeout` after `ObjectReadTimeout` and stops its driver: it is one such failure, so it holds the
-  walk, the host's rebuild slot (`rebuildingStores`) and a cancel for at most that long. The same bound covers the
+  walk, the host's rebuild slot and a cancel for at most that long. The same bound covers the
   sweep's reads (5.3: the object stays pending for the next round) and the retries (5.4). More than
   `RebuildState.MaxFailedObjects` (10,000) failures latch an abort; a resumed pass keeps its checkpoint's failed list,
   counted once per object, so an earlier pass's failures count toward it. `MaxConsecutiveReadTimeouts` (100) read
@@ -461,16 +461,13 @@ since. It answers `Unconfirmed` instead. The host acts only after the decision:
 
 * `Adopt`: removes `rebuild-complete` durably (`clearRebuildCompleteMarker`: unlink if present, then force the store
   directory), then `loadStoreById`. The committed flip gossips `StoreMoved` (`HostServices.gossipStoreOnline`),
-  clearing the `StoreOffline` gossiped at the start. A failed removal leaves the store unloaded and router-offline,
-  records it in `StoreRebuilds.pendingMarkerRemovals` and in the device's `offlineStores` (`keepUnpromotedCopyOffline`,
-  through `DeviceControl.markCopyOffline`, which sets the router's mark too unless a copy of the store is served or
-  opening here, say from another device of this host after a same-host transfer or re-placement; a copy whose stat
-  fails counts as present), so the reconcile's Completed Rebuilds pass (`DeviceReconciler.completeRebuilds`, for a store not
-  rebuilding here), finding the entry Active and the marker present or the removal pending,
-  retries the removal and the load at each device check. The pending record is what selects a store whose unlink
-  succeeded but whose directory sync failed, and the retry forces the directory even with the marker already gone; a
-  later rebuild of the store starting on this host drops the record, its own completion then owning the marker. A
-  store rebuilt on a device that never held it is in no `offlineStores` otherwise, and its pending-delete copy elsewhere is released by the Active entry.
+  clearing the `StoreOffline` gossiped at the start. A failed removal leaves the store unloaded and silent, its copy
+  offline on its device (its Rebuilt record, as a restart's load would leave it). A failed unlink keeps the marker, so
+  the reconcile's Completed Rebuilds pass (`DeviceReconciler.completeRebuilds`, for a store not rebuilding here),
+  finding the entry Active and the marker present, retries the removal and the load at each device check. An unlink
+  whose directory sync failed leaves no marker to select it by: its copy is unsynced (`host.CopyMarkers`), never
+  loaded until the next device check forces the directory again and loads it (`DeviceReconciler.loadResynced`). Its
+  pending-delete copy elsewhere is released by the Active entry.
 * `AdoptOffline`: `keepRebuiltStoreOffline` writes a `transferring-out` marker beside the empty `crl_save.log`
   `finish` wrote, then removes `rebuild-complete`; an adopter classes it Clean and a restart's reinstatement loads it.
 * `Discard`: deletes the final directory (`LocalDevices.discardStoreDirectory`).
@@ -489,7 +486,7 @@ since. It answers `Unconfirmed` instead. The host acts only after the decision:
   instead; a transfer of the store onto the device that finds it first retires it itself (FS18). An Active entry from another episode
   cannot meet a running rebuild: every transition out of Rebuilding on this device passes a reconcile whose
   `abandonUnlisted` cancels it, a second rebuild of the store cannot start on this host while one runs
-  (`rebuildingStores`), and a transfer in cannot promote over a final path the rebuild's move then fails on.
+  (its Rebuild work, stage Running or Abandoned), and a transfer in cannot promote over a final path the rebuild's move then fails on.
 
 Every settled outcome resets the store's failure count, releases the slot and then re-checks all devices
 (`finishSettled`); `NotOwned` re-checks the others only. A failed pass
@@ -504,7 +501,7 @@ nudge checks the device) starts at once. A further failure while a re-check is s
 it ran for. A failed flip first records its copy in the
 device's `offlineStores`, as `Superseded` does: the Deleted Stores pass retires it if the entry leaves the device during
 the backoff, and an entry found Active (the flip committed after all) has the Completed Rebuilds pass load it. A cancel
-for a shutdown re-checks the other devices; a cancel because the entry left the device (`abandonedRebuilds`) re-checks
+for a shutdown re-checks the other devices; a cancel because the entry left the device (its Rebuild work Abandoned) re-checks
 all, so the next check deletes the staging copy. The abandoned branch is taken only when the completion is
 `RebuildCancelled`; a cancelled rebuild that ends otherwise (finished past the latch re-check, or failed with another latched cause) takes that outcome's branch.
 The slot release clears the abandoned mark whichever branch runs, so a later rebuild of the store on this host is
@@ -869,7 +866,7 @@ on the old device when it is tombstoned completes and gets `Discard`.
 `relinquishDevice` (or lost with its crash); the new owner resumes from the checkpoint; an old completion gets
 `NotOwned`. (b) A tombstone repointing a store whose in-place rebuild runs: the destination builds a fresh copy; the old
 completion gets `Discard`. (c) Concurrent drains: `KeyRevision`s make one lose (`StoreAlreadyMoved`). (d) The
-double-start guard is host-local (`rebuildingStores`); across hosts it is the tree entry and the guarded flip.
+double-start guard is host-local (the copy registry's Rebuild work, `HostCopies.rebuilding`); across hosts it is the tree entry and the guarded flip.
 
 **FS12 Destination runs out of space.** The abort latches, staging and checkpoint stay, `REBUILD OUT OF SPACE` names the
 remedy (`transfer-store` on the Rebuilding store); the old device's reconcile then cancels the rebuild and deletes its

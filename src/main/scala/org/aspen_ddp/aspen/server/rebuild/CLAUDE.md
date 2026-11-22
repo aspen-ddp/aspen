@@ -77,8 +77,20 @@
   `REBUILD OUT OF SPACE` (from any write of the walk, the sweep, a checkpoint, or `finish`'s flush and completion
   files), and a warning for a store with no recorded usage. The remedy for either is re-placement,
   `transfer-store` on the Rebuilding store (`server/host/CLAUDE.md`)
+- Rebuild work lives only in the copy registry: `Work.Rebuild(episode, stage)` on its device, stage Queued (waiting
+  for a slot), DiscardingLost (its lost copy's retire), Running, or Abandoned (cancelled by `abandonUnlisted`, still
+  running until its slot is released). `StoreRebuilds` keeps only what Work cannot hold: each running rebuild's handle
+  and settled promise (`runningRebuilds`), the pending flips, requests and retry backoff. One predicate answers "is a
+  rebuild registered", `HostCopies.rebuilding(stages)`, each caller naming its stages (R20): `RebuildReads` (Running,
+  Abandoned: repairability, the Completed Rebuilds pass, an earlier tenancy's retire, a second start), `RebuildHolds`
+  (plus DiscardingLost: a load retry waits, `startOut` refuses), all stages for silence; `hasRebuildWork(store,
+  device)` is any stage on one device. Slots (`maxConcurrentRebuilds`) count running rebuilds by handle and discards by
+  work; a discard hands its slot to the rebuild with no gap (`startRebuild(handoff = true)`: DiscardingLost goes
+  straight to Running, the discard's own slot not counted), and a rebuild that does not start leaves the work Queued.
+  An outcome that ends the work ends it at the slot's release, after the outcome's steps (an Adopt's marker removal
+  and load), so the store stays Rebuilding-silent throughout
 - Silence (rebuild-process 6.2): `StoreRebuilds.startRebuild` registers the store's Rebuild work on its device at the
-  first reconcile that sees its Rebuilding entry, queued or running (`heldWork`), and the work keeps the store silent
+  first reconcile that sees its Rebuilding entry, and the work keeps the store silent
   (derived silence, `server/host/CLAUDE.md`), so its host drops its messages rather than answering UnknownStore. No
   other path can unsilence it while the work is held (another device's Deleted Stores pass after a same-host
   re-placement only removes that device's copy). `Adopt`, `AdoptOffline`, `Discard`, `Unconfirmed`, `NotOwned`, a

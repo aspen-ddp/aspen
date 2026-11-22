@@ -146,6 +146,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   private def reconcileDeviceState(local: LocalStorageDeviceState,
                                    remote: StorageDeviceState): Unit =
     local.reconciledEntries = Some(remote.stores)
+    // Copies whose marker change was not durable (CopyMarkers) are forced again first, so the passes see them synced
+    val resynced = ctx.markers.resync(local)
     if remote.isFailed then
       // An operator has declared this device dead. Its directory can still mount -- a dead
       // controller rather than a dead platter -- and its zeroed host id must not be mistaken for
@@ -181,6 +183,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
 
       completeTransfersIn(local, remote)
       completeRebuilds(local, remote)
+      loadResynced(local, remote, resynced)
       // New stores
       remote.stores.filter((storeId, entry) =>
         entry.status == StorageDeviceState.StoreStatus.Initializing
@@ -313,12 +316,10 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // A store still sending is left alone but re-checked shortly. An abort's nudge usually
     // arrives while the send is still running, and the send ends (the destination cancels its
     // receive) with nothing to prompt another check for a full checkStorageDevicePeriod.
-    val (stillSending, abandonedOut) = (ctx.copyRegistry.offlineCopies(local) -- lostCrl).filter(storeId =>
-      remote.stores.get(storeId).exists(entry =>
-        entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
-      ) &&
+    val (abandonedOut, stillSending) = (ctx.copyRegistry.offlineCopies(local) -- lostCrl).filter(storeId =>
+      remote.stores.get(storeId).exists(ctx.copyRegistry.noTransferOut) &&
       hasMarker(local, storeId, StoreDirMarkers.Marker.TransferOut)
-    ).partition(ctx.storeTransferService.isTransferringOut)
+    ).partition(storeId => remote.stores.get(storeId).exists(ctx.copyRegistry.mayReinstateOut(_, storeId)))
     abandonedOut.foreach: storeId =>
       ctx.transfersOut.reinstateAbandonedOut(local, storeId)
     if stillSending.nonEmpty then
@@ -330,17 +331,17 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // leaves an Active entry naming this device over a copy that tryLoadStore skips. The entry
     // is no longer TransferringIn, so StoreTransfers.startIn never sees it, and nothing else
     // removes the marker. Active is the tree's word that the pool now names this device, so
-    // the copy is ours to load. transferringIn covers the window where this process's own
-    // metadata step has committed but has not yet removed the marker itself.
+    // the copy is ours to load. The store's receive attempt (on any device of the host) covers the window where this
+    // process's own metadata step has committed but has not yet removed the marker itself.
     ctx.copyRegistry.offlineCopies(local).filter(storeId =>
-      !ctx.transfers.transferringIn.contains(storeId) &&
+      !ctx.transfers.receiving.contains(storeId) &&
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
       hasMarker(local, storeId, StoreDirMarkers.Marker.TransferredIn)
     ).foreach: storeId =>
       val storePath = local.devicePath / storeId.directoryName
       logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but still " +
                   s"carries its transferred-in marker. Completing the transfer and loading the store")
-      if ctx.transfers.clearTransferredInMarker(storeId, storePath) then
+      if ctx.transfers.clearTransferredInMarker(local, storeId) then
         ctx.tryLoadStore(local, storePath, None)
 
   /** Completes a rebuild whose flip committed but whose marker removal did not, and loads the store. */
@@ -348,25 +349,40 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // A crash between a rebuild's flip committing and the removal of its rebuild-complete marker leaves an Active
     // entry over a copy that tryLoadStore skips; the rebuild's completion, which would remove the marker, is gone.
     // Active is the tree's word that the flip committed, so the copy is ours to load. A rebuild still running here
-    // removes its own marker once its flip commits. A removal that failed here or in the rebuild's completion is
-    // retried too, marker or not: an unlink whose directory sync failed leaves none.
+    // removes its own marker once its flip commits. An unlink that failed here or in the rebuild's completion is
+    // retried too; one whose directory sync failed left the copy unsynced, which loadResynced loads once forced.
     ctx.copyRegistry.offlineCopies(local).filter(storeId =>
-      !ctx.rebuilds.rebuildingStoreIds.contains(storeId) &&
+      !ctx.copyRegistry.rebuilding(HostCopies.RebuildReads).contains(storeId) &&
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
-      (ctx.rebuilds.markerRemovalsPending.contains(storeId) ||
-       hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildComplete))
+      hasMarker(local, storeId, StoreDirMarkers.Marker.RebuildComplete)
     ).foreach: storeId =>
       val storePath = local.devicePath / storeId.directoryName
       logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but its rebuild-complete marker " +
                   s"is not durably removed. Completing the rebuild and loading the store")
-      if ctx.rebuilds.clearRebuildCompleteMarker(storeId, storePath) then
+      if ctx.rebuilds.clearRebuildCompleteMarker(local, storeId) then
         ctx.tryLoadStore(local, storePath, None)
+
+  /** Loads each copy this check forced again (`resynced`, CopyMarkers.resync) that a marker removal had left unsynced
+   *  over a Live copy: the removal's own load was held back (an unsynced copy is never loaded), and the pass that made
+   *  it keys off the marker it removed. Only a copy still offline and free of work, whose entry is Active; one whose
+   *  entry is not Active then is left as a restart's scan would leave it. Its online gossip goes with the load, as a
+   *  reinstated transfer out's does */
+  private def loadResynced(local: LocalStorageDeviceState, remote: StorageDeviceState,
+                           resynced: List[StoreId]): Unit =
+    val free = ctx.copyRegistry.offlineCopies(local)
+    resynced.filter(storeId =>
+      free.contains(storeId) && !ctx.copyRegistry.isUnsynced(local, storeId) &&
+      ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase == Phase.Live) &&
+      remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active)
+    ).foreach: storeId =>
+      logger.info(s"Loading store $storeId on device ${local.storageDeviceId}: its marker removal is durable now")
+      ctx.tryLoadStore(local, local.devicePath / storeId.directoryName, Some(() => ctx.gossipStoreOnline(storeId)))
 
   /** Drops the transfers in this host is still tracking that the tree no longer records. */
   private def dropAbortedTransfersIn(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     // An abort removes this device's TransferringIn entry and tells nobody, so this check is the
     // only thing that learns of it. Left alone, an attempt still waiting on bytes keeps
-    // retransmitting its request and holds the store in transferringIn, which would make the
+    // retransmitting its request and holds the store's receive attempt, which would make the
     // pass below skip a later transfer of the same store. Before that pass for that reason.
     // An attempt past promotion is not covered here; updateStateForTransferredStore sees the
     // abort in the source's entry instead.
@@ -384,8 +400,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     ).foreach: (storeId, fromDeviceId) =>
       ctx.transfers.dropAbandonedTransferIn(storeId, fromDeviceId, local.storageDeviceId)
 
-    // The same store can be re-targeted at another device of this host. transferringIn is keyed
-    // by store, so the earlier attempt would block the new one until its own device's next
+    // The same store can be re-targeted at another device of this host. A receive attempt is held
+    // per store, so the earlier attempt would block the new one until its own device's next
     // check noticed the abort. This device's entry is the newer word on who receives the store,
     // so the other device's attempt is dropped here instead of a poll later.
     val retargeted =

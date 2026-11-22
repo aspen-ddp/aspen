@@ -705,7 +705,7 @@ Future with `CrlClosed` and passes the shutdown to the writer, which drains the 
 releases the lock and signals. The unwritten entries, sealed and newest, are discarded, as is the in-flight entry's
 completion: none of their handlers runs (C3), so no vote follows. Every later tracked call fails with `CrlClosed`
 (`closed` is set before the pending Futures are failed, and `tracked` adds its promise before checking it, the same
-handshake as `dead`). So a caller waiting on a drop, a deletion or a read (`StoreRebuilds.droppingCrlState`,
+handshake as `dead`). So a caller waiting on a drop, a deletion or a read (a rebuild's discard, Rebuild work `DiscardingLost`,
 `DeviceReconciler.crlDropsRunning`, a transfer's extraction) always hears back and frees what it holds; a drop or
 deletion that failed this way is retried by a later check.
 

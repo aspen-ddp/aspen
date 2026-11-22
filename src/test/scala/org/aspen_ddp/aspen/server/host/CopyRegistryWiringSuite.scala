@@ -314,7 +314,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
         _ <- waitForTransactionsToComplete()
         _ = host.control.rebuilds.startRebuild(local, sid(0), Some(episode), acceptLoss = false)
         _ <- awaitRebuild(host, deviceA, sid(0))
-        _ <- pumpUntil(host, !host.control.rebuilds.rebuildingStoreIds.contains(sid(0)), drain = false)
+        _ <- pumpUntil(host, !host.control.copyRegistry.rebuilding(HostCopies.RebuildReads).contains(sid(0)), drain = false)
         outcome = recorded(host).rebuildOutcomes((deviceA, sid(0)))
         // The device's own records: the check after an AdoptOffline flip finds the device shutting down and unloads it
         after = local.copies.copies.view.mapValues(_.phase).toMap
@@ -636,7 +636,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       _ = host.control.rebuilds.startRebuild(local, sid(0), Some(episode), acceptLoss = false)
       queued = host.control.copyRegistry.silence(sid(0))
       _ <- awaitRebuild(host, deviceA, sid(0))
-      _ <- pumpUntil(host, !host.control.rebuilds.rebuildingStoreIds.contains(sid(0)), drain = false)
+      _ <- pumpUntil(host, !host.control.copyRegistry.rebuilding(HostCopies.RebuildReads).contains(sid(0)), drain = false)
     yield
       recorded(host).rebuildOutcomes((deviceA, sid(0))) should be(RebuildOutcome.Adopt)
       queued should be(Silence.Silent(Set(SilenceReason.Rebuilding)))
@@ -979,3 +979,88 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     host.testingOnlyHandleEvents()
     host.control.copyRegistry.silence(sid(3)) should be(Silence.Silent(Set(SilenceReason.CopyHere)))
     host.control.router.answersUnknown(sid(3)) should be(false)
+
+  // R6: marker durability is uniform. A removal whose directory sync fails after the unlink leaves the copy unsynced,
+  // and it is never loaded until a later device check forces the directory again, which loads it
+  for (name, marker) <- List(("TI", StoreTransfer.TransferredInMarkerFile), ("TO", StoreTransfer.TransferOutMarkerFile),
+                             ("RC", RebuildingStore.RebuildCompleteMarkerFile)) do
+    atest(s"a failed sync after removing any marker leaves the copy unsynced and unloaded, and the next check loads it ($name)"):
+      given ExecutionContext = executionContext
+      val hostRoot = newHostDir()
+      val dev = device(hostRoot, deviceA)
+      val dir = writeStoreConfig(dev, sid(0))
+      os.write(dir / marker, "x")
+      val host = newHost(hostRoot, verifyCopyRegistry = true)
+      var failSync = true
+      var syncs = List.empty[os.Path]
+      host.control.markers.syncDirectory = d =>
+        syncs = d :: syncs
+        if failSync && d == dir then throw new java.io.IOException("injected directory sync failure")
+      host.testingOnlyHandleEvents()
+      val local = loadedDevices(host)(deviceA)
+      val active = deviceState(deviceA,
+        Map(sid(0) -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)))
+      def check(): Future[Unit] =
+        val armed = recorded(host).armLookup(deviceA)
+        host.control.reconciler.checkStorageDevice(deviceA)
+        armed.success(active)
+        awaitLoudly(s"the check of device $deviceA") {
+          host.testingOnlyHandleEvents()
+          !host.control.reconciler.activeDeviceChecks.contains(deviceA)
+        }
+      def loads: Int = recorded(host).storeLoadAttempts.count(_ == (deviceA, dir))
+      val loadedAtStart = loads
+      for
+        _ <- check()
+        removed = !os.exists(dir / marker)
+        unsynced = record(host, deviceA, sid(0)).map(_.unsynced)
+        loadsAfterFailure = loads
+        _ = failSync = false
+        _ <- check()
+      yield
+        removed should be(true)
+        unsynced should be(Some(true))
+        loadsAfterFailure should be(loadedAtStart)
+        syncs should contain(dir)
+        record(host, deviceA, sid(0)).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Live, false)))
+        loads should be(loadedAtStart + 1)
+        consistent(host)
+
+  // One predicate answers "is a rebuild of this store registered here", by stage: the discard of its lost copy hands
+  // its slot straight to the rebuild, with no queued gap between them
+  atest("rebuilding answers the same through a discard and a run"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val dev = device(hostRoot, deviceA)
+    writeStoreConfig(dev, sid(0))
+    val host = newHost(hostRoot, storeRebuildFactory = new PlacingRebuildFactory(writeStoreConfig)(using executionContext),
+                       verifyCopyRegistry = true)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    val episode = UUID.randomUUID()
+    val registry = host.control.copyRegistry
+    // Each change: the store's work there, and what each view of `rebuilding` answers
+    val seen = mutable.ArrayBuffer[(Option[RebuildStage], Boolean, Boolean, Boolean)]()
+    registry.observer = (copies, s) =>
+      if s == sid(0) then
+        val stage = copies.work.get(s).collect { case w: Work.Rebuild => w.stage }
+        seen += ((stage, registry.rebuilding().contains(s), registry.rebuilding(HostCopies.RebuildHolds).contains(s),
+                  registry.rebuilding(HostCopies.RebuildReads).contains(s)))
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.setRebuilding(sid(0), episode))
+      _ <- waitForTransactionsToComplete()
+      // The reconcile's entries, which the discard's handoff re-reads
+      _ = local.reconciledEntries = Some(Map(sid(0) -> StorageDeviceState.StoreEntry(
+            StorageDeviceState.StoreStatus.Rebuilding, None, Some(episode))))
+      _ = host.control.rebuilds.startRebuild(local, sid(0), Some(episode), acceptLoss = false)
+      _ <- awaitRebuild(host, deviceA, sid(0))
+    yield
+      recorded(host).rebuildOutcomes((deviceA, sid(0))) should be(RebuildOutcome.Adopt)
+      runs(seen.map(_._1)) should be(List(Some(RebuildStage.Queued), Some(RebuildStage.DiscardingLost),
+        Some(RebuildStage.Running), None))
+      seen.foreach: (stage, any, holds, reads) =>
+        any should be(stage.isDefined)
+        holds should be(stage.exists(HostCopies.RebuildHolds.contains))
+        reads should be(stage.exists(HostCopies.RebuildReads.contains))
+      consistent(host)

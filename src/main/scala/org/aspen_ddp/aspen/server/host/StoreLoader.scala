@@ -140,6 +140,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             // Its copy's record (readAtLoad) keeps it silent and offline on its device
           else if isOpening(storeCfg.storeId) || router.get(storeCfg.storeId).isDefined then
             logger.debug(s"Not loading store ${storeCfg.storeId} again: it is already open or opening")
+          else if ctx.copyRegistry.isUnsynced(sds, storeId) then
+            // A marker change a crash could undo (CopyMarkers): the next check of its device forces its directory
+            // and loads it (DeviceReconciler.loadResynced)
+            logger.info(s"Not loading store $storeId yet: a marker change to its copy is not durable. $potentialStoreFile")
           else
             startOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)
         catch
@@ -417,7 +421,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         awaitRetry("retryFailedLoads", storeId, wait.copy(scansLeft = wait.scansLeft - 1))
       else if ! entry.forall(_.exists(e => e.status == StorageDeviceState.StoreStatus.Active ||
                                            e.status == StorageDeviceState.StoreStatus.Offline)) ||
-              wait.sds.declaredMissing.contains(storeId) || ctx.rebuilds.isRebuilding(storeId) then
+              wait.sds.declaredMissing.contains(storeId) ||
+              ctx.copyRegistry.rebuilding(HostCopies.RebuildHolds).contains(storeId) then
         logger.debug(s"Store $storeId awaiting a load retry is not loaded yet: its entry on device $deviceId is " +
                      s"${entry.flatten.map(_.status)}, or the host is rebuilding or has declared it")
       else if ! ctx.shutdown.isShuttingDown(deviceId) then

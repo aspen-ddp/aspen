@@ -462,15 +462,11 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Active => storeId -> entry
     }
     active.foreach: (storeId, entry) =>
-      val markerFile = path / storeId.directoryName / StoreTransfer.TransferOutMarkerFile
-      if entry.transferDevice.isEmpty && !ctx.storeTransferService.isTransferringOut(storeId) then
-        // A marker that cannot be removed, or whose stat fails, keeps the store offline as a present one does
-        try
-          os.remove(markerFile, checkExists = false)
-          ctx.copyRegistry.markerRemoved("bringIntoService", path / storeId.directoryName)
-        catch case t: Throwable =>
-          logger.error(s"Failed to remove the transfer-out marker for store $storeId at $markerFile. " +
-                       s"The store stays offline until a later check of its device. Error: $t")
+      if ctx.copyRegistry.mayReinstateOut(entry, storeId) then
+        // A marker that cannot be removed keeps the store offline as a present one does, until a later check of its
+        // device; one removed whose directory could not be forced leaves the copy unsynced, which its attach takes
+        // and the device's check forces and loads (CopyMarkers, logged there)
+        ctx.markers.removeAt(path / storeId.directoryName, StoreDirMarkers.Marker.TransferOut): Unit
 
     announceOnLoad += path -> active.keySet
     DeviceMarkers.removeShutdownState(path)

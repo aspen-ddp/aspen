@@ -40,9 +40,10 @@ object DeviceDiscovery:
     case _ => false
 
   /** What asked for a discovery: `scan`, a ScanDevices, whose loads' transient CRL open failures count
-   *  (CrlOpenAttempts); `check`, each device it loads is checked at once (DeviceReconciler.checkStorageDevice) */
-  final case class Trigger(scan: Boolean, check: Boolean):
-    def |(o: Trigger): Trigger = Trigger(scan || o.scan, check || o.check)
+   *  (CrlOpenAttempts); `check`, each device it loads is checked at once (DeviceReconciler.checkStorageDevice), or,
+   *  for the `startup` scan, by a CheckLoadedDevice event posted as its load applies */
+  final case class Trigger(scan: Boolean, check: Boolean, startup: Boolean = false):
+    def |(o: Trigger): Trigger = Trigger(scan || o.scan, check || o.check, startup || o.startup)
 
 /** Runs only on the control thread. See HostThreading.scala.
  *
@@ -111,8 +112,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     var again: Option[DeviceDiscovery.Trigger] = None
   private var busy: Map[os.Path, Busy] = Map()
 
-  // The paths the startup scan began a probe of whose decision is still to come, and what to run once there are none
-  // (startupScan). None once it has run
+  // The startup gate (startupScan): the paths the startup scan began a probe of whose decision is still to come, and
+  // what to run once there are none, a listing no longer names them, or the first ScanDevices comes. None once run
   private var startupPaths: Option[Set[os.Path]] = None
   private var startupDecided: () => Unit = () => ()
 
@@ -135,14 +136,22 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     loadedDirs = loadedDirs.filter((_, id) => id != storageDeviceId)
 
   /** The Host constructor's scan, before the threading starts: the same jobs as every scan, so it blocks on no device.
-   *  `decided` runs (on the control thread) once every path it listed has been decided: its device attached, or left
-   *  unloaded, or handed to resolveOwnership, whose stores are marked awaiting their device. A path whose job never
-   *  returns holds it back. A listing that fails decides at once. Its loads are not checked: `decided` posts the
-   *  initial CheckAllDevices */
+   *  Each device it loads is checked by a CheckLoadedDevice event posted as its load applies. `decided` runs once, on
+   *  the control thread, at the first of: every path it listed decided (its device attached, or left unloaded, or
+   *  handed to resolveOwnership, whose stores are marked awaiting their device; a path a later listing no longer
+   *  names counts as decided), its listing failing or throwing, or the first ScanDevices (`endStartupGate`). So a
+   *  path whose job never returns holds it back for one scan period at most: no timeout on its I/O, which stays
+   *  outstanding */
   def startupScan(decided: () => Unit): Unit =
     startupDecided = decided
     startupPaths = Some(Set())
-    discover(DeviceDiscovery.Trigger(scan = false, check = false), startup = true)
+    discover(DeviceDiscovery.Trigger(scan = false, check = true, startup = true), startup = true)
+
+  /** The first ScanDevices after startup: runs the startup gate's `decided` if it has not run */
+  def endStartupGate(): Unit =
+    if startupPaths.isDefined then
+      startupPaths = None
+      startupDecided()
 
   /** Scans storage-devices/ and loads any device found there that this host owns.
    *
@@ -173,8 +182,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       relist = Some(relist.fold(trigger)(_ | trigger))
     else
       listing = true
-      val job = ctx.deviceIos.hostRoot.submit(JobKind.Scan, None)(DiscoveryDisk.listDevicePaths(storageDevicesDir))
-      ctx.onControl("device listing", job): result =>
+      val job = ctx.deviceIos.hostRoot.submit(JobKind.DeviceListing, None)(
+        DiscoveryDisk.listDevicePaths(storageDevicesDir))
+      ctx.onControl("device listing", job, discovery = true): result =>
         listing = false
         try applyListing(result, trigger, startup)
         finally
@@ -183,7 +193,18 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             discover(t, startup = false)
 
   private def applyListing(result: Try[Seq[os.Path]], trigger: DeviceDiscovery.Trigger, startup: Boolean): Unit =
-    val begun = result match
+    var begun = Set[os.Path]()
+    // Whatever this throws, the startup gate learns which of its paths are outstanding (none, if it threw first)
+    try begun = listAndProbe(result, trigger)
+    finally
+      if startup then
+        startupPaths = startupPaths.map(_ => begun)
+      // A path a listing no longer names is decided for the startup gate: it holds no device to wait for
+      startupPaths = startupPaths.map(_.filter(listed.contains))
+      checkStartup()
+
+  private def listAndProbe(result: Try[Seq[os.Path]], trigger: DeviceDiscovery.Trigger): Set[os.Path] =
+    result match
       case Failure(_: DiscoveryDisk.NotADirectory) =>
         warnOnce(storageDevicesDir, s"Invalid storage devices directory: $storageDevicesDir")
         Set()
@@ -200,9 +221,6 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         disownedDirs = disownedDirs.filter(listed.contains)
         forgetUnlisted()
         paths.filterNot(loadedDirs.contains).filter(probe(_, trigger, explicit = false)).toSet
-    if startup then
-      startupPaths = Some(begun)
-      checkStartup()
 
   /** Closes the DeviceIo of each device directory gone from the listing that holds no loaded device and has no
    *  discovery job outstanding, once it is idle (DeviceIos.forget); one that is not stays, for the next listing */
@@ -247,7 +265,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  submits the next step as its last act */
   private def submitFor[T](path: os.Path, b: Busy, kind: JobKind, what: String)(job: => T)
                           (abandon: () => Unit)(apply: T => Unit): Unit =
-    ctx.onControl(what, b.io.submit(kind, None)(job)): result =>
+    ctx.onControl(what, b.io.submit(kind, None)(job), discovery = true): result =>
       if busy.get(path).exists(_ eq b) then
         val current = listed.contains(path) && ctx.deviceIos.get(path).exists(_ eq b.io)
         result match
@@ -623,7 +641,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
           if explicit then again(path, trigger)
           false
         case Some(b) =>
-          submitFor(path, b, JobKind.Markers, "device probe")(DiscoveryDisk.probe(path))(() => ()): result =>
+          submitFor(path, b, JobKind.DeviceProbe, "device probe")(DiscoveryDisk.probe(path))(() => ()): result =>
             decide(path, b, result, trigger)
           true
 
@@ -890,7 +908,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     if alreadyLoaded(storageDevicePath, sdCfg) then
       end(storageDevicePath, b)
     else
-      submitFor(storageDevicePath, b, JobKind.Sweep, "device load sweep")({
+      submitFor(storageDevicePath, b, JobKind.LoadSweep, "device load sweep")({
         DiscoveryDisk.sweepAtLoad(storageDevicePath)
         Try(CopyLayout.list(storageDevicePath))
       })(() => ()):
@@ -933,7 +951,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       ctx.shutdown.shutDownCrl(storageDevicePath, crl)
     val sync = ctx.moves.syncDirectory
     val rename = ctx.moves.rename
-    submitFor(storageDevicePath, b, JobKind.Move, "device load P2")(
+    submitFor(storageDevicePath, b, JobKind.LoadDuplicates, "device load P2")(
       DiscoveryDisk.retireDuplicates(storageDevicePath, sync, rename))(() => abandon()): dups =>
       // Held for the attach, as CopyMoves.moveUnattached holds an unsynced move of a device being loaded
       dups.unsynced.foreach: (from, to) =>
@@ -969,4 +987,6 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
           stores.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach(ctx.gossipStoreOnline)
       end(storageDevicePath, b)
       if attached && trigger.check then
-        ctx.reconciler.checkStorageDevice(sdCfg.storageDeviceId)
+        // The startup scan's check waits for the threading's start, as its events do
+        if trigger.startup then ctx.post(Host.CheckLoadedDevice(sdCfg.storageDeviceId))
+        else ctx.reconciler.checkStorageDevice(sdCfg.storageDeviceId)

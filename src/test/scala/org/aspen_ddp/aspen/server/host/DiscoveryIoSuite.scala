@@ -3,6 +3,8 @@ package org.aspen_ddp.aspen.server.host
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.HostId
+import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{DeviceMarkers, Host, StorageDeviceConfig, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.store.backend.{DefaultBackendOpener, StoreCreation}
@@ -51,53 +53,87 @@ class DiscoveryIoSuite extends IntegrationTestSuite with ControlFixture:
     holdDevice(host, devA)
     checkAllNow(host)
 
-    heldJobs(host, devA) should be(List(JobKind.Markers))
+    heldJobs(host, devA) should be(List(JobKind.DeviceProbe))
     loadedDevices(host).keySet should be(Set(deviceB))
     host.control.discovery.busyDeviceDirs should be(Set(devA))
 
     // Later scans skip the path whose probe is outstanding: the held lane holds one probe, not one per scan
     checkAllNow(host)
     scanNow(host)
-    heldJobs(host, devA) should be(List(JobKind.Markers))
+    heldJobs(host, devA) should be(List(JobKind.DeviceProbe))
 
     releaseDevice(host, devA)
     runDiscovery(host)
     host.control.discovery.busyDeviceDirs should be(empty)
     Future.successful(loadedDevices(host).keySet should be(Set(deviceA, deviceB)))
 
-  atest("startup scan with one path held starts the host and loads the other device"):
-    given ExecutionContext = executionContext
+  private val unknownStore = StoreId(PoolId(new UUID(9, 9)), 0.toByte)
+
+  private def queuedEvent(host: Host)(p: Host.Event => Boolean): Boolean =
+    lockstep(host).queuedItems.exists:
+      case t: Host.EventTask => p(t.event)
+      case _ => false
+
+  /** A host whose path `held` is held from before its constructor, so its startup probe never returns until released;
+   *  devices A (held) and B, B with a real RocksDB store */
+  private def startupWithHeldPath(): (Host, os.Path, os.Path) =
     val hostRoot = newHostDir()
     val devA = device(hostRoot, "dev0", deviceA)
     val devB = device(hostRoot, "dev1", deviceB)
     val storeB = CopyFixtures.freshCopyPath(devB, storeId)
     DefaultBackendOpener.createStore(StoreConfig(storeId, StoreConfig.RocksDB(None), None, Replication(3, 2)),
       storeB, devB / StoreCreation.CreatingDirectory)
-    var threading: LockstepThreading = null
-    // Held before the Host exists, so its constructor's probe of A never returns
     val host = newHost(hostRoot, keepCheckAllDevices = true, adjustSeams = _.copy(tryLoadStore = None),
       threadingOf = ec =>
-        threading = new LockstepThreading(ec)
+        val threading = new LockstepThreading(ec)
         threading.hold(devA)
         threading)
-
     // The constructor returned, and B is loaded while A's probe waits
-    heldJobs(host, devA) should be(List(JobKind.Markers))
+    heldJobs(host, devA) should be(List(JobKind.DeviceProbe))
     loadedDevices(host).keySet should be(Set(deviceB))
     host.control.discovery.startupScanDecided should be(false)
-    // Not ready to answer for stores it does not know: A may hold any of them
-    lockstep(host).queuedItems.exists:
-      case t: Host.EventTask => t.event.isInstanceOf[Host.StoresReady]
-      case _ => false
-    .should(be(false))
+    // B is checked as its load applied, whatever A does
+    queuedEvent(host)(_ == Host.CheckLoadedDevice(deviceB)) should be(true)
+    // Not yet ready to answer for stores it does not know: A may hold any of them
+    queuedEvent(host)(_.isInstanceOf[Host.StoresReady]) should be(false)
+    (host, devA, devB)
 
-    host.testingOnlyHandleEvents() // B's store opens and loads
+  atest("startup scan with one path held starts the host and loads the other device"):
+    val (host, devA, _) = startupWithHeldPath()
+    host.testingOnlyHandleEvents() // B's check, and its store opens and loads
     host.getStoreIds should contain(storeId)
+    host.control.router.answersUnknown(unknownStore) should be(false)
 
     releaseDevice(host, devA)
     host.testingOnlyHandleEvents()
     host.control.discovery.startupScanDecided should be(true)
+    host.control.router.answersUnknown(unknownStore) should be(true)
     Future.successful(loadedDevices(host).keySet should be(Set(deviceA, deviceB)))
+
+  atest("the startup gate opens at the first ScanDevices while a startup path stays held"):
+    val (host, devA, _) = startupWithHeldPath()
+    host.testingOnlyHandleEvents()
+    host.control.router.answersUnknown(unknownStore) should be(false)
+
+    host.control.reconciler.scan()
+    queuedEvent(host)(_.isInstanceOf[Host.StoresReady]) should be(true)
+    host.testingOnlyHandleEvents()
+    host.control.discovery.startupScanDecided should be(true)
+    host.control.router.answersUnknown(unknownStore) should be(true)
+    host.getStoreIds should contain(storeId)
+    // A's probe is still outstanding, and the scan queued no second one
+    heldJobs(host, devA) should be(List(JobKind.DeviceProbe))
+    Future.successful(loadedDevices(host).keySet should be(Set(deviceB)))
+
+  atest("a held startup path that a listing no longer names stops holding the startup gate"):
+    val (host, devA, _) = startupWithHeldPath()
+    host.testingOnlyHandleEvents()
+    os.move(devA, devA / os.up / os.up / "pulled")
+    checkAllNow(host)
+    host.control.discovery.startupScanDecided should be(true)
+    queuedEvent(host)(_.isInstanceOf[Host.StoresReady]) should be(true)
+    host.testingOnlyHandleEvents()
+    Future.successful(host.control.router.answersUnknown(unknownStore) should be(true))
 
   atest("device probe completing after its path went away changes nothing"):
     val hostRoot = newHostDir()
@@ -105,7 +141,7 @@ class DiscoveryIoSuite extends IntegrationTestSuite with ControlFixture:
     val devA = device(hostRoot, "dev0", deviceA)
     holdDevice(host, devA)
     checkAllNow(host)
-    heldJobs(host, devA) should be(List(JobKind.Markers))
+    heldJobs(host, devA) should be(List(JobKind.DeviceProbe))
     val io = host.control.deviceIos.get(devA)
     io should not be empty
 
@@ -136,13 +172,13 @@ class DiscoveryIoSuite extends IntegrationTestSuite with ControlFixture:
     val devA = device(hostRoot, "dev0", deviceA)
     holdDevice(host, devA)
     host.control.reconciler.checkAll()
-    runJob(host, JobKind.Scan)
+    runJob(host, JobKind.DeviceListing)
     applyResults(host) // submits the probe, held
     releaseDevice(host, devA)
-    runJob(host, JobKind.Markers)
+    runJob(host, JobKind.DeviceProbe)
     holdDevice(host, devA)
     applyResults(host) // the probe says ours: the load's sweep is submitted, held
-    heldJobs(host, devA) should be(List(JobKind.Sweep))
+    heldJobs(host, devA) should be(List(JobKind.LoadSweep))
 
     os.move(devA, hostRoot / "pulled")
     checkAllNow(host)
@@ -159,15 +195,15 @@ class DiscoveryIoSuite extends IntegrationTestSuite with ControlFixture:
     val devA = device(hostRoot, "dev0", deviceA)
     holdDevice(host, devA)
     host.control.reconciler.checkAll()
-    runJob(host, JobKind.Scan)
+    runJob(host, JobKind.DeviceListing)
     applyResults(host)
     releaseDevice(host, devA)
-    runJob(host, JobKind.Markers)
+    runJob(host, JobKind.DeviceProbe)
     applyResults(host)
-    runJob(host, JobKind.Sweep)
+    runJob(host, JobKind.LoadSweep)
     holdDevice(host, devA)
     applyResults(host) // the CRL opened on the control thread, then P2 submitted, held
-    heldJobs(host, devA) should be(List(JobKind.Move))
+    heldJobs(host, devA) should be(List(JobKind.LoadDuplicates))
 
     os.move(devA, hostRoot / "pulled")
     checkAllNow(host)

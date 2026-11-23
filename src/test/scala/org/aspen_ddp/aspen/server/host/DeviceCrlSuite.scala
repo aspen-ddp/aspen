@@ -955,8 +955,9 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
 
   atest("only device scans count transient CRL open failures: host start and nudges never declare the CRL lost"):
-    // Host start opens twice (constructor, startup CheckAllDevices), each round below twice, then the scans once each
-    val uncounted = 2 + 2 * DeviceDiscovery.CrlOpenAttempts
+    // Host start opens once (the startup scan; it posts no CheckAllDevices), each round below twice, then the scans
+    // once each
+    val uncounted = 1 + 2 * DeviceDiscovery.CrlOpenAttempts
     val (deviceDir, storeDir, inner, calls, host) =
       transientlyFailingCrlDevice(uncounted + DeviceDiscovery.CrlOpenAttempts)
     host.testingOnlyHandleEvents()

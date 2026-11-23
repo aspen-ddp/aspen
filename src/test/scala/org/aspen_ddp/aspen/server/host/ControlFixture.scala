@@ -527,8 +527,8 @@ trait ControlFixture:
 
   /** Builds a Host with LockstepThreading, a ManualControlScheduler and RecordingSeams.
    *
-   *  Of the events the constructor posts, the initial CheckAllDevices is dropped unless `keepCheckAllDevices` (it
-   *  would race a test's own device checks) and InitializeTaskExecutor unless `keepInitializeTaskExecutor` (draining
+   *  Of the events the constructor posts, the startup scan's device checks (CheckLoadedDevice) are dropped unless
+   *  `keepCheckAllDevices` (they would race a test's own device checks) and InitializeTaskExecutor unless `keepInitializeTaskExecutor` (draining
    *  it starts a real task-executor bootstrap). Everything else the constructor's device scan queued (store loads,
    *  marker resolutions, adoption continuations) stays queued for the test to drain. `crlFactory` opens its devices'
    *  CRLs; `adjustSeams` changes its seams (e.g. `tryLoadStore = None`, for a host that loads its stores for real). */
@@ -558,7 +558,8 @@ trait ControlFixture:
     runDiscovery(threading)
     threading.removeQueued:
       case t: Host.EventTask =>
-        (!keepCheckAllDevices && t.event.isInstanceOf[Host.CheckAllDevices]) ||
+        (!keepCheckAllDevices && (t.event.isInstanceOf[Host.CheckAllDevices] ||
+          t.event.isInstanceOf[Host.CheckLoadedDevice])) ||
           (!keepInitializeTaskExecutor && t.event.isInstanceOf[Host.InitializeTaskExecutor])
       case _ => false
     rigs.put(host, new Rig(recording, scheduler))
@@ -708,16 +709,20 @@ trait ControlFixture:
     runDiscovery(host)
 
   /** Runs the queued device-discovery work (DeviceDiscovery: the listing, probe, load sweep and P2 jobs and their
-   *  results, Host.DeviceJobDone), including what it queues, ahead of and leaving queued everything else (store
-   *  opens and loads, ownership lookups' results, StoresReady): what a discovery once did inside the call that asked
-   *  for it. A held path's jobs stay held */
+   *  results, Host.DeviceJobDone with `discovery`), including what it queues, ahead of and leaving queued everything
+   *  else (store opens and loads, other jobs' results, ownership lookups' results, StoresReady): what a discovery once
+   *  did inside the call that asked for it. A held path's jobs stay held */
   protected def runDiscovery(host: Host): Unit = runDiscovery(lockstep(host))
 
   private def runDiscovery(ls: LockstepThreading): Unit =
-    val kinds = Set[JobKind](JobKind.Scan, JobKind.Markers, JobKind.Sweep, JobKind.Move)
+    // Discovery's own job kinds and results only (JobKind.DeviceListing etc., DeviceJobDone.discovery): other
+    // subsystems' jobs and results keep their place on the FIFO
+    val kinds = Set[JobKind](JobKind.DeviceListing, JobKind.DeviceProbe, JobKind.LoadSweep, JobKind.LoadDuplicates)
     def isDiscovery(task: Runnable): Boolean = task match
       case t: LockstepThreading.DeviceTask => kinds.contains(t.kind)
-      case t: Host.EventTask => t.event.isInstanceOf[Host.DeviceJobDone]
+      case t: Host.EventTask => t.event match
+        case e: Host.DeviceJobDone => e.discovery
+        case _ => false
       case _ => false
     var batch = ls.removeQueued(isDiscovery)
     while batch.nonEmpty do

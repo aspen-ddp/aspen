@@ -114,8 +114,8 @@ final class DeviceControl(val metadata: DeviceMetadata,
   /** Delivers the outcome of `job` (a management-lane job) to `apply` as a posted control event, Host.DeviceJobDone,
    *  never inline in whichever thread completes it. `apply` must recheck that the device, path or copy the job was
    *  for is still the one it was submitted for, and treat `DeviceIo.Cancelled` as nothing having happened */
-  def onControl[T](what: String, job: JobHandle[T])(apply: scala.util.Try[T] => Unit): Unit =
-    job.future.onComplete(r => post(Host.DeviceJobDone(what, () => apply(r))))(using ExecutionContext.parasitic)
+  def onControl[T](what: String, job: JobHandle[T], discovery: Boolean = false)(apply: scala.util.Try[T] => Unit): Unit =
+    job.future.onComplete(r => post(Host.DeviceJobDone(what, () => apply(r), discovery)))(using ExecutionContext.parasitic)
 
   @volatile private var view: HostStoreView = HostStoreView.Empty
 

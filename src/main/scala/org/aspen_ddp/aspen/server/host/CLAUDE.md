@@ -62,7 +62,9 @@
   discovery job outstanding gets one `Markers` job on its own `DeviceIo` (`DiscoveryDisk.probe`: isDir, config,
   `failed`, then `shutdown.state`/`owning-host` read into `DeviceMarkers.State`; `ProbeResult` NotADevice, Failed,
   Unreadable, Device), whose result is decided on its own (`decide`), so a hung path delays only itself and no
-  control step joins paths. A path with a job outstanding (`busy`, a token per path) is skipped by scans; an explicit
+  control step joins paths. Discovery's jobs have their own kinds (`DeviceListing`, `DeviceProbe`, `LoadSweep`,
+  `LoadDuplicates`) and results (`DeviceJobDone.discovery`). A path with a job outstanding (`busy`, a token per
+  path) is skipped by scans; an explicit
   request (bringIntoService, an ownership outcome's load) is merged into `again` and probed once it ends. Every apply
   (`submitFor`, through `DeviceControl.onControl`, which posts `Host.DeviceJobDone`) rechecks that the token is still
   the path's, the path is still in the last listing and its DeviceIo is still the one submitted to; otherwise, or on
@@ -71,12 +73,15 @@
   also checks it at once. A path gone from the listing, with no device loaded from it and nothing outstanding, has its
   DeviceIo closed by `DeviceIos.forget`, which closes only an idle one (`DeviceIo.idle`: no management job queued or
   running, no data or serial task queued or running); a busy one stays and is asked again at the next listing. The
-  Host constructor's scan (`startupScan`, before `threading.start()`) posts the same jobs and blocks on no device;
-  once it has decided every path it listed it posts `StoresReady` and then the initial `CheckAllDevices`, so a hung
-  path holds both back (the router answers no UnknownStore meanwhile: the hung device may hold any store) while the
-  other devices load and serve. The ownership decisions (`resolveOwnership`'s listing, `handleOwnershipResolved`,
+  Host constructor's scan (`startupScan`, before `threading.start()`) posts the same jobs and blocks on no device.
+  Each device it loads is checked by a `Host.CheckLoadedDevice` posted as its load applies (there is no initial
+  CheckAllDevices), so a hung path never delays another device's check. The startup gate posts `StoresReady` once,
+  at the first of: every path the startup listing named decided (a path a later listing no longer names counts as
+  decided), the listing failing or its apply throwing, or the first `ScanDevices` (`endStartupGate`). Until then the
+  router answers no UnknownStore (a startup device may hold any store); the scan period bounds that wait, and the hung
+  path's job stays outstanding (no timeout on its I/O). The ownership decisions (`resolveOwnership`'s listing, `handleOwnershipResolved`,
   adoption, `bringIntoService`) and the device CRL open still read the disk on the control thread (later tasks).
-  Tests run discovery's work with `ControlFixture.runDiscovery` (and `checkAllNow`, `scanNow`, `discoverNow`,
+  Tests run discovery's work, and only it, with `ControlFixture.runDiscovery` (and `checkAllNow`, `scanNow`, `discoverNow`,
   `nudgeNow`, which call and then run it; `newHost` and `handleMarkerEvents` run it too)
 - Device load (`DeviceDiscovery.loadOwnedDevice`): one `Sweep` job (`DiscoveryDisk.sweepAtLoad`: transfer staging,
   `creating/`, `deleting/`, `crl.creating`; then the listing, P6), the device CRL's open on the control thread (a lost
@@ -379,8 +384,8 @@
 - The hot path (network messages, I/O completions, heartbeats, repairs) goes through `StoreRouter` straight to the
   store's executor: a concurrent map lookup on the calling thread, then the task, which runs only if that store is
   not closed when the task runs (tasks queued ahead of a close still run). Unknown stores are answered from the
-  calling thread; silent ones (derived, above) are not answered, nor are any until the startup scan has decided
-  every path it listed (`StoresReady`). A store whose load is under way is silent (its copy Opening), as are the stores of a device whose
+  calling thread; silent ones (derived, above) are not answered, nor are any until the startup gate opens
+  (`StoresReady`: every startup path decided, or the first ScanDevices). A store whose load is under way is silent (its copy Opening), as are the stores of a device whose
   shutdown-marker lookup (or adoption) is deciding whether to load it
 - Backend opens are backend-neutral: `BackendOpener.open` and `create` (`server.store.backend`) take the
   device's `DeviceIo` (`sds.io`) and always run as one of its management-lane jobs (`JobKind.BackendOpen` /

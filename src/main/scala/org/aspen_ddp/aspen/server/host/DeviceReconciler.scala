@@ -52,6 +52,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // loads is checked at once, as CheckAllDevices would, so its Initializing stores are
     // created now rather than up to checkStorageDevicePeriod from now.
     // The one caller that counts transient CRL open failures (DeviceDiscovery.CrlOpenAttempts)
+    // The startup gate holds StoresReady at most until the first scan (DeviceDiscovery.startupScan)
+    ctx.discovery.endStartupGate()
     ctx.discovery.checkForNewDevices(scan = true)
     ctx.loader.retryFailedLoads()
 

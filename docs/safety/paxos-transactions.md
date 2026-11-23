@@ -746,8 +746,11 @@ repair, no safety effect.
   Frontend creates a Tx with `outcomeDecided`: no locks, still votes, answers status queries with the cached outcome.
   The sender's recovery driver learns the outcome from its copy. The store's own copy arrives after the Tx and any
   driver exist, so the new Tx resolves from it and the store's own driver learns it. The designated leader drives such
-  a T on purpose: its deciding driver may have died on another host, and its own copy resolves the new driver at once. The copy to itself does not ask whether the entry is a same-host
-  sibling's or an earlier instance's of this store, which re-runs T's actions (transaction-recovery.md R-W13).
+  a T on purpose: its deciding driver may have died on another host, and its own copy resolves the new driver at once.
+  Neither happens for a driver's prepare from this host, the store itself included (`Store.handleTransactionMessage`,
+  `sameHostDriver`): the entry is then a same-host sibling's or an earlier instance's of this store, stale news that
+  would re-run T's actions, and the sending driver is the takeover (transaction-recovery.md 4.2). A client's prepare
+  names its leader as sender and is never such a prepare.
   The same relay is sent whenever a resolved entry exists, also to a store that holds a Tx (a duplicate there), and
   also below the floor, where the Frontend then refuses the prepare and the leader starts no driver. The copy to
   itself is withheld while the store's own Tx for T knows its outcome (`Tx.knownOutcome`): the entry may be that

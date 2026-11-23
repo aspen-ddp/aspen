@@ -189,7 +189,14 @@ answers in this order:
    (`TxFinalized(late)`, then `resolveLate`), or by Paxos while they still hold T. Nor does a store relay a
    non-finalized entry to a sender on its own host (`Store.onThisHost`, the router's installed stores): that sender
    shares the cache, so its own store's relay already decided, under the rule above, what its driver may learn from
-   the entry; a sibling store of T answering with the non-late entry would re-run T's actions.
+   the entry; a sibling store of T answering with the non-late entry would re-run T's actions. For the same reason a
+   store sends itself nothing, and its designated leader starts no driver from the entry, when the prepare is a
+   driver's from its own host, the store itself included (`fromClient = false`, `msg.from == msg.to` or
+   `onThisHost`): the entry is then a sibling's, or an earlier instance's of this store after a same-host reopen (the
+   host's status cache outlives the Frontend instance), and as stale to this store's drivers as its own Tx's would be.
+   The sending driver is itself the takeover and learns from its remote peers. A client's prepare names the
+   designated leader as its sender, so it is never such a prepare: the leader's takeover of a dead remote driver is
+   unchanged.
 3. **Live `Tx`** (`Tx.receivePrepare`): it answers with its fixed vote and an acceptor promise, sent only after the
    CRL save of that state completes (or after its objects load, then the save). A Tx that already applied the commit
    also resends `TxCommitted` to the proposer.
@@ -932,39 +939,4 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-**R-W13 A designated leader with no Tx self-relays a same-host sibling's stale non-finalized commit and re-runs T's
-finalization actions.** PLAUSIBLE, effort S, priority 5. Mechanism: `Store.handleTransactionMessage`'s relay of a
-resolved, non-finalized cache entry sends `TxResolved(committed, late = false)` to the store itself whenever the store
-holds no Tx with a known outcome (`frontend.transactions.get(txid).forall(_.knownOutcome.isEmpty)`), and the same
-prepare makes the designated leader start a driver (`driveTransaction`, the cached outcome not finalized). The
-`onThisHost` rule suppresses only the reply to a same-host sender; the self-send does not ask who sent the prepare, nor
-whose Tx wrote the entry (the host cache is shared, `Tx.resolved` records a non-finalized `Committed`). Trigger: T's
-designated leader store A never got a Tx for T (its client prepares were dropped: its device's CRL lane full, or
-the client cut off from A), so a recovery driver on another primary store decided T; store B of T on A's host
-resolved T committed and lost its `TxFinalized`; every other store finalized and forgot T. Inside the horizon B's idle
-driver (`Store.heartbeat`) prepares to A, which is above its floor: A sends itself the non-late commit, starts its
-leader driver and creates an `outcomeDecided` Tx (`Frontend.createTx`). A's driver takes the self-send as resolution
-(`receiveTxResolved` -> `onResolution(sendResolutionMessage = false)`) and starts a finalizer. Resolved, it sends only
-`TxResolved` (`SimpleTransactionDriver.sendPeerMessages`), never a prepare; its first send, delayed by a random part
-of the backoff (`nextRound`), normally comes after the local self-send, so no peer's finalized relay answers it.
-What cancels its finalizer is B's driver: it resolves late from the remote peers' relay and its `TxFinalized(late)`
-reaches A's driver (`receiveTxFinalized` -> `resolveLate`). Consequence: T's non-marker finalization actions, which
-execute at once (`RegisteredTransactionFinalizerFactory.Finalizer`), run again after T was finalized and forgotten,
-against `resolveLate`'s premise. If B's late `TxFinalized` does not reach A's driver within `errorTimeout` (B's remote
-peers slow or unreachable), the marker (voters unknown, no incarnations heard) also writes ErrorTree marks for every
-store of T and voter-unknown UnackedCommits entries for every store hosting a changed object, and A's `TxFinalized`
-lists them in `owed`, so each writes a stub: the effect the `onThisHost` rule removes from the reply to the sender,
-reached through the self-send. The shipped actions tolerate a late re-run and the entries are harmless at stores that saw T (5.4): extra
-repair passes, stubs and marker load, no safety effect. B's own driver is already taking T over, so the 10.2 fast takeover gains nothing here.
-Fix direction: in the relay, send no self `TxResolved` of a non-finalized entry, and start no leader driver from it,
-when the prepare's sender is on this host (`onThisHost(msg.from)`): the sender shares the cache and is itself the
-takeover; the takeover of a dead remote driver (a remote sender, or a client prepare) is unchanged.
-A second trigger reaches the same self-send with no sibling: a store that served and is opened again on the same host
-keeps the host status cache (a cancelled shutdown's close and the reconcile's `Load`, an abandoned transfer out's
-reinstatement, `StoreTransfersOut.reinstateAbandonedOut`; a `ClosePurpose.Reload` close is only of a store that never
-recovered, so it has no old Tx). The root cause is host state keyed by `StoreId` that outlives the Frontend instance (cross-document-review.md
-2.2); a repair snapshot guards against the same thing by carrying its instance (`RepairSnapshot.takenBy`). If its old Tx resolved T committed (a non-finalized `Committed`
-entry), its saved status was `Unresolved`, and T's `TxFinalized` arrived only while it was unloaded, the recovered
-Tx has `knownOutcome = None`, so its own idle driver's prepare to itself (or any prepare while `recoveryPending`)
-receives the stale non-late `TxResolved` and re-runs T's finalization actions until peers' late relays cancel it.
-The fix direction covers it: the store itself is `onThisHost`.
+(none)

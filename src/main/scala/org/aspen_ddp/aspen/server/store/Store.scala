@@ -285,6 +285,11 @@ class Store(val storageDeviceId: StorageDeviceId,
         // whose finalization completed, so its driver runs no finalization actions and stores apply the commit only where
         // it is owed (TransactionDriver.resolveLate). A cached entry is finalized only from a real TxFinalized or a late
         // outcome
+        // A driver's prepare from this host (the store itself included) brings no news of a dead driver: its sender
+        // shares the host's status cache, so a non-finalized entry is its own or a sibling's, and the sender's driver
+        // is itself the takeover. A client's prepare names its leader as sender, so it never counts as one
+        val sameHostDriver = !m.fromClient && (msg.from == msg.to || onThisHost(msg.from))
+        var cachedUnfinalized = false
         val notFinalized = txStatusCache.getStatus(m.txd.transactionId).forall { entry =>
           val late = entry.late || entry.finalized
           val (r, committed: Boolean) = entry.status match {
@@ -302,9 +307,14 @@ class Store(val storageDeviceId: StorageDeviceId,
           // and run T's finalization actions again. That driver learns the outcome from its peers instead: late from
           // their finalized relay, or by Paxos while they still hold T (transaction-recovery 4.2). Nor to a sender
           // on this host: it shares the cache, so its own store's relay already decided what its driver learns from
-          // the entry under the rule above
+          // the entry under the rule above. Nor to itself for a same-host driver's prepare (sameHostDriver): the entry
+          // may be a sibling's, or an earlier instance's of this store after a same-host reopen, and is then as stale
+          // to this store's drivers as its own Tx's entry is (transaction-recovery 4.2)
           r.foreach { resolved =>
-            if (entry.finalized || frontend.transactions.get(m.txd.transactionId).forall(_.knownOutcome.isEmpty))
+            if (!entry.finalized)
+              cachedUnfinalized = true
+            if (entry.finalized ||
+                (!sameHostDriver && frontend.transactions.get(m.txd.transactionId).forall(_.knownOutcome.isEmpty)))
               net.sendTransactionMessage(resolved)
             if (msg.from != msg.to && !entry.finalized && !onThisHost(msg.from))
               net.sendTransactionMessage(resolved.copy(to = msg.from, from = msg.to))
@@ -330,9 +340,10 @@ class Store(val storageDeviceId: StorageDeviceId,
         // (or ignores it, its finalized outcome cached), and a driver could only run rounds with stores
         // that may have forgotten the transaction. An outcome cached but not finalized is driven on purpose
         // (paxos-transactions 10.2):
-        // its deciding driver ran on another host, and if it died this takes over without waiting for an idle Tx
+        // its deciding driver ran on another host, and if it died this takes over without waiting for an idle Tx. Not
+        // for a same-host driver's prepare: that driver is the takeover, and this one would learn nothing from the entry
         val refused = frontend.belowForgetFloor(m.txd) && !frontend.transactions.contains(m.txd.transactionId)
-        if (notFinalized && m.txd.primaryObject.poolId == storeId.poolId && m.txd.designatedLeaderUID == storeId.poolIndex
+        if (notFinalized && !(sameHostDriver && cachedUnfinalized) && m.txd.primaryObject.poolId == storeId.poolId && m.txd.designatedLeaderUID == storeId.poolIndex
             && !frontend.startsTooFarAhead(m.txd) && !refused) {
           // Handled before the Frontend sees the prepare, so no Tx yet means this prepare creates it
           driveTransaction(m.txd, initialProposal = m.fromClient && !frontend.transactions.contains(m.txd.transactionId))

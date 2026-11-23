@@ -116,7 +116,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
     statusCache.updateStatus(txid1, TransactionStatus.Committed)
     val (store, net, _) = mkStore(storeId, statusCache, Duration(40, SECONDS))
 
-    store.receiveTransactionMessage(prepare(storeId, storeId))
+    // A client's prepare names the leader as sender; at the leader that is the store itself
+    store.receiveTransactionMessage(prepare(storeId, storeId).copy(fromClient = true))
 
     net.sentTx.collect { case r: TxResolved => (r.to, r.from) } shouldBe List((storeId, storeId))
   }
@@ -139,7 +140,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
 
   // transaction-recovery 4.2: a store of T on the same host shares the status cache, so its relay of a non-finalized
   // entry tells the sender's recovery driver nothing the sender's own relay did not already decide; sent, it would be
-  // taken as a non-late resolution and re-run T's finalization actions
+  // taken as a non-late resolution and re-run T's finalization actions. Nor does it tell itself: the entry
+  // is the sender's, as stale to the relaying store's drivers
   test("the relay of a non-finalized entry tells nothing to a sender on the same host") {
     val statusCache = new TransactionStatusCache()
     val (store, _, _) = mkStore(storeId, statusCache, Duration(40, SECONDS))
@@ -149,12 +151,60 @@ class StoreSuite extends AnyFunSuite with Matchers:
     statusCache.getStatus(txid1).map(e => (e.status, e.finalized)) shouldBe Some((TransactionStatus.Committed, false))
 
     sibling.receiveTransactionMessage(prepare(peer, storeId))
-    net.sentTx.collect { case r: TxResolved => (r.to, r.from) } shouldBe List((peer, storeId))
+    net.sentTx.collect { case r: TxResolved => r } shouldBe Nil
 
     // A sender on another host still learns the outcome
     net.sentTx = Nil
     sibling.receiveTransactionMessage(prepare(peer, leader))
     net.sentTx.collect { case r: TxResolved => (r.to, r.from) }.toSet should contain((leader, peer))
+  }
+
+  /** A non-finalized commit in the shared cache, written by a Tx of `peer` that resolved it (its TxFinalized lost) */
+  private def siblingResolvedCommit(statusCache: TransactionStatusCache): Unit =
+    val (sibling, _, _) = mkStore(peer, statusCache, Duration(40, SECONDS))
+    sibling.receiveTransactionMessage(prepare(peer, storeId))
+    sibling.receiveTransactionMessage(TxResolved(peer, storeId, txid1, committed = true, late = false, proof = false))
+    statusCache.getStatus(txid1).map(e => (e.status, e.finalized)) shouldBe Some((TransactionStatus.Committed, false))
+
+  // transaction-recovery 4.2: the entry is a same-host sibling's stale one. Sent to itself, the leader's new driver
+  // would take it as a non-late resolution and re-run T's finalization actions; the sibling's driver is the takeover
+  test("a designated leader relays a same-host sibling's non-finalized entry to nobody and starts no driver from it") {
+    val statusCache = new TransactionStatusCache()
+    siblingResolvedCommit(statusCache)
+    val factory = new RecordingFactory
+    val (store, net, _) = mkStore(leader, statusCache, Duration(40, SECONDS), driverFactory = factory,
+      onThisHost = Set(leader, peer))
+
+    store.receiveTransactionMessage(prepare(leader, peer))
+
+    net.sentTx.collect { case r: TxResolved => r } shouldBe Nil
+    factory.starts shouldBe Nil
+  }
+
+  // transaction-recovery 4.2: after a same-host reopen the entry may be the store's earlier instance's own
+  test("a store's own prepare is not answered from a non-finalized entry") {
+    val statusCache = new TransactionStatusCache()
+    siblingResolvedCommit(statusCache)
+    val (store, net, _) = mkStore(storeId, statusCache, Duration(40, SECONDS), onThisHost = Set(storeId, peer))
+
+    store.receiveTransactionMessage(prepare(storeId, storeId))
+
+    net.sentTx.collect { case r: TxResolved => r } shouldBe Nil
+  }
+
+  // paxos-transactions 10.2: a client's prepare names its leader as sender, but only says the deciding driver may have
+  // died, so the leader still takes over from the entry
+  test("a client prepare is still relayed to the leader itself and driven, though its sender is on this host") {
+    val statusCache = new TransactionStatusCache()
+    siblingResolvedCommit(statusCache)
+    val factory = new RecordingFactory
+    val (store, net, _) = mkStore(leader, statusCache, Duration(40, SECONDS), driverFactory = factory,
+      onThisHost = Set(leader, peer))
+
+    store.receiveTransactionMessage(prepare(leader, leader).copy(fromClient = true))
+
+    net.sentTx.collect { case r: TxResolved => (r.to, r.from, r.late) } shouldBe List((leader, leader, false))
+    factory.starts should have size 1
   }
 
   // paxos-transactions 10.6: a sibling store's delayed resolution no longer downgrades the host's finalized entry, so

@@ -78,14 +78,7 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-5.1 [R-W13] A store with no Tx self-relays a stale non-finalized commit from the shared status cache and re-runs T's
-    finalization actions. PLAUSIBLE, S. Store.handleTransactionMessage's relay sends the store itself a non-late
-    TxResolved when it holds no Tx with a known outcome, and the designated leader starts a driver; the onThisHost rule
-    suppresses only the reply. Triggers: (a) a same-host sibling's idle driver prepares to a leader that never got a
-    Tx; (b) a same-host reopen of a store whose old Tx wrote the non-finalized entry (cross-document-review 2.2). The
-    driver resolves non-late and re-runs non-marker finalization actions after T was finalized; past errorTimeout the
-    marker writes voter-unknown marks, entries and stubs for every store. No safety effect. Fix: no self TxResolved of a
-    non-finalized entry, and no leader driver from it, when the sender is onThisHost (the store itself included).
+(no open items)
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)

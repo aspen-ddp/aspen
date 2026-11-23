@@ -44,11 +44,11 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Rebuild completion | Transfers | A flip that finds the entry already Active adopts the copy without checking its episode (`DeviceMetadata.markRebuiltStoreActive`); a transfer in retires an earlier tenancy's copy before asking for bytes, so the copy is this episode's (2.2). A flip retried after `TransactionOutcomeUnknown` that finds the entry moved on (TransferringOut, absent) keeps the copy offline rather than discarding it (`Unconfirmed`, rebuild-process.md 5.7) |
 | Rebuild, CRL | Store lifecycle | A rebuilt copy's first load recovers nothing an earlier copy left under its id in the device CRL: it is a save-file load of the empty state `RebuildingStore.finish` writes, which drops those entries first (rebuild-process.md 5.6) |
 | Lost device CRL | Rebuild | A finished rebuild awaiting its flip (in `rebuilt/`) has never served, so it holds nothing in the device CRL and is not moved to `lost/` (`DeviceDiscovery.holdsOwnState`) |
-| Status-cache relay | Finalization actions | Every shipped action is safe to run again after T was finalized and forgotten, which a second driver's resent `TxResolved` makes happen (paxos-transactions.md 10.5; 2.6), and a relay's copy to the store itself of a same-host sibling's or earlier instance's entry (transaction-recovery.md R-W13) |
+| Status-cache relay | Finalization actions | Every shipped action is safe to run again after T was finalized and forgotten, which a second driver's resent `TxResolved` makes happen (paxos-transactions.md 10.5; 2.6) |
 | Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit; a tree-learned resolution is reported `Unresolved` until finalized (`Tx.statusForExpiry`) |
 | Expiry tallies | Recovery | A reported `votedCommit` stands for a voter holding T's locks, or for a committed T (a tree-learned or not-owed resolution, whose locks are released) (2.1) |
 | Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a reconcile case, or retried (2.2); one whose directory or config is missing is rebuilt, its device-CRL entries kept (2.2). A device load serves every `live/` copy without reading the tree, so the phase directories, `phase-param.*` files, the save file and the incarnation file are read with stats that tell a failure from an absence (`server.FileStat`), and an incarnation file is never written by a load (2.2) |
-| Repair (snapshot, then reconcile), status-cache self-relay | Host store routing | Both steps, and the cached entry, belong to the Frontend instance that answers: not upheld across a same-host reopen, which keeps the host's `StoreId` routing and status cache (2.2; transaction-recovery.md R-W13; a repair snapshot carries its instance, `RepairSnapshot.takenBy`) |
+| Repair (snapshot, then reconcile), status-cache self-relay | Host store routing | Both steps belong to the Frontend instance that answers, though a same-host reopen keeps the host's `StoreId` routing and status cache: a repair snapshot carries its instance (`RepairSnapshot.takenBy`), and no store self-relays a non-finalized entry for a driver's prepare from its own host, whose entry may be an earlier instance's (2.2; transaction-recovery.md 4.2) |
 | Rebuild, Missing Stores, discard | Copy registry | Its records of a store's copies match the disk: it learns them at the device load, and re-reads a store's from the disk where a copy may have appeared or vanished since (the Missing Stores case, a rebuild's retire, a failed move to `lost/`'s retry); a rebuild's completion lists them before its flip (2.2) |
 | CRL admission | Host reconcile | A retained charge is released only once the records it covers have left the CRL or been counted again; the leftover drop releases only the charge it was issued for, unchanged since |
 | Systemic-loss protection | All of the above | Declarations of loss are independent and true (they are not checked; see that document) |
@@ -160,9 +160,9 @@ The premises other subsystems take from this:
   admission charges retained for the store. A `ClosePurpose.Reload` close is not one of these: it closes only a store
   that never recovered (a failed `loadStore`, a failed save-file removal), so it leaves no Tx and no cache entry of its
   own. A repair snapshot carries the instance that took it (`RepairSnapshot.takenBy`), so one taken before a reopen
-  ends no inherited-growth guard of the next instance (repair-process.md 10.3). One guard assumes one instance and
-  fails across a reopen: a cached non-finalized commit written by the earlier instance's Tx is self-relayed to the new
-  one as news (transaction-recovery.md R-W13, second trigger). Every other host-side request answers through `Frontend.post` on the instance that
+  ends no inherited-growth guard of the next instance (repair-process.md 10.3). A cached non-finalized commit written
+  by the earlier instance's Tx is never self-relayed to the new one for its own driver's prepare (a same-host
+  driver's prepare, transaction-recovery.md 4.2). Every other host-side request answers through `Frontend.post` on the instance that
   asked, and the CRL state the new instance recovers stands for the earlier one as a crash's would.
   `StoreRouter.install` over a still-installed store, with no close, is reachable only in tests
   (`TestNetwork.restartStore`): a production load needs the store's executor slot, which a served or closing instance
@@ -521,8 +521,8 @@ floor the Frontend refuses the prepare and nothing is created but a rebuilt stor
 the store's own Tx's, so no self-relay is sent while that Tx is resolved: after a lost `TxFinalized` its idle driver
 would take it as a non-late commit and run T's finalization actions again; it learns the outcome from its peers. A
 sibling store of T on the same host shares the cache, so it relays no non-finalized entry to a sender on its host
-(`Store.onThisHost`); the copy to itself has no such rule, so a store with no resolved Tx self-relays a same-host
-sibling's entry, or an earlier instance's of itself after a same-host reopen (transaction-recovery.md R-W13). T's
+(`Store.onThisHost`), nor sends itself the entry for any driver's prepare from its host, its own included: the entry
+may be a same-host sibling's, or an earlier instance's of itself after a same-host reopen. T's
 actions can still run after T was finalized and forgotten, from a second driver's resent
 `TxResolved` (paxos-transactions.md 10.5). Each shipped action tolerates it: the allocation action finds its entry, or records a live object under a shared revision lock that fails
 once the object is deleted, and records nothing for one proven deleted; the deletion action removes the entry of an id

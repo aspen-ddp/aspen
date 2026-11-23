@@ -22,6 +22,7 @@ final class TestDeviceIo(val path: os.Path, readBound: Int = Int.MaxValue) exten
   def beginRead(): Unit = reads.incrementAndGet()
   def endRead(): Unit = reads.decrementAndGet()
   def readsOverBound: Boolean = reads.get() >= readBound
+  def idle: Boolean = true
   def close(): Unit = ()
 
   def submit[T](kind: JobKind, store: Option[StoreId])(job: => T): JobHandle[T] =

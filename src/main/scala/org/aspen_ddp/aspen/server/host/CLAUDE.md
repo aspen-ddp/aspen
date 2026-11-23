@@ -56,8 +56,34 @@
   parameter file, or a phase directory that cannot be listed, fails `CopyLayout.list`: the device stays unloaded,
   nothing on it moved, for the next scan (P6; `DeviceDiscovery.loadOwnedDevice` lists before anything but the scratch
   sweeps)
-- Device load (`DeviceDiscovery.loadOwnedDevice`): the listing (P6), the device CRL's open (a lost CRL's moves), then
-  P2 (`retireDuplicates`): a store with more than one copy directory outside `pending-delete/` (any phases) is logged
+- Device discovery (`DeviceDiscovery`, disk work in `DiscoveryDisk`) does no disk I/O on the control thread for a
+  device of its own: the listing of `storage-devices/` is one `Scan` job on `deviceIos.hostRoot` (one outstanding; a
+  discovery asked for meanwhile is merged and runs after it), and each listed path with no loaded device and no
+  discovery job outstanding gets one `Markers` job on its own `DeviceIo` (`DiscoveryDisk.probe`: isDir, config,
+  `failed`, then `shutdown.state`/`owning-host` read into `DeviceMarkers.State`; `ProbeResult` NotADevice, Failed,
+  Unreadable, Device), whose result is decided on its own (`decide`), so a hung path delays only itself and no
+  control step joins paths. A path with a job outstanding (`busy`, a token per path) is skipped by scans; an explicit
+  request (bringIntoService, an ownership outcome's load) is merged into `again` and probed once it ends. Every apply
+  (`submitFor`, through `DeviceControl.onControl`, which posts `Host.DeviceJobDone`) rechecks that the token is still
+  the path's, the path is still in the last listing and its DeviceIo is still the one submitted to; otherwise, or on
+  `DeviceIo.Cancelled`, it undoes what the load opened (the CRL) and changes nothing else. Each device a discovery
+  loads is checked at once (`Trigger.check`: ScanDevices, CheckAllDevices, a nudge); a nudge naming a device not loaded
+  also checks it at once. A path gone from the listing, with no device loaded from it and nothing outstanding, has its
+  DeviceIo closed by `DeviceIos.forget`, which closes only an idle one (`DeviceIo.idle`: no management job queued or
+  running, no data or serial task queued or running); a busy one stays and is asked again at the next listing. The
+  Host constructor's scan (`startupScan`, before `threading.start()`) posts the same jobs and blocks on no device;
+  once it has decided every path it listed it posts `StoresReady` and then the initial `CheckAllDevices`, so a hung
+  path holds both back (the router answers no UnknownStore meanwhile: the hung device may hold any store) while the
+  other devices load and serve. The ownership decisions (`resolveOwnership`'s listing, `handleOwnershipResolved`,
+  adoption, `bringIntoService`) and the device CRL open still read the disk on the control thread (later tasks).
+  Tests run discovery's work with `ControlFixture.runDiscovery` (and `checkAllNow`, `scanNow`, `discoverNow`,
+  `nudgeNow`, which call and then run it; `newHost` and `handleMarkerEvents` run it too)
+- Device load (`DeviceDiscovery.loadOwnedDevice`): one `Sweep` job (`DiscoveryDisk.sweepAtLoad`: transfer staging,
+  `creating/`, `deleting/`, `crl.creating`; then the listing, P6), the device CRL's open on the control thread (a lost
+  CRL's moves), then one `Move` job for
+  P2 (`DiscoveryDisk.retireDuplicates`, moves through `CopyDisk.relocate`, an unforced one held by the apply with
+  `CopyMoves.heldUnforced` and `HostCopies.unsynced`): a store with more than one copy directory outside
+  `pending-delete/` (any phases) is logged
   at error, every one moved to `lost/` (T10), the one with the least copy id kept there (registered Lost, so the Lost
   CRL case flips its Active entry to Rebuilding and the rebuild's discard retires it) and the others moved on into
   `pending-delete/` whole, their files inside them; a failed move leaves the device unloaded. Then `attach`, and only
@@ -353,8 +379,8 @@
 - The hot path (network messages, I/O completions, heartbeats, repairs) goes through `StoreRouter` straight to the
   store's executor: a concurrent map lookup on the calling thread, then the task, which runs only if that store is
   not closed when the task runs (tasks queued ahead of a close still run). Unknown stores are answered from the
-  calling thread; silent ones (derived, above) are not answered, nor are any until the startup scan's LoadStores
-  are handled. A store whose load is under way is silent (its copy Opening), as are the stores of a device whose
+  calling thread; silent ones (derived, above) are not answered, nor are any until the startup scan has decided
+  every path it listed (`StoresReady`). A store whose load is under way is silent (its copy Opening), as are the stores of a device whose
   shutdown-marker lookup (or adoption) is deciding whether to load it
 - Backend opens are backend-neutral: `BackendOpener.open` and `create` (`server.store.backend`) take the
   device's `DeviceIo` (`sds.io`) and always run as one of its management-lane jobs (`JobKind.BackendOpen` /
@@ -482,7 +508,7 @@
   threads of that device, so a hung device stalls only its own work. `HostThreading.newDeviceIo(path)` builds it
   (`ThreadedDeviceIo` for StoreThreadPool and SingleThreadThreading, configured by `DeviceIo.Config`;
   `LockstepDeviceIo` under lockstep). `DeviceControl.deviceIos` (`DeviceIos`, control-owned) keeps one per path from
-  first sight, so a reload reuses it (`forPath`, `get`, `forget` only with nothing in flight, `hostRoot`, `all`);
+  first sight, so a reload reuses it (`forPath`, `get`, `forget` only when `DeviceIo.idle`, `hostRoot`, `all`);
   `Host.shutdown` closes them all without waiting. `Store.deviceIo` (set by `StoreLoader` from `sds.io`; None runs inline, tests only) is how code on a store's
   executor reaches its device: store-thread code never touches the disk, it submits a job and applies the result back
   on the executor after rechecking that the store is still the installed one (`crlLoaded`; the transfer-out close

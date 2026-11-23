@@ -40,8 +40,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
 
   /** The CheckAllDevices event: discovers new devices, then checks every loaded one. */
   def checkAll(): Unit =
-    // Discover first so a device found by this scan is checked within the same event
-    // and its Initializing stores are created now rather than a period from now.
+    // A device this discovery loads is checked once its load has been applied, so its Initializing stores are
+    // created then rather than a period from now
     ctx.discovery.checkForNewDevices()
     ctx.devices.devices.valuesIterator.foreach: sds =>
       checkStorageDevice(sds.storageDeviceId)
@@ -52,19 +52,18 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     // loads is checked at once, as CheckAllDevices would, so its Initializing stores are
     // created now rather than up to checkStorageDevicePeriod from now.
     // The one caller that counts transient CRL open failures (DeviceDiscovery.CrlOpenAttempts)
-    ctx.discovery.checkForNewDevices(scan = true).foreach(checkStorageDevice)
+    ctx.discovery.checkForNewDevices(scan = true)
     ctx.loader.retryFailedLoads()
 
   /** A CheckStorageDevice message. */
   def handleCheckMessage(m: CheckStorageDevice): Unit =
     // A device id we do not know may simply be one that has appeared on disk since
     // our last scan -- create-storage-device sends this message as a discovery nudge
-    // for exactly that case -- so rescan before concluding the device is not ours. Any
-    // other device the rescan loads is checked too, as the periodic scan checks it.
-    val loaded =
-      if ! ctx.devices.devices.contains(m.deviceId) then ctx.discovery.checkForNewDevices()
-      else Nil
-    (loaded :+ m.deviceId).distinct.foreach(checkStorageDevice)
+    // for exactly that case -- so rescan. Every device the rescan loads is checked once loaded, as the periodic scan
+    // checks it. The named device is checked now, loaded or not: a check of a device not loaded here marks its stores
+    // offline, and one that loads meanwhile is reconciled instead (startDeviceCheck)
+    if ! ctx.devices.devices.contains(m.deviceId) then ctx.discovery.checkForNewDevices()
+    checkStorageDevice(m.deviceId)
 
   /** Drops the device-CRL entries of every store the device no longer holds: one its entry does not name, with no
    *  directory on the device, not loaded and not being retired. Retiring a copy (StoreCopies.retire) drops them

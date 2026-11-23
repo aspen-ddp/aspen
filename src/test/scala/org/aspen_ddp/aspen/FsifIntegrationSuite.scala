@@ -184,7 +184,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
       pid <- client.createNewStoragePool("fsif-pool", ida, None, fsifConfig, setId, 0L)
       _ = poolId = pid
       _ = net.poolHosts += poolId -> host
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- awaitStoresServed()
     yield ()
 

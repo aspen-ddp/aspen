@@ -102,7 +102,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       (host, flat, gate) <- heldFailStop(hostRoot, dev)
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpTx(host, recorded(host).shutdownOutcomes.nonEmpty)
       _ <- pumpTx(host, false, rounds = 10)
       // Shut down in the tree, but not unloaded while the close runs: the copy is still Live where it was
@@ -505,13 +505,13 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
         failSyncs -= 1
         throw new java.io.IOException("injected sync")
       DurableFiles.syncDirectory(d)
-    host.control.discovery.checkForNewDevices()
+    discoverNow(host)
     host.testingOnlyHandleEvents()
     val loadedFirst = loadedDevices(host).contains(deviceA)
     val rootAfterFirst = os.list(dev).map(_.last).toSet
     val phaseAfterFirst = CopyFixtures.phaseOf(dev, s)
     syncs = Vector.empty
-    host.control.discovery.checkForNewDevices()
+    discoverNow(host)
     host.testingOnlyHandleEvents()
     Future.successful:
       failSyncs should be(0)
@@ -1086,7 +1086,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       _ <- client.transferStore(moving, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
       pstate <- client.getStoragePoolState(moving.poolId)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpTx(host, transfers.startedTransfersIn.contains(moving))
       // The source's copy as it ships from outbound/ after a rebuild whose flip was Unconfirmed: a real store, its
       // Outbound transfer id and its episode in their phase-param files, and its empty save file
@@ -1215,7 +1215,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
         _ = spoil(CopyFixtures.copyPath(dev, moving).get)
         transfers2 = new StagedTransferService
         host2 = newHost(hostRoot, transferService = transfers2)
-        _ = host2.control.reconciler.checkAll()
+        _ = checkAllNow(host2)
         _ <- awaitBegun(host2, transfers2)
       yield
         transfers2.transfersIn.size should be(1)
@@ -1472,7 +1472,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       _ <- net.createDevice(deviceA)
       _ <- setDeviceState(deviceA)(_.copy(stores = initializing))
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpTx(host, host.control.router.loaded.contains(created) && !host.control.copyRegistry.isCreating(created))
     yield
       val listing = CopyLayout.list(dev)
@@ -1525,7 +1525,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       _ <- net.createDevice(deviceA)
       _ <- setDeviceState(deviceA)(_.copy(stores = active))
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- awaitLoudly("the store's rebuild to start"):
              host.testingOnlyHandleEvents()
              !rebuilds.created.isEmpty
@@ -1593,7 +1593,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       val loadedWhileUnreadable = loadedDevices(host).contains(deviceA)
       val attemptsWhileUnreadable = recorded(host).storeLoadAttempts.toList
       val afterFailure = CopyLayout.list(dev).copies.toSet
-      host.control.discovery.checkForNewDevices()
+      discoverNow(host)
       host.testingOnlyHandleEvents()
       Future.successful:
         loadedWhileUnreadable should be(false)
@@ -1650,7 +1650,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       _ <- setDeviceState(deviceA)(_.copy(stores = initializing))
       _ <- waitForTransactionsToComplete()
       _ <- pumpTx(host, {
-             if host.control.reconciler.activeDeviceChecks.isEmpty then host.control.reconciler.checkAll()
+             if host.control.reconciler.activeDeviceChecks.isEmpty then checkAllNow(host)
              !rebuilds.created.isEmpty && !host.control.copies.isRetiring(creating)
            })
       st <- client.getStorageDeviceState(deviceA)

@@ -471,7 +471,7 @@ trait ControlFixture:
         anyRebuilding().flatMap:
           case false => Future.unit
           case true =>
-            host.control.reconciler.checkAll()
+            checkAllNow(host)
             for
               // Yield so queued work -- the rebuild's own Future and its callbacks -- gets to run. The host is lockstep:
               // the staging store's open is a lane job that the drain runs
@@ -554,6 +554,8 @@ trait ControlFixture:
                         Duration(5, SECONDS), Duration(60, SECONDS), transferService, storeRebuildFactory,
                         maxConcurrentRebuilds, seams = adjustSeams(recording.seams(scheduler, verifyCopyRegistry)))
     recording.attach(host)
+    // The constructor's scan posts its jobs: run them, and only them, as the scan once ran inside the constructor
+    runDiscovery(threading)
     threading.removeQueued:
       case t: Host.EventTask =>
         (!keepCheckAllDevices && t.event.isInstanceOf[Host.CheckAllDevices]) ||
@@ -683,6 +685,45 @@ trait ControlFixture:
         case Some(t) if !isLoad(t) => ls.removeQueued(_ eq t).foreach(_.run())
         case _ => go = false
 
+  /** CheckAllDevices, its discovery run (runDiscovery) before returning, as the call once discovered inline */
+  protected def checkAllNow(host: Host): Unit =
+    host.control.reconciler.checkAll()
+    runDiscovery(host)
+
+  /** ScanDevices, its discovery run before returning */
+  protected def scanNow(host: Host): Unit =
+    host.control.reconciler.scan()
+    runDiscovery(host)
+
+  /** A discovery (DeviceDiscovery.checkForNewDevices), run before returning. Returns the devices it loaded */
+  protected def discoverNow(host: Host, scan: Boolean = false): List[StorageDeviceId] =
+    val before = host.control.devices.devices.keySet
+    host.control.discovery.checkForNewDevices(scan)
+    runDiscovery(host)
+    host.control.devices.devices.keys.filterNot(before.contains).toList
+
+  /** A CheckStorageDevice message, its discovery run before returning */
+  protected def nudgeNow(host: Host, m: org.aspen_ddp.aspen.common.network.CheckStorageDevice): Unit =
+    host.control.reconciler.handleCheckMessage(m)
+    runDiscovery(host)
+
+  /** Runs the queued device-discovery work (DeviceDiscovery: the listing, probe, load sweep and P2 jobs and their
+   *  results, Host.DeviceJobDone), including what it queues, ahead of and leaving queued everything else (store
+   *  opens and loads, ownership lookups' results, StoresReady): what a discovery once did inside the call that asked
+   *  for it. A held path's jobs stay held */
+  protected def runDiscovery(host: Host): Unit = runDiscovery(lockstep(host))
+
+  private def runDiscovery(ls: LockstepThreading): Unit =
+    val kinds = Set[JobKind](JobKind.Scan, JobKind.Markers, JobKind.Sweep, JobKind.Move)
+    def isDiscovery(task: Runnable): Boolean = task match
+      case t: LockstepThreading.DeviceTask => kinds.contains(t.kind)
+      case t: Host.EventTask => t.event.isInstanceOf[Host.DeviceJobDone]
+      case _ => false
+    var batch = ls.removeQueued(isDiscovery)
+    while batch.nonEmpty do
+      batch.foreach(_.run())
+      batch = ls.removeQueued(isDiscovery)
+
   /** The kinds of the management jobs held on `path`, in submission order. */
   protected def heldJobs(host: Host, path: os.Path): List[JobKind] = lockstep(host).held(path)
 
@@ -697,6 +738,8 @@ trait ControlFixture:
   /** Removes the queued DeviceOwnershipResolved events and handles them, leaving every other event queued. */
   protected def handleMarkerEvents(host: Host): Unit =
     lockstep(host).removeQueued(isMarkerResolution).foreach(_.run())
+    // A device an outcome loads is probed and loaded by discovery jobs
+    runDiscovery(host)
 
   protected val deviceA = StorageDeviceId(UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001"))
   protected val deviceB = StorageDeviceId(UUID.fromString("bbbbbbbb-0000-0000-0000-000000000002"))

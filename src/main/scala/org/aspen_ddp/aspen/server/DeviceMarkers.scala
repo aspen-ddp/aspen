@@ -20,6 +20,15 @@ object DeviceMarkers:
   val ShutdownStateFile = "shutdown.state"
   val FailedFile = "failed"
 
+  /** The host-id markers of a device directory as one probe read them (host.DiscoveryDisk.probe), each as its read
+   *  ended: a value, or the error `readShutdownState`/`readOwningHost` threw. Kept apart so the caller decides in
+   *  their order (shutdown.state first) and an error in one it does not need never refuses the device */
+  final case class State(shutdownState: scala.util.Try[Option[HostId]], owningHost: scala.util.Try[Option[HostId]])
+
+  /** Reads both host-id markers (State) */
+  def read(devicePath: os.Path): State =
+    State(scala.util.Try(readShutdownState(devicePath)), scala.util.Try(readOwningHost(devicePath)))
+
   /** Whether the device carries `failed`. A stat that fails throws (FileStat), so the caller refuses the device as if
    *  it did: a tombstoned device is never loaded on a false absence */
   def isFailed(devicePath: os.Path): Boolean = FileStat.exists(devicePath / FailedFile)

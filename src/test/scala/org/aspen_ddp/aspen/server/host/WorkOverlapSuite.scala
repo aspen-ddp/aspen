@@ -521,7 +521,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       listed = host.control.copyRegistry.openCopies(local).contains(moving)
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(!loadedDevices(host).contains(deviceA), drain = Some(host))
     yield
       queued should be(List((deviceA, moving)))

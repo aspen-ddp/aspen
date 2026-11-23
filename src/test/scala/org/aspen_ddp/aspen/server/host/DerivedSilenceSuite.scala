@@ -136,7 +136,7 @@ class DerivedSilenceSuite extends IntegrationTestSuite with ControlFixture:
       unloaded = List(served, rebuilt, listed).map(host.control.copyRegistry.silence)
       unloadedAnswer = List(served, rebuilt, listed).map(host.control.router.answersUnknown)
       _ <- yieldUntil(!host.control.devices.closingCrls.contains(dev))
-      reloaded = host.control.discovery.checkForNewDevices()
+      reloaded = discoverNow(host)
       _ = host.testingOnlyHandleEvents()
       // Loaded, before its first reconcile: still silent by what its last tree entry listed
       beforeReconcile = List(served, rebuilt, listed).map(host.control.router.answersUnknown)

@@ -230,7 +230,7 @@ class CopyCrashSuite extends IntegrationTestSuite with CopyHostFixture:
       _ <- pump(restarted, restarted.control.router.loaded.contains(s))
       servedAtRestart = restarted.control.router.loaded.contains(s)
       // The next check leaves it served there
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty)
     yield
       outcome should be(RebuildOutcome.Adopt)
@@ -268,7 +268,7 @@ class CopyCrashSuite extends IntegrationTestSuite with CopyHostFixture:
       restarted = realHost(hostRoot, new TestOpener, transfers = new StagedTransferService)
       _ <- pump(restarted, restarted.control.router.loaded.contains(moving))
       servedAtRestart = restarted.control.router.loaded.contains(moving)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty)
     yield
       recorded(host).transferOutcomes.get(moving) should be(Some(TransferOutcome.PoolRepointed))
@@ -309,7 +309,7 @@ class CopyCrashSuite extends IntegrationTestSuite with CopyHostFixture:
       atRestart = onlyCopy(dev, moving)
       servedAtRestart = restarted.control.router.loaded.contains(moving)
       // The next check resumes the pool update (startIn: the copy is this transfer's), and moves the copy Live
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpTx(restarted, restarted.control.router.loaded.contains(moving))
       st <- client.getStorageDeviceState(net.secondDeviceId)
     yield
@@ -343,14 +343,14 @@ class CopyCrashSuite extends IntegrationTestSuite with CopyHostFixture:
       _ <- net.createDevice(deviceA)
       _ <- setDeviceState(deviceA)(_.copy(stores = initializing))
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpTx(host, copiesOf(dev, creating).nonEmpty && opener.opens.get > 0)
       beforeCrash = onlyCopy(dev, creating)
       stBeforeCrash <- client.getStorageDeviceState(deviceA)
       restarted = realHost(hostRoot, new TestOpener)
       _ <- pump(restarted, restarted.control.router.loaded.contains(creating))
       servedAtRestart = restarted.control.router.loaded.contains(creating)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty &&
                              !restarted.control.rebuilds.createFlipsPending.contains(creating))
       st <- client.getStorageDeviceState(deviceA)
@@ -400,8 +400,8 @@ class CopyCrashSuite extends IntegrationTestSuite with CopyHostFixture:
       _ <- awaitLoudly("the restarted device's copy to go live"):
              restarted.testingOnlyHandleEvents()
              if restarted.control.reconciler.activeDeviceChecks.isEmpty then
-               if loadedDevices(restarted).contains(deviceA) then restarted.control.reconciler.checkAll()
-               else restarted.control.discovery.checkForNewDevices()
+               if loadedDevices(restarted).contains(deviceA) then checkAllNow(restarted)
+               else discoverNow(restarted)
              copiesOf(dev, s).exists(_.phase == Phase.Live)
     yield (restarted, loadedBefore, atRestart)
 

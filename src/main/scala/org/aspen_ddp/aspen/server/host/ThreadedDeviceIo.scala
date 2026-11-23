@@ -47,6 +47,9 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
 
   private final class Entry(val state: AtomicInteger, val run: () => Unit, val skip: () => Unit)
   private val lane = new LinkedBlockingQueue[Entry]()
+  // Lane jobs submitted and not yet run or skipped, and pool tasks executed and not yet ended (idle)
+  private val laneJobs = new AtomicInteger(0)
+  private val poolTasks = new AtomicInteger(0)
   @volatile private var closed = false
 
   private def laneLoop(): Unit =
@@ -59,6 +62,7 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
             e.run()
           else e.skip()
         catch case t: Throwable => logger.error(s"device io lane task failed: $t")
+        finally laneJobs.decrementAndGet(): Unit
     catch case _: InterruptedException => ()
 
   laneThread.start()
@@ -73,6 +77,7 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
       p.complete(r)
       ()
     val skip: () => Unit = () => { p.tryFailure(DeviceIo.Cancelled); () }
+    laneJobs.incrementAndGet()
     lane.add(new Entry(state, run, skip))
     new JobHandle[T]:
       def future: Future[T] = p.future
@@ -86,14 +91,21 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
     val exec = Executors.newFixedThreadPool(n, factory(role, false))
     val ec = new ExecutionContext:
       def execute(r: Runnable): Unit =
-        exec.execute: () =>
-          val token = observer.started(if role == "io" then "data" else "serial", None, 0L)
-          var ok = false
-          try
-            gate()
-            r.run()
-            ok = true
-          finally observer.finished(token, ok)
+        poolTasks.incrementAndGet()
+        try
+          exec.execute: () =>
+            val token = observer.started(if role == "io" then "data" else "serial", None, 0L)
+            var ok = false
+            try
+              gate()
+              r.run()
+              ok = true
+            finally
+              observer.finished(token, ok)
+              poolTasks.decrementAndGet(): Unit
+        catch case t: Throwable =>
+          poolTasks.decrementAndGet()
+          throw t
       def reportFailure(t: Throwable): Unit = logger.error(s"device io task failed: $t")
     (exec, ec)
 
@@ -107,6 +119,11 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
   def beginRead(): Unit = reads.incrementAndGet()
   def endRead(): Unit = reads.decrementAndGet()
   def readsOverBound: Boolean = reads.get() >= cfg.readBound
+
+  def idle: Boolean = laneJobs.get() == 0 && poolIdle
+
+  /** No data or serial task queued or running */
+  private[host] def poolIdle: Boolean = poolTasks.get() == 0
 
   def close(): Unit =
     closed = true

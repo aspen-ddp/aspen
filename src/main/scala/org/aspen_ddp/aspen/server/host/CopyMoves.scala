@@ -161,34 +161,15 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
         logger.error(s"Failed to move the copy at $from to $target ($site). It stays where it is. Error: $t")
     result
 
-  /** The steps of a move from `from` to `target`, into phase `to`: the target's directory made if absent, `to`'s own
-   *  parameter file placed durably (the source phase's file is never touched, so a failed move leaves the source
-   *  reading what it read), then the rename forced. A move onto the copy's own path is no move: NotMoved */
+  /** CopyDisk.relocate through this host's seams, an Unsynced result's directories held for the resync */
   private[host] def relocate(from: os.Path, target: os.Path, to: Phase): MoveResult =
-    if from == target then
-      MoveResult.NotMoved(IllegalArgumentException(s"$to is the path $from, where the copy already is"))
-    else
-      renameCopy(from, target, to)
+    val result = CopyDisk.relocate(from, target, to, syncDirectory, rename)
+    result match
+      case MoveResult.Unsynced(_) => heldUnforced(from, target)
+      case _ => ()
+    result
 
-  private def renameCopy(from: os.Path, target: os.Path, to: Phase): MoveResult =
-    val prepared =
-      try
-        val dir = target / os.up
-        if !FileStat.exists(dir) then
-          os.makeDir.all(dir)
-          syncDirectory(dir / os.up)
-        for
-          file <- CopyLayout.paramFile(to)
-          p <- CopyLayout.param(to)
-        do DurableFiles.write(from / file, p)
-        None
-      catch case NonFatal(t) => Some(MoveResult.NotMoved(t))
-    prepared.getOrElse:
-      try
-        DurableFiles.move(from, target, syncDirectory, rename)
-        MoveResult.Durable
-      catch
-        case t: DurableFiles.MoveNotForced =>
-          unforced += target -> List(target / os.up, from / os.up).distinct
-          MoveResult.Unsynced(t)
-        case NonFatal(t) => MoveResult.NotMoved(t)
+  /** A copy moved from `from` to `target` off the control thread whose rename landed unforced: both directories are
+   *  held for the resync, as `relocate` holds them */
+  private[host] def heldUnforced(from: os.Path, target: os.Path): Unit =
+    unforced += target -> List(target / os.up, from / os.up).distinct

@@ -50,8 +50,10 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
     for
       _ <- pumpUntil(queuedMarkerEvents(host) > 0)
       _ = handleMarkerEvents(host)
-      _ <- pumpUntil(host.control.discovery.pendingMarkerResolutions.isEmpty &&
-                     host.control.reconciler.activeDeviceChecks.isEmpty)
+      _ <- pumpUntil(host.control.discovery.pendingMarkerResolutions.isEmpty)
+      // An adoption's commit brings the device into service, whose load is discovery's jobs
+      _ = runDiscovery(host)
+      _ <- pumpUntil(host.control.reconciler.activeDeviceChecks.isEmpty)
     yield ()
 
   /** Pumps until `condition` holds or `deadline` (System.nanoTime) passes, waiting in real time between rounds for
@@ -66,7 +68,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
         p.future.flatMap(_ => pollUntil(deadline)(condition))
 
   private def scanAndResolve(host: Host): Future[Unit] =
-    host.control.reconciler.scan()
+    scanNow(host)
     resolve(host)
 
   private def state(id: StorageDeviceId): Future[StorageDeviceState] = client.getStorageDeviceState(id)
@@ -226,7 +228,10 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       host = newHost(hostRoot)
       _ <- resolve(host)
       // The retry follows the Unknown after the client's real-time backoff
-      _ <- pollUntil(System.nanoTime() + 10_000_000_000L)(loadedDevices(host).contains(deviceA))
+      // Its load, once the retry has committed, is discovery's jobs
+      _ <- pollUntil(System.nanoTime() + 10_000_000_000L):
+             runDiscovery(host)
+             loadedDevices(host).contains(deviceA)
       st <- state(deviceA)
     yield
       net.pendingUnknownCommits should be(0)
@@ -619,7 +624,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.restartStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       _ = net.takeCapturedGossip()
-      _ = host.control.reconciler.handleCheckMessage(CheckStorageDevice(me, client.clientId, deviceA))
+      _ = nudgeNow(host, CheckStorageDevice(me, client.clientId, deviceA))
       _ <- resolve(host)
       st <- state(deviceA)
     yield
@@ -646,7 +651,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       host = newHost(hostRoot)
       _ <- resolve(host)
       loadedAfterResolve = loadedDevices(host).contains(deviceA)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(recorded(host).shutdownOutcomes.nonEmpty && !loadedDevices(host).contains(deviceA))
       st <- state(deviceA)
     yield
@@ -672,7 +677,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       st <- state(deviceA)
       // Its copy, registered Arrived at the device's load, is offline there, so the completed-transfers-in pass of
       // the adoption's own reconcile, or of the check below, completes it
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(CopyFixtures.phaseOf(deviceDir, s1).contains(Phase.Live) &&
                      host.control.reconciler.activeDeviceChecks.isEmpty)
     yield
@@ -697,12 +702,12 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       oldRoot = newHostDir()
       oldDir = writeDevice(oldRoot, "dev0", deviceA, owner = Some(oldHostId))
       oldHost = newHost(oldRoot, storeRebuildFactory = rebuilds, hostId = oldHostId)
-      _ = oldHost.control.reconciler.checkAll()
+      _ = checkAllNow(oldHost)
       _ <- pumpUntil(rebuilds.created.nonEmpty && oldHost.control.reconciler.activeDeviceChecks.isEmpty)
       // The pool lives on deviceA alone, so the real request would refuse this shutdown.
       _ <- forceShuttingDown(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = oldHost.control.reconciler.checkAll()
+      _ = checkAllNow(oldHost)
       // The rebuild ignores its cancel, so the shutdown proceeds only once its wait times out.
       _ <- pumpUntil(recorded(oldHost).shutdownWorkTimeouts.nonEmpty)
       _ = recorded(oldHost).fireShutdownWorkTimeouts()
@@ -762,7 +767,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       _ = writeDevice(destRoot, "dev0", deviceB, owner = Some(destHostId))
       dest = newHost(destRoot, transferService = transfers, hostId = destHostId)
       _ = net.takeCapturedHostMessages()
-      _ = dest.control.reconciler.checkAll()
+      _ = checkAllNow(dest)
       _ <- pumpUntil(transfers.startedTransfersIn.contains(s0))
       firstAsk = startTransfers()
       _ <- setDeviceState(deviceA)(_.copy(status = DeviceStatus.Shutdown))
@@ -838,7 +843,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       _ = if closeLast then writeClosedStore(deviceDir, s1)
       lookup = recorded(host).armLookup(deviceA)
       _ = net.takeCapturedGossip()
-      _ = host.control.reconciler.scan()
+      _ = scanNow(host)
       _ = lookup.success(current.copy(stores = current.stores - s1))
       _ <- resolve(host)
     yield (host, deviceDir, stores)

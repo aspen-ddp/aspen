@@ -66,8 +66,8 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   // loads it again, harmlessly: the store served nothing since it was written
   private val saveFileRemovals: java.util.Set[os.Path] = ConcurrentHashMap.newKeySet[os.Path]()
 
-  /** Set (markReady) by a control event the Host constructor posts after its device scan, so FIFO order puts it after
-   *  every LoadStore that scan queued. Until then a message for a store not loaded is dropped silently rather than
+  /** Set (markReady) by a control event the startup device scan posts once it has decided every path it listed, each
+   *  device it loads attached (so its stores are silent until served; DeviceDiscovery.startupScan). Until then a message for a store not loaded is dropped silently rather than
    *  answered UnknownStore/StoreNotFound: production dispatch is inline, and traffic arriving between the network
    *  starting and the host's start would otherwise be told that stores about to load are not here, costing clients
    *  re-reads, location-cache drops and missed-update marks at every host start. Silence makes them retry, as for an

@@ -7,9 +7,7 @@ import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, FileStat, Host, 
   StorageDeviceManager, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlConfigInvalid, CrlCorrupt, CrlLocked,
   CrlMissing, CrlSizingMismatch}
-import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
-import org.aspen_ddp.aspen.server.store.backend.{Backend, StoreCreation}
-import org.aspen_ddp.aspen.server.transfer.StoreTransfer
+import org.aspen_ddp.aspen.server.store.backend.Backend
 import scribe.Logging
 
 import java.util.UUID
@@ -41,6 +39,11 @@ object DeviceDiscovery:
     case _: java.io.IOException | _: java.io.UncheckedIOException | _: VirtualMachineError => true
     case _ => false
 
+  /** What asked for a discovery: `scan`, a ScanDevices, whose loads' transient CRL open failures count
+   *  (CrlOpenAttempts); `check`, each device it loads is checked at once (DeviceReconciler.checkStorageDevice) */
+  final case class Trigger(scan: Boolean, check: Boolean):
+    def |(o: Trigger): Trigger = Trigger(scan || o.scan, check || o.check)
+
 /** Runs only on the control thread. See HostThreading.scala.
  *
  *  Finds the storage devices under `storage-devices/` and decides whether to load, restart, or adopt each. */
@@ -53,7 +56,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   // Directories under storage-devices/ that hold a loaded device. checkForNewDevices skips these
   // without reading anything in them, which keeps the frequent scan down to one directory
   // listing. An entry is dropped when its path stops being listed, so a disk pulled and
-  // re-inserted on this host is checked again in full (and the duplicate guard in tryLoadDevice
+  // re-inserted on this host is checked again in full (and the duplicate guard in loadOwnedDevice
   // finds it already loaded). Unloading a device must also remove its entry.
   private var loadedDirs: Map[os.Path, StorageDeviceId] = Map()
 
@@ -89,8 +92,29 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   // only: a restart allows CrlOpenAttempts more
   private var transientCrlFailures: Map[os.Path, Int] = Map()
 
-  // Set while a device scan runs checkForNewDevices: only then does a transient CRL open failure count
+  // Set while a load started by a device scan opens its device's CRL: only then does a transient CRL open failure count
   private var countingCrlFailures = false
+
+  // The listing of storage-devices/ is outstanding on the host root's lane. A discovery asked for meanwhile is merged
+  // into `relist` and runs once it has been applied, so at most one listing waits behind a slow host root
+  private var listing = false
+  private var relist: Option[DeviceDiscovery.Trigger] = None
+
+  // The paths the last listing that succeeded returned. A job's result for a path no longer listed changes nothing
+  private var listed: Set[os.Path] = Set()
+
+  // The device directories with a discovery job outstanding on their own DeviceIo: a probe, or a load's sweep or P2 job.
+  // A scan skips them (coalescing, so a hung device's lane holds one discovery job at most). A load or probe asked for
+  // one explicitly (`again`) runs once its job has been applied. The entry is the token each of its jobs' results is
+  // checked against: a result whose token is no longer the path's changes nothing
+  private final class Busy(val io: DeviceIo):
+    var again: Option[DeviceDiscovery.Trigger] = None
+  private var busy: Map[os.Path, Busy] = Map()
+
+  // The paths the startup scan began a probe of whose decision is still to come, and what to run once there are none
+  // (startupScan). None once it has run
+  private var startupPaths: Option[Set[os.Path]] = None
+  private var startupDecided: () => Unit = () => ()
 
   /** Keeps the scan from loading the device at `path` again (see disownedDirs). */
   private[host] def disown(path: os.Path): Unit =
@@ -101,60 +125,144 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   private[server] def loadedDeviceDirs: Map[os.Path, StorageDeviceId] = loadedDirs
   private[server] def reportedDeviceDirs: Set[os.Path] = reportedDirs
   private[server] def pendingMarkerResolutions: Set[os.Path] = pendingResolutions.keySet
+  /** The device directories with a discovery job outstanding (a probe, or a load's sweep or P2 job) */
+  private[server] def busyDeviceDirs: Set[os.Path] = busy.keySet
+  /** Whether the startup scan has decided every path it listed */
+  private[server] def startupScanDecided: Boolean = startupPaths.isEmpty
 
   /** Forgets the directory of a device that has been unloaded, so the next scan reads it again. */
   private[host] def forgetDevice(storageDeviceId: StorageDeviceId): Unit =
     loadedDirs = loadedDirs.filter((_, id) => id != storageDeviceId)
 
+  /** The Host constructor's scan, before the threading starts: the same jobs as every scan, so it blocks on no device.
+   *  `decided` runs (on the control thread) once every path it listed has been decided: its device attached, or left
+   *  unloaded, or handed to resolveOwnership, whose stores are marked awaiting their device. A path whose job never
+   *  returns holds it back. A listing that fails decides at once. Its loads are not checked: `decided` posts the
+   *  initial CheckAllDevices */
+  def startupScan(decided: () => Unit): Unit =
+    startupDecided = decided
+    startupPaths = Some(Set())
+    discover(DeviceDiscovery.Trigger(scan = false, check = false), startup = true)
+
   /** Scans storage-devices/ and loads any device found there that this host owns.
    *
-   *  Called at construction and from the event loop: every ScanDevices (each deviceScanPeriod),
-   *  every CheckAllDevices, and every CheckStorageDevice naming a device we have not loaded.
-   *  Directories in loadedDeviceDirs are skipped without being read, so the common-case scan is
-   *  a single listing. Every other directory gets tryLoadDevice's full check each time; its
-   *  problems are logged once (warnOnce) and then rechecked silently.
+   *  Called from the event loop: every ScanDevices (each deviceScanPeriod), every CheckAllDevices, and every
+   *  CheckStorageDevice naming a device we have not loaded. Nothing here touches a disk on the control thread: the
+   *  listing is one job on the host root's lane (DeviceIos.hostRoot), and each path it lists that holds no loaded
+   *  device and has no discovery job outstanding (`busy`) gets one probe job on its own DeviceIo (DiscoveryDisk.probe:
+   *  stat, config, markers), whose result is decided on its own (`decide`), so a hung device delays only its own load.
+   *  Its problems are logged once (warnOnce) and then rechecked silently. A path gone from the listing, with no device
+   *  loaded from it and no job outstanding, has its DeviceIo closed (DeviceIos.forget) once that drops nothing; a busy
+   *  one is kept and asked again at the next listing.
    *
-   *  Repeated scans are safe: tryLoadDevice also skips any device already present in
-   *  storageDevices, so a device's LocalStorageDeviceState -- and with it the copy registry
-   *  that reconcileDeviceState reads -- survives, and its children are not re-offered to
-   *  tryLoadStore over already-open backends.
+   *  Repeated scans are safe: a device already present in storageDevices is never loaded again, so a device's
+   *  LocalStorageDeviceState -- and with it the copy registry that reconcileDeviceState reads -- survives, and its
+   *  children are not re-offered to tryLoadStore over already-open backends.
    *
-   *  Returns the devices this call loaded, so ScanDevices can check them at once.
+   *  Each device this loads is checked at once (DeviceReconciler.checkStorageDevice), as ScanDevices,
+   *  CheckAllDevices and a nudge each want for a device found by their scan.
    *
-   *  `scan` is true only for ScanDevices: its transient CRL open failures count towards CrlOpenAttempts, while the
-   *  other callers' are retried uncounted (openDeviceCrl), so the allowance is one per scan, not one per open.
-   *
-   *  Mutual exclusion: the handleEvent calls run on the control thread; the constructor call
-   *  precedes start(), so no control thread runs yet.
+   *  `scan` is true only for ScanDevices: its loads' transient CRL open failures count towards CrlOpenAttempts, while
+   *  the other callers' are retried uncounted (openDeviceCrl), so the allowance is one per scan, not one per open.
    */
-  def checkForNewDevices(scan: Boolean = false): List[StorageDeviceId] =
-    countingCrlFailures = scan
-    try discoverDevices()
-    finally countingCrlFailures = false
+  def checkForNewDevices(scan: Boolean = false): Unit =
+    discover(DeviceDiscovery.Trigger(scan, check = true), startup = false)
 
-  private def discoverDevices(): List[StorageDeviceId] =
-    // A stat that fails loads nothing, as an absent directory does
-    if ! Try(FileStat.isDir(storageDevicesDir)).getOrElse(false) then
-      warnOnce(storageDevicesDir, s"Invalid storage devices directory: $storageDevicesDir")
-      Nil
+  private def discover(trigger: DeviceDiscovery.Trigger, startup: Boolean): Unit =
+    if listing then
+      relist = Some(relist.fold(trigger)(_ | trigger))
     else
-      // Listing can fail with an IO error even when isDir just succeeded. Uncaught, the
-      // constructor and the event loop fare differently: from the constructor it would abort
-      // Host construction outright, while from the event loop start()'s catch-all would keep the
-      // loop running but report only the event class and the exception. Warn here so both name
-      // the directory that could not be listed.
-      Try(os.list(storageDevicesDir)) match
-        case Failure(t) =>
-          warnOnce(storageDevicesDir, s"Failed to list storage devices directory: $storageDevicesDir. Error: $t")
-          Nil
-        case Success(paths) =>
-          reportedDirs -= storageDevicesDir
-          // A loaded device whose directory is gone is forgotten here, so it is read in full
-          // again if it comes back. Its storageDevices entry is untouched: its stores are open.
-          val listed = paths.toSet
-          loadedDirs = loadedDirs.filter((path, _) => listed.contains(path))
-          disownedDirs = disownedDirs.filter(listed.contains)
-          paths.filterNot(loadedDirs.contains).flatMap(tryLoadDevice).toList
+      listing = true
+      val job = ctx.deviceIos.hostRoot.submit(JobKind.Scan, None)(DiscoveryDisk.listDevicePaths(storageDevicesDir))
+      ctx.onControl("device listing", job): result =>
+        listing = false
+        try applyListing(result, trigger, startup)
+        finally
+          relist.foreach: t =>
+            relist = None
+            discover(t, startup = false)
+
+  private def applyListing(result: Try[Seq[os.Path]], trigger: DeviceDiscovery.Trigger, startup: Boolean): Unit =
+    val begun = result match
+      case Failure(_: DiscoveryDisk.NotADirectory) =>
+        warnOnce(storageDevicesDir, s"Invalid storage devices directory: $storageDevicesDir")
+        Set()
+      // Listing can fail with an IO error even when isDir just succeeded: warn naming the directory
+      case Failure(t) =>
+        warnOnce(storageDevicesDir, s"Failed to list storage devices directory: $storageDevicesDir. Error: $t")
+        Set()
+      case Success(paths) =>
+        reportedDirs -= storageDevicesDir
+        // A loaded device whose directory is gone is forgotten here, so it is read in full
+        // again if it comes back. Its storageDevices entry is untouched: its stores are open.
+        listed = paths.toSet
+        loadedDirs = loadedDirs.filter((path, _) => listed.contains(path))
+        disownedDirs = disownedDirs.filter(listed.contains)
+        forgetUnlisted()
+        paths.filterNot(loadedDirs.contains).filter(probe(_, trigger, explicit = false)).toSet
+    if startup then
+      startupPaths = Some(begun)
+      checkStartup()
+
+  /** Closes the DeviceIo of each device directory gone from the listing that holds no loaded device and has no
+   *  discovery job outstanding, once it is idle (DeviceIos.forget); one that is not stays, for the next listing */
+  private def forgetUnlisted(): Unit =
+    ctx.deviceIos.all.keys
+      .filter(p => p / os.up == storageDevicesDir && !listed.contains(p) && !busy.contains(p))
+      .filterNot(p => devices.valuesIterator.exists(_.devicePath == p))
+      .foreach(ctx.deviceIos.forget(_): Unit)
+
+  private def checkStartup(): Unit =
+    startupPaths match
+      case Some(paths) if paths.isEmpty =>
+        startupPaths = None
+        startupDecided()
+      case _ => ()
+
+  /** Marks `path` busy with a fresh token, unless a discovery job is outstanding for it */
+  private def begin(path: os.Path): Option[Busy] =
+    if busy.contains(path) then
+      None
+    else
+      val b = new Busy(ctx.deviceIos.forPath(path))
+      busy += path -> b
+      Some(b)
+
+  /** Asks for a probe of `path` once its outstanding discovery job has been applied */
+  private def again(path: os.Path, trigger: DeviceDiscovery.Trigger): Unit =
+    busy.get(path).foreach(b => b.again = Some(b.again.fold(trigger)(_ | trigger)))
+
+  /** Ends `b`'s hold on `path`, if it still holds it, and runs any probe asked for meanwhile */
+  private def end(path: os.Path, b: Busy): Unit =
+    if busy.get(path).exists(_ eq b) then
+      busy -= path
+      startupPaths.foreach: paths =>
+        startupPaths = Some(paths - path)
+        checkStartup()
+      b.again.foreach(probe(path, _, explicit = true): Unit)
+
+  /** Runs `job` on `b`'s DeviceIo and applies its result on the control thread, if `b` still holds `path`, the path is
+   *  still listed and its DeviceIo is still `b`'s. Otherwise, or on Cancelled or a failure, `abandon` undoes what the
+   *  steps before it did and the path is released; a failure is warned about once. `apply` ends the hold (`end`) or
+   *  submits the next step as its last act */
+  private def submitFor[T](path: os.Path, b: Busy, kind: JobKind, what: String)(job: => T)
+                          (abandon: () => Unit)(apply: T => Unit): Unit =
+    ctx.onControl(what, b.io.submit(kind, None)(job)): result =>
+      if busy.get(path).exists(_ eq b) then
+        val current = listed.contains(path) && ctx.deviceIos.get(path).exists(_ eq b.io)
+        result match
+          case Success(v) if current =>
+            try apply(v)
+            catch case t: Throwable =>
+              end(path, b)
+              warnOnce(path, s"Failed to load storage device found at path $path. Error: $t")
+          case Failure(t) if current && t != DeviceIo.Cancelled =>
+            abandon()
+            end(path, b)
+            warnOnce(path, s"Failed to load storage device found at path $path. Error: $t")
+          case _ =>
+            abandon()
+            end(path, b)
 
   /** Logs `msg` unless a problem with `path` has already been logged by this process. */
   def warnOnce(path: os.Path, msg: => String): Unit =
@@ -261,8 +369,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                 case DeviceStatus.ShuttingDown if ownedHere =>
                   logger.info(s"Storage device $deviceId at $path was being shut down when this host " +
                               s"stopped. Loading it to finish the shutdown")
-                  loadOwnedDevice(path, path / StorageDeviceConfig.configFilename, sdCfg)
-                    .foreach(ctx.reconciler.checkStorageDevice)
+                  loadResolved(path, sdCfg)
                 case DeviceStatus.Operational if ownedHere =>
                   logger.info(s"Storage device $deviceId at $path has been restarted. Loading it")
                   bringIntoService(path, sdCfg, state, rewriteOwner = false)
@@ -452,7 +559,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *     reconcile's completed-transfers-in pass writes its arrival, moves it Live and loads the store, as it
    *     would after any crash.
    *  3. shutdown.state is removed.
-   *  4. The device is loaded through tryLoadDevice and checked at once, so its Rebuilding and
+   *  4. The device is probed and loaded as a scan loads it, and checked at once, so its Rebuilding and
    *     TransferringIn work resumes now rather than at the next periodic check.
    *  5. StoreMoved is gossiped for every Active store, read from the pool as for a completed
    *     transfer in: the shutdown announced them all offline, and after an adoption peers must
@@ -497,14 +604,36 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     announceOnLoad += path -> active.keySet
     DeviceMarkers.removeShutdownState(path)
 
-    tryLoadDevice(path).foreach(ctx.reconciler.checkStorageDevice)
+    probe(path, DeviceDiscovery.Trigger(scan = false, check = true), explicit = true): Unit
 
-  /** Loads the device at `storageDevicePath` if this host owns it, returning its id when this
-   *  call is what loaded it.
+  /** Probes the device directory `path` (DiscoveryDisk.probe, one job on its DeviceIo) and decides on the result
+   *  (`decide`), unless a discovery job is outstanding for it: then a scan skips it, and an `explicit` request asks for
+   *  a probe once that job has been applied. Returns whether a probe began.
+   *
+   *  Nothing is decided for a path whose unloaded device's CRL is still shutting down
+   *  (LocalDevices.closingCrls): a second CRL opened over the same files would corrupt them. The
+   *  scan retries it once the shutdown has ended. */
+  private def probe(path: os.Path, trigger: DeviceDiscovery.Trigger, explicit: Boolean): Boolean =
+    if ctx.devices.closingCrls.contains(path) then
+      logger.debug(s"Not loading the device at $path yet: its CRL is still shutting down")
+      false
+    else
+      begin(path) match
+        case None =>
+          if explicit then again(path, trigger)
+          false
+        case Some(b) =>
+          submitFor(path, b, JobKind.Markers, "device probe")(DiscoveryDisk.probe(path))(() => ()): result =>
+            decide(path, b, result, trigger)
+          true
+
+  /** Loads the device whose probe found `result` at `storageDevicePath` if this host owns it.
    *
    *  The load decision is made from device-local files before anything on the device is
    *  touched -- not even its stale staging directory is removed -- because a device that is
    *  not ours may still be needed exactly as it is by the host that does own it:
+   *  - `failed` present: never loaded or claimed. A failed stat of it is Unreadable (DiscoveryDisk.probe): the
+   *    device is left for the next scan, never loaded on a false absence.
    *  - `shutdown.state` present: handed to resolveOwnership, which decides.
    *  - otherwise `owning-host` names this host: loaded, unless this process relinquished it to
    *    another host (disownedDirs).
@@ -515,58 +644,59 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  The decision for a device of ours needs no network, which matters at startup: a host may
    *  need its own devices loaded before it can read any metadata.
    *
-   *  Nothing is decided for a path whose unloaded device's CRL is still shutting down
-   *  (LocalDevices.closingCrls): a second CRL opened over the same files would corrupt them. The
-   *  scan retries it once the shutdown has ended.
-   */
-  private def tryLoadDevice(storageDevicePath: os.Path): Option[StorageDeviceId] =
-    val sdCfgPath = storageDevicePath / StorageDeviceConfig.configFilename
+   *  A path loaded meanwhile (by another request's probe) is left as it is. */
+  private def decide(storageDevicePath: os.Path, b: Busy, result: ProbeResult,
+                     trigger: DeviceDiscovery.Trigger): Unit =
+    def done(): Unit = end(storageDevicePath, b)
+    result match
+      case ProbeResult.NotADevice =>
+        done()
+      case ProbeResult.Unreadable(t) =>
+        done()
+        warnOnce(storageDevicePath, s"Failed to load storage device found at path $storageDevicePath. Error: $t")
+      case ProbeResult.Failed =>
+        done()
+        warnOnce(storageDevicePath, s"Storage device at $storageDevicePath has been declared failed. Not loading " +
+                                    s"or claiming it")
+      case ProbeResult.Device(_, _) if loadedDirs.contains(storageDevicePath) =>
+        done()
+      case ProbeResult.Device(sdCfg, _) if sdCfg.aspenSystemId != ctx.aspenSystemId =>
+        done()
+        warnOnce(storageDevicePath,
+                 s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
+      case ProbeResult.Device(sdCfg, markers) =>
+        try
+          markers.shutdownState.get match
+            case Some(markerHost) =>
+              done()
+              resolveOwnership(storageDevicePath, sdCfg, markerHost, fromShutdownMarker = true)
+            case None =>
+              markers.owningHost.get match
+                case Some(owner) if owner == ctx.hostId =>
+                  if disownedDirs.contains(storageDevicePath) then
+                    done()
+                  else
+                    loadOwnedDevice(storageDevicePath, b, sdCfg, trigger)
+                case Some(owner) =>
+                  done()
+                  resolveOwnership(storageDevicePath, sdCfg, owner, fromShutdownMarker = false)
+                case None =>
+                  done()
+                  warnOnce(storageDevicePath, s"Storage device ${sdCfg.storageDeviceId} at $storageDevicePath " +
+                                              s"has no ${DeviceMarkers.OwningHostFile} file. Not loading or " +
+                                              s"claiming it")
+        catch
+          case t: Throwable =>
+            done()
+            warnOnce(storageDevicePath, s"Failed to load storage device found at path $storageDevicePath. Error: $t")
 
-    // A stat that fails throws (FileStat) and the device is left for the next scan, never loaded on a false absence:
-    // of the failed marker above all, which would serve a tombstoned device's stores (rebuild-process B19)
-    def isDevice = FileStat.isDir(storageDevicePath) && FileStat.exists(sdCfgPath)
-
-    if ctx.devices.closingCrls.contains(storageDevicePath) then
-      logger.debug(s"Not loading the device at $storageDevicePath yet: its CRL is still shutting down")
-      None
-    else
-      try
-        if !isDevice then
-          None
-        else if DeviceMarkers.isFailed(storageDevicePath) then
-          warnOnce(storageDevicePath, s"Storage device at $storageDevicePath has been declared failed. Not loading " +
-                                      s"or claiming it")
-          None
-        else
-          val sdCfg = StorageDeviceConfig.loadStorageDeviceConfig(sdCfgPath)
-          if sdCfg.aspenSystemId != ctx.aspenSystemId then
-            warnOnce(storageDevicePath,
-                     s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
-            None
-          else
-            DeviceMarkers.readShutdownState(storageDevicePath) match
-              case Some(markerHost) =>
-                resolveOwnership(storageDevicePath, sdCfg, markerHost, fromShutdownMarker = true)
-                None
-              case None =>
-                DeviceMarkers.readOwningHost(storageDevicePath) match
-                  case Some(owner) if owner == ctx.hostId =>
-                    if disownedDirs.contains(storageDevicePath) then
-                      None
-                    else
-                      loadOwnedDevice(storageDevicePath, sdCfgPath, sdCfg)
-                  case Some(owner) =>
-                    resolveOwnership(storageDevicePath, sdCfg, owner, fromShutdownMarker = false)
-                    None
-                  case None =>
-                    warnOnce(storageDevicePath, s"Storage device ${sdCfg.storageDeviceId} at $storageDevicePath " +
-                                                s"has no ${DeviceMarkers.OwningHostFile} file. Not loading or " +
-                                                s"claiming it")
-                    None
-      catch
-        case t: Throwable =>
-          warnOnce(storageDevicePath, s"Failed to load storage device found at path $storageDevicePath. Error: $t")
-          None
+  /** Loads a device of ours that an ownership decision found (handleOwnershipResolved), or asks for a probe of its
+   *  directory once its outstanding discovery job has been applied */
+  private def loadResolved(path: os.Path, sdCfg: StorageDeviceConfig): Unit =
+    val trigger = DeviceDiscovery.Trigger(scan = false, check = true)
+    begin(path) match
+      case Some(b) => loadOwnedDevice(path, b, sdCfg, trigger)
+      case None => again(path, trigger)
 
   /** Opens the device's CRL. It is lost when its directory is absent from a device that holds stores, or holds no
    *  stream files there (CrlMissing: stores exist only on a device whose CRL was opened), or when opening it throws
@@ -721,123 +851,122 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       case Phase.Rebuilt(_) => true
       case _ => ownSaveFile
 
-  /** P2 (spec I1, every phase): a store with more than one copy outside pending-delete/ on a device being loaded. It
-   *  is logged at error, and every one of its copies is moved to lost/ (T10); the one with the least copy id stays
-   *  there, to be registered Lost and retired by the normal passes, and the others are moved on into pending-delete/
-   *  whole (T11's move, their files, crl_save.log included, kept inside them), released as any retired copy is. None
-   *  is served, and the store's entry is then rebuilt through the Lost CRL pass. A move that fails throws, leaving the
-   *  device unloaded for the next scan, which decides again over what is left. Returns the listing after the moves */
-  private def retireDuplicates(devicePath: os.Path, listing: CopyLayout.Listing): CopyLayout.Listing =
-    val duplicated = listing.copies.filter(_.phase != Phase.Retired).groupBy(_.storeId).filter(_._2.size > 1)
-    if duplicated.isEmpty then
-      listing
-    else
-      def moved(r: (MoveResult, os.Path)): os.Path = r match
-        case (MoveResult.NotMoved(t), _) => throw t
-        case (_, path) => path
-      duplicated.toList.sortBy((s, _) => (s.poolId.uuid, s.poolIndex)).foreach: (storeId, found) =>
-        logger.error(s"Storage device $devicePath holds ${found.size} copies of store $storeId " +
-                     s"(${found.map(f => s"${f.phase} at ${f.path}").mkString(", ")}). Retiring every one; the store " +
-                     "is rebuilt")
-        val ordered = found.sortBy(_.copyId)
-        val lost = ordered.map: f =>
-          if f.phase == Phase.Lost then
-            f.path
-          else
-            moved(ctx.moves.moveUnattached("duplicate copies at load", f.path, storeId, f.copyId, Phase.Lost))
-        ordered.zip(lost).drop(1).foreach: (f, path) =>
-          moved(ctx.moves.moveUnattached("duplicate copies at load", path, storeId, f.copyId, Phase.Retired))
-      CopyLayout.list(devicePath)
-
-  /** The load half of tryLoadDevice, run only once the device is known to be ours. */
-  private def loadOwnedDevice(storageDevicePath: os.Path,
-                              sdCfgPath: os.Path,
-                              sdCfg: StorageDeviceConfig): Option[StorageDeviceId] =
+  /** Whether a device with `sdCfg`'s id is loaded already. Usually that is just a rescan finding the same directory
+   *  again -- a directory that briefly disappeared, since loaded ones are not otherwise read -- which must be a no-op
+   *  so the device's state and open backends survive. A different directory claiming the same id -- a duplicate mount
+   *  or a copied config file -- would otherwise replace the map entry and orphan the original's already-open stores,
+   *  so it is reported and the original kept. */
+  private def alreadyLoaded(storageDevicePath: os.Path, sdCfg: StorageDeviceConfig): Boolean =
     devices.get(sdCfg.storageDeviceId) match
       case Some(existing) =>
-        // Already loaded. Usually this is just a rescan finding the same directory
-        // again -- a directory that briefly disappeared, since loaded ones are not otherwise
-        // read -- which must be a no-op so the device's state and open backends survive. A
-        // different directory claiming the same id -- a duplicate mount or a copied config
-        // file -- would otherwise replace the map entry and orphan the original's
-        // already-open stores, so report it and keep the original.
         if existing.devicePath != storageDevicePath then
           warnOnce(storageDevicePath, s"Storage device ${sdCfg.storageDeviceId} is already loaded from " +
                                       s"${existing.devicePath}; ignoring duplicate at $storageDevicePath")
         else
           loadedDirs += storageDevicePath -> sdCfg.storageDeviceId
-        None
-      case None =>
-        // Nothing can be receiving onto a device that is not loaded yet, so whatever is in
-        // its staging directory was left by an attempt that crashed or was abandoned. A copy
-        // that had finished arriving was already moved to its final path.
-        val staging = storageDevicePath / StoreTransfer.StagingDirectory
-        try os.remove.all(staging)
-        catch case t: Throwable =>
-          logger.warn(s"Failed to remove stale transfer staging directory $staging: $t")
-        // Likewise for store creates: a complete store was already renamed out of it (StoreCreation)
-        val creating = storageDevicePath / StoreCreation.CreatingDirectory
-        try os.remove.all(creating)
-        catch case t: Throwable =>
-          logger.warn(s"Failed to remove stale store-creation directory $creating: $t")
-        // And whatever an interrupted delete left (StoreCopies.delete)
-        StoreCopies.sweepDeleting(storageDevicePath)
-        // And an unfinished replacement of a lost CRL (openDeviceCrl): it holds no entry
-        val replacementCrl = CrashRecoveryLog.replacementCrlDir(storageDevicePath)
-        try os.remove.all(replacementCrl)
-        catch case t: Throwable =>
-          logger.warn(s"Failed to remove the unfinished replacement CRL directory $replacementCrl: $t")
-        // P6: a phase directory that cannot be listed, or a phase-param that cannot be read, leaves the device
-        // unloaded, nothing on it moved, for the next scan
-        Try(CopyLayout.list(storageDevicePath)) match
-          case Failure(t) =>
-            // Same hazard as the scan in checkForNewDevices: listing can fail with an IO
-            // error even when isDir just succeeded. The catch in tryLoadDevice would absorb
-            // the exception and leave the device unregistered and retryable just the same;
-            // this guard exists to name the directory instead.
-            warnOnce(storageDevicePath, s"Failed to list the copies of storage device $storageDevicePath. " +
-                                        s"Will retry on the next scan. Error: $t")
-            None
-          case Success(listing) =>
-            // Opened before any store is offered, so each store recovers from it. Recovery blocks the control
-            // thread. A throw leaves the device unloaded.
-            val crl = openDeviceCrl(storageDevicePath, sdCfg, listing)
-            val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath, crl,
-              ctx.deviceIos.forPath(storageDevicePath), new CrlAdmission(crl.admissionLimitBytes))
-            // A growth raises the limit the stores admit against; registered before any store loads
-            crl.onAdmissionLimitRaised(sds.admission.raiseLimit)
-            // Everything the CRL holds is counted, retained for its store, before any store loads: a store that loads
-            // counts its own afresh, and the entries of one that does not are copied forward all the same
-            // (crash-recovery-log 6.1)
-            crl.recoveredBytesByStore.foreach((storeId, bytes) => sds.admission.chargeRetained(storeId, bytes))
-            // On the control context. Ignored unless sds is still the device loaded (DeviceShutdown.crlFailed)
-            crl.failed.foreach(t => ctx.shutdown.crlFailed(sds, t))
-            logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
-            try
-              // Its copies registered before any store is offered (HostCopies). Listed again: a lost CRL's open moved
-              // copies to lost/ since the listing above, and P2 may move more
-              val copies = retireDuplicates(storageDevicePath, CopyLayout.list(storageDevicePath))
-              ctx.copyRegistry.attach(sds, copies)
-              // Only Live copies are offered to the loader: every other phase is its pass's
-              copies.copies.filter(_.phase == Phase.Live).foreach: found =>
-                ctx.tryLoadStore(sds, found.path, None)
-            catch
-              case t: Throwable =>
-                // Shut down as an unload does, so the retry does not open the files a second time
-                ctx.copyRegistry.detach(sds.storageDeviceId, Set())
-                ctx.shutdown.shutDownCrl(storageDevicePath, crl)
-                throw t
-            // Registered only after every child has been offered to tryLoadStore. If
-            // anything above throws, the catch in tryLoadDevice logs it and the device stays
-            // unregistered, so the next scan retries the whole device rather than
-            // skipping it as already loaded. That retry re-offers children whose
-            // LoadStore events are already queued; tryLoadStore's own catch absorbs the
-            // resulting duplicate-backend failures.
-            ctx.devices.devices += sdCfg.storageDeviceId -> sds
-            ctx.publishView()
-            loadedDirs += storageDevicePath -> sdCfg.storageDeviceId
-            reportedDirs -= storageDevicePath
-            announceOnLoad.get(storageDevicePath).foreach: stores =>
-              announceOnLoad -= storageDevicePath
-              stores.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach(ctx.gossipStoreOnline)
-            Some(sdCfg.storageDeviceId)
+        true
+      case None => false
+
+  /** The load half of a device decision, run only once the device is known to be ours, `b` holding its path
+   *  throughout. Each step that touches the disk is one job on the device's own lane, its result applied on the
+   *  control thread after the recheck submitFor makes (and, after each, whether the device id has been loaded from
+   *  elsewhere meanwhile):
+   *  1. DiscoveryDisk.sweepAtLoad (the scratch areas, nothing can be receiving onto or creating on a device that is not
+   *     loaded yet) and the copy listing (P6: a phase directory that cannot be listed, or a phase-param that cannot be
+   *     read, leaves the device unloaded, nothing on it moved, for the next scan).
+   *  2. On the control thread: the device CRL's open (openDeviceCrl, a lost CRL's moves), before any store is offered,
+   *     so each store recovers from it.
+   *  3. P2 (DiscoveryDisk.retireDuplicates), over a fresh listing: a lost CRL's open moved copies to lost/ since the
+   *     first one. Then, on the control thread, its copies are registered (HostCopies.attach) and its Live copies
+   *     offered to tryLoadStore, and only then is the device registered, so a throw anywhere leaves it unregistered
+   *     and the next scan retries it whole (its CRL shut down, as an unload does, so the retry does not open the files
+   *     a second time). That retry re-offers children whose LoadStore events are already queued; tryLoadStore's own
+   *     catch absorbs the resulting duplicate-backend failures. */
+  private def loadOwnedDevice(storageDevicePath: os.Path,
+                              b: Busy,
+                              sdCfg: StorageDeviceConfig,
+                              trigger: DeviceDiscovery.Trigger): Unit =
+    val sdCfgPath = storageDevicePath / StorageDeviceConfig.configFilename
+    if alreadyLoaded(storageDevicePath, sdCfg) then
+      end(storageDevicePath, b)
+    else
+      submitFor(storageDevicePath, b, JobKind.Sweep, "device load sweep")({
+        DiscoveryDisk.sweepAtLoad(storageDevicePath)
+        Try(CopyLayout.list(storageDevicePath))
+      })(() => ()):
+        case _ if alreadyLoaded(storageDevicePath, sdCfg) =>
+          end(storageDevicePath, b)
+        case Failure(t) =>
+          end(storageDevicePath, b)
+          warnOnce(storageDevicePath, s"Failed to list the copies of storage device $storageDevicePath. " +
+                                      s"Will retry on the next scan. Error: $t")
+        case Success(listing) =>
+          openAndAttach(storageDevicePath, b, sdCfgPath, sdCfg, listing, trigger)
+
+  /** Steps 2 and 3 of loadOwnedDevice */
+  private def openAndAttach(storageDevicePath: os.Path,
+                            b: Busy,
+                            sdCfgPath: os.Path,
+                            sdCfg: StorageDeviceConfig,
+                            listing: CopyLayout.Listing,
+                            trigger: DeviceDiscovery.Trigger): Unit =
+    // Recovery blocks the control thread (moved to the device's lane by a later task). A throw leaves the device
+    // unloaded: submitFor's catch ends the hold and warns
+    countingCrlFailures = trigger.scan
+    val crl =
+      try openDeviceCrl(storageDevicePath, sdCfg, listing)
+      finally countingCrlFailures = false
+    val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath, crl, b.io,
+      new CrlAdmission(crl.admissionLimitBytes))
+    // A growth raises the limit the stores admit against; registered before any store loads
+    crl.onAdmissionLimitRaised(sds.admission.raiseLimit)
+    // Everything the CRL holds is counted, retained for its store, before any store loads: a store that loads
+    // counts its own afresh, and the entries of one that does not are copied forward all the same
+    // (crash-recovery-log 6.1)
+    crl.recoveredBytesByStore.foreach((storeId, bytes) => sds.admission.chargeRetained(storeId, bytes))
+    logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
+    // Shut down as an unload does, so the retry does not open the files a second time
+    def abandon(): Unit =
+      // Not the registry of a device with this id loaded from another directory meanwhile
+      if !devices.contains(sds.storageDeviceId) then
+        ctx.copyRegistry.detach(sds.storageDeviceId, Set())
+      ctx.shutdown.shutDownCrl(storageDevicePath, crl)
+    val sync = ctx.moves.syncDirectory
+    val rename = ctx.moves.rename
+    submitFor(storageDevicePath, b, JobKind.Move, "device load P2")(
+      DiscoveryDisk.retireDuplicates(storageDevicePath, sync, rename))(() => abandon()): dups =>
+      // Held for the attach, as CopyMoves.moveUnattached holds an unsynced move of a device being loaded
+      dups.unsynced.foreach: (from, to) =>
+        ctx.moves.heldUnforced(from, to)
+        ctx.copyRegistry.unsynced(DiscoveryDisk.DuplicatesSite, to)
+      val attached =
+        try
+          if alreadyLoaded(storageDevicePath, sdCfg) then
+            abandon()
+            false
+          else
+            // Its copies registered before any store is offered (HostCopies)
+            val copies = dups.outcome.get
+            ctx.copyRegistry.attach(sds, copies)
+            // Only Live copies are offered to the loader: every other phase is its pass's
+            copies.copies.filter(_.phase == Phase.Live).foreach: found =>
+              ctx.tryLoadStore(sds, found.path, None)
+            true
+        catch
+          case t: Throwable =>
+            abandon()
+            throw t
+      if attached then
+        ctx.devices.devices += sdCfg.storageDeviceId -> sds
+        ctx.publishView()
+        loadedDirs += storageDevicePath -> sdCfg.storageDeviceId
+        reportedDirs -= storageDevicePath
+        // On the control context. Ignored unless sds is still the device loaded (DeviceShutdown.crlFailed), so
+        // registered only once it is: a failure meanwhile is acted on now
+        crl.failed.foreach(t => ctx.shutdown.crlFailed(sds, t))
+        announceOnLoad.get(storageDevicePath).foreach: stores =>
+          announceOnLoad -= storageDevicePath
+          stores.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach(ctx.gossipStoreOnline)
+      end(storageDevicePath, b)
+      if attached && trigger.check then
+        ctx.reconciler.checkStorageDevice(sdCfg.storageDeviceId)

@@ -122,9 +122,13 @@ object Host:
                                 create: Boolean, previous: Option[LoadRetry], result: Try[Backend],
                                 created: Option[Promise[Unit]], onServed: Option[() => Unit]) extends Event
   private[server] case class InitializeTaskExecutor() extends Event
-  /** Posted by the constructor after its device scan, so it follows every LoadStore that scan queued: from then on
-   *  the router answers messages for stores not loaded here (StoreRouter.markReady). */
+  /** Posted once the startup device scan has decided every path it listed (DeviceDiscovery.startupScan): each device
+   *  it loads attached, so its stores are silent until served. From then on the router answers messages for stores not
+   *  loaded here (StoreRouter.markReady). */
   private[server] case class StoresReady() extends Event
+  /** The outcome of a job on a DeviceIo's management lane, applied on the control thread (DeviceControl.onControl):
+   *  `apply` rechecks that what the job was for is still current before it acts. `what` names it in logs */
+  private[server] final case class DeviceJobDone(what: String, apply: () => Unit) extends Event
 
   /** What Host posts to its threading's control events: one event, handled by handleEvent. Carries the event so the
    *  test hooks can find queued events, and names it in the log line written when its handler throws. */
@@ -406,15 +410,11 @@ class Host(val client: AspenClient,
   deviceControl.copyRegistry.strict = seams.verifyCopyRegistry || seams.strictCopyRegistry
   seams.copyRename.foreach(deviceControl.moves.rename = _)
 
-  deviceControl.discovery.checkForNewDevices()
-
-  // After the LoadStores the scan queued: until it is handled, messages for stores not loaded get no reply
-  post(StoresReady())
-
-  // After we've loaded all the stores, initiate an initial check of all our
-  // devices in case operations were preformed while we were down and missed
-  // the CheckDeviceState messages
-  post(CheckAllDevices())
+  // Posts the same jobs as every later scan, and blocks on no device. Once it has decided every path it listed it posts
+  // StoresReady (until that is handled, messages for stores not loaded get no reply) and then CheckAllDevices, an
+  // initial check of every device in case operations were performed while we were down and missed the
+  // CheckDeviceState messages. A path whose device never answers holds both back; the periodic checks still run
+  deviceControl.discovery.startupScan(() => { post(StoresReady()); post(CheckAllDevices()) })
   post(InitializeTaskExecutor())
 
   def getTaskExecutor(): Future[TaskExecutor] = services.getTaskExecutor()
@@ -628,6 +628,8 @@ class Host(val client: AspenClient,
         deviceControl.discovery.handleOwnershipResolved(e)
 
       case ScanDevices() => reconciler.scan()
+
+      case e: DeviceJobDone => e.apply()
 
       case StoresReady() =>
         deviceControl.router.markReady()

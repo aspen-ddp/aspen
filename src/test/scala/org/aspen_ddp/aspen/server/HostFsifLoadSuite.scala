@@ -179,6 +179,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       seams = compared(Host.Seams(backends = Some(seams), wrapMetadata = Some(seams.withDeviceStates),
                          gossipStoreOnline = Some(seams.gossipStoreOnline), loadStore = Some(loadStore))))
     built = host
+    runDiscovery(host)
     host
     fsifSeams.put(host, seams)
     host
@@ -325,17 +326,17 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) should be(false)
 
       // Still full on the first retry, the next scan
-      host.control.reconciler.scan()
+      scanNow(host)
       host.testingOnlyHandleEvents()
       fsif(host).opens should be(2)
       host.getStoreIds should not contain storeId
 
       // Backed off: the next retry waits two scans
-      host.control.reconciler.scan()
+      scanNow(host)
       host.testingOnlyHandleEvents()
       fsif(host).opens should be(2)
 
-      host.control.reconciler.scan()
+      scanNow(host)
       host.testingOnlyHandleEvents()
       fsif(host).opens should be(3)
       host.getStoreIds should contain(storeId)
@@ -343,7 +344,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) should be(false)
 
       // Loaded: later scans no longer retry it
-      host.control.reconciler.scan()
+      scanNow(host)
       host.testingOnlyHandleEvents()
       fsif(host).opens should be(3)
 
@@ -358,7 +359,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       load(host)
       val retriedAt = (1 to 100).filter: scan =>
         val before = fsif(host).opens
-        host.control.reconciler.scan()
+        scanNow(host)
         host.testingOnlyHandleEvents()
         fsif(host).opens > before
       // Waits of 1, 2, 4, 8, 16 scans, then the cap: 5 minutes of 10 s scans
@@ -597,13 +598,13 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) should be(false)
 
         // Fails again on the first retry, the next scan, then waits two scans
-        host.control.reconciler.scan()
+        scanNow(host)
         host.testingOnlyHandleEvents()
         fsif(host).opens should be(2)
-        host.control.reconciler.scan()
+        scanNow(host)
         host.testingOnlyHandleEvents()
         fsif(host).opens should be(2)
-        host.control.reconciler.scan()
+        scanNow(host)
         host.testingOnlyHandleEvents()
         fsif(host).opens should be(3)
         host.getStoreIds should contain(storeId)
@@ -623,7 +624,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       fsif(host).opens should be(1)
       val sds = host.control.devices.devices(deviceA)
       def scans(n: Int): Unit = (0 until n).foreach: _ =>
-        host.control.reconciler.scan()
+        scanNow(host)
         host.testingOnlyHandleEvents()
       def entry(status: StorageDeviceState.StoreStatus): Map[StoreId, StorageDeviceState.StoreEntry] =
         Map(storeId -> StorageDeviceState.StoreEntry(status, None))
@@ -654,7 +655,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       fsif(host).failedOpens = 1
       load(host)
       host.control.devices.devices(deviceA).reconciledEntries = Some(Map())
-      host.control.reconciler.scan()
+      scanNow(host)
       host.testingOnlyHandleEvents()
       fsif(host).opens should be(1)
       host.control.loader.awaitingRetryWaitScans(storeId) should be(None)
@@ -720,7 +721,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       fsif(host).openQueue = Some(queued)
       fsif(host).deviceStates = Map(deviceA -> deviceState(deviceA,
         Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
-      host.control.reconciler.checkAll()
+      checkAllNow(host)
       yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).map: _ =>
         host.control.reconciler.activeDeviceChecks should not contain deviceA
         CopyFixtures.phaseOf(deviceDir, storeId).exists(_.isInstanceOf[Phase.Outbound]) should be(false)
@@ -822,7 +823,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
           host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(true))
           fsif(host).gossipedOnline should be(Nil)
       waited.andThen(_ => os.perms.set(storeDir, "rwx------")).flatMap: _ =>
-        host.control.reconciler.scan() // the retry: its open is queued
+        scanNow(host) // the retry: its open is queued
         queued.size should be(1)
         queued.poll().run()
         host.testingOnlyHandleEvents()
@@ -847,7 +848,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     host.control.router.silentStores should contain(storeId)
     fsif(host).deviceStates = Map(deviceA -> deviceState(deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).flatMap: _ =>
       host.control.reconciler.activeDeviceChecks should not contain deviceA
       // Opened synchronously, but not gossiped until its LoadStore has served it (X-W15): silent while it opens
@@ -874,17 +875,17 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(false))
 
     // Still unreadable: kept waiting
-    host.control.reconciler.scan()
+    scanNow(host)
     host.testingOnlyHandleEvents()
     host.getStoreIds should not contain storeId
     host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(false))
 
     os.write.over(storeDir / StoreConfig.configFilename, cfg)
     // The failed retry doubled the wait: the first scan only counts it down
-    host.control.reconciler.scan()
+    scanNow(host)
     host.testingOnlyHandleEvents()
     host.getStoreIds should not contain storeId
-    host.control.reconciler.scan()
+    scanNow(host)
     host.testingOnlyHandleEvents()
     Future.successful:
       host.getStoreIds should contain(storeId)
@@ -905,7 +906,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     os.write.over(outboundDir / StoreConfig.configFilename, "not: [a store config")
     fsif(host).deviceStates = Map(deviceA -> deviceState(deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).flatMap: _ =>
       // Moved back to Live in live/ (T7), so only the retry can take the store up again
       CopyFixtures.phaseOf(deviceDir, storeId).exists(_.isInstanceOf[Phase.Outbound]) should be(false)
@@ -915,7 +916,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       fsif(host).gossipedOnline should be(Nil)
 
       os.write.over(storeDir / StoreConfig.configFilename, cfg)
-      host.control.reconciler.scan()
+      scanNow(host)
       host.testingOnlyHandleEvents()
       host.getStoreIds should contain(storeId)
       yieldUntil(fsif(host).gossipedOnline.nonEmpty).map: _ =>
@@ -936,7 +937,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       fsif(host).gossipedOnline should be(Nil)
       host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(true))
 
-      host.control.reconciler.scan() // the retry: its open is queued
+      scanNow(host) // the retry: its open is queued
       queued.size should be(1)
       fsif(host).gossipedOnline should be(Nil)
       queued.poll().run()
@@ -946,7 +947,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         fsif(host).gossipedOnline should be(List(storeId))
 
         // Exactly once: later scans and events gossip nothing more
-        host.control.reconciler.scan()
+        scanNow(host)
         host.testingOnlyHandleEvents()
         queued.size should be(0)
         yieldUntil(fsif(host).gossipedOnline.size > 1, maxYields = 10).map: _ =>
@@ -965,13 +966,13 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.testingOnlyHandleEvents() // out of space, awaiting space
       val cfg = os.read.bytes(storeDir / StoreConfig.configFilename)
       os.remove(storeDir / StoreConfig.configFilename)
-      host.control.reconciler.scan() // its config is gone: dropped from the wait, no retry
+      scanNow(host) // its config is gone: dropped from the wait, no retry
       queued.size should be(0)
       fsif(host).gossipedOnline should be(Nil)
 
       // A later, unrelated load serves it without the dropped callback
       os.write(storeDir / StoreConfig.configFilename, cfg)
-      host.control.reconciler.scan()
+      scanNow(host)
       queued.size should be(0) // no longer waiting
       load(host)
       queued.poll().run()

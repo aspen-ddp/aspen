@@ -225,11 +225,14 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
                          hostId: HostId = HostId.BootstrapHostId, seams: Host.Seams = Host.Seams.default,
                          rebuilds: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
                          maxConcurrentRebuilds: Int = 2): Host =
-    new Host(client, hostId, systemId, hostRoot, executionContext,
+    val host = new Host(client, hostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net,
       BackgroundTaskManager.NoBackgroundTaskManager, crlFactory, net.FinalizerFactory,
       TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
       StoreTransferService.Disabled, rebuilds, maxConcurrentRebuilds, seams = compared(seams))
+    // The constructor's scan, run as it once ran inside the constructor
+    runDiscovery(host)
+    host
 
   /** Drains `host`'s events and yields until `condition` holds. The caller asserts it.
    *
@@ -334,7 +337,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       // The pool lives on deviceA alone, so the real request would refuse this shutdown
       _ <- forceShuttingDown(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = oldHost.control.reconciler.checkAll()
+      _ = checkAllNow(oldHost)
       _ <- pumpWithTx(oldHost, !oldHost.control.devices.devices.contains(deviceA) &&
                                oldHost.control.devices.closingCrls.isEmpty)
       shutDown <- client.getStorageDeviceState(deviceA)
@@ -415,7 +418,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       recoveredTx = recovered(host, sid, txid)
       nudges = net.takeCapturedHostMessages().collect { case m: CheckStorageDevice => m }
       loadedBeforeNudge = oldHost.control.devices.devices.contains(deviceA)
-      _ = nudges.filter(_.toHost == oldHostId).foreach(oldHost.control.reconciler.handleCheckMessage)
+      _ = nudges.filter(_.toHost == oldHostId).foreach(nudgeNow(oldHost, _))
       _ <- pumpWithTx(oldHost, !oldHost.control.devices.devices.contains(deviceA))
       _ <- host.control.router.loaded.get(sid).map(_.backend.close()).getOrElse(Future.unit)
     yield
@@ -460,7 +463,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       markedWhileRefused = markedLost(deviceDir, sid)
       // The CRL arrives on the drive
       _ = createCrl(deviceDir)
-      _ = host.control.reconciler.scan()
+      _ = scanNow(host)
       _ <- pumpWithTx(host, host.control.router.loaded.contains(sid))
       adopted <- client.getStorageDeviceState(deviceA)
       _ <- host.control.router.loaded.get(sid).map(_.backend.close()).getOrElse(Future.unit)
@@ -494,7 +497,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- prepareInFlight(host, factory.opened.head, storeId, txid)
       _ <- forceShuttingDown(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpWithTx(host, host.control.router.loaded.get(storeId).exists(_ ne firstStore) &&
                             recovered(host, storeId, txid))
       st <- client.getStorageDeviceState(deviceA)
@@ -614,7 +617,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
             recoveryState(storeId, TransactionId(new UUID(9, 6)), new Array[Byte](2 * 1024 * 1024)), () => ())
       _ <- crl.failed
       _ <- pumpUntil(host, !host.control.devices.devices.contains(deviceA) && crl.shutdownCalls.get > 0)
-      rescanned = host.control.discovery.checkForNewDevices()
+      rescanned = discoverNow(host)
     yield
       host.control.devices.devices.contains(deviceA) should be(false)
       crl.shutdownCalls.get should be >= 1
@@ -678,13 +681,13 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
     for
       _ <- factory.opened.head.shutdownCalled.future
-      reloadedWhileClosing = host.control.discovery.checkForNewDevices()
+      reloadedWhileClosing = discoverNow(host)
       _ = reloadedWhileClosing should be(Nil)
       _ = factory.opened.size should be(1)
       _ = gate.countDown()
       _ <- closing
       _ <- yieldUntil(!host.control.devices.closingCrls.contains(deviceDir))
-      reloaded = host.control.discovery.checkForNewDevices()
+      reloaded = discoverNow(host)
     yield
       host.control.devices.closingCrls.contains(deviceDir) should be(false)
       reloaded should be(List(deviceA))
@@ -814,12 +817,12 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
         unreadable = if what == "save file" then Backend.crlSaveFile(saved) else saved / StoreConfig.configFilename
         _ = os.perms.set(unreadable, "---------")
         host = newCrlHost(hostRoot, corruptUntilReplaced)
-        _ = host.control.reconciler.scan()
+        _ = scanNow(host)
         loadedWhileUnreadable = host.control.devices.devices.contains(deviceA)
         lostWhileUnreadable = os.list(deviceDir).count(_.last.startsWith("crl.lost-"))
         markedWhileUnreadable = List(storeId, StoreId(poolId, 1.toByte)).map(markedLost(deviceDir, _))
         _ = os.perms.set(unreadable, "rw-------")
-        _ = host.control.reconciler.scan()
+        _ = scanNow(host)
         _ <- pumpUntil(host, host.control.router.loaded.contains(storeId) && !os.exists(Backend.crlSaveFile(saved)))
       yield
         loadedWhileUnreadable should be(false)
@@ -858,7 +861,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       // As RebuildingStore.finish leaves it. It never served, so the lost CRL held nothing of it
       _ = landRebuiltCopy(deviceDir, episode)
       host = newCrlHost(hostRoot, corruptOnFirstOpen(newFactory()), rebuilds = rebuilds)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpWithTx(host, host.control.reconciler.activeDeviceChecks.isEmpty &&
                             (host.control.router.loaded.contains(storeId) || rebuilds.created.nonEmpty))
     yield (deviceDir, storeDir, host, rebuilds)
@@ -925,11 +928,11 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     host.control.devices.devices.contains(deviceA) should be(false)
     markedLost(deviceDir) should be(false)
     for _ <- 2 to failures do
-      host.control.reconciler.scan()
+      scanNow(host)
     host.control.devices.devices.contains(deviceA) should be(false)
     markedLost(deviceDir) should be(false)
 
-    host.control.reconciler.scan()
+    scanNow(host)
     calls.get should be(failures + 1)
     Future.successful:
       markedLost(deviceDir) should be(false)
@@ -940,11 +943,11 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     // The constructor's open, uncounted, then CrlOpenAttempts scans
     val (deviceDir, storeDir, inner, calls, host) = transientlyFailingCrlDevice(1 + DeviceDiscovery.CrlOpenAttempts)
     for _ <- 1 until DeviceDiscovery.CrlOpenAttempts do
-      host.control.reconciler.scan()
+      scanNow(host)
     markedLost(deviceDir) should be(false)
 
     // The last scan fails too: the CRL is lost and a fresh one opened
-    host.control.reconciler.scan()
+    scanNow(host)
     Future.successful:
       markedLost(deviceDir) should be(true)
       os.list(deviceDir).count(_.last.startsWith("crl.lost-")) should be(1)
@@ -958,17 +961,17 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       transientlyFailingCrlDevice(uncounted + DeviceDiscovery.CrlOpenAttempts)
     host.testingOnlyHandleEvents()
     for _ <- 1 to DeviceDiscovery.CrlOpenAttempts do
-      host.control.reconciler.checkAll()
-      host.control.reconciler.handleCheckMessage(CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
+      checkAllNow(host)
+      nudgeNow(host, CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
     markedLost(deviceDir) should be(false)
     os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
     calls.get should be(uncounted)
 
     // Device scans count, CrlOpenAttempts in a row declaring it lost
     for _ <- 1 until DeviceDiscovery.CrlOpenAttempts do
-      host.control.reconciler.scan()
+      scanNow(host)
     markedLost(deviceDir) should be(false)
-    host.control.reconciler.scan()
+    scanNow(host)
     Future.successful:
       markedLost(deviceDir) should be(true)
       os.list(deviceDir).count(_.last.startsWith("crl.lost-")) should be(1)
@@ -988,13 +991,14 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     // Not a transient failure counting towards CrlOpenAttempts, nor a lost CRL, however often it is retried
     host.control.devices.devices.contains(deviceA) should be(false)
     for _ <- 1 to DeviceDiscovery.CrlOpenAttempts do
-      host.control.discovery.checkForNewDevices(scan = true) should be(Nil)
+      discoverNow(host, scan = true)
+      host.control.devices.devices.contains(deviceA) should be(false)
     markedLost(deviceDir) should be(false)
     os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
     factory.opened should be(Nil)
 
     holder.shutdown()
-    host.control.discovery.checkForNewDevices() should be(List(deviceA))
+    discoverNow(host) should be(List(deviceA))
     Future.successful:
       markedLost(deviceDir) should be(false)
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened.head
@@ -1010,7 +1014,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     markedLost(deviceDir) should be(false)
 
     factory.opened.head.shutdownCalled.future.flatMap(_ => yieldUntil(host.control.devices.closingCrls.isEmpty)).map: _ =>
-      host.control.discovery.checkForNewDevices() should be(List(deviceA))
+      discoverNow(host) should be(List(deviceA))
       markedLost(deviceDir) should be(true)
       os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
       os.exists(CrashRecoveryLog.deviceCrlDir(deviceDir) / "0.crl") should be(true)
@@ -1086,7 +1090,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     os.exists(CrashRecoveryLog.replacementCrlDir(deviceDir)) should be(false)
     os.list(deviceDir).count(_.last.startsWith("crl.lost-")) should be(1)
 
-    host.control.reconciler.scan()
+    scanNow(host)
     Future.successful:
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs inner.opened.head
       os.list(deviceDir).count(_.last.startsWith("crl.lost-")) should be(1)
@@ -1161,7 +1165,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
   private def rebuildAndServe(host: Host, rebuilds: RecordingRebuildFactory, deviceDir: os.Path,
                               storeDir: os.Path): Future[(Boolean, Set[TransactionId])] =
     given ExecutionContext = executionContext
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     for
       _ <- pumpWithTx(host, rebuilds.created.nonEmpty)
       _ = rebuilds.created.map(_.storeId).toList should be(List(storeId))
@@ -1258,7 +1262,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
       heldAtRestart = held(second.opened.head, storeId)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
       _ <- writeRocksStore(deviceDir, storeId)
       _ = landRebuiltCopy(deviceDir, Some(episode))
@@ -1296,13 +1300,13 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = first.shutdownAll()
       _ = CopyFixtures.markCopy(deviceDir, storeId, Phase.Lost)
       restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
       copies = os.list(deviceDir / RebuildingStore.PendingDeleteDirectory).toList
       saved = copies.map(c => CrashRecoveryLog.loadValidStoreState(c / RebuildingStore.LostCrlStateFile, storeId))
       leftInCrl = held(second.opened.head, storeId)
       // Checks while the entry is Rebuilding keep it
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty)
       keptWhileRebuilding = copies.forall(os.exists(_))
       _ <- writeRocksStore(deviceDir, storeId)
@@ -1336,7 +1340,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.write.over(Backend.crlSaveFile(storeDir), "damaged")
       _ = CopyFixtures.markCopy(deviceDir, storeId, Phase.Lost)
       restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
       copies = pendingCopies(deviceDir)
       kept = copies.map(c => CrashRecoveryLog.loadValidStoreState(c / RebuildingStore.LostCrlEntriesFile, storeId))
@@ -1406,13 +1410,13 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       restarted = newCrlHost(hostRoot, second)
       crl = second.opened.head
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, pendingCopies(deviceDir).nonEmpty && !restarted.control.copies.isRetiring(storeId))
       copies = pendingCopies(deviceDir)
       saved = copies.map(c => CrashRecoveryLog.loadValidStoreState(c / RebuildingStore.LostCrlStateFile, storeId))
       leftInCrl = held(crl, storeId)
       // The store is not Active anywhere its pool names: later checks keep the copy
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty &&
                                  restarted.control.reconciler.pendingDeleteLookupsInFlight.isEmpty)
       kept = copies.forall(os.exists(_))
@@ -1448,7 +1452,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       // The extraction deleted them from the device CRL: the save file is the only copy
       heldAfterClose = held(crl, storeId)
       // The rebuild starts once the copy is retired; the copy is kept until the store is Active again
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpWithTx(host, rebuilds.created.nonEmpty)
       copies = pendingCopies(deviceDir)
       saved = copies.map(c => CrashRecoveryLog.loadValidStoreState(c / RebuildingStore.LostCrlStateFile, storeId))
@@ -1476,7 +1480,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.makeDir.all(unknown)
       host = newCrlHost(hostRoot, factory)
       _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpWithTx(host, host.control.reconciler.activeDeviceChecks.isEmpty && !os.exists(released))
       _ <- host.control.router.loaded(storeId).backend.close()
       _ = factory.shutdownAll()
@@ -1590,7 +1594,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       awaiting = host.control.loader.awaitingRetryHasCallback(storeId)
       _ = os.perms.set(locked, "rwx------")
       fileKept = os.exists(Backend.crlSaveFile(storeDir))
-      _ = host.control.reconciler.scan()
+      _ = scanNow(host)
       // Recovered once the CRL holds the file's state, after its install
       _ <- pumpUntil(host, host.control.router.loaded.get(storeId).exists(_.frontend.transactions.contains(fileTx)))
       store = host.control.router.loaded(storeId)
@@ -1625,7 +1629,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
         _ <- pumpUntil(host, host.control.loader.awaitingRetryHasCallback(storeId).isDefined)
         servedWhileUnreadable = host.control.router.loaded.contains(storeId)
         _ = os.perms.set(locked, "rwx------")
-        _ = host.control.reconciler.scan()
+        _ = scanNow(host)
         _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
         store = host.control.router.loaded(storeId)
         loadedSince = store.frontend.acceptorSince
@@ -1654,7 +1658,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       awaiting = host.control.loader.awaitingRetryHasCallback(storeId)
       marked = markedLost(deviceDir)
       _ = os.perms.set(saveFile, "rw-------")
-      _ = host.control.reconciler.scan()
+      _ = scanNow(host)
       // Recovered once the CRL holds the file's state, after its install
       _ <- pumpUntil(host, host.control.router.loaded.get(storeId).exists(_.frontend.transactions.contains(fileTx)))
       store = host.control.router.loaded(storeId)
@@ -1698,7 +1702,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       marked = markedLost(deviceDir)
       // Readable again (a release that reads its own format): the next retry serves it under its own incarnation
       _ = os.write.over(file, original)
-      _ = host.control.reconciler.scan()
+      _ = scanNow(host)
       _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
       store = host.control.router.loaded(storeId)
       incarnation = store.frontend.incarnation
@@ -1989,10 +1993,10 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
       crl = second.opened.head
       _ = crl.dropGate = Some(gate.future)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, crl.dropCalled.isCompleted)
       // More checks while the drop is held start nothing and discard nothing
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, false, rounds = 20)
       dropRequested = crl.dropCalled.isCompleted
       keptWhileDropping = markedLost(deviceDir)
@@ -2031,17 +2035,17 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       host = newCrlHost(hostRoot, first, rebuilds = rebuilds, maxConcurrentRebuilds = 1)
       crl = first.opened.head
       _ = crl.dropGate = Some(gate.future)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpWithTx(host, crl.dropCalled.isCompleted)
       // The single slot is held by the first store's discard: further checks discard nothing more
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpWithTx(host, false, rounds = 20)
       dropsWhileHeld = crl.dropCalls.get
       secondKeptWhileHeld = markedLost(deviceDir, second)
       _ = gate.success(())
       // The slot passes from the first store's discard to its rebuild, with no gap a second discard could take
       _ <- pumpWithTx(host, rebuilds.created.nonEmpty)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpWithTx(host, false, rounds = 20)
     yield
       dropsWhileHeld should be(1)
@@ -2108,7 +2112,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       // The recorded copy's directory vanishes while the host runs (a bad restore over the mounted device)
       _ = host.testingOnlySkipDiskCheckAt(storeDir)
       _ = os.remove.all(storeDir)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpWithTx(host, rebuilds.created.nonEmpty)
       sds = host.control.devices.devices(deviceA)
       held = host.control.moves.isPendingLost(sds, storeId)
@@ -2451,7 +2455,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       // The transfer completed: the device's entry no longer names the store
       _ <- setDeviceState(deviceA)(_.copy(stores = Map()))
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpWithTx(host, !os.exists(storeDir) && crl.dropDone.isCompleted)
       deleted = !os.exists(storeDir)
       leftInCrl = held(crl, storeId)
@@ -2478,7 +2482,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       heldBefore = heldOnDisk(deviceDir, storeId)
       restarted = newCrlHost(hostRoot, second)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       crl = second.opened.head
       _ <- pumpUntil(restarted, crl.dropDone.isCompleted)
       leftInCrl = held(crl, storeId)
@@ -2505,10 +2509,10 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.move(storeDir, aside)
       restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
       crl = second.opened.head
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
       // Later reconciles, the entry now Rebuilding, drop nothing either
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty)
       state <- client.getStorageDeviceState(deviceA)
       leftInCrl = held(crl, storeId)
@@ -2544,13 +2548,13 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       aside = deviceDir / os.up / "aside"
       _ = os.move(storeDir, aside)
       restarted = newCrlHost(hostRoot, second, seams = seams, rebuilds = rebuilds)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, requestsFailed.get > 0 && restarted.control.reconciler.activeDeviceChecks.isEmpty)
       // The directory comes back (a restore finishing late) after the request failed
       _ = os.move(aside, storeDir)
       _ = restarted.testingOnlyRescan(deviceA)
       _ = failRequests.set(false)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
       state <- client.getStorageDeviceState(deviceA)
       silenced = restarted.control.router.isOffline(storeId)
@@ -2585,14 +2589,14 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.move(storeDir, aside)
       restarted = newCrlHost(hostRoot, second, seams = seams, rebuilds = rebuilds)
       crl = second.opened.head
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, requestsFailed.get > 0 && restarted.control.reconciler.activeDeviceChecks.isEmpty)
       // The mount finishes: the directory is back while the host runs, and nothing tells the registry (no rescan).
       // The drain's disk check skips its path until a reconcile re-reads it
       _ = restarted.testingOnlySkipDiskCheckAt(storeDir)
       _ = os.move(aside, storeDir)
       _ = failRequests.set(false)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
       state <- client.getStorageDeviceState(deviceA)
       leftInCrl = held(crl, storeId)
@@ -2628,14 +2632,14 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.move(storeDir, aside)
       restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
       crl = second.opened.head
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
       // The mount finishes while the rebuild runs, past its retire; then the rebuild finishes
       _ = restarted.testingOnlySkipDiskCheckAt(storeDir)
       _ = os.move(aside, storeDir)
       _ = rebuilds.created.head.placeAndComplete()
       _ <- pumpWithTx(restarted, restarted.control.copyRegistry.rebuilding(HostCopies.RebuildReads).isEmpty)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, rebuilds.created.size >= 2)
       state <- client.getStorageDeviceState(deviceA)
       leftInCrl = held(crl, storeId)
@@ -2670,9 +2674,9 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.perms.set(storeDir, "rw-------")
       restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
       crl = second.opened.head
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, restarted.control.reconciler.activeDeviceChecks.isEmpty)
       state <- client.getStorageDeviceState(deviceA)
       leftInCrl = held(crl, storeId)
@@ -2701,7 +2705,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.remove(storeDir / StoreConfig.configFilename)
       restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
       crl = second.opened.head
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
       state <- client.getStorageDeviceState(deviceA)
       leftInCrl = held(crl, storeId)
@@ -2741,7 +2745,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       sds = restarted.control.devices.devices(deviceA)
       leftoverBytes = sds.admission.retainedBytes(storeId)
       _ = crl.dropGate = Some(dropGate.future)
-      _ = restarted.control.reconciler.checkAll()
+      _ = checkAllNow(restarted)
       _ <- pumpUntil(restarted, crl.dropCalls.get == 1)
       // The store lands while the leftover drop runs: its crl_save.log state is charged, its own drop and its load
       // queue behind the leftover drop. Its device lists it again first, so no device check retires the copy as one
@@ -2855,14 +2859,15 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
     host.control.devices.devices.contains(deviceA) should be(false)
     for _ <- 1 to DeviceDiscovery.CrlOpenAttempts do
-      host.control.discovery.checkForNewDevices(scan = true) should be(Nil)
+      discoverNow(host, scan = true)
+      host.control.devices.devices.contains(deviceA) should be(false)
     markedLost(deviceDir) should be(false)
     os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
     factory.opened should be(Nil)
     contents should be(damaged)
 
     repair(crlDir)
-    host.control.discovery.checkForNewDevices() should be(List(deviceA))
+    discoverNow(host) should be(List(deviceA))
     Future.successful:
       markedLost(deviceDir) should be(false)
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened.head
@@ -2914,14 +2919,15 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 
     host.control.devices.devices.contains(deviceA) should be(false)
     for _ <- 1 to DeviceDiscovery.CrlOpenAttempts do
-      host.control.discovery.checkForNewDevices(scan = true) should be(Nil)
+      discoverNow(host, scan = true)
+      host.control.devices.devices.contains(deviceA) should be(false)
     os.list(deviceDir).exists(_.last.startsWith("crl.lost-")) should be(false)
     os.list(crlDir) should be(Nil)
     factory.opened should be(Nil)
 
     os.write.over(deviceDir / StorageDeviceConfig.configFilename,
       StorageDeviceConfig(deviceA, systemId, crlFileSizeMb = Some(1)).yamlConfig)
-    host.control.discovery.checkForNewDevices() should be(List(deviceA))
+    discoverNow(host) should be(List(deviceA))
     Future.successful:
       host.control.devices.devices(deviceA).crl should be theSameInstanceAs factory.opened.head
       os.exists(crlDir / SimpleCRL.SizingFile) should be(true)

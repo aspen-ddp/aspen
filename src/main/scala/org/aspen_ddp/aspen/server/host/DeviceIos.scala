@@ -20,12 +20,19 @@ final class DeviceIos(threading: HostThreading, rootDir: os.Path):
 
   def get(path: os.Path): Option[DeviceIo] = Option(ios.get(path))
 
-  /** Closes and drops the path's DeviceIo, unless its observer shows work in flight, in which case it is kept. */
-  def forget(path: os.Path): Unit =
+  /** Closes and drops the path's DeviceIo if it is idle (`DeviceIo.idle`: no management job queued or running, no
+   *  data or serial task queued or running), so closing drops nothing; a busy one is kept, and its caller (discovery,
+   *  for a path gone from its listing) asks again later. Returns whether the path now has no DeviceIo. */
+  def forget(path: os.Path): Boolean =
     val io = ios.get(path)
-    if io != null && io.observer.inFlight.isEmpty then
+    if io == null then
+      true
+    else if io.idle then
       ios.remove(path)
       io.close()
+      true
+    else
+      false
 
   def all: Map[os.Path, DeviceIo] = ios.asScala.toMap
 

@@ -149,6 +149,7 @@ object StoreRouterSuite:
     def beginRead(): Unit = under.beginRead()
     def endRead(): Unit = under.endRead()
     def readsOverBound: Boolean = under.readsOverBound
+    def idle: Boolean = under.idle
     def close(): Unit = under.close()
 
     /** Blocks until a job has been submitted and held, and returns its kind */

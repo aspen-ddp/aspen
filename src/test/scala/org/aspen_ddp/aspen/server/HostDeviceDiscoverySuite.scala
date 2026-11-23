@@ -121,14 +121,14 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     loadedDevices(host).keySet should be(empty)
 
     writeDevice(hostRoot, "dev0", deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
 
     Future.successful(loadedDevices(host).keySet should be(Set(deviceA)))
 
   atest("a missing storage-devices directory does not throw"):
     val host = newHost(newHostDir(withStorageDevicesDir = false))
 
-    noException should be thrownBy host.control.reconciler.checkAll()
+    noException should be thrownBy checkAllNow(host)
 
     Future.successful(loadedDevices(host).keySet should be(empty))
 
@@ -146,8 +146,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // tryLoadDevice offers each live/ copy to tryLoadStore, once
     attemptsAfterConstruction should be(List((deviceA, live)))
 
-    host.control.reconciler.checkAll()
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
+    checkAllNow(host)
 
     // Same instance: the device's copy registry survives a rescan.
     loadedDevices(host)(deviceA) should be theSameInstanceAs firstState
@@ -169,7 +169,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // A later scan, once the CRL the failed load opened has shut down, retries it from scratch and succeeds.
     yieldUntil(host.control.devices.closingCrls.isEmpty).map: _ =>
       host.control.devices.closingCrls should be(empty)
-      host.control.reconciler.checkAll()
+      checkAllNow(host)
       loadedDevices(host).keySet should be(Set(deviceA))
 
   atest("a second directory claiming a loaded device id is ignored"):
@@ -182,7 +182,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
     // A duplicate mount or a copied config file: same device id, different directory.
     writeDevice(hostRoot, "dev0-copy", deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
 
     loadedDevices(host).keySet should be(Set(deviceA))
     Future.successful(loadedDevices(host)(deviceA) should be theSameInstanceAs originalState)
@@ -198,7 +198,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // mounted-but-not-yet-registered directory is a normal steady state, not a brief window.
     // Every scan has to tolerate it and pick the device up whenever the config does appear.
     writeDeviceConfig(deviceDir, deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
 
     Future.successful(loadedDevices(host).keySet should be(Set(deviceA)))
 
@@ -209,7 +209,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     loadedDevices(host).keySet should be(empty)
 
     writeDevice(hostRoot, "dev0", deviceA)
-    host.control.reconciler.handleCheckMessage(
+    nudgeNow(host, 
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
 
     Future.successful(loadedDevices(host).keySet should be(Set(deviceA)))
@@ -234,7 +234,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
     loadedDevices(host).keySet should be(Set(deviceB))
 
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
 
     Future.successful(loadedDevices(host).keySet should be(Set(deviceB)))
 
@@ -251,11 +251,11 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     loadedDevices(host).keySet should be(empty)
 
     // A config that stays broken must not poison later scans or half-register the device.
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     loadedDevices(host).keySet should be(empty)
 
     writeDeviceConfig(deviceDir, deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
 
     Future.successful(loadedDevices(host).keySet should be(Set(deviceA)))
 
@@ -268,7 +268,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val storeDir = CopyFixtures.placeCopy(deviceDir, storeId, configured = false)
 
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
 
     loadedDevices(host).keySet should be(Set(deviceA))
     // tryLoadDevice offers every child of the device directory to tryLoadStore: here the
@@ -292,7 +292,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // is not that state at all but a failed metadata read, which arrives here identically.
     // (A copied or moved config is not one of these: its device is registered, so the lookup
     // succeeds.) The failure must still release the activeDeviceChecks entry.
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
 
     yieldUntil(host.control.reconciler.activeDeviceChecks.isEmpty).map: _ =>
       // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait
@@ -301,7 +301,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       // And the release lets a later check of the same device start rather than being skipped
       // forever by the in-progress guard.
-      host.control.reconciler.checkAll()
+      checkAllNow(host)
       host.control.reconciler.activeDeviceChecks should be(Set(deviceA))
 
   atest("an armed lookup holds the device check open until the test completes it"):
@@ -311,7 +311,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot)
     val p = recorded(host).armLookup(deviceA)
 
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
 
     recorded(host).lookupAttempts.toList should be(List(deviceA))
 
@@ -341,7 +341,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // The lookup the re-dispatch issues. Armed so it does not fall through to the real client.
     recorded(host).armLookup(deviceA)
 
-    host.control.reconciler.handleCheckMessage(
+    nudgeNow(host, 
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
 
     loadedDevices(host).keySet should be(empty)
@@ -349,7 +349,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
     // The config appears and a later event loads the device while the lookup is outstanding.
     writeStoreConfig(writeDevice(hostRoot, "dev0", deviceA), storeId)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     loadedDevices(host).keySet should be(Set(deviceA))
 
     // That event's own check request collided with the outstanding lookup. It is the request
@@ -381,7 +381,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
     val p = recorded(host).armLookup(deviceA)
 
-    host.control.reconciler.handleCheckMessage(
+    nudgeNow(host, 
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
 
     // Nothing was written under storage-devices/, so the check runs against a device this
@@ -410,13 +410,13 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // The lookup the re-dispatch issues. Armed so it does not fall through to the real client.
     recorded(host).armLookup(deviceA)
 
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     host.control.reconciler.activeDeviceChecks should be(Set(deviceA))
     recorded(host).lookupAttempts.toList should be(List(deviceA))
 
     // Collides with the outstanding lookup. This is the create-storage-device nudge landing
     // during a periodic sweep, and dropping it costs a full checkStorageDevicePeriod.
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     host.control.reconciler.deferredDeviceChecks should be(Set(deviceA))
     recorded(host).lookupAttempts.toList should be(List(deviceA))
 
@@ -425,7 +425,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // be holding a second request for deviceA there, having only shed one on the re-dispatch.
     // lookupAttempts cannot pin it -- the re-dispatch consumes the second armed lookup, which
     // this test never completes, so no implementation gets as far as a second re-dispatch.
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     host.control.reconciler.deferredDeviceChecks should be(Set(deviceA))
 
     p1.success(deviceState(deviceA))
@@ -444,8 +444,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // The lookup the re-dispatch issues. Armed so it does not fall through to the real client.
     recorded(host).armLookup(deviceA)
 
-    host.control.reconciler.checkAll()
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
+    checkAllNow(host)
     host.control.reconciler.deferredDeviceChecks should be(Set(deviceA))
 
     // A failed lookup never reaches the completion-time re-read, so the deferral is the only
@@ -472,7 +472,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // Treated as a failed lookup, not propagated. handleCheckMessage is called
     // directly rather than through the event loop, so start()'s catch-all is not in the
     // way and a propagating throw would surface right here.
-    noException should be thrownBy host.control.reconciler.handleCheckMessage(
+    noException should be thrownBy nudgeNow(host, 
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
 
     recorded(host).lookupAttempts.toList should be(List(deviceA))
@@ -497,7 +497,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     // check of this device a no-op: checkStorageDevice records a deferral instead of starting a
     // lookup, and the only thing that would clear that deferral is the finally that never ran.
     val p = recorded(host).armLookup(deviceA)
-    host.control.reconciler.handleCheckMessage(
+    nudgeNow(host, 
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
 
     recorded(host).lookupAttempts.toList should be(List(deviceA, deviceA))
@@ -537,12 +537,12 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val redispatchError = new RuntimeException("test-controlled re-dispatch lookup failure")
     recorded(host).armLookupThrow(deviceA, redispatchError)
 
-    host.control.reconciler.handleCheckMessage(
+    nudgeNow(host, 
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
     host.control.reconciler.activeDeviceChecks should be(Set(deviceA))
 
     // Collides with the outstanding lookup, so the finally has a deferral to re-dispatch.
-    host.control.reconciler.handleCheckMessage(
+    nudgeNow(host, 
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
     host.control.reconciler.deferredDeviceChecks should be(Set(deviceA))
 
@@ -584,8 +584,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     CopyFixtures.placeCopy(deviceDir, storeId, configured = false)
     val host = newHost(hostRoot)
 
-    host.control.reconciler.scan()
-    host.control.reconciler.checkAll()
+    scanNow(host)
+    checkAllNow(host)
 
     Future.successful:
       loadedDevices(host).keySet should be(empty)
@@ -601,7 +601,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val before = recorded(host).storeLoadAttempts.size
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     // An Initializing store would normally drive createNewStore. Nothing runs here.
     armed.success(StorageDeviceState(deviceA, HostId(UUID.randomUUID()), 0L, 1024L,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Initializing, None)),
@@ -611,7 +611,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       loadedDevices(host).keySet should be(empty)
       host.control.discovery.disownedDeviceDirs should be(Set(deviceDir))
       // Its owning-host file still names this host, but the scan leaves it alone
-      host.control.reconciler.scan()
+      scanNow(host)
       loadedDevices(host).keySet should be(empty)
       CopyFixtures.copyPath(deviceDir, storeId) should be(None)
       os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
@@ -619,7 +619,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).storeLoadAttempts.size should be(before)
       // Forgotten once its directory goes, so a disk inserted there later is read afresh
       os.move(deviceDir, hostRoot / "parked-dev0")
-      host.control.reconciler.scan()
+      scanNow(host)
       host.control.discovery.disownedDeviceDirs should be(empty)
 
   atest("the device scan skips directories that are already loaded"):
@@ -631,8 +631,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
     // Were the scan to read it again, this would be a warned-about parse failure.
     writeUnparseableDeviceConfig(deviceDir)
-    host.control.reconciler.scan()
-    host.control.reconciler.scan()
+    scanNow(host)
+    scanNow(host)
 
     Future.successful:
       loadedDevices(host)(deviceA) should be theSameInstanceAs firstState
@@ -650,11 +650,11 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
     val parked = hostRoot / "parked-dev0"
     os.move(deviceDir, parked)
-    host.control.reconciler.scan()
+    scanNow(host)
     host.control.discovery.loadedDeviceDirs should be(empty)
 
     os.move(parked, deviceDir)
-    host.control.reconciler.scan()
+    scanNow(host)
 
     Future.successful:
       host.control.discovery.loadedDeviceDirs should be(Map(deviceDir -> deviceA))
@@ -669,7 +669,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot)
 
     loadedDevices(host).keySet should be(empty)
-    host.control.reconciler.scan()
+    scanNow(host)
     loadedDevices(host).keySet should be(empty)
     recorded(host).storeLoadAttempts should be(empty)
     host.control.discovery.reportedDeviceDirs should be(Set(deviceDir))
@@ -678,7 +678,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
     // Recovery: once the device is marked as ours it loads, and its warning state is cleared.
     DeviceMarkers.writeOwningHost(deviceDir, HostId.BootstrapHostId)
-    host.control.reconciler.scan()
+    scanNow(host)
 
     Future.successful:
       loadedDevices(host).keySet should be(Set(deviceA))
@@ -690,7 +690,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     os.write.over(deviceDir / DeviceMarkers.OwningHostFile, "not a uuid")
     val host = newHost(hostRoot)
 
-    host.control.reconciler.scan()
+    scanNow(host)
 
     Future.successful:
       loadedDevices(host).keySet should be(empty)
@@ -710,7 +710,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val (loadedWhileUnknown, attemptsWhileUnknown, warned) =
       try
         val host = newHost(hostRoot)
-        host.control.reconciler.scan()
+        scanNow(host)
         (loadedDevices(host).keySet, recorded(host).storeLoadAttempts.toList,
          recorded(host).deviceDirWarnings.toList.map(_._1))
       finally
@@ -729,7 +729,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     CopyFixtures.placeCopy(deviceDir, storeId, configured = false)
     val host = newHost(hostRoot)
 
-    host.control.reconciler.scan()
+    scanNow(host)
 
     Future.successful:
       loadedDevices(host).keySet should be(empty)
@@ -744,7 +744,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     CopyFixtures.placeCopy(deviceDir, storeId, configured = false)
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.scan()
+    scanNow(host)
     // Restarted while unloaded: Operational and owned here
     armed.success(deviceState(deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
@@ -757,7 +757,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ = os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(false)
       _ = recorded(host).gossipedOnline should be(empty)
       _ <- yieldUntil(host.control.devices.closingCrls.isEmpty)
-      _ = host.control.reconciler.scan()
+      _ = scanNow(host)
     yield
       loadedDevices(host).keySet should be(Set(deviceA))
       recorded(host).gossipedOnline.toList should be(List(storeId))
@@ -796,7 +796,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val before = recorded(host).storeLoadAttempts.size
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     // An Initializing store would normally drive createNewStore; on a tombstone nothing runs.
     armed.success(tombstonedState(
       Map(storeId -> StorageDeviceState.StoreEntry(
@@ -839,7 +839,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val before = recorded(host).storeLoadAttempts.size
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
 
     // Active with no transferDevice: the destination was declared failed mid-flight and the
     // source's entry has been put back. Nothing will ever move the copy out of outbound/ on its own -- the
@@ -876,7 +876,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val before = recorded(host).storeLoadAttempts.size
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
 
     // The two states that mean a transfer is still outstanding and outbound/ is doing its job.
     // Only Active *and* no transferDevice says the transfer is over and was abandoned.
@@ -950,7 +950,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.transferStore(movingStore, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
       _ = transfers.startedTransfersIn should contain(movingStore)
 
@@ -1008,7 +1008,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       // The destination host's own poll is what starts the receiving half. Driving it through
       // the device check rather than calling startStoreTransferIn directly is the point of the
       // test: the round-3 fix was tested through a seam that skipped this path entirely.
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
       _ = transfers.startedTransfersIn should contain(movingStore)
 
@@ -1078,7 +1078,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.transferStore(movingStore, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
       _ = transfers.startedTransfersIn should contain(movingStore)
 
@@ -1110,7 +1110,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.transferStore(movingStore, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
       _ = net.takeCapturedGossip()
       _ = transfers.finishTransferIn(movingStore)
@@ -1151,7 +1151,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.transferStore(movingStore, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(startTransferSent(transfers, movingStore, 1))
     yield
       // pumpUntil gives up silently, so assert what it waited on.
@@ -1279,7 +1279,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(startTransferSent(t.transfers, t.movingStore, 2), rounds = 3)
 
       // A device check during the wait must not start a parallel attempt either
-      _ = t.host.control.reconciler.checkAll()
+      _ = checkAllNow(t.host)
       _ <- pumpUntil(startTransferSent(t.transfers, t.movingStore, 2), rounds = 3)
       _ = t.host.control.transfers.retransmitPendingStarts(force = true)
     yield
@@ -1302,7 +1302,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       // With the outcome still pending, a device check must neither start a second attempt nor
       // (once promoted) report the arrived copy as a conflicting store directory
-      _ = t.host.control.reconciler.checkAll()
+      _ = checkAllNow(t.host)
       _ <- pumpUntil(t.transfers.transfersIn.size > 1, rounds = 3)
       attemptsWhileHeld = t.transfers.transfersIn.size
 
@@ -1342,7 +1342,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       // The source dies mid-transfer; the destination's next device check abandons the entry.
       _ <- tombstoneDevice(StorageDeviceId.BootstrapStorageDeviceId)
       _ <- waitForTransactionsToComplete()
-      _ = t.host.control.reconciler.checkAll()
+      _ = checkAllNow(t.host)
       _ <- pumpUntil(!t.host.control.transfers.receiving.keySet.contains(t.movingStore))
       // The cancellation fails the attempt's future, which must not schedule a restart.
       _ <- pumpUntil(t.host.control.transfers.transferInRetries.keySet.nonEmpty, rounds = 3)
@@ -1373,7 +1373,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(store, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(startTransferSent(transfers, store, 1))
 
       // Aborted and retried to the host's other device. Only the new destination is checked, as
@@ -1381,7 +1381,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.abortStoreTransfer(store)
       _ <- client.transferStore(store, net.thirdDeviceId)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.handleCheckMessage(
+      _ = nudgeNow(host, 
             CheckStorageDevice(HostId.BootstrapHostId, client.clientId, net.thirdDeviceId))
       _ <- pumpUntil(startTransferSent(transfers, store, 2))
     yield
@@ -1402,7 +1402,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       _ <- tombstoneDevice(StorageDeviceId.BootstrapStorageDeviceId)
       _ <- waitForTransactionsToComplete()
-      _ = t.host.control.reconciler.checkAll()
+      _ = checkAllNow(t.host)
       _ <- pumpUntil(!t.host.control.transfers.receiving.keySet.contains(t.movingStore))
 
       _ = retryTransferIns(t.host)
@@ -1449,7 +1449,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       _ <- client.abortStoreTransfer(t.movingStore)
       _ <- waitForTransactionsToComplete()
-      _ = t.host.control.reconciler.checkAll()
+      _ = checkAllNow(t.host)
       _ <- pumpUntil(!t.host.control.transfers.receiving.keySet.contains(t.movingStore))
       // The cancellation fails the attempt's future, which must not schedule a restart.
       _ <- pumpUntil(t.host.control.transfers.transferInRetries.keySet.nonEmpty, rounds = 3)
@@ -1475,7 +1475,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       _ <- client.abortStoreTransfer(t.movingStore)
       _ <- waitForTransactionsToComplete()
-      _ = t.host.control.reconciler.checkAll()
+      _ = checkAllNow(t.host)
       _ <- pumpUntil(!t.host.control.transfers.receiving.keySet.contains(t.movingStore))
 
       _ = retryTransferIns(t.host)
@@ -1530,12 +1530,12 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       t <- startTransferIn()
       _ <- client.abortStoreTransfer(t.movingStore)
       _ <- waitForTransactionsToComplete()
-      _ = t.host.control.reconciler.checkAll()
+      _ = checkAllNow(t.host)
       _ <- pumpUntil(!t.host.control.transfers.receiving.keySet.contains(t.movingStore))
 
       _ <- client.transferStore(t.movingStore, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
-      _ = t.host.control.reconciler.checkAll()
+      _ = checkAllNow(t.host)
       _ <- pumpUntil(startTransferSent(t.transfers, t.movingStore, 2))
       _ = t.transfers.finishTransferIn(t.movingStore)
       _ <- pumpUntil(recorded(t.host).transferOutcomes.contains(t.movingStore))
@@ -1580,14 +1580,14 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
 
       // While the transfer is outstanding outbound/ is doing its job.
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(!host.control.reconciler.activeDeviceChecks.contains(sourceId))
       markedBeforeAbort = outbound(deviceDir, movingStore)
       before = recorded(host).storeLoadAttempts.size
 
       _ <- client.abortStoreTransfer(movingStore)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(!outbound(deviceDir, movingStore) &&
                      !host.control.reconciler.activeDeviceChecks.contains(sourceId))
     yield
@@ -1652,7 +1652,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
 
       // The abort's nudge: the send is still running, so the copy stays in outbound/ for now.
-      _ = t.host.control.reconciler.checkAll()
+      _ = checkAllNow(t.host)
       _ <- pumpUntil(!t.host.control.reconciler.activeDeviceChecks.contains(t.sourceId))
       markedWhileSending = outbound(t.deviceDir, t.movingStore)
       before = recorded(t.host).storeLoadAttempts.size
@@ -1761,7 +1761,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       transfers2 = new StagedTransferService
       host2 = newHost(t.hostRoot, transferService = transfers2)
-      _ = host2.control.reconciler.checkAll()
+      _ = checkAllNow(host2)
       _ <- pumpUntil(recorded(host2).transferOutcomes.contains(t.movingStore) &&
                      !host2.control.transfers.receiving.keySet.contains(t.movingStore))
 
@@ -1798,7 +1798,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       transfers2 = new StagedTransferService
       host2 = newHost(t.hostRoot, transferService = transfers2)
-      _ = host2.control.reconciler.checkAll()
+      _ = checkAllNow(host2)
       _ <- pumpUntil(transfers2.transfersIn.nonEmpty)
     yield
       transfers2.transfersIn.size should be(1)
@@ -1822,15 +1822,15 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       transfers2 = new StagedTransferService
       host2 = newHost(t.hostRoot, transferService = transfers2)
-      _ = host2.control.reconciler.checkAll()
+      _ = checkAllNow(host2)
       _ <- pumpUntil(false, rounds = 5)
       loadedWhileUnreadable = loadedDevices(host2).contains(net.secondDeviceId)
       keptWhileUnreadable = os.isDir(promoted)
       shippedWhileUnreadable = transfers2.transfersIn.nonEmpty
       outcomeWhileUnreadable = recorded(host2).transferOutcomes.get(t.movingStore)
       _ = os.perms.set(param, "rw-------")
-      _ = host2.control.discovery.checkForNewDevices()
-      _ = host2.control.reconciler.checkAll()
+      _ = discoverNow(host2)
+      _ = checkAllNow(host2)
       _ <- pumpUntil(recorded(host2).transferOutcomes.contains(t.movingStore))
     yield
       loadedWhileUnreadable should be(false)
@@ -1860,7 +1860,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
         transfers2 = new StagedTransferService
         host2 = newHost(t.hostRoot, transferService = transfers2)
-        _ = host2.control.reconciler.checkAll()
+        _ = checkAllNow(host2)
         _ <- pumpUntil(transfers2.transfersIn.nonEmpty)
         poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
       yield
@@ -1887,7 +1887,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
         transfers2 = new StagedTransferService
         host2 = newHost(t.hostRoot, transferService = transfers2)
-        _ = host2.control.reconciler.checkAll()
+        _ = checkAllNow(host2)
         _ <- pumpUntil(transfers2.transfersIn.nonEmpty)
       yield
         transfers2.transfersIn.size should be(1)
@@ -1912,7 +1912,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       transfers2 = new StagedTransferService
       host2 = newHost(t.hostRoot, transferService = transfers2)
-      _ = host2.control.reconciler.checkAll()
+      _ = checkAllNow(host2)
       _ <- pumpUntil(transfers2.transfersIn.nonEmpty)
     yield
       transfers2.transfersIn.size should be(1)
@@ -1944,7 +1944,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         _ <- client.transferStore(movingStore, net.secondDeviceId)
         _ <- waitForTransactionsToComplete()
 
-        _ = host.control.reconciler.checkAll()
+        _ = checkAllNow(host)
         _ <- pumpUntil(startTransferSent(transfers, movingStore, 1))
       yield
         startTransferSent(transfers, movingStore, 1) should be(true)
@@ -1986,7 +1986,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
         _ <- client.transferStore(movingStore, net.secondDeviceId)
         _ <- waitForTransactionsToComplete()
-        _ = host.control.reconciler.checkAll()
+        _ = checkAllNow(host)
         _ <- pumpUntil(startTransferSent(transfers, movingStore, 1))
       yield
         markedOffline should be(true)
@@ -2016,6 +2016,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       new LockstepThreading(executionContext), net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
       TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
       Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared())
+    runDiscovery(host)
 
     Future.successful:
       host.control.router.silentStores should contain(storeId)
@@ -2039,6 +2040,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       new LockstepThreading(executionContext), net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
       TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
       Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared())
+    runDiscovery(host)
 
     Future.successful:
       host.control.router.silentStores should contain(storeId)
@@ -2068,7 +2070,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val before = recorded(host).storeLoadAttempts.size
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     armed.success(deviceState(
       deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None),
@@ -2097,7 +2099,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val before = recorded(host).storeLoadAttempts.size
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
 
     // Active: the pool update committed and the destination crashed before moving the copy out of arrived/.
     // TransferringIn with no source named keeps the other out of startStoreTransferIn, so it
@@ -2119,10 +2121,12 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
   /** A real Host, which opens RocksDB backends and reads the copies' phases, over `hostRoot`. */
   private def newRealHost(hostRoot: os.Path): Host =
-    new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+    val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager,
       TestNetwork.TestCRL, net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
       Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = compared())
+    runDiscovery(host)
+    host
 
   private def writeStoreDir(deviceDir: os.Path, storeId: StoreId = storeId): os.Path =
     val storeDir = CopyFixtures.freshCopyPath(deviceDir, storeId)

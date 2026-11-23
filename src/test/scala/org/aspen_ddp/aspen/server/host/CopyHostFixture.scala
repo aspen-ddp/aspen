@@ -256,7 +256,7 @@ trait CopyHostFixture extends ControlFixture:
       _ <- client.transferStore(moving, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
       st <- client.getStorageDeviceState(net.secondDeviceId)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
     yield st.stores(moving).transferId.get
 
   /** Gives a staged copy of `moving` its store config, as every shipped copy has: without one, an Active entry's

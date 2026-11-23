@@ -467,7 +467,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
         _ <- waitForTransactionsToComplete()
         _ <- client.transferStore(shipped, net.secondDeviceId)
         _ <- waitForTransactionsToComplete()
-        _ = host.control.reconciler.checkAll()
+        _ = checkAllNow(host)
         _ <- pumpUntil(host, transfers.startedTransfersIn.contains(shipped))
         // Held between the promotion and its pool update
         gate = recorded(host).holdTransferOutcomes()
@@ -498,7 +498,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(shipped, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(host, transfers.startedTransfersIn.contains(shipped))
     yield
       before should be(Map(shipped -> Phase.Arrived("another-transfer")))
@@ -521,7 +521,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(shipped, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(host, transfers.startedTransfersIn.contains(shipped))
       retransmitting = host.control.transfers.pendingStartTransfers.contains(shipped)
       _ = host.control.shutdown.crlFailed(loadedDevices(host)(net.secondDeviceId), new Exception("injected CRL failure"))

@@ -123,7 +123,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     for
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
     yield ()
 
@@ -200,11 +200,11 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val rebuilding = StoreEntry(StoreStatus.Rebuilding, None)
     for
       (host, _) <- setUp(Map(s0 -> rebuilding), rebuilds = rebuilds)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(rebuilds.created.nonEmpty)
       _ <- shutDown(host)
       // A check after the shutdown must not start the rebuild again either.
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(host.control.reconciler.activeDeviceChecks.isEmpty)
       st <- state(deviceA)
     yield
@@ -223,7 +223,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- net.createDevice(deviceB)
       (host, _) <- setUp(Map(s0 -> inEntry, s1 -> outEntry), transfers = transfers)
       _ = transfers.markSending(s1)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(transfers.startedTransfersIn.nonEmpty)
       _ <- shutDown(host)
       st <- state(deviceA)
@@ -261,9 +261,9 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       gate = recorded(host).holdShutdownCloses()
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(host.control.reconciler.activeDeviceChecks.isEmpty)
       closesWhileHeld = recorded(host).shutdownCloses.toList
       _ = gate.success(())
@@ -282,7 +282,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       gate = recorded(host).holdShutdownCloses()
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- client.restartStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
@@ -314,7 +314,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       gate = recorded(host).holdShutdownCloses()
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- client.restartStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
@@ -326,7 +326,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
              host.control.reconciler.activeDeviceChecks.isEmpty && attempts().contains(paths(0)))
       heldBack = !attempts().contains(paths(1))
       _ = host.control.copyRegistry.work("test", deviceA, s1, _.isInstanceOf[Work.TransferIn], None)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- awaitLoudly("the next reconcile to reload s1")(attempts().contains(paths(1)))
     yield
       recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Cancelled))
@@ -343,7 +343,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       gate = recorded(host).holdShutdownCloses()
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       // Its stats now fail (EACCES): its load cannot read it
       unreadable = copyAt(deviceDir, s0)
@@ -406,7 +406,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- net.createDevice(deviceB)
       _ <- setDeviceState(deviceB)(_.copy(status = DeviceStatus.Shutdown))
       (host, _) <- setUp(Map(s0 -> inEntry), transfers = transfers)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(recorded(host).transferSourceReads.contains(deviceB))
       // The record precedes Host's continuation on the serial ExecutionContext; these yields let
       // that continuation run before the assertion's snapshot.
@@ -414,7 +414,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       startedWhileShutdown = transfers.startedTransfersIn
       // Positive control: the same check starts the transfer once the source is back.
       _ <- setDeviceState(deviceB)(_.copy(status = DeviceStatus.Operational))
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(transfers.startedTransfersIn.nonEmpty)
     yield
       recorded(host).transferSourceReads.toList should be(List(deviceB, deviceB))
@@ -435,7 +435,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(movingStore, destId)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
       // Hold the pool update between promotion and its transaction, then request the shutdown.
       gate = recorded(host).holdTransferOutcomes()
@@ -446,7 +446,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ = gate.success(())
       _ <- pumpUntil(recorded(host).transferOutcomes.contains(movingStore))
       entryAfterUpdate <- state(destId).map(_.stores.get(movingStore))
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(!loadedDevices(host).contains(destId))
       st <- state(destId)
       pool <- client.getStoragePoolState(PoolId.BootstrapPoolId)
@@ -467,7 +467,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val rebuilds = new RecordingRebuildFactory
     for
       (host, deviceDir) <- setUp(Map(s0 -> StoreEntry(StoreStatus.Rebuilding, None)), rebuilds = rebuilds)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(rebuilds.created.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
@@ -477,7 +477,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ = rebuilds.created.head.completeFromDisk()
       _ <- pumpUntil(recorded(host).rebuildFlipSeq.contains((deviceA, s0)))
       entryAfterFlip <- state(deviceA).map(_.stores.get(s0))
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
       st <- state(deviceA)
     yield
@@ -497,7 +497,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     for
       (host, deviceDir) <- setUp(Map(creating -> StoreEntry(StoreStatus.Initializing, None)))
       gate = recorded(host).holdStoreLoads()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil({ host.testingOnlyHandleEvents(); recorded(host).loadStoreRequests.nonEmpty })
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
@@ -505,7 +505,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ = gate.success(())
       _ <- pumpUntilEntry(deviceA, creating)(!_.exists(_.status == StoreStatus.Initializing))
       entryAfterFlip <- state(deviceA).map(_.stores.get(creating))
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       // The shutdown's close of the opening store waits for its LoadStore to install it, then closes it
       _ <- pumpUntil({ host.testingOnlyHandleEvents(); !loadedDevices(host).contains(deviceA) })
       st <- state(deviceA)
@@ -524,7 +524,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val initializing = StoreEntry(StoreStatus.Initializing, None)
     for
       (host, _) <- setUp(Map(creating -> initializing))
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- shutDown(host)
       st <- state(deviceA)
@@ -571,7 +571,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val rebuilds = new RecordingRebuildFactory
     for
       (host, deviceDir) <- setUp(Map(s0 -> rebuilding), rebuilds = rebuilds)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(rebuilds.created.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- setDeviceState(deviceA)(_.copy(hostId = otherHostId))
       _ = rebuiltCopy(deviceDir, s0)
@@ -595,11 +595,11 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
     val rebuilds = new RecordingRebuildFactory
     for
       (host, deviceDir) <- setUp(Map(s0 -> rebuilding, s1 -> active), loaded = Set(s1), rebuilds = rebuilds)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(rebuilds.created.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty)
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(recorded(host).shutdownWorkTimeouts.nonEmpty)
     yield (host, deviceDir, rebuilds)
 
@@ -657,14 +657,14 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(movingStore, destId)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
       gate = recorded(host).holdTransferOutcomes()
       _ = transfers.finishTransferIn(movingStore)
       _ <- pumpUntil(CopyFixtures.phaseOf(deviceDir, movingStore).exists(_.isInstanceOf[Phase.Arrived]))
       _ <- client.shutdownStorageDevice(destId)
       _ <- waitForTransactionsToComplete()
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(recorded(host).shutdownWorkTimeouts.nonEmpty)
       outcomesWhileWaiting = recorded(host).shutdownOutcomes.toList
       _ = gate.success(())
@@ -747,7 +747,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       // bootstrap device holds the whole bootstrap pool, so the real request would refuse.
       shutdownGate = recorded(host).holdShutdownCloses()
       _ <- forceShuttingDown(sourceId)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- pumpUntil(recorded(host).shutdownCloses.nonEmpty)
       // The transfer's close finishes while the shutdown runs. Its continuation is queued on the
       // serial ExecutionContext ahead of these yields.

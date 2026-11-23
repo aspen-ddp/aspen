@@ -71,7 +71,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, storeRebuildFactory = factory)
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     armed.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
 
     yieldUntil(factory.created.nonEmpty).map: _ =>
@@ -85,7 +85,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     armed.success(deviceState(deviceA, Map(rebuilding(storeN(0)), rebuilding(storeN(1)))))
 
     for
@@ -103,7 +103,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, storeRebuildFactory = factory)
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     armed.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
 
     for
@@ -120,14 +120,14 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, storeRebuildFactory = factory)
 
     val first = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
 
     for
       _ <- yieldUntil(factory.created.size == 1)
       // A second check of the same device sees the same Rebuilding entry.
       second = recorded(host).armLookup(deviceA)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ = second.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
       _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
     yield
@@ -140,7 +140,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 2)
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     armed.success(deviceState(deviceA,
       Map(rebuilding(storeN(0)), rebuilding(storeN(1)), rebuilding(storeN(2)))))
 
@@ -159,7 +159,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
 
     val first = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     val twoRebuilding = deviceState(deviceA, Map(rebuilding(storeN(0)), rebuilding(storeN(1))))
     first.success(twoRebuilding)
 
@@ -189,7 +189,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
 
     val first = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
 
     for
@@ -205,7 +205,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       restartedImmediately = factory.created.size
       // Nor does any other check of the device inside the backoff (RB-W24)
       periodic = recorded(host).armLookup(deviceA)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ = periodic.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
       _ <- yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
       restartedInBackoff = factory.created.size
@@ -227,7 +227,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val both = deviceState(deviceA, Map(rebuilding(storeN(0)), rebuilding(storeN(1))))
 
     val first = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(both)
 
     for
@@ -259,7 +259,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
 
     val first = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
 
     for
@@ -317,7 +317,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     // deviceB's store is queued behind the single slot deviceA's rebuild holds.
     val firstA = recorded(host).armLookup(deviceA)
     val firstB = recorded(host).armLookup(deviceB)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     firstA.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
     firstB.success(deviceState(deviceB, Map(rebuilding(storeN(1)))))
 
@@ -364,7 +364,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = injectLoadedDevice(host, new LocalStorageDeviceState(
         realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir)))
       armed = recorded(host).armLookup(realDeviceId)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       readState = deviceState(realDeviceId, Map(rebuilding(rebuilt)))
       _ = armed.success(readState)
       _ <- yieldUntil(factory.created.nonEmpty)
@@ -428,7 +428,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
         realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir))
       _ = injectLoadedDevice(host, local)
       armed = recorded(host).armLookup(realDeviceId)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ = armed.success(deviceState(realDeviceId, Map(rebuilding(rebuilt))))
       _ <- yieldUntil(factory.created.nonEmpty)
       _ = CopyFixtures.placeCopy(deviceDir, rebuilt, Phase.Rebuilt(""), configured = false)
@@ -444,7 +444,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       // The move can succeed now: the next check of the device moves the copy Live and loads it
       _ = failRename = false
       before = recorded(host).storeLoadAttempts.size
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- yieldUntil(recorded(host).storeLoadAttempts.size > before)
     yield
       CopyFixtures.phaseOf(deviceDir, rebuilt) should be(Some(Phase.Live))
@@ -482,7 +482,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
         realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir))
       _ = injectLoadedDevice(host, local)
       armed = recorded(host).armLookup(realDeviceId)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ = armed.success(deviceState(realDeviceId, Map(rebuilding(rebuilt))))
       _ <- yieldUntil(factory.created.nonEmpty)
       // Configured: a Live copy is loaded only with its config present (CopyDecision.Load)
@@ -502,7 +502,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = failSync = false
       _ = syncs = Nil
       before = recorded(host).storeLoadAttempts.size
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- yieldUntil(recorded(host).storeLoadAttempts.size > before)
     yield
       syncs should contain(storeDir)
@@ -534,7 +534,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       local = new LocalStorageDeviceState(
         realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir))
       _ = injectLoadedDevice(host, local)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ <- completeRebuildsStarted(factory)
       finalState <- client.getStorageDeviceState(realDeviceId)
     yield
@@ -555,7 +555,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, storeRebuildFactory = factory)
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     armed.success(deviceState(deviceA, Map(rebuilding(stale))))
 
     def pending: List[os.Path] =
@@ -591,7 +591,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, storeRebuildFactory = factory)
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     armed.success(deviceState(deviceA, Map(rebuilding(back))))
 
     yieldUntil(factory.created.nonEmpty).map: _ =>
@@ -693,7 +693,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val current = UUID.randomUUID()
 
     val first = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(deviceState(deviceA, Map(rebuildingIn(storeN(0), earlier))))
 
     for
@@ -736,7 +736,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA))
 
     val first = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(deviceState(deviceA, Map(rebuildingIn(storeN(0), e1))))
 
     for
@@ -768,7 +768,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 2)
 
     val armed = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     armed.success(deviceState(deviceA, Map(rebuildingIn(storeN(0), current), rebuildingIn(storeN(1), current))))
 
     def pending: List[os.Path] =
@@ -797,13 +797,13 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
 
     def check(): Unit =
       val armed = recorded(host).armLookup(deviceA)
-      host.control.reconciler.checkAll()
+      checkAllNow(host)
       armed.success(deviceState(deviceA, Map(rebuildingIn(storeN(0), current))))
 
     val loadedWhileUnreadable = loadedDevices(host).contains(deviceA)
     val createdWhileUnreadable = factory.created.size
     os.perms.set(param, "rw-------")
-    host.control.discovery.checkForNewDevices()
+    discoverNow(host)
     check()
     for
       _ <- yieldUntil(factory.created.nonEmpty)
@@ -843,7 +843,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = injectLoadedDevice(host, new LocalStorageDeviceState(
         realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir)))
       armed = recorded(host).armLookup(realDeviceId)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ = armed.success(deviceState(realDeviceId, Map(rebuildingIn(rebuilt, earlier))))
       _ <- yieldUntil(factory.created.nonEmpty)
       // Re-placed away and back before any check of this device saw it
@@ -898,7 +898,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = injectLoadedDevice(host, new LocalStorageDeviceState(
         realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir)))
       armed = recorded(host).armLookup(realDeviceId)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       _ = armed.success(deviceState(realDeviceId, Map(rebuildingIn(rebuilt, earlier))))
       _ <- yieldUntil(factory.created.nonEmpty)
       _ <- setEntry(realDeviceId, current)
@@ -935,7 +935,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       if os.exists(dir) then os.list(dir).toList else Nil
 
     val first = recorded(host).armLookup(synthetic)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(deviceState(synthetic, Map(rebuilding(storeN(0)))))
 
     for
@@ -972,7 +972,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     injectLoadedDevice(host, local)
 
     val first = recorded(host).armLookup(synthetic)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(deviceState(synthetic, Map(rebuilding(storeN(0)))))
 
     for
@@ -1015,7 +1015,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
 
     val firstSource = recorded(host).armLookup(source.storageDeviceId)
     val firstDestination = recorded(host).armLookup(destination.storageDeviceId)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     // The destination reconciles first, so the source's forget is the last word
     firstDestination.success(deviceState(destination.storageDeviceId, Map(rebuilding(storeN(0)))))
     firstSource.success(deviceState(source.storageDeviceId, Map()))
@@ -1084,7 +1084,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = injectLoadedDevice(host, new LocalStorageDeviceState(
         realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir)))
       armed = recorded(host).armLookup(realDeviceId)
-      _ = host.control.reconciler.checkAll()
+      _ = checkAllNow(host)
       readState = deviceState(realDeviceId, Map(rebuilding(storeN(0))))
       _ = armed.success(readState)
       _ <- yieldUntil(factory.created.nonEmpty)
@@ -1123,7 +1123,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       syntheticB, deviceDir2, deviceDir2 / "dummy.file", new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir2)))
 
     val first = recorded(host).armLookup(syntheticA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(deviceState(syntheticA, Map(rebuilding(storeN(0)))))
 
     for
@@ -1158,7 +1158,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val rebuildingState = deviceState(deviceA, Map(rebuilding(storeN(0))))
 
     val first = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(rebuildingState)
 
     def retriesPending = scheduler(host).pending.filter(d =>
@@ -1194,7 +1194,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val rebuildingState = deviceState(synthetic, Map(rebuilding(storeN(0))))
 
     val first = recorded(host).armLookup(synthetic)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(rebuildingState)
 
     for
@@ -1220,7 +1220,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     def staging(n: Int): os.Path = devDir / RebuildingStore.RebuildDirectory / storeN(n).directoryName
 
     val first = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(deviceState(deviceA, Map(rebuilding(storeN(0)), rebuilding(storeN(1)))))
 
     for
@@ -1255,7 +1255,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val other = storeN(2)
 
     val first = recorded(host).armLookup(deviceA)
-    host.control.reconciler.checkAll()
+    checkAllNow(host)
     first.success(deviceState(deviceA, Map(rebuilding(storeN(0)), rebuilding(storeN(1)), rebuilding(other))))
 
     for

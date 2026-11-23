@@ -23,16 +23,23 @@ final class LockstepDeviceIo(val path: os.Path, threading: LockstepThreading, cf
   def endRead(): Unit = threaded.endRead()
   def readsOverBound: Boolean = threaded.readsOverBound
 
+  // Management jobs submitted whose task has not run yet (on the FIFO, held, or cancelled and not yet drained)
+  private val laneJobs = new java.util.concurrent.atomic.AtomicInteger(0)
+
+  def idle: Boolean = laneJobs.get() == 0 && threaded.poolIdle
+
   def submit[T](jobKind: JobKind, store: Option[StoreId])(job: => T): JobHandle[T] =
     val p = Promise[T]()
     val task = new LockstepThreading.DeviceTask(jobKind):
       def run(): Unit =
-        if state.compareAndSet(0, 1) then
-          val token = observer.started(kind.label, store, 0L)
-          val r = Try(job)
-          observer.finished(token, r.isSuccess)
-          p.complete(r)
-          ()
+        try
+          if state.compareAndSet(0, 1) then
+            val token = observer.started(kind.label, store, 0L)
+            val r = Try(job)
+            observer.finished(token, r.isSuccess)
+            p.complete(r)
+        finally laneJobs.decrementAndGet(): Unit
+    laneJobs.incrementAndGet()
     threading.enqueueDevice(path, task)
     new JobHandle[T]:
       def future: Future[T] = p.future

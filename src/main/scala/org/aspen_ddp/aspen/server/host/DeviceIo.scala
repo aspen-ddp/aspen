@@ -37,6 +37,10 @@ trait DeviceIo:
   def beginRead(): Unit
   def endRead(): Unit
   def readsOverBound: Boolean
+  /** No management job queued or running, and no data or serial task queued or running: closing now drops nothing
+   *  (DeviceIos.forget). A snapshot: true only while nothing submits to this DeviceIo, which holds for a path with no
+   *  device loaded and no control step outstanding on it */
+  def idle: Boolean
   def close(): Unit
 
 object DeviceIo:

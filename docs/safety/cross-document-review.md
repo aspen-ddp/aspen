@@ -43,7 +43,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Transfer out (closed store) | Host loader | The store stays closed from its extraction until its copy is moved to `outbound/` (its TransferOut work on the source device refuses every open of the copy meanwhile, `StoreLoader.startOpen`), and the extraction fails on a failed stat of the directory or save file rather than take it for an absence (crash-recovery-log.md 3.5). A load retry is refused by that work, and waits while its reconciled entry is TransferringOut; a load of a save file is queued behind a device CRL's earlier deletions (an empty `dropStore` is a barrier, crash-recovery-log.md 5.8), so its saves create records |
 | Rebuild completion | Transfers | A flip that finds the entry already Active adopts the copy without checking its episode (`DeviceMetadata.markRebuiltStoreActive`); a transfer in retires an earlier tenancy's copy before asking for bytes, so the copy is this episode's (2.2). A flip retried after `TransactionOutcomeUnknown` that finds the entry moved on (TransferringOut, absent) keeps the copy offline rather than discarding it (`Unconfirmed`, rebuild-process.md 5.7) |
 | Rebuild, CRL | Store lifecycle | A rebuilt copy's first load recovers nothing an earlier copy left under its id in the device CRL: it is a save-file load of the empty state `RebuildingStore.finish` writes, which drops those entries first (rebuild-process.md 5.6) |
-| Lost device CRL | Rebuild | A finished rebuild awaiting its flip (in `rebuilt/`) has never served, so it holds nothing in the device CRL and is not moved to `lost/` (`DeviceDiscovery.holdsOwnState`) |
+| Lost device CRL | Rebuild | A finished rebuild awaiting its flip (in `rebuilt/`) has never served, so it holds nothing in the device CRL and is not moved to `lost/` (`DeviceCrlDisk.holdsOwnState`) |
 | Status-cache relay | Finalization actions | Every shipped action is safe to run again after T was finalized and forgotten, which a second driver's resent `TxResolved` makes happen (paxos-transactions.md 10.5; 2.6) |
 | Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit; a tree-learned resolution is reported `Unresolved` until finalized (`Tx.statusForExpiry`) |
 | Expiry tallies | Recovery | A reported `votedCommit` stands for a voter holding T's locks, or for a committed T (a tree-learned or not-owed resolution, whose locks are released) (2.1) |
@@ -277,7 +277,7 @@ The premises other subsystems take from this:
   rather than report a clear path, the Deleted Stores case keeps the store offline, and the device CRL's open leaves the
   device unloaded for the next scan rather than declare a `crl/` lost (a child whose config cannot be stat'd counts as
   a store). So do the opens they lead to: the CRL open's own tests (a failed stat throws, transient to
-  `openDeviceCrl`, and no stream file is created under `mustExist`), the backend opens and FSIF recovery (an
+  `DeviceCrlDisk.open`, and no stream file is created under `mustExist`), the backend opens and FSIF recovery (an
   `IOException` the load retries, never `BackendStateLost`), and the rebuilt store's `acceptor-since` and
   `inherited-votes` reads (the load held back as for the save file). `StoreCopies.delete` reports gone only a copy
   known absent. No existence test under `server/` uses os-lib's `os.exists`/`os.isDir`/`os.isFile`, which answer
@@ -298,13 +298,13 @@ The premises other subsystems take from this:
   `retireForeignCopy` holds the rebuild for a later check when it cannot drop the staging checkpoint durably or
   its copy's move to `lost/` is not durable, and `discardLostStore` only retires the registry's Lost copy;
   `startIn` neither resumes nor deletes an arrived copy whose save file cannot be read (`isUnreadable`) or whose
-  deletion cannot stat it, and waits on a retired or unsynced one; `openDeviceCrl` throws before moving `crl/`; an
+  deletion cannot stat it, and waits on a retired or unsynced one; `DeviceCrlDisk.open` throws before moving `crl/`; an
   unserved `backendFailed` moves its recorded copy to `lost/` (or leaves it to its open's or close's end).
   A phase a reconcile case looks for counts only from the registry's record, which a device load builds only from a
   listing that succeeded, so a failed listing leaves the device unloaded and no decision runs on it; `CopyDecision.Load`
   loads a Live record's store, the load then holding it back with its own `FileStat` tests. `StoreTransfersOut.extractUnloaded` tests the directory and the save file with `FileStat`, failing
   the extraction on a failed stat.
-* A lost device CRL moves every store copy to `lost/` except those that held nothing in it (`DeviceDiscovery.holdsOwnState`):
+* A lost device CRL moves every store copy to `lost/` except those that held nothing in it (`DeviceCrlDisk.holdsOwnState`):
   a store whose valid `crl_save.log` is its whole state, and a finished rebuild awaiting its flip (in `rebuilt/`),
   which `tryLoadStore` never serves, so its flip or the Completed Rebuilds case loads it over the fresh CRL. A Rebuilt
   copy whose move to `live/` failed after its flip still holds nothing; it stays in `rebuilt/` and is not moved.

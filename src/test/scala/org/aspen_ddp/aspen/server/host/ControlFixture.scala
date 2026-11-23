@@ -717,7 +717,8 @@ trait ControlFixture:
   private def runDiscovery(ls: LockstepThreading): Unit =
     // Discovery's own job kinds and results only (JobKind.DeviceListing etc., DeviceJobDone.discovery): other
     // subsystems' jobs and results keep their place on the FIFO
-    val kinds = Set[JobKind](JobKind.DeviceListing, JobKind.DeviceProbe, JobKind.LoadSweep, JobKind.LoadDuplicates)
+    val kinds = Set[JobKind](JobKind.DeviceListing, JobKind.DeviceProbe, JobKind.LoadSweep, JobKind.CrlOpen,
+      JobKind.LoadDuplicates)
     def isDiscovery(task: Runnable): Boolean = task match
       case t: LockstepThreading.DeviceTask => kinds.contains(t.kind)
       case t: Host.EventTask => t.event match

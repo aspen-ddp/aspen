@@ -201,8 +201,10 @@ class DiscoveryIoSuite extends IntegrationTestSuite with ControlFixture:
     runJob(host, JobKind.DeviceProbe)
     applyResults(host)
     runJob(host, JobKind.LoadSweep)
+    applyResults(host) // the CRL open submitted
+    runJob(host, JobKind.CrlOpen)
     holdDevice(host, devA)
-    applyResults(host) // the CRL opened on the control thread, then P2 submitted, held
+    applyResults(host) // the CRL opened, then P2 submitted, held
     heldJobs(host, devA) should be(List(JobKind.LoadDuplicates))
 
     os.move(devA, hostRoot / "pulled")

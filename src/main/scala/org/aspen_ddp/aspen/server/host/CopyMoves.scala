@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.{DurableFiles, FileStat}
+import org.aspen_ddp.aspen.server.DurableFiles
 import scribe.Logging
 
 import java.util.UUID
@@ -111,7 +111,7 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
   def placedUnforced(e: DurableFiles.MoveNotForced): Unit =
     unforced += e.target -> List(e.target / os.up, e.source / os.up).distinct
 
-  /** As `move`, for a copy of a device being loaded (lost CRL, adoption, P2), at `from` as `copyId`:
+  /** As `move`, for a copy of a device not attached (an adoption's, a rebuilt copy kept offline), at `from` as `copyId`:
    *  returns the copy's new path, and an unsynced result is held for the device's attach, as an unsynced move
    *  of such a device is (HostCopies.unsynced) */
   def moveUnattached(site: String, from: os.Path, storeId: StoreId, copyId: UUID, to: Phase): (MoveResult, os.Path) =
@@ -122,16 +122,15 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
       case _ => ()
     (result, target)
 
-  /** Forces every phase directory a copy of the device at `devicePath`, being loaded, may have left or entered (all
-   *  but pending-delete/), and each of `copies` (their paths), as `resync` does: the lost CRL's moves, this scan's or
-   *  an earlier one's whose rename landed unforced (in memory or not: a restart forgets it), made durable before the
-   *  CRL is replaced. A sync that fails throws, leaving the device unloaded for the next scan */
-  def forceUnattached(devicePath: os.Path, copies: List[os.Path]): Unit =
-    List(CopyLayout.LiveDirectory, CopyLayout.ArrivedDirectory, CopyLayout.OutboundDirectory,
-         CopyLayout.RebuiltDirectory, CopyLayout.ParkedDirectory, CopyLayout.LostDirectory)
-      .map(devicePath / _).filter(FileStat.exists(_)).foreach(syncDirectory)
+  /** The directories still to force of each unsynced move's copy on the device at `devicePath`, by the copy's path:
+   *  what a lost device CRL's open (DeviceCrlDisk.open) forces with its lost/ copies, off the control thread */
+  private[host] def unforcedUnder(devicePath: os.Path): Map[os.Path, List[os.Path]] =
+    unforced.filter((path, _) => path.startsWith(devicePath))
+
+  /** A lost device CRL's open forced each of `copies` (their paths) and their earlier unforced moves' directories:
+   *  those moves are done with, and each copy is synced */
+  private[host] def forcedUnattached(copies: List[os.Path]): Unit =
     copies.foreach: path =>
-      (unforced.getOrElse(path, Nil) :+ path).foreach(syncDirectory)
       unforced -= path
       ctx.copyRegistry.synced(path)
 

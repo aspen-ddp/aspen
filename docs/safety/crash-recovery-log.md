@@ -204,7 +204,7 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
 ### 3.3 Loading and recovery of a store
 
 1. The device's CRL is opened before any of its stores are offered for loading (`DeviceDiscovery.loadOwnedDevice`,
-   `openDeviceCrl`), on the control thread.
+   `DeviceCrlDisk.open`), as one job on the device's own management lane, its result applied on the control thread.
 2. `StoreLoader.handleLoad` reads the store's `crl_save.log`, if any, before the `Store` exists. An unusable
    one (`loadValidStoreState` returns `Left` for a file missing, cut short, unparsable or another store's) makes the
    store permanently unservable (`StoreRebuilds.crlSaveFileLost`). A read that fails without saying anything of the
@@ -344,8 +344,8 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
 - **Created.** `StorageDeviceManager` writes the device config and `owning-host` and calls
   `CrashRecoveryLog.createDeviceCrlDir` (makes `crl/`, forces the device directory). The stream files are created at
   the first open (5.1).
-- **Opened.** `DeviceDiscovery.openDeviceCrl`, on the control thread, blocking (Backlog.txt, "Device CRL recovery
-  currently runs on the host control thread"). Recovery reads the walked entries and the CRC of each; it writes
+- **Opened.** `DeviceCrlDisk.open`, one `CrlOpen` job on the device's management lane (the control thread only
+  applies its result, `DeviceDiscovery.openCrl`). Recovery reads the walked entries and the CRC of each; it writes
   nothing. Then `loadOwnedDevice` creates the device's `CrlAdmission` with `admissionLimitBytes`, registers its
   `raiseLimit` with `onAdmissionLimitRaised`, charges `recoveredBytesByStore` retained per store
   (`chargeRetained`), and subscribes `DeviceShutdown.crlFailed` to `crl.failed`, all before any store is offered
@@ -372,7 +372,7 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   only on a device whose CRL was opened, so a `crl/` emptied by hand, a file system repair or a partial restore is a
   lost CRL, never a new one), or the open throws anything else, or a transient error a third time in a row: every
   such store copy is moved to `lost/` durably (`CopyMoves.moveUnattached`), one by one, except one that held nothing in the lost
-  CRL (`DeviceDiscovery.holdsOwnState`): its `crl_save.log` validates as its own, so its whole state is that file (3.3,
+  CRL (`DeviceCrlDisk.holdsOwnState`): its `crl_save.log` validates as its own, so its whole state is that file (3.3,
   step 4: a store with a save file has served nowhere since it was written, and its load drops what the device CRL
   holds for it), or it is in `rebuilt/`, a finished rebuild awaiting its flip that has never served
   (only `live/` copies are loaded), so its flip and load proceed as over the old CRL. Every existence
@@ -382,7 +382,7 @@ Paxos state or requirements. It is never recovered as a transaction: the Fronten
   content (`CrashRecoveryLog.isUnreadable`), throws before anything is moved (every store is decided before any is
   moved), leaving the device unloaded for the next scan,
   uncounted by `CrlOpenAttempts`. A move that fails or lands unforced throws the same way, and every copy in `lost/`,
-  moved now or by an earlier scan, is forced (`CopyMoves.forceUnattached`) before `crl/` is touched, so a crash cannot undo a
+  moved now or by an earlier scan, is forced (inside `DeviceCrlDisk.open`) before `crl/` is touched, so a crash cannot undo a
   move to `lost/` over the empty replacement CRL. `crl/` is moved to
   `crl.lost-<uuid>` (kept deliberately, Backlog.txt); the device directory is forced; a fresh CRL is created in
   `crl.creating/` (`CrashRecoveryLog.replacementCrlDir`, `CrashRecoveryLogFactory.createCRL`, `SimpleCRL.create`: an
@@ -461,7 +461,7 @@ and `SizingFile`, both re-exported by `SimpleCRL`):
 
 The open's own file tests (`DeviceFactory.openCRL`, `CrlDirectory.streamFiles`, `recordedSizing`,
 `removeUncommittedGrowth`, `CrlLock`, `StreamReader`) are `server.FileStat`'s: a stat that fails throws its
-`IOException`, which `DeviceDiscovery.openDeviceCrl` retries as transient, and is never read as a missing file. Every
+`IOException`, which `DeviceCrlDisk.open` retries as transient, and is never read as a missing file. Every
 absence the open acts on (`CrlMissing`, a new CRL's creation, a growth's removal, an empty stream) is a known one. And
 `createStreamsIfNew` itself throws `CrlMissing` under `mustExist` when it finds no stream files, so no stream file is
 created, or renamed over a live one, on a device that holds stores, even if its check and step 1's disagree.
@@ -1282,7 +1282,7 @@ store comes back with no Paxos memory; it is muted for every transaction started
 (rebuild-process.md).
 
 **10.14 CRL files unrecoverable.** `openCRL` throws `BrokenEntryChain`, `CrlCorrupt`, a decode error, or an I/O or VM
-error three scans in a row: `openDeviceCrl` moves every store copy to `lost/` (durably, one by one) except those
+error three scans in a row: `DeviceCrlDisk.open` moves every store copy to `lost/` (durably, one by one) except those
 that held nothing in it (section 4), moves `crl/` aside, and creates a fresh one apart, renames it into place and
 opens it. A crash between those moves and the CRL's move leaves copies in `lost/` and the old `crl/`: the next
 open may succeed, but those stores stay unservable. The decision is irreversible and made from local evidence

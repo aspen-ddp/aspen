@@ -3,17 +3,14 @@ package org.aspen_ddp.aspen.server.host
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
-import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, FileStat, Host, StorageDeviceConfig,
-  StorageDeviceManager, StoreConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlConfigInvalid, CrlCorrupt, CrlLocked,
-  CrlMissing, CrlSizingMismatch}
+import org.aspen_ddp.aspen.server.{DeviceMarkers, FileStat, Host, StorageDeviceConfig, StorageDeviceManager,
+  StoreConfig}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlConfigInvalid, CrlSizingMismatch}
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import scribe.Logging
 
-import java.util.UUID
 import scala.concurrent.Future
 import scala.util.{Failure, Success, Try}
-import scala.util.control.NonFatal
 
 /** How one store an adoption serves (an Offline or Active entry) was left, as adoptionClass reads it from its
  *  directory. */
@@ -89,12 +86,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   // being listed, as loadedDirs' are. In memory only: a restart loads it once more and relinquishes it again.
   private var disownedDirs: Set[os.Path] = Set()
 
-  // Consecutive device scans whose open of each device directory's CRL failed transiently (openDeviceCrl). In memory
+  // Consecutive device scans whose open of each device directory's CRL failed transiently (openCrl). In memory
   // only: a restart allows CrlOpenAttempts more
   private var transientCrlFailures: Map[os.Path, Int] = Map()
-
-  // Set while a load started by a device scan opens its device's CRL: only then does a transient CRL open failure count
-  private var countingCrlFailures = false
 
   // The listing of storage-devices/ is outstanding on the host root's lane. A discovery asked for meanwhile is merged
   // into `relist` and runs once it has been applied, so at most one listing waits behind a slow host root
@@ -172,7 +166,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  CheckAllDevices and a nudge each want for a device found by their scan.
    *
    *  `scan` is true only for ScanDevices: its loads' transient CRL open failures count towards CrlOpenAttempts, while
-   *  the other callers' are retried uncounted (openDeviceCrl), so the allowance is one per scan, not one per open.
+   *  the other callers' are retried uncounted (openCrl), so the allowance is one per scan, not one per open.
    */
   def checkForNewDevices(scan: Boolean = false): Unit =
     discover(DeviceDiscovery.Trigger(scan, check = true), startup = false)
@@ -260,11 +254,11 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       b.again.foreach(probe(path, _, explicit = true): Unit)
 
   /** Runs `job` on `b`'s DeviceIo and applies its result on the control thread, if `b` still holds `path`, the path is
-   *  still listed and its DeviceIo is still `b`'s. Otherwise, or on Cancelled or a failure, `abandon` undoes what the
-   *  steps before it did and the path is released; a failure is warned about once. `apply` ends the hold (`end`) or
-   *  submits the next step as its last act */
+   *  still listed and its DeviceIo is still `b`'s. Otherwise, or on Cancelled or a failure, `abandon` (given the job's
+   *  result) undoes what the steps before it, and a job that succeeded, did, and the path is released if `b` holds
+   *  it; a failure is warned about once. `apply` ends the hold (`end`) or submits the next step as its last act */
   private def submitFor[T](path: os.Path, b: Busy, kind: JobKind, what: String)(job: => T)
-                          (abandon: () => Unit)(apply: T => Unit): Unit =
+                          (abandon: Try[T] => Unit)(apply: T => Unit): Unit =
     ctx.onControl(what, b.io.submit(kind, None)(job), discovery = true): result =>
       if busy.get(path).exists(_ eq b) then
         val current = listed.contains(path) && ctx.deviceIos.get(path).exists(_ eq b.io)
@@ -275,12 +269,15 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
               end(path, b)
               warnOnce(path, s"Failed to load storage device found at path $path. Error: $t")
           case Failure(t) if current && t != DeviceIo.Cancelled =>
-            abandon()
+            abandon(result)
             end(path, b)
             warnOnce(path, s"Failed to load storage device found at path $path. Error: $t")
           case _ =>
-            abandon()
+            abandon(result)
             end(path, b)
+      else
+        // Superseded: whatever the job opened is still undone
+        abandon(result)
 
   /** Logs `msg` unless a problem with `path` has already been logged by this process. */
   def warnOnce(path: os.Path, msg: => String): Unit =
@@ -641,7 +638,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
           if explicit then again(path, trigger)
           false
         case Some(b) =>
-          submitFor(path, b, JobKind.DeviceProbe, "device probe")(DiscoveryDisk.probe(path))(() => ()): result =>
+          submitFor(path, b, JobKind.DeviceProbe, "device probe")(DiscoveryDisk.probe(path))(_ => ()): result =>
             decide(path, b, result, trigger)
           true
 
@@ -716,159 +713,6 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       case Some(b) => loadOwnedDevice(path, b, sdCfg, trigger)
       case None => again(path, trigger)
 
-  /** Opens the device's CRL. It is lost when its directory is absent from a device that holds stores, or holds no
-   *  stream files there (CrlMissing: stores exist only on a device whose CRL was opened), or when opening it throws
-   *  anything but a transient error (DeviceDiscovery.isTransient) or a transient error on CrlOpenAttempts device
-   *  scans in a row (an open outside a scan neither counts nor declares; a success anywhere resets). The stores'
-   *  transaction state was in it, so each is moved to lost/ (the reconcile pass turns them into rebuilds),
-   *  except one that held nothing in it (holdsOwnState: its valid crl_save.log is its whole state, or it is a
-   *  finished rebuild awaiting its flip). The old directory is kept aside as
-   *  `crl.lost-<uuid>`, and a fresh CRL is created in `crl.creating` (CrashRecoveryLog.replacementCrlDir), renamed
-   *  to `crl/` durably once finished, and opened. A failed creation removes `crl.creating` and is rethrown, leaving no
-   *  `crl/`. A transient error before then is rethrown: the device stays unloaded and the next scan retries.
-   *  A corrupt CRL (CrlCorrupt) is lost too, logged under its own cause.
-   *  A CRL another writer holds open (CrlLocked) is never lost: it is rethrown each time, uncounted.
-   *  Nor is a CRL whose files do not match the sizing it recorded, or that holds a `.crl.tmp` that is no unfinished
-   *  creation (CrlSizingMismatch): configuration cannot cause that,
-   *  so it is a hand edit or damage of the directory, never by itself proof that the state is gone. The device is
-   *  refused (left unloaded, an error logged once) until an operator repairs it (systemic-loss-protection.md).
-   *  Nor is a CRL directory holding no CRL yet whose device config cannot size one (CrlConfigInvalid): the device is
-   *  refused the same way until the config is fixed.
-   *  A device without stores simply gets its CRL created. */
-  private def openDeviceCrl(devicePath: os.Path,
-                            sdCfg: StorageDeviceConfig,
-                            listing: CopyLayout.Listing): CrashRecoveryLog =
-    val crlDir = CrashRecoveryLog.deviceCrlDir(devicePath)
-    // Stats that fail are no absence (FileStat). A copy whose config cannot be stat'd may be a store, so it counts as
-    // one (CopyLayout.list): missing it could take an emptied crl/ for a new CRL. A failed stat of crl/ itself throws,
-    // leaving the device unloaded for the next scan, rather than declare a crl/ that is there lost. Retired copies
-    // keep their CRL state in their own files
-    val storeDirs = listing.copies.filter(_.phase != Phase.Retired)
-      .filter(f => FileStat.existence(f.path / StoreConfig.configFilename).forall(identity))
-    val lost =
-      if storeDirs.nonEmpty && ! FileStat.exists(crlDir) then
-        logger.error(s"Storage device $devicePath holds stores but has no CRL directory. Its stores must be rebuilt")
-        true
-      else
-        try
-          val crl = ctx.crlFactory.openCRL(devicePath, sdCfg, holdsStores = storeDirs.nonEmpty)
-          transientCrlFailures -= devicePath
-          return crl
-        catch
-          case t: CrlLocked =>
-            // Another writer has the files open: a double mount, or a host still running that this one adopted from.
-            // Its CRL is in use, not lost, so nothing is marked or moved aside, and the next scan retries
-            transientCrlFailures -= devicePath
-            throw t
-          case t: CrlSizingMismatch =>
-            transientCrlFailures -= devicePath
-            if !reportedDirs.contains(devicePath) then
-              reportedDirs += devicePath
-              logger.error(s"Refusing to load storage device $devicePath: its CRL does not match the sizing it was " +
-                           s"created with, or holds stray .crl.tmp files. Its stores are not declared lost. Restore " +
-                           s"the CRL directory's stream files and sizing file (removing any stray .crl.tmp), then " +
-                           s"the next scan loads it: $t")
-            throw t
-          case t: CrlConfigInvalid =>
-            // The directory holds no CRL yet and the config cannot size one: a refusal, like a sizing mismatch.
-            // Nothing was created, so the next scan after the config is fixed opens it
-            transientCrlFailures -= devicePath
-            if !reportedDirs.contains(devicePath) then
-              reportedDirs += devicePath
-              logger.error(s"Refusing to load storage device $devicePath: its config cannot size a new CRL. Its " +
-                           s"stores are not declared lost. Fix the device config, then the next scan loads it: $t")
-            throw t
-          case t: Throwable =>
-            if storeDirs.isEmpty then
-              throw t
-            if DeviceDiscovery.isTransient(t) then
-              if ! countingCrlFailures then
-                logger.error(s"Failed to open the CRL of storage device $devicePath outside a device scan. " +
-                             s"Retrying on the next scan: $t")
-                throw t
-              val attempts = transientCrlFailures.getOrElse(devicePath, 0) + 1
-              if attempts < DeviceDiscovery.CrlOpenAttempts then
-                transientCrlFailures += devicePath -> attempts
-                logger.error(s"Failed to open the CRL of storage device $devicePath (scan $attempts of " +
-                             s"${DeviceDiscovery.CrlOpenAttempts}). Retrying on the next scan: $t")
-                throw t
-            transientCrlFailures -= devicePath
-            t match
-              case _: CrlCorrupt =>
-                logger.error(s"The CRL of storage device $devicePath is corrupt: an entry fails its checksums. Its " +
-                             s"stores must be rebuilt: $t")
-              case _: CrlMissing =>
-                logger.error(s"Storage device $devicePath holds stores but its CRL directory has no stream files. " +
-                             s"Its stores must be rebuilt")
-              case _ =>
-                logger.error(s"Failed to recover the CRL of storage device $devicePath. Its stores must be rebuilt: $t")
-            true
-    // Decided for every store before any is moved: a read that fails leaves all of them as they are. A copy already
-    // in lost/ stays there
-    val toMove =
-      try storeDirs.filter(_.phase != Phase.Lost).filterNot(holdsOwnState)
-      catch case t: Throwable =>
-        logger.error(s"The CRL of storage device $devicePath is lost, but a store's save file or config could not " +
-                     s"be read to tell whether it holds its own state. Retrying on the next scan: $t")
-        throw t
-    // T10: into lost/. A move that fails, or lands unforced, throws, leaving the device unloaded (and its CRL where it
-    // is) for the next scan, which decides again: a crash undoing an unforced move would put the copy back in live/
-    // over the empty replacement CRL. Then every copy in lost/, moved now or by an earlier scan whose move landed
-    // unforced, is forced before the CRL is replaced
-    val lostCopies = toMove.map: found =>
-      ctx.moves.moveUnattached("lost device CRL", found.path, found.storeId, found.copyId, Phase.Lost) match
-        case (MoveResult.NotMoved(t), _) => throw t
-        case (MoveResult.Unsynced(t), _) => throw t
-        case (MoveResult.Durable, path) => path
-    ctx.moves.forceUnattached(devicePath, storeDirs.filter(_.phase == Phase.Lost).map(_.path) ++ lostCopies)
-    // A stat that fails throws (FileStat), leaving the device unloaded for the next scan, rather than leave a crl/ in
-    // the replacement's way
-    if FileStat.exists(crlDir) then
-      DurableFiles.move(crlDir, devicePath / s"crl.lost-${UUID.randomUUID()}")
-    // A fresh CRL, which the copies now in lost/ recover nothing from. Created apart and renamed into place only once
-    // finished, so a crash or a failure (ENOSPC while preallocating) leaves no crl/ beside the stores: the next load
-    // declares the CRL lost again, moving nothing aside, and creates it afresh
-    val replacement = CrashRecoveryLog.replacementCrlDir(devicePath)
-    try
-      os.remove.all(replacement)
-      os.makeDir(replacement)
-      ctx.crlFactory.createCRL(devicePath, sdCfg, replacement)
-      DurableFiles.move(replacement, crlDir)
-    catch case t: Throwable =>
-      try os.remove.all(replacement)
-      catch case r: Throwable => t.addSuppressed(r)
-      logger.error(s"Failed to create the CRL replacing the lost CRL of storage device $devicePath. Retrying on " +
-                   s"the next scan: $t")
-      throw t
-    ctx.crlFactory.openCRL(devicePath, sdCfg, holdsStores = true)
-
-  /** Whether the store directory `storeDir` holds nothing in the device CRL, so losing that CRL loses nothing of its.
-   *  Either its whole transaction state is in its own crl_save.log, which validates as that store's (an arrived
-   *  transfer, a transfer out's source, a rebuilt store kept offline): its load drops whatever the device CRL holds
-   *  for it and loads the file (StoreLoader.awaitCrlLoad). A directory whose config cannot be read, or whose file is
-   *  missing, cut short or another store's, does not hold its state that way; one whose config or save file could
-   *  not be read (CrashRecoveryLog.isUnreadable) is not known either way, so the read's error is thrown, leaving the
-   *  device unloaded for the next scan before any copy is moved to lost/. Or it is in rebuilt/: a
-   *  finished rebuild awaiting its flip, which has never served (StoreLoader.tryLoadStore leaves it offline), so its
-   *  transaction state is empty. Its rebuild or the reconcile's Completed Rebuilds pass flips and loads it as it
-   *  would have over the old CRL; one finished for an earlier episode is retired by retireForeignCopy as before. A
-   *  failed stat throws (FileStat), leaving the device unloaded for the next scan. */
-  private def holdsOwnState(copy: CopyLayout.Found): Boolean =
-    val storeDir = copy.path
-    val saveFile = Backend.crlSaveFile(storeDir)
-    def configuredStoreId: Option[StoreId] =
-      try Some(StoreConfig.loadStoreConfig(storeDir / StoreConfig.configFilename).storeId)
-      catch
-        case t: Throwable if CrashRecoveryLog.isUnreadable(t) => throw t
-        case NonFatal(_) => None
-    def ownSaveFile: Boolean =
-      FileStat.exists(saveFile) && configuredStoreId.exists: storeId =>
-        CrashRecoveryLog.loadValidStoreState(saveFile, storeId).isRight
-    // By location
-    copy.phase match
-      case Phase.Rebuilt(_) => true
-      case _ => ownSaveFile
-
   /** Whether a device with `sdCfg`'s id is loaded already. Usually that is just a rescan finding the same directory
    *  again -- a directory that briefly disappeared, since loaded ones are not otherwise read -- which must be a no-op
    *  so the device's state and open backends survive. A different directory claiming the same id -- a duplicate mount
@@ -892,8 +736,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  1. DiscoveryDisk.sweepAtLoad (the scratch areas, nothing can be receiving onto or creating on a device that is not
    *     loaded yet) and the copy listing (P6: a phase directory that cannot be listed, or a phase-param that cannot be
    *     read, leaves the device unloaded, nothing on it moved, for the next scan).
-   *  2. On the control thread: the device CRL's open (openDeviceCrl, a lost CRL's moves), before any store is offered,
-   *     so each store recovers from it.
+   *  2. The device CRL's open (DeviceCrlDisk.open: recovery, and a lost CRL's moves and replacement, one CrlOpen
+   *     job), before any store is offered, so each store recovers from it. Its result is applied by openCrl.
    *  3. P2 (DiscoveryDisk.retireDuplicates), over a fresh listing: a lost CRL's open moved copies to lost/ since the
    *     first one. Then, on the control thread, its copies are registered (HostCopies.attach) and its Live copies
    *     offered to tryLoadStore, and only then is the device registered, so a throw anywhere leaves it unregistered
@@ -911,7 +755,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       submitFor(storageDevicePath, b, JobKind.LoadSweep, "device load sweep")({
         DiscoveryDisk.sweepAtLoad(storageDevicePath)
         Try(CopyLayout.list(storageDevicePath))
-      })(() => ()):
+      })(_ => ()):
         case _ if alreadyLoaded(storageDevicePath, sdCfg) =>
           end(storageDevicePath, b)
         case Failure(t) =>
@@ -919,21 +763,97 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
           warnOnce(storageDevicePath, s"Failed to list the copies of storage device $storageDevicePath. " +
                                       s"Will retry on the next scan. Error: $t")
         case Success(listing) =>
-          openAndAttach(storageDevicePath, b, sdCfgPath, sdCfg, listing, trigger)
+          openCrl(storageDevicePath, b, sdCfgPath, sdCfg, listing, trigger)
 
-  /** Steps 2 and 3 of loadOwnedDevice */
-  private def openAndAttach(storageDevicePath: os.Path,
-                            b: Busy,
-                            sdCfgPath: os.Path,
-                            sdCfg: StorageDeviceConfig,
-                            listing: CopyLayout.Listing,
-                            trigger: DeviceDiscovery.Trigger): Unit =
-    // Recovery blocks the control thread (moved to the device's lane by a later task). A throw leaves the device
-    // unloaded: submitFor's catch ends the hold and warns
-    countingCrlFailures = trigger.scan
-    val crl =
-      try openDeviceCrl(storageDevicePath, sdCfg, listing)
-      finally countingCrlFailures = false
+  /** Step 2 of loadOwnedDevice: the device CRL's open, one CrlOpen job on the device's lane (DeviceCrlDisk.open), and
+   *  the decisions on its result, made here once submitFor's recheck has passed. A result for a path no longer held,
+   *  listed or on the same DeviceIo shuts the CRL it opened, as an unload does, and changes nothing else.
+   *  A transient open failure on a device holding stores counts towards CrlOpenAttempts only on a device scan
+   *  (`trigger.scan`); the open declares it lost (`transientIsLost`) when this scan would be the CrlOpenAttempts-th in
+   *  a row. Anything else that declares a CRL lost is DeviceCrlDisk.open's: slowness never does (no timeout on it) */
+  private def openCrl(storageDevicePath: os.Path,
+                      b: Busy,
+                      sdCfgPath: os.Path,
+                      sdCfg: StorageDeviceConfig,
+                      listing: CopyLayout.Listing,
+                      trigger: DeviceDiscovery.Trigger): Unit =
+    val counted = trigger.scan
+    val transientIsLost =
+      counted && transientCrlFailures.getOrElse(storageDevicePath, 0) + 1 >= DeviceDiscovery.CrlOpenAttempts
+    val factory = ctx.crlFactory
+    val earlierUnforced = ctx.moves.unforcedUnder(storageDevicePath)
+    val sync = ctx.moves.syncDirectory
+    val rename = ctx.moves.rename
+    def shutDown(crl: CrashRecoveryLog): Unit = ctx.shutdown.shutDownCrl(storageDevicePath, crl)
+    submitFor(storageDevicePath, b, JobKind.CrlOpen, "device CRL open")(
+      DeviceCrlDisk.open(storageDevicePath, sdCfg, listing, factory, transientIsLost, earlierUnforced, sync, rename))(
+      _.foreach(_.openedCrl.foreach(shutDown))):
+      case CrlOpenResult.Failed(t, how, unsynced) =>
+        // Held for the attach, as an unsynced move of a device being loaded is (HostCopies.unsynced)
+        unsynced.foreach: (from, to) =>
+          ctx.moves.heldUnforced(from, to)
+          ctx.copyRegistry.unsynced(DeviceCrlDisk.LostSite, to)
+        crlOpenFailed(storageDevicePath, t, how, counted)
+        end(storageDevicePath, b)
+        warnOnce(storageDevicePath, s"Failed to load storage device found at path $storageDevicePath. Error: $t")
+      case opened =>
+        transientCrlFailures -= storageDevicePath
+        val crl = opened.openedCrl.get
+        opened match
+          case CrlOpenResult.Lost(_, _, forced) => ctx.moves.forcedUnattached(forced)
+          case _ => ()
+        if alreadyLoaded(storageDevicePath, sdCfg) then
+          shutDown(crl)
+          end(storageDevicePath, b)
+        else
+          try attachOpened(storageDevicePath, b, sdCfgPath, sdCfg, crl, trigger)
+          catch case t: Throwable =>
+            shutDown(crl)
+            throw t
+
+  /** The count and log of a CRL open that failed (CrlOpenResult.Failed). A CRL another writer holds open (CrlLocked)
+   *  is in use, not lost: its count is reset, and the next scan retries. A sizing mismatch and a config that cannot
+   *  size a new CRL are refusals, logged once at error, until an operator repairs the directory or the config */
+  private def crlOpenFailed(devicePath: os.Path, t: Throwable, how: CrlOpenFailure, counted: Boolean): Unit =
+    how match
+      case CrlOpenFailure.Refused =>
+        transientCrlFailures -= devicePath
+        t match
+          case _: CrlSizingMismatch =>
+            if !reportedDirs.contains(devicePath) then
+              reportedDirs += devicePath
+              logger.error(s"Refusing to load storage device $devicePath: its CRL does not match the sizing it was " +
+                           s"created with, or holds stray .crl.tmp files. Its stores are not declared lost. Restore " +
+                           s"the CRL directory's stream files and sizing file (removing any stray .crl.tmp), then " +
+                           s"the next scan loads it: $t")
+          case _: CrlConfigInvalid =>
+            // The directory holds no CRL yet and the config cannot size one. Nothing was created, so the next scan
+            // after the config is fixed opens it
+            if !reportedDirs.contains(devicePath) then
+              reportedDirs += devicePath
+              logger.error(s"Refusing to load storage device $devicePath: its config cannot size a new CRL. Its " +
+                           s"stores are not declared lost. Fix the device config, then the next scan loads it: $t")
+          case _ => ()
+      case CrlOpenFailure.AfterLost =>
+        transientCrlFailures -= devicePath
+      case CrlOpenFailure.Undecided => ()
+      case CrlOpenFailure.Transient =>
+        if !counted then
+          logger.error(s"Failed to open the CRL of storage device $devicePath outside a device scan. " +
+                       s"Retrying on the next scan: $t")
+        else
+          val attempts = transientCrlFailures.getOrElse(devicePath, 0) + 1
+          transientCrlFailures += devicePath -> attempts
+          logger.error(s"Failed to open the CRL of storage device $devicePath (scan $attempts of " +
+                       s"${DeviceDiscovery.CrlOpenAttempts}). Retrying on the next scan: $t")
+
+  /** Step 3 of loadOwnedDevice, over the CRL step 2 opened */
+  private def attachOpened(storageDevicePath: os.Path,
+                           b: Busy,
+                           sdCfgPath: os.Path,
+                           sdCfg: StorageDeviceConfig,
+                           crl: CrashRecoveryLog,
+                           trigger: DeviceDiscovery.Trigger): Unit =
     val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath, crl, b.io,
       new CrlAdmission(crl.admissionLimitBytes))
     // A growth raises the limit the stores admit against; registered before any store loads
@@ -952,7 +872,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     val sync = ctx.moves.syncDirectory
     val rename = ctx.moves.rename
     submitFor(storageDevicePath, b, JobKind.LoadDuplicates, "device load P2")(
-      DiscoveryDisk.retireDuplicates(storageDevicePath, sync, rename))(() => abandon()): dups =>
+      DiscoveryDisk.retireDuplicates(storageDevicePath, sync, rename))(_ => abandon()): dups =>
       // Held for the attach, as CopyMoves.moveUnattached holds an unsynced move of a device being loaded
       dups.unsynced.foreach: (from, to) =>
         ctx.moves.heldUnforced(from, to)

@@ -30,20 +30,19 @@ Hung devices: isolate, detect, handle (from Backlog "Isolate every device's I/O,
         separate Env per device, or accepting background-pool sharing and bounding its effect).
       - Rebuild staging I/O (FSIF `rebuildWrite`/`rebuildFlush` Awaits, RocksDB put/flush, `RebuildState` saves,
         `completeStaging`, `cleanupStaging`) runs on the `aspen-client` pool.
-      - The control thread does direct device I/O: RocksDB open/create (`DefaultBackendOpener`, inline), device CRL
-        open and recovery (`DeviceDiscovery.openDeviceCrl`, incl. the lost-CRL path), device scans (`config.yaml`,
-        markers, `CopyLayout.list`, sweeps), `crl_save.log` reads (`StoreLoader.handleLoad`), copy moves/retire/
+      - The control thread does direct device I/O: RocksDB open/create (`DefaultBackendOpener`, inline), device scans
+        (`config.yaml`, markers, `CopyLayout.list`, sweeps), `crl_save.log` reads (`StoreLoader.handleLoad`), copy moves/retire/
         release, `StoreCopies.delete`'s `os.remove.all`, rebuild and transfer staging cleanup, `DeviceMarkers`
         writes, and statfs of every device every 20 s (`LocalDevices` usage).
       - Store threads: `StoreRouter.crlLoaded` (remove + syncDirectory), transfer-out close's `saveStoreState`, FSIF
         `estimateSize` stats.
-      - Global locks held across I/O: `CrlLock.held` (JVM-global monitor across makeDir/stat/FileChannel.open/
-        tryLock) and `StoreTransferManager.directoryLock` (across `os.remove.all`, which the control thread can wait
-        on via `cancelTransferIn`/`beginTransferIn`).
+      - Global locks held across I/O: `StoreTransferManager.directoryLock` (across `os.remove.all`, which the control
+        thread can wait on via `cancelTransferIn`/`beginTransferIn`).
+      - Done: the device CRL's open and recovery, the lost-CRL path included, is one job on the device's lane
+        (`DeviceCrlDisk.open`), and `CrlLock` keeps a monitor per lock file (no JVM-global monitor across I/O).
       - Already per-device: the CRL writer, CRL thread, `crl-completions` and `crl-growth` threads.
     - Shape: a per-device I/O context (one per loaded device, owned by the device's lifecycle) through which every
-      device operation runs: backend I/O and opens, the device CRL (incl. its open and recovery: this also covers
-      the Backlog "CRL recovery on the control thread" item), rebuilds, transfers, markers, DurableFiles, copy moves
+      device operation runs: backend I/O and opens, the device CRL (incl. its open and recovery), rebuilds, transfers, markers, DurableFiles, copy moves
       and deletes, statfs. Results post back to the control thread or the store's executor as today.
     - To facilitate project 2, the context is the single choke point for device I/O: it must be able to see each
       operation's start and end (kind, store, size) without the callers changing again.

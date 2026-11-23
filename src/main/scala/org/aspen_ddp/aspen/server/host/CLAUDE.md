@@ -63,12 +63,13 @@
   `failed`, then `shutdown.state`/`owning-host` read into `DeviceMarkers.State`; `ProbeResult` NotADevice, Failed,
   Unreadable, Device), whose result is decided on its own (`decide`), so a hung path delays only itself and no
   control step joins paths. Discovery's jobs have their own kinds (`DeviceListing`, `DeviceProbe`, `LoadSweep`,
-  `LoadDuplicates`) and results (`DeviceJobDone.discovery`). A path with a job outstanding (`busy`, a token per
+  `CrlOpen`, `LoadDuplicates`) and results (`DeviceJobDone.discovery`). A path with a job outstanding (`busy`, a token per
   path) is skipped by scans; an explicit
   request (bringIntoService, an ownership outcome's load) is merged into `again` and probed once it ends. Every apply
   (`submitFor`, through `DeviceControl.onControl`, which posts `Host.DeviceJobDone`) rechecks that the token is still
   the path's, the path is still in the last listing and its DeviceIo is still the one submitted to; otherwise, or on
-  `DeviceIo.Cancelled`, it undoes what the load opened (the CRL) and changes nothing else. Each device a discovery
+  `DeviceIo.Cancelled`, it undoes what the load opened (the CRL, including one a CRL open job's own result carries,
+  shut down as an unload does) and changes nothing else. Each device a discovery
   loads is checked at once (`Trigger.check`: ScanDevices, CheckAllDevices, a nudge); a nudge naming a device not loaded
   also checks it at once. A path gone from the listing, with no device loaded from it and nothing outstanding, has its
   DeviceIo closed by `DeviceIos.forget`, which closes only an idle one (`DeviceIo.idle`: no management job queued or
@@ -79,13 +80,17 @@
   at the first of: every path the startup listing named decided (a path a later listing no longer names counts as
   decided), the listing failing or its apply throwing, or the first `ScanDevices` (`endStartupGate`). Until then the
   router answers no UnknownStore (a startup device may hold any store); the scan period bounds that wait, and the hung
-  path's job stays outstanding (no timeout on its I/O). The ownership decisions (`resolveOwnership`'s listing, `handleOwnershipResolved`,
-  adoption, `bringIntoService`) and the device CRL open still read the disk on the control thread (later tasks).
+  path's job stays outstanding (no timeout on its I/O; a path whose CRL open hangs is undecided the same way). The
+  ownership decisions (`resolveOwnership`'s listing, `handleOwnershipResolved`, adoption, `bringIntoService`) still
+  read the disk on the control thread (later tasks).
   Tests run discovery's work, and only it, with `ControlFixture.runDiscovery` (and `checkAllNow`, `scanNow`, `discoverNow`,
   `nudgeNow`, which call and then run it; `newHost` and `handleMarkerEvents` run it too)
 - Device load (`DeviceDiscovery.loadOwnedDevice`): one `Sweep` job (`DiscoveryDisk.sweepAtLoad`: transfer staging,
-  `creating/`, `deleting/`, `crl.creating`; then the listing, P6), the device CRL's open on the control thread (a lost
-  CRL's moves), then one `Move` job for
+  `creating/`, `deleting/`, `crl.creating`; then the listing, P6), one `CrlOpen` job for the device CRL's open
+  (`DeviceCrlDisk.open`, below: recovery and the whole lost-CRL path, its result a `CrlOpenResult` Opened, Lost or
+  Failed applied by `DeviceDiscovery.openCrl`: a Failed one's unsynced moves held as P2's are, the CrlOpenAttempts
+  count kept, the device left unloaded; a Lost one's forced copies done with, `CopyMoves.forcedUnattached`; a result
+  for a device loaded from elsewhere meanwhile shuts its CRL), then one `Move` job for
   P2 (`DiscoveryDisk.retireDuplicates`, moves through `CopyDisk.relocate`, an unforced one held by the apply with
   `CopyMoves.heldUnforced` and `HostCopies.unsynced`): a store with more than one copy directory outside
   `pending-delete/` (any phases) is logged
@@ -168,10 +173,12 @@
   check retries the move first, beside `resync` (`StoreRebuilds.retryPendingLost`). A crash forgets the hold. Every reader of
   "is it lost" reads the record's phase: the Lost CRL case (`CopyDecision`'s RequestRebuild), `discardLostStore`,
   `retireForeignCopy`, `startOut`/`closedForTransfer`. A device being loaded moves copies with
-  `CopyMoves.moveUnattached`: a lost device CRL moves every copy that does not hold its own state (a move that fails or
-  lands unforced throws, leaving the device unloaded and its CRL untouched for the next scan, and every `lost/` copy and
-  phase directory is forced, `CopyMoves.forceUnattached`, before the CRL is replaced: a crash undoing an unforced move
-  would put the copy back in `live/` over the empty CRL), and adoption's `CrlLost` stores move through the
+  `CopyMoves.moveUnattached`, except a lost device CRL's moves, made inside its open job (`DeviceCrlDisk.open`,
+  through `CopyDisk.relocate` and CopyMoves' seams): every copy that does not hold its own state is moved (a move that
+  fails or lands unforced fails the open, leaving the device unloaded and its CRL untouched for the next scan, its
+  unforced moves held for the resync by the apply, and every `lost/` copy, with an earlier unforced move's directories
+  passed in from `CopyMoves.unforcedUnder`, and phase directory is forced before the CRL is replaced: a crash undoing
+  an unforced move would put the copy back in `live/` over the empty CRL), and adoption's `CrlLost` stores move through the
   `DeviceMetadata.adoptDevice` callback `moveToLost: StoreId => Unit` (a failed move fails the adoption's transaction).
   The device load offers no phase directory, and no copy in `lost/` or `pending-delete/`, to `tryLoadStore`. Tests fail
   renames with `Host.Seams.copyRename` (installed as `CopyMoves.rename` before the first device load). The phase suites
@@ -465,7 +472,7 @@
   checks hold a load whose stat fails back through `awaitUnreadRetry` (a rebuilt store loaded without its gates would be
   a full acceptor of its old incarnation's transactions); the Missing Stores case, `dropLeftoverCrlState` and the
   Deleted Stores case skip such a store; `StoreCopies.retire` fails rather than report a clear path, and
-  `StoreCopies.delete` reports gone only a copy known absent; `DeviceDiscovery.openDeviceCrl` throws (device left for
+  `StoreCopies.delete` reports gone only a copy known absent; `DeviceCrlDisk.open` fails (device left for
   the next scan; a child whose config cannot be stat'd counts as a store directory) and so does `holdsOwnState`.
   `tryLoadDevice` leaves a device whose directory, config or `failed` marker cannot be stat'd for the next scan, and
   `DeviceMarkers`' host-id reads and `storesIn` throw too. `StoreLoader.readArrivedAt` counts a failed stat as an
@@ -612,13 +619,14 @@
   uses over any CRL), or a finished rebuild in `rebuilt/` (never served, so its state is empty; its flip and load
   proceed as over the old CRL), the old directory is kept as `crl.lost-<uuid>`, and a fresh CRL is created in
   `crl.creating/` (`CrashRecoveryLogFactory.createCRL`), renamed to `crl/` durably once finished, and opened
-  (`DeviceDiscovery.openDeviceCrl`). A crash or failed creation (ENOSPC) leaves no `crl/`: device load sweeps
+  (`DeviceCrlDisk.open`, one job on the device's lane). A crash or failed creation (ENOSPC) leaves no `crl/`: device load sweeps
   `crl.creating/` and the next load declares the CRL lost again, moving nothing aside. A CRL another writer holds open
   (`CrlLocked`) is never lost: the device stays unloaded and each scan retries. Nor is a CRL whose files disagree with
   its recorded sizing (`CrlSizingMismatch`), nor a `crl/` holding no CRL yet whose device config cannot size one
   (`CrlConfigInvalid`): the device is refused, an error is logged once, and each scan retries. A transient error (I/O or
   VM error, `DeviceDiscovery.isTransient`) leaves the device unloaded for the next scan instead, until it has failed on
-  `CrlOpenAttempts` (3) device scans in a row, when the CRL is lost. Only a `ScanDevices` open counts
+  `CrlOpenAttempts` (3) device scans in a row, when the CRL is lost (the apply passes `transientIsLost` to the open
+  job for the scan that would be the third). Slowness never declares a CRL lost: the open has no timeout. Only a `ScanDevices` open counts
   (`checkForNewDevices(scan = true)`): host start, `CheckAllDevices` and nudges retry uncounted, so start-up's burst of
   opens cannot use up the allowance.
 - `Host.StoreFailStopped` (a store's CRL read failed other than by the CRL's death or shutdown, its recovery threw, or

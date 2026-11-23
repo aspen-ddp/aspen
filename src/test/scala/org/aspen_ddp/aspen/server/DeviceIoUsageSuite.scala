@@ -18,8 +18,8 @@ class DeviceIoUsageSuite extends AnyFunSuite with Matchers:
 
   private val baseline: Map[String, Int] = Map(
     "host/CopyLayout.scala" -> 10,
-    "host/CopyMoves.scala" -> 4,
-    "host/DeviceDiscovery.scala" -> 22,
+    "host/CopyMoves.scala" -> 3,
+    "host/DeviceDiscovery.scala" -> 12,
     "host/DeviceShutdown.scala" -> 4,
     "host/HostCopies.scala" -> 4,
     "host/JoinCeiling.scala" -> 3,

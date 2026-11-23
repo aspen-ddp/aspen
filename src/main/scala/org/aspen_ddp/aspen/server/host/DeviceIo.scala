@@ -13,7 +13,8 @@ enum JobKind:
   case Scan, ReadConfig, Markers, CopyLayout, Move, Retire, Release, Delete, Sweep, SaveFile, CrlOpen, CrlCreate,
     BackendOpen, BackendCreate, Usage, Staging, ReconcileInputs
   /** Device discovery's own jobs (DeviceDiscovery), used by nothing else: the listing of storage-devices/ on the host
-   *  root's lane, a path's probe, and a load's sweep and P2 */
+   *  root's lane, a path's probe, and a load's sweep and P2. A load's device CRL open (DeviceCrlDisk.open) is
+   *  `CrlOpen`, used by discovery only */
   case DeviceListing, DeviceProbe, LoadSweep, LoadDuplicates
   case Other(name: String)
 

@@ -61,7 +61,11 @@
     fallocate is one call), no later step runs, and the leftovers are removed at the next open. `StreamWriter` dies
     of a write to a stream it does not know rather than completing it unwritten
 - One CRL per storage device, in `<device>/crl` (`CrashRecoveryLog.deviceCrlDir`), opened by
-  `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads
+  `CrashRecoveryLogFactory.openCRL` when the device loads and shut down when it unloads. The open, recovery and the
+  whole lost-CRL path (`host/DeviceCrlDisk.open`: the save-file checks, the moves to `lost/`, `crl.lost-<uuid>`, the
+  replacement's creation and open) run as one `CrlOpen` job on the device's own management lane, never on the host
+  control thread, which only applies the result (`server/host/CLAUDE.md`, device load); a hung device's open delays
+  only that device
 - Sizing keys in the device config are all optional (`CrlSizingDefaults.resolve`, from the capacity of the file
   system holding the device): `crl-num-streams` 4 (also the minimum; fewer is refused), `crl-max-file-size-mb`
   capacity / 2048 rounded down to 4 KiB, at least 64 MiB, `crl-max-streams` 20 (at most 1024: a `StreamLocation`
@@ -76,7 +80,7 @@
   throws (invalid growth bounds disable growth), so a bad config never hides the `CrlSizingMismatch` below.
   `SimpleCRL.apply` throws `CrlSizingMismatch` for stream files without a readable sizing file or of another count or
   size than recorded. That is damage or a hand edit, never declared a lost CRL: the device is refused until repaired
-  (`DeviceDiscovery.openDeviceCrl`)
+  (`DeviceCrlDisk.open`)
 - `openCRL`'s `holdsStores` (`SimpleCRL.apply`'s `mustExist`): the device holds stores, so its CRL must exist. With no
   stream files (only `sizing` or `.crl.tmp` files at most) the open throws `CrlMissing`, writing nothing, and the
   caller declares the CRL lost instead of creating an empty one under live stores. `createStreamsIfNew` checks it again
@@ -84,7 +88,7 @@
   stores on a device not yet loaded (`Main.bootstrap`) creates its CRL first
 - Every existence test of the open (`streamFiles`, `recordedSizing`, `removeUncommittedGrowth`, `CrlLock`,
   `StreamReader`, `DeviceFactory.openCRL`) is `server.FileStat`'s: a failed stat throws an `IOException` (transient to
-  `DeviceDiscovery.openDeviceCrl`), never a missing stream or an empty one
+  `DeviceCrlDisk.open`), never a missing stream or an empty one
 - Each entry header carries CRC32Cs of the header and of the body (`LogEntry`). Recovery drops a torn newest entry
   (only the write in flight at a crash can be torn) and throws `CrlCorrupt` for any other failed checksum (the body
   of the entry before a dropped one is checked too, `StreamReader.lastIntactEntry`), or when an
@@ -107,7 +111,9 @@
 - An open CRL holds an exclusive lock on `crl/lock` (`simple/CrlLock`), from before its files are read until its writer
   has closed them; a second opener, in this process or another, gets `CrlLocked` and touches nothing. Never open
   the lock file elsewhere: closing any descriptor of it drops the process's POSIX lock, which is why in-process
-  openers are refused by a registry first. It does not fence shared-storage double mounts (crash-recovery-log AS3)
+  openers are refused by a registry first (keyed by the file's identity). Each lock file has its own monitor
+  (`CrlLock.Slot`, kept once made), and only that file's descriptor open, lock, release and close run under it: no
+  JVM-global monitor is held across I/O, so one device's hung acquire never delays another's. It does not fence shared-storage double mounts (crash-recovery-log AS3)
 - `readStoreState` answers from the CRL thread's in-memory live records and stubs (`onGetRecoveryState`), never from
   the stream files, and leaves them live. Store loads (`StoreRouter`), transfers out (`StoreTransfers`,
   `StoreLoader` extraction) and the save that precedes a drop (`StoreCopies`) all read this way

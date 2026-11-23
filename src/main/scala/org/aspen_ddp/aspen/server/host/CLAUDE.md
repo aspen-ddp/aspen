@@ -432,7 +432,13 @@
   carries it to its outcome and, through `awaitingInstall`, to its LoadStore). A load that throws before its open (an
   unreadable `config.yaml`, `StoreLoader.awaitUnreadRetry`), one whose executor slot an earlier close still holds
   (`HostThreading.AlreadyAssigned`) and one whose Store fails to build in `handleLoad` (`awaitBuildRetry`, backoff per
-  failure in a row) are left offline and retried the same way. `tryLoadStore` reads no tree, so a retry is held to the
+  failure in a row) are left offline and retried the same way. A load that fails after its open with its data intact
+  (`StoreLoader.abandonLoad`: an unreadable save, gate or incarnation file, no executor slot, no CRL room, a failed
+  build; and a LoadStore that cannot be queued) records its retry first, then holds its copy Closing(Unserved) while
+  its unserved backend closes (`HostCopies.closingUnserved` with `keepRetry`: the retry parked, taken back at
+  `closeEnded`), so the retry never opens a second backend over a directory the first still holds (a RocksDB lock, an
+  FSIF backend's files). Tests that scan for a retry wait for `StoreLoader.awaitingRetryReady` (the retry on the
+  copy's record, not parked behind a close); `awaitingRetryHasCallback` also counts a parked one. `tryLoadStore` reads no tree, so a retry is held to the
   entries the device's latest reconcile read (`LocalStorageDeviceState.reconciledEntries`, set by
   `reconcileDeviceState`) and to the host's own work: it waits while that entry is neither Active nor Offline, the store
   is `declaredMissing` or a rebuild of it discards or runs (`HostCopies.rebuilding(RebuildHolds)`), its copy is unsynced

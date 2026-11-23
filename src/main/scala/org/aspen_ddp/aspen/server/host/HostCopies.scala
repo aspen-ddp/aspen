@@ -394,6 +394,10 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
 
   /** A retry of `storeId` the loader holds on any loaded device: a record's AwaitingRetry, or one parked until its
    *  record is Idle again */
+  /** Whether the copy of `storeId` awaits a load retry on its record, not parked behind a close or retire: the retry
+   *  the next device scan considers (retries) */
+  def retryReady(storeId: StoreId): Boolean = retries.exists(_._1 == storeId)
+
   def retryOf(storeId: StoreId): Option[LoadRetry] =
     retries.collectFirst { case (s, r) if s == storeId => r }
       .orElse(parkedRetries.toList.sortBy(_._1._1.uuid).collectFirst { case ((_, s), r) if s == storeId => r })
@@ -479,14 +483,25 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
    *  serves the store): its Live copy, Opening, Idle or AwaitingRetry, is held Closing(Unserved) until
    *  the close ends (closeEnded), so that no load opens a second backend on its directory while the first still
    *  closes. A claim; returns whether the copy is held. A copy in any other activity (Served: a reload's earlier store
-   *  still serving it; Closing; Retiring), in another phase, or with no record is left as it is, and false returned */
-  def closingUnserved(id: StorageDeviceId, storeId: StoreId): Boolean =
+   *  still serving it; Closing; Retiring), in another phase, or with no record is left as it is, and false returned.
+   *
+   *  `keepRetry` (StoreLoader.abandonLoad: a load that failed with its data intact, retried at the device scans):
+   *  a retry the copy awaits is parked, as one recorded while it closes is, and taken back at closeEnded, so the
+   *  retry's open waits for this backend's close instead of racing it on the directory */
+  def closingUnserved(id: StorageDeviceId, storeId: StoreId, site: String = "retireUnserved",
+                      keepRetry: Boolean = false): Boolean =
     device(id).flatMap(_.copies.get(storeId)) match
       case Some(r) if r.phase == Phase.Live && (r.activity match
           case Activity.Idle | Activity.AwaitingRetry(_) | Activity.Opening(_) => true
           case _ => false) =>
-        claim("retireUnserved"):
+        val awaited = r.activity match
+          case Activity.AwaitingRetry(retry) if keepRetry => Some(retry)
+          case _ => None
+        val held = claim(site):
           device(id).foreach(_.setActivity(storeId, Activity.Closing(ClosePurpose.Unserved)))
+        if held then
+          awaited.foreach(retry => parkedRetries += (id, storeId) -> retry)
+        held
       case _ => false
 
   /** The close of `storeId`, loaded from device `id`, ended (StoreLoader: handleClose, closeUnloaded): its record is

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.server.host.{CopyFixtures, CopyLayout, DeviceIo, JobKind, Phase}
+import org.aspen_ddp.aspen.server.host.{Activity, ClosePurpose, CopyFixtures, CopyLayout, DeviceIo, JobKind, Phase}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -50,6 +50,10 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
   /** While set, an open is queued here instead of submitted to its device's lane, until a test runs it: the open
    *  then runs on the lane at the next drain. Unset (the default), opens are submitted at once. */
   @volatile var openQueue: Option[java.util.concurrent.ConcurrentLinkedQueue[Runnable]] = None
+  /** While set, the close of each backend opened from now on starts only once this completes, as a slow device's does */
+  @volatile var closeGate: Option[Future[Unit]] = None
+  /** Closes started on backends opened under a closeGate */
+  @volatile var gatedCloses: Int = 0
 
   override def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit,
                     io: DeviceIo): Future[Backend] =
@@ -141,9 +145,15 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
     else
       val dataEc = io.dataEc
       val serial = Some(io.serialEc)
+      val gate = closeGate
       val b = new FsifBackend(storeId, path, layout, new FullableFiles(path), dataEc, FsifTuning(),
           onFatal, org.aspen_ddp.aspen.server.store.backend.SharedRetryScheduler, serial):
         override def hasFailed: Boolean = super.hasFailed || FsifSeams.this.reportFailed
+        override def close(): Future[Unit] = gate match
+          case None => super.close()
+          case Some(g) =>
+            FsifSeams.this.gatedCloses += 1
+            g.flatMap(_ => super.close())(using ExecutionContext.parasitic)
       lastBackend = Some(b)
       b
 
@@ -529,6 +539,9 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val storeDir = writeFsifStoreConfig(deviceDir)
     FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
       val queued = holdOpens(host)
+      // The unserved backend's close is held, so the retry is seen waiting for it
+      val gate = Promise[Unit]()
+      fsif(host).closeGate = Some(gate.future)
       load(host)
       queued.size should be(1)
       val closed = host.closeStore(storeId)
@@ -537,23 +550,82 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       fsif(host).throwingLoadStores = 1
       queued.poll().run()
       host.testingOnlyHandleEvents() // BackendOpened, whose serveOpened throws, then the deferred ShutdownStore
-      val activity = host.control.copyRegistry.device(deviceA).flatMap(_.copies.get(storeId)).map(_.activity)
+      fsif(host).closeGate = None
+      def activity = host.control.copyRegistry.device(deviceA).flatMap(_.copies.get(storeId)).map(_.activity)
       val opening = host.control.copyRegistry.isOpening(storeId)
       val waitScans = host.control.loader.awaitingRetryWaitScans(storeId)
       closed.flatMap: _ =>
-        activity.get should be(a[org.aspen_ddp.aspen.server.host.Activity.AwaitingRetry])
         opening should be(false)
         waitScans should be(Some(1))
         host.getStoreIds should not contain storeId
         host.control.router.silentStores should contain(storeId)
-        // The retry opens the store again (its first backend was closed) and serves it
+        // Its copy is held while the unserved backend closes, the retry parked: no second backend opens over it
+        fsif(host).gatedCloses should be(1)
+        activity should be(Some(Activity.Closing(ClosePurpose.Unserved)))
+        host.control.loader.awaitingRetryReady(storeId) should be(Some(false))
         fsif(host).openQueue = None
+        val opensBefore = fsif(host).opens
         host.control.loader.retryFailedLoads()
         host.testingOnlyHandleEvents()
-        awaitLoudly("the retried load to serve the store")(
-          { host.testingOnlyHandleEvents(); host.getStoreIds.contains(storeId) }).map: _ =>
-            host.control.loader.awaitingRetryWaitScans(storeId) should be(None)
-            host.control.router.silentStores should not contain storeId
+        fsif(host).opens should be(opensBefore)
+        gate.success(())
+        awaitLoudly("the unserved backend's close to give the copy its retry back") {
+          host.testingOnlyHandleEvents()
+          host.control.loader.awaitingRetryReady(storeId).contains(true)
+        }.flatMap: _ =>
+          activity.get should be(a[Activity.AwaitingRetry])
+          // The retry opens the store again (its first backend was closed) and serves it
+          host.control.loader.retryFailedLoads()
+          host.testingOnlyHandleEvents()
+          awaitLoudly("the retried load to serve the store")(
+            { host.testingOnlyHandleEvents(); host.getStoreIds.contains(storeId) }).map: _ =>
+              host.control.loader.awaitingRetryWaitScans(storeId) should be(None)
+              host.control.router.silentStores should not contain storeId
+
+  // A load that fails with its data intact after its open (StoreLoader.abandonLoad) retries only once its unserved
+  // backend has closed: a retry racing that close would open a second backend over the directory
+  atest("a store whose LoadStore fails after its open retries only once its unserved backend has closed"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+      // Read by the LoadStore, after the open: unparsable, so the load is retried, the file never replaced
+      val file = storeDir / StoreIncarnationFile.FileName
+      val original = os.read(file)
+      os.write.over(file, "not a uuid")
+      val gate = Promise[Unit]()
+      fsif(host).closeGate = Some(gate.future)
+      load(host)
+      awaitLoudly("the failed LoadStore to start closing its unserved backend") {
+        host.testingOnlyHandleEvents()
+        fsif(host).gatedCloses == 1
+      }.flatMap: _ =>
+        fsif(host).closeGate = None
+        def activity = host.control.copyRegistry.device(deviceA).flatMap(_.copies.get(storeId)).map(_.activity)
+        host.getStoreIds should not contain storeId
+        host.control.router.silentStores should contain(storeId)
+        activity should be(Some(Activity.Closing(ClosePurpose.Unserved)))
+        host.control.loader.awaitingRetryReady(storeId) should be(Some(false))
+        os.write.over(file, original)
+        // Its retry waits for the close: no second open
+        val opensBefore = fsif(host).opens
+        scanNow(host)
+        host.testingOnlyHandleEvents()
+        fsif(host).opens should be(opensBefore)
+        activity should be(Some(Activity.Closing(ClosePurpose.Unserved)))
+        gate.success(())
+        awaitLoudly("the unserved backend's close to give the copy its retry back") {
+          host.testingOnlyHandleEvents()
+          host.control.loader.awaitingRetryReady(storeId).contains(true)
+        }.flatMap: _ =>
+          activity.get should be(a[Activity.AwaitingRetry])
+          scanNow(host)
+          awaitLoudly("the retried load to serve the store")(
+            { host.testingOnlyHandleEvents(); host.getStoreIds.contains(storeId) }).map: _ =>
+              fsif(host).opens should be(opensBefore + 1)
+              host.control.loader.awaitingRetryReady(storeId) should be(None)
 
   /** Holds every FSIF open of `host` until the test runs it */
   private def holdOpens(host: Host): java.util.concurrent.ConcurrentLinkedQueue[Runnable] =
@@ -814,9 +886,12 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         host.testingOnlyHandleEvents()
         // Its CRL load completes off the control context (CrashRecoveryLog.loadStore), then the failed removal
         // posts SaveFileRemovalFailed
-        awaitLoudly("the failed save-file removal to leave the store awaiting a retry") {
+        // The retry is parked until the unloaded store's close ends (closeUnloaded): the scan below considers it only
+        // once its copy's record awaits it
+        awaitLoudly("the failed save-file removal to leave the store awaiting a retry, its close ended") {
           host.testingOnlyHandleEvents()
-          host.control.loader.awaitingRetryHasCallback(storeId).contains(true)
+          host.control.loader.awaitingRetryHasCallback(storeId).contains(true) &&
+            host.control.loader.awaitingRetryReady(storeId).contains(true)
         }.map: _ =>
           host.getStoreIds should not contain storeId
           host.control.router.silentStores should contain(storeId)

@@ -88,6 +88,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   private[server] def awaitingRetryHasCallback(storeId: StoreId): Option[Boolean] =
     ctx.copyRegistry.retryOf(storeId).map(_.onServed.isDefined)
 
+  /** Whether a store awaiting a load retry awaits it on its copy's record (not parked while an unserved backend, or
+   *  the store, still closes), so the next device scan considers it; None if it awaits none */
+  private[server] def awaitingRetryReady(storeId: StoreId): Option[Boolean] =
+    ctx.copyRegistry.retryOf(storeId).map(_ => ctx.copyRegistry.retryReady(storeId))
+
   /** The wait, in device scans, of a store awaiting a load retry; None if it awaits none */
   private[server] def awaitingRetryWaitScans(storeId: StoreId): Option[Int] =
     ctx.copyRegistry.retryOf(storeId).map(_.waitScans)
@@ -320,10 +325,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             logger.error(s"Store $storeId opened, but its LoadStore could not be queued. Closing it unserved and " +
                          s"retrying at the device scans. $storePath. Error: $e")
             newStores -= storeId
-            try backend.close()
-            catch case NonFatal(t) => logger.warn(s"Failed to close the unserved backend of store $storeId: $t")
             awaitRetry("serveOpened threw", storeId, LoadRetry(sds, storePath, nextWait(previous), nextWait(previous),
               onServed))
+            // Its retry waits for this close (closeAbandoned)
+            closeAbandoned(sds.storageDeviceId, backend, replaced = false)
             created.foreach(_.tryFailure(e))
       case Failure(e: BackendStateLost) =>
         logger.error(s"Store $storeId cannot be loaded: its backend found its acknowledged state lost. " +
@@ -533,10 +538,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           logger.warn(s"Not reloading store ${backend.storeId}: its save, incarnation, acceptor-since or " +
                       s"inherited-votes file could not be read. " +
                       s"The loaded copy keeps serving. Error: $err")
-        abandonLoad(storageDeviceId, backend, replaced, err, p)
+        // The retry is recorded first, so the unserved backend's close parks it (abandonLoad)
         if !replaced then
           ctx.devices.devices.get(storageDeviceId).foreach(awaitUnreadRetry(_, backend.path, None, err,
             ofLoad = fromOpen))
+        abandonLoad(storageDeviceId, backend, replaced, err, p)
 
       case (Left(err), _) =>
         ctx.rebuilds.crlSaveFileLost(storageDeviceId, backend, err)
@@ -714,16 +720,27 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   /** A LoadStore that failed before its store was installed: closes `backend` unserved and fails `p`. Unless an
    *  earlier store is still served in its place (`replaced`), the store is left offline: its open's copy ends Opening
-   *  (handleLoad). */
+   *  (handleLoad). Its Live copy is held Closing(Unserved) until the close ends (HostCopies.closingUnserved), the
+   *  retry its caller recorded parked meanwhile: the backend still holds the directory (a RocksDB lock, an FSIF
+   *  backend's files), and a retry's open racing its close would open a second backend over it, or fail and double
+   *  its backoff. Callers record the retry before calling this */
   private def abandonLoad(storageDeviceId: StorageDeviceId, backend: Backend, replaced: Boolean, err: Throwable,
                           p: Promise[Unit]): Unit =
-    val storeId = backend.storeId
-    try
-      backend.close().onComplete:
-        case Failure(t) => logger.warn(s"Failed to close the unserved backend of store $storeId: $t")
-        case Success(_) =>
-    catch case NonFatal(t) => logger.warn(s"Failed to close the unserved backend of store $storeId: $t")
+    closeAbandoned(storageDeviceId, backend, replaced)
     p.tryFailure(err)
+
+  /** abandonLoad's close of the unserved `backend`, its copy held while it runs unless `replaced` */
+  private def closeAbandoned(storageDeviceId: StorageDeviceId, backend: Backend, replaced: Boolean): Unit =
+    val storeId = backend.storeId
+    val held = !replaced && ctx.copyRegistry.closingUnserved(storageDeviceId, storeId, "abandonLoad",
+      keepRetry = true)
+    val closed =
+      try backend.close()
+      catch case NonFatal(t) => Future.failed(t)
+    closed.onComplete: result =>
+      result.failed.foreach(t => logger.warn(s"Failed to close the unserved backend of store $storeId: $t"))
+      if held then
+        ctx.copyRegistry.closeEnded(storageDeviceId, storeId)
 
   /** The rest of a LoadStore once its store is installed: with no saved state, recovers it from the device CRL and
    *  completes `p` at once; otherwise completes `p` once the CRL holds `trs` and the store has recovered from it. Its

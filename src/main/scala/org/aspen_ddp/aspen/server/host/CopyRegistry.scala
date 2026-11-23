@@ -7,9 +7,11 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.Host.LoadRetry
 
 /** Why a store is being closed. FailStop: the copy moves to lost/ when its close ends (P5). Reload: the copy stays
- *  where it is, to load again (a failed CRL load, a failed save-file removal). Unserved: a backend never served, which
- *  must never serve, closes (StoreRebuilds.retireUnserved), and the copy moves to lost/ when its close ends; the only
- *  close of a copy that is not Served */
+ *  where it is, to load again (a failed CRL load, a failed save-file removal). Unserved: a backend never served
+ *  closes, the only close of a copy that is not Served: one that must never serve (StoreRebuilds.retireUnserved, a
+ *  failed one in StoreLoader.handleBackendOpened), whose copy moves to lost/ when its close ends, or the backend of a
+ *  load that failed with its data intact (StoreLoader.abandonLoad), whose copy stays for its load retry, parked until
+ *  the close ends */
 enum ClosePurpose:
   case TransferOut, Shutdown, Relinquish, FailStop, Reload, Unserved
 
@@ -87,8 +89,8 @@ object Transitions:
     case (Activity.AwaitingRetry(_), Activity.AwaitingRetry(_) | Activity.Opening(_) | Activity.Idle) => true
     case (Activity.Opening(_), Activity.Served | Activity.Idle | Activity.AwaitingRetry(_)) => true
     case (Activity.Served, Activity.Closing(_) | Activity.Served) => true
-    // An unserved backend that must never serve closing (StoreRebuilds.retireUnserved): its copy is held Closing until
-    // the close ends, so no load opens it meanwhile
+    // An unserved backend closing (StoreRebuilds.retireUnserved, StoreLoader.abandonLoad): its copy is held Closing
+    // until the close ends, so no load opens a second backend on its directory meanwhile
     case (Activity.Idle | Activity.AwaitingRetry(_) | Activity.Opening(_), Activity.Closing(ClosePurpose.Unserved)) =>
       phase == Phase.Live
     case (Activity.Closing(_), Activity.Idle) => true

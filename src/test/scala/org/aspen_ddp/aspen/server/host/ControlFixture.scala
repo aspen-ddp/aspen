@@ -85,6 +85,10 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
     enqueueArmed(deviceId, Right(p))
     p
 
+  /** How many of the lookups armed for `deviceId` no lookup has taken yet */
+  def armedLookupsLeft(deviceId: StorageDeviceId): Int = synchronized:
+    armedLookups.get(deviceId).map(_.size).getOrElse(0)
+
   /** Arms one lookup of `deviceId` to throw `error` instead of returning a Future at all. This is the case no
    *  Promise can stage: a failed Promise still yields a Future, and it is the absence of the Future -- and so of the
    *  callback, and so of the callback's finally -- that leaks startDeviceCheck's guard entry. */

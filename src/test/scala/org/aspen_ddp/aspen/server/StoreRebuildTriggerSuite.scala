@@ -906,12 +906,18 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       // The check the Superseded outcome asks for finds the entry re-placed to another device, before the current
       // episode's rebuild could start here
       _ = recorded(host).armLookup(realDeviceId).success(deviceState(realDeviceId, Map()))
+      // So does the check the retire's end asks for. The tree itself still names the current episode here: unarmed,
+      // that check would start its rebuild
+      retireCheck = recorded(host).armLookup(realDeviceId)
       _ = factory.created.head.completeFromDisk()
       _ <- waitForTransactionsToComplete()
       _ <- awaitLoudly("the flip's outcome")(recorded(host).rebuildOutcomes.contains((realDeviceId, rebuilt)))
       // Retired into pending-delete, its record gone with it
       _ <- awaitLoudly("the retire of the superseded copy")(CopyFixtures.copyPath(deviceDir, rebuilt).isEmpty &&
              !host.control.copyRegistry.device(realDeviceId).exists(_.copies.contains(rebuilt)))
+      _ <- awaitLoudly("the check the retire's end asks for")(recorded(host).armedLookupsLeft(realDeviceId) == 0)
+      _ = retireCheck.success(deviceState(realDeviceId, Map()))
+      _ <- awaitLoudly("that check's end")(!host.control.reconciler.activeDeviceChecks.contains(realDeviceId))
     yield
       recorded(host).rebuildOutcomes((realDeviceId, rebuilt)) should be(RebuildOutcome.Superseded)
       factory.created should have size 1

@@ -55,3 +55,30 @@ class ScanStateSuite extends AnyFunSuite with Matchers:
     val stale = ScanState(0L, Duration(1, SECONDS))
     val s = ScanState.advance(stale, 0L, foundEntries = false, policy, r)
     s.currentInterval shouldBe policy.scanIntervalFloor
+
+  test("a bootstrap store's first sweep is due within the shorter of the floor and the sweep interval"):
+    val r = rand
+    val fast = policy.copy(bootstrapSweepInterval = Duration(10, SECONDS))
+    (0 until 200).foreach: _ =>
+      val d = ScanState.admitSweep(1000L, policy, r)
+      d should be >= 1000L
+      d should be < 1000L + policy.scanIntervalFloor.toMillis
+      ScanState.admitSweep(1000L, fast, r) should be < 1000L + 10_000L
+
+  test("a clean sweep is next due one jittered sweep interval later"):
+    val r = rand
+    val interval = policy.bootstrapSweepInterval.toMillis
+    (0 until 200).foreach: _ =>
+      val d = ScanState.nextSweep(5000L, needsAnotherPass = false, policy, r)
+      d should be >= 5000L + interval * 3 / 4
+      d should be <= 5000L + interval * 5 / 4
+
+  test("a sweep that needs another pass retries at the shorter of the floor and the sweep interval"):
+    val r = rand
+    val floor = policy.scanIntervalFloor.toMillis
+    val slow = policy.copy(bootstrapSweepInterval = Duration(10, MINUTES))
+    val fast = policy.copy(bootstrapSweepInterval = Duration(10, SECONDS))
+    (0 until 200).foreach: _ =>
+      ScanState.nextSweep(0L, needsAnotherPass = true, policy, r) should be <= floor * 5 / 4
+      ScanState.nextSweep(0L, needsAnotherPass = true, slow, r) should be <= floor * 5 / 4
+      ScanState.nextSweep(0L, needsAnotherPass = true, fast, r) should be <= 12_500L

@@ -26,23 +26,36 @@ import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
   *                                     it) a repair entry's object may have parts deferred by a lock before the
   *                                     scan proves them with a transaction instead of waiting for the
   *                                     lock to clear (RepairProofs)
+  * @param bootstrapSweepInterval       how often a store of the bootstrap pool sweeps its copies of the bootstrap
+  *                                     pool's own tree nodes (StoreRepairer.sweepBootstrapTrees), independent of
+  *                                     its scan back-off. Writes to those nodes run untracked, so the sweep is the
+  *                                     only thing that heals a missed one, and this bounds how long it stays
+  *                                     unhealed. Read only from the bootstrap pool's policy; like the floor, a value
+  *                                     below RepairService.TickPeriod acts as the tick
   */
 case class RepairPolicy(scanIntervalFloor: Duration,
                         scanIntervalCap: Duration,
                         minErrorEntryAgeForDeletion: Duration,
-                        proofAfterDeferrals: Int = RepairPolicy.DefaultProofAfterDeferrals):
+                        proofAfterDeferrals: Int = RepairPolicy.DefaultProofAfterDeferrals,
+                        bootstrapSweepInterval: Duration = RepairPolicy.DefaultBootstrapSweepInterval):
 
   def encode(): Array[Byte] = codec.RepairPolicy(
     scanIntervalFloorSeconds = scanIntervalFloor.toSeconds.toInt,
     scanIntervalCapSeconds = scanIntervalCap.toSeconds.toInt,
     minErrorEntryAgeForDeletionSeconds = minErrorEntryAgeForDeletion.toSeconds.toInt,
-    proofAfterDeferrals = proofAfterDeferrals
+    proofAfterDeferrals = proofAfterDeferrals,
+    bootstrapSweepIntervalSeconds = bootstrapSweepInterval.toSeconds.toInt
   ).toByteArray
 
 object RepairPolicy:
 
   /** 5 minutes of deferral at the 30 s scan floor */
   val DefaultProofAfterDeferrals: Int = 10
+
+  /** One walk of the bootstrap pool's small trees per minute per bootstrap store bounds a missed untracked write's
+    * staleness window (repair-process 10.1)
+    */
+  val DefaultBootstrapSweepInterval: Duration = Duration(60, SECONDS)
 
   val Default: RepairPolicy = RepairPolicy(
     scanIntervalFloor = Duration(30, SECONDS),
@@ -63,7 +76,8 @@ object RepairPolicy:
       seconds(m.scanIntervalFloorSeconds, Default.scanIntervalFloor),
       seconds(m.scanIntervalCapSeconds, Default.scanIntervalCap),
       seconds(m.minErrorEntryAgeForDeletionSeconds, Default.minErrorEntryAgeForDeletion),
-      if m.proofAfterDeferrals <= 0 then Default.proofAfterDeferrals else m.proofAfterDeferrals)
+      if m.proofAfterDeferrals <= 0 then Default.proofAfterDeferrals else m.proofAfterDeferrals,
+      seconds(m.bootstrapSweepIntervalSeconds, Default.bootstrapSweepInterval))
 
   /** Reads the pool's policy. An absent key yields Default -- no pool has this key today and
     * nothing is required to write one, so repair works with zero administration. A failed read

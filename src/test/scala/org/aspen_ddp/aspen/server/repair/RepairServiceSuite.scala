@@ -309,30 +309,58 @@ class RepairServiceSuite extends IntegrationTestSuite:
         clock.addAndGet(20 * 60_000L)
         svc.sweep()
 
-  test("a bootstrap store's scan also sweeps; a metadata pool store's does not"):
+  test("a bootstrap store sweeps; a metadata pool store does not"):
     val clock = AtomicLong(0L)
     val svc = SweepingService(clock, List(bootstrapStore, metadataStore), Future.successful(ScanResult.Empty),
                               Future.successful(SweepResult.Empty))
     ticks(svc, clock, 1).map: _ =>
       svc.swept shouldBe List(bootstrapStore)
 
-  test("a sweep that needs another pass keeps the store at the floor"):
+  private def sweepOffset(svc: RepairService, clock: AtomicLong): Long =
+    svc.testingOnlySweepDue(bootstrapStore) - clock.get
+
+  test("a sweep that needs another pass retries at the floor without holding the scan there"):
     val clock = AtomicLong(0L)
     val svc = SweepingService(clock, List(bootstrapStore), Future.successful(ScanResult.Empty),
                               Future.successful(SweepResult(3, 1, 0, true)))
     ticks(svc, clock, 3).map: _ =>
       svc.swept.size shouldBe 3
-      svc.testingOnlyScanStates(bootstrapStore).currentInterval shouldBe RepairPolicy.Default.scanIntervalFloor
+      svc.testingOnlyScanStates(bootstrapStore).currentInterval should be > RepairPolicy.Default.scanIntervalFloor
+      sweepOffset(svc, clock) should be <= (RepairPolicy.Default.scanIntervalFloor.toMillis * 5 / 4)
 
-  test("a clean sweep lets the store back off"):
+  test("a clean sweep is next due one sweep interval later and the scan backs off"):
     val clock = AtomicLong(0L)
     val svc = SweepingService(clock, List(bootstrapStore), Future.successful(ScanResult.Empty),
                               Future.successful(SweepResult(3, 0, 0, true)))
     ticks(svc, clock, 1).map: _ =>
       svc.testingOnlyScanStates(bootstrapStore).currentInterval shouldBe
         RepairPolicy.Default.scanIntervalFloor * 2
+      val interval = RepairPolicy.Default.bootstrapSweepInterval.toMillis
+      sweepOffset(svc, clock) should be >= (interval * 3 / 4)
+      sweepOffset(svc, clock) should be <= (interval * 5 / 4)
 
-  test("a sweep cut off by its deadline keeps the store at the floor and keeps its deferrals"):
+  test("a bootstrap store backed off to the scan cap still sweeps every sweep interval"):
+    val clock = AtomicLong(0L)
+    val svc = SweepingService(clock, List(bootstrapStore), Future.successful(ScanResult.Empty),
+                              Future.successful(SweepResult.Empty))
+    val tick = RepairService.TickPeriod.toMillis
+    val f = for
+      _ <- ticks(svc, clock, 6)
+      _ = svc.testingOnlyScanStates(bootstrapStore).currentInterval shouldBe RepairPolicy.Default.scanIntervalCap
+      sweptBefore = svc.swept.size
+      scanDue = svc.testingOnlyScanStates(bootstrapStore).nextDue
+      // Ten minutes of ordinary ticks, all before the next scan (at least 3/4 of the 15 min cap away)
+      _ <- (0 until 20).foldLeft(Future.unit): (f, _) =>
+        f.flatMap: _ =>
+          clock.addAndGet(tick)
+          svc.sweep()
+    yield
+      clock.get should be < scanDue
+      // One sweep per 45 to 90 s (the jittered interval, rounded up to a tick)
+      (svc.swept.size - sweptBefore) should be >= 6
+    f
+
+  test("a sweep cut off by its deadline retries at the floor and keeps its deferrals"):
     val clock = AtomicLong(0L)
     val bgTasks = BackgroundTaskManager(scala.concurrent.ExecutionContext.global)
     val svc = SweepingService(clock, List(bootstrapStore), Future.successful(ScanResult.Empty),
@@ -343,7 +371,7 @@ class RepairServiceSuite extends IntegrationTestSuite:
       _ = clock.set(60_000L)
       _ <- svc.sweep()
     yield
-      svc.testingOnlyScanStates(bootstrapStore).currentInterval shouldBe RepairPolicy.Default.scanIntervalFloor
+      sweepOffset(svc, clock) should be <= (RepairPolicy.Default.scanIntervalFloor.toMillis * 5 / 4)
       svc.testingOnlyDeferrals.get(bootstrapStore).exists(_ eq kept) shouldBe true
       svc.sweepControls.headOption.exists(_.cancelled) shouldBe true
     f.andThen: _ =>

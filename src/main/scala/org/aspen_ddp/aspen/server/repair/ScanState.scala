@@ -49,3 +49,22 @@ object ScanState:
         else doubled
 
     ScanState(now + jitter(next.toMillis, rand), next)
+
+  /** The sweep's retry interval: the shorter of the scan floor and the sweep interval */
+  private def sweepRetry(policy: RepairPolicy): Duration =
+    if policy.scanIntervalFloor < policy.bootstrapSweepInterval then policy.scanIntervalFloor
+    else policy.bootstrapSweepInterval
+
+  /** A newly admitted bootstrap store's first bootstrap tree sweep, at a random offset inside the retry interval: a
+    * store that just loaded or was promoted from a rebuild is the likeliest to hold stale nodes (rebuild F8).
+    */
+  def admitSweep(now: Long, policy: RepairPolicy, rand: Random): Long =
+    now + rand.nextLong(math.max(1L, sweepRetry(policy).toMillis))
+
+  /** The next sweep's due time after one settled. The sweep keeps its own fixed interval, independent of the scan
+    * back-off; a sweep that needs another pass (reconciled something, left something incomplete, failed or timed out)
+    * retries at the shorter of the floor and that interval, so the store's trees converge promptly.
+    */
+  def nextSweep(now: Long, needsAnotherPass: Boolean, policy: RepairPolicy, rand: Random): Long =
+    val interval = if needsAnotherPass then sweepRetry(policy) else policy.bootstrapSweepInterval
+    now + jitter(interval.toMillis, rand)

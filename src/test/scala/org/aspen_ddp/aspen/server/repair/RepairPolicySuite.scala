@@ -14,11 +14,12 @@ class RepairPolicySuite extends IntegrationTestSuite:
       RepairPolicy.Default.scanIntervalFloor shouldBe Duration(30, SECONDS)
       RepairPolicy.Default.scanIntervalCap shouldBe Duration(15, MINUTES)
       RepairPolicy.Default.minErrorEntryAgeForDeletion shouldBe Duration(60, SECONDS)
+      RepairPolicy.Default.bootstrapSweepInterval shouldBe Duration(60, SECONDS)
       HostRepairLimits.Default.maxConcurrentStoreScans shouldBe 4
 
   test("a repair policy survives a codec round trip"):
     Future.successful:
-      val p = RepairPolicy(Duration(5, SECONDS), Duration(90, SECONDS), Duration(120, SECONDS), 7)
+      val p = RepairPolicy(Duration(5, SECONDS), Duration(90, SECONDS), Duration(120, SECONDS), 7, Duration(45, SECONDS))
       RepairPolicy.decode(p.encode()) shouldBe p
 
   test("proofAfterDeferrals defaults to 10"):

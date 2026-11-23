@@ -39,15 +39,17 @@
   (repair-process 8.1). A timed-out scan counts as having found entries if it had seen any
   (`ScanControl.sawEntries`): a backlog keeps the store at the floor, while a scan that reached no entry backs off
   (repair-process 4.2). A reconcile in flight at the cancel still records, which can bring a proof one pass early
-- `RepairService.scanOne` runs the sweep for a store of the bootstrap pool right after its entry scan settles (success
-  or failure), under its own deadline (`SweepDeadline`, 90 s). The store's pacing is advanced with
-  `foundEntries || sweep.needsAnotherPass`: a failed or timed-out sweep counts as needing another pass (unlike a
-  failed entry scan; a timed-out one counts as found if it had seen entries), so the store stays at
-  `scanIntervalFloor` until its trees converge and a clean sweep lets it back off to `scanIntervalCap`. A node
-  skipped because the store stopped being repairable here counts as incomplete too. A missed untracked write is
-  therefore healed within about one cap interval (Backlog.txt "Bootstrap tree sweep staleness window"). While the
-  bootstrap pool is unreadable, a bootstrap store's scan and sweep each run to their 90 s deadline, so it holds a scan
-  slot most of each floor interval (spec-mandated)
+- `RepairService` sweeps each store of the bootstrap pool on a schedule of its own (`sweepDue`, beside the store's
+  `ScanState`), independent of the scan back-off: due every `RepairPolicy.bootstrapSweepInterval` (60 s, read from the
+  bootstrap pool's policy; below the 30 s tick it acts as the tick), jittered like scans. A newly admitted store's
+  first sweep is due within the shorter of the floor and that interval (`ScanState.admitSweep`), so a store just
+  loaded or promoted from a rebuild sweeps promptly. A sweep that needs another pass, failed, or timed out retries at
+  that shorter interval (`ScanState.nextSweep`); a node skipped because the store stopped being repairable here counts
+  as incomplete too. The sweep never moves the scan's pacing. When a scan and a sweep are both due on a tick,
+  `scanOne` runs the sweep after the entry scan settles (success or failure), each under its own deadline
+  (`ScanDeadline`, `SweepDeadline`, 90 s), in the same scan slot. A missed untracked write is therefore healed within
+  about one sweep interval plus a tick. While the bootstrap pool is unreadable, each sweep runs to its 90 s deadline,
+  so a bootstrap store holds a scan slot for most of each retry interval (there are only IDA-width such stores)
 - After `RepairPolicy.proofAfterDeferrals` (10) lock-deferred passes since the last complete one, `RepairProofs` commits a no-op
   transaction proving the read state, and reconciles from it. A deferred object level (either object type: refcount
   plus revision, a DataObject's data or a KeyValue object's min/max/left/right) is proven by one transaction,

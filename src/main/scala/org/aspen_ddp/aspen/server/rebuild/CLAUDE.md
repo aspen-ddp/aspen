@@ -136,7 +136,7 @@
   fresh staging store atomically (`BackendOpener.create`); a resume only opens it, and one whose backend is lost
   (missing or blank files included) is discarded, checkpoint and all, so the next pass starts over
 - A promoted bootstrap-pool store may hold stale copies of the bootstrap pool's own ErrorTree/UnackedCommits nodes
-  (their writes are untracked, so the rebuild recorded no misses). Its first repair scan after promotion sweeps and
-  reconciles every node of both trees (`server/repair/CLAUDE.md`), closing the staleness window of rebuild-process 8.3
+  (their writes are untracked, so the rebuild recorded no misses). Its first bootstrap tree sweep after promotion
+  (within one scan floor) reconciles every node of both trees (`server/repair/CLAUDE.md`), closing the staleness window of rebuild-process 8.3
 - What triggers a rebuild (a copy in `lost/`, lost CRLs, failed transfers) and when the old copy in
   `pending-delete/` may be deleted: `server/host/CLAUDE.md`

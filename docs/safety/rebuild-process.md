@@ -703,10 +703,9 @@ is never repaired (5.2's locked copies are marked for this reason).
 
 * `MissedUpdateFinalizationAction.limitTracking` disables tracking for an ErrorTree write only when that transaction
   references the pool the entry is about: in practice the bootstrap pool, whose trees live in itself. A rebuilt
-  bootstrap-pool store may therefore hold stale copies of those tree nodes with no entry. Its first repair scan after
-  load sweeps every node of both trees (`StoreRepairer.sweepBootstrapTrees`) and stays at the scan floor until they
-  converge. The staleness window before the sweep runs is accepted (`Backlog.txt`, "Bootstrap tree sweep staleness
-  window").
+  bootstrap-pool store may therefore hold stale copies of those tree nodes with no entry. Its first bootstrap tree
+  sweep after load, due within one scan floor, reconciles every node of both trees (`StoreRepairer.sweepBootstrapTrees`),
+  and it retries at the floor until they converge (repair-process 10.1).
 
 ---
 

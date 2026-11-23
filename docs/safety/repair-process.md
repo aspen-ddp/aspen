@@ -110,7 +110,7 @@ recorded", and a read decides (section 9).
 
 | Record | Key | Default | Code |
 |--------|-----|---------|------|
-| `RepairPolicy` | pool state `RepairPolicyKey` | `scanIntervalFloor` 30 s, `scanIntervalCap` 15 min, `minErrorEntryAgeForDeletion` 60 s, `proofAfterDeferrals` 10. An absent key gives the default; a non-positive field gives that field's default | `server/repair/RepairPolicy.scala` |
+| `RepairPolicy` | pool state `RepairPolicyKey` | `scanIntervalFloor` 30 s, `scanIntervalCap` 15 min, `minErrorEntryAgeForDeletion` 60 s, `proofAfterDeferrals` 10, `bootstrapSweepInterval` 60 s (read from the bootstrap pool's policy only). An absent key gives the default; a non-positive field gives that field's default | `server/repair/RepairPolicy.scala` |
 | `HostRepairLimits` | host state `RepairLimitsKey` | `maxConcurrentStoreScans` 4; non-positive gives the default | `server/repair/HostRepairLimits.scala` |
 
 ### 2.6 Who writes, who deletes
@@ -186,15 +186,19 @@ tick (`RepairService.TickPeriod`; stall report after 6 h).
 sweep():
   repairable = target.repairableStoreIds   -- HostCopies.repairable, published in HostStoreView (4.4)
   refreshLimits()                          -- 15 s deadline (MetadataDeadline); keeps the last good value
-  due = selectDue(repairable, now)         -- drops state of departed stores; admits new ones (not due this tick)
+  due = selectDue(repairable, now)         -- drops state of departed stores; admits new ones (not due this tick);
+                                           -- a store is due when its scan is, or (bootstrap pool) its sweep is
   refreshPolicies(pools of due)            -- per pool, 15 s deadline, last good or default
   runBoundedParallel(due, maxConcurrentStoreScans)(scanOne)
 scanOne(store):
-  found = withDeadline(90 s)(StoreRepairer.scan(store, policy, deferralOf(store), control)).foundEntries
-    on ScanTimedOut: control.cancel(); found = control.sawEntries
-    on any other failure: found = false
-  if bootstrap pool: found ||= withDeadline(90 s)(sweepBootstrapTrees(...)).needsAnotherPass  -- failure or timeout: true
-  scanStates[store] = ScanState.advance(prev, now, found, policy)
+  if scan due:
+    found = withDeadline(90 s)(StoreRepairer.scan(store, policy, deferralOf(store), control)).foundEntries
+      on ScanTimedOut: control.cancel(); found = control.sawEntries
+      on any other failure: found = false
+    scanStates[store] = ScanState.advance(prev, now, found, policy)
+  if sweep due (after the scan settles):
+    again = withDeadline(90 s)(sweepBootstrapTrees(...)).needsAnotherPass  -- failure or timeout: true
+    sweepDue[store] = ScanState.nextSweep(now, again, policy)
 ```
 
 A newly seen store is admitted at the floor, due at a random time inside the first floor interval. Because the tick
@@ -210,10 +214,19 @@ A store leaving the set loses its `ScanState` and `DeferralState` at the next ti
 
 | Outcome | Next interval |
 |---------|---------------|
-| Any entry seen in either tree (repaired, deferred or skipped), or a bootstrap sweep needing another pass | floor |
+| Any entry seen in either tree (repaired, deferred or skipped) | floor |
 | Clean scan, or a failed one, or one timed out before seeing any entry | `min(2 * current, cap)`, at least floor |
 
-The next due time is `now + interval` jittered by +/-25 %.
+The next due time is `now + interval` jittered by +/-25 %. A bootstrap store's sweep is paced apart from its scan
+(`sweepDue`), and never moves it:
+
+| Sweep outcome | Next sweep |
+|---------------|------------|
+| Admitted (new store) | random offset inside `min(floor, bootstrapSweepInterval)` |
+| Needs another pass (reconciled, incomplete, walk missed nodes), failed, or timed out | `min(floor, bootstrapSweepInterval)` |
+| Clean | `bootstrapSweepInterval` |
+
+Sweep intervals are jittered the same way; like the floor, one below the tick acts as the tick.
 
 ### 4.3 Bounds
 
@@ -740,14 +753,17 @@ no-op that the snapshot check would miss: it is reported and marked instead.
 ### 10.1 Bootstrap tree sweep
 
 Writes to the bootstrap pool's own ErrorTree and UnackedCommits nodes run untracked (`limitTracking`), so a bootstrap
-store that misses one gets no entry. `StoreRepairer.sweepBootstrapTrees` heals it: after each entry scan of a
-bootstrap store (success or failure), it reconciles the store's copy of every node of both trees, every tier
+store that misses one gets no entry. `StoreRepairer.sweepBootstrapTrees` heals it: on its own schedule (4.2, every
+`bootstrapSweepInterval`, independent of the scan back-off; after the entry scan settles when both are due), it
+reconciles the store's copy of every node of both trees, every tier
 (`TieredKeyValueList.foreachNode`), through `repairUpdate` with no minimum timestamp, no proofs (they would collide
 with marker traffic), never narrowed to deferred keys (a later missed untracked write records nothing), keyed
 `sweepDeferralKey`. A node deleted under the walk, an unreadable node, or one skipped because the store stopped being
 repairable or the sweep was cancelled counts as incomplete. `SweepResult.needsAnotherPass` (anything reconciled or
-incomplete, or a walk that missed nodes) keeps the store at the floor; a clean sweep lets it back off. Its staleness
-window is an accepted limitation (13).
+incomplete, or a walk that missed nodes) makes the next sweep come at the floor. A missed untracked write therefore
+stays unhealed for at most about one sweep interval (60 s, jittered up to 75 s) plus a tick and the sweep itself,
+which bounds the window in which two bootstrap stores stale on different nodes could let a quorum read lose a
+just-written entry.
 
 ### 10.2 No read-driven repair
 
@@ -928,8 +944,8 @@ its read threshold stalls the scan until the deadline.
 
 ## 13. Accepted limitations
 
-- **Bootstrap tree sweep staleness window** (Backlog.txt): a bootstrap store whose scans come back clean backs off to
-  the 15 min cap, so a missed untracked write to the bootstrap pool's own trees can stay unhealed that long.
+- **Bootstrap tree sweep staleness window** (10.1): a missed untracked write to the bootstrap pool's own trees stays
+  unhealed until the store's next sweep, about one `bootstrapSweepInterval` (60 s) plus a tick.
 - **Head-of-line blocking on many unreadable objects** (12.8): each costs one `ObjectReadTimeout` per scan, so more
   than six at the head of a store's range use up its scan; tree reads are untimed and bounded only by the deadline.
 - **Traceless follow-ups** (Backlog.txt "Traceless commits follow-ups"): UnackedCommits entries are per transaction,

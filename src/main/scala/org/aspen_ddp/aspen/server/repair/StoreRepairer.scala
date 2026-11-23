@@ -46,8 +46,8 @@ object ScanResult:
   * @param walkComplete false when either tree's walk missed nodes deleted under it
   *
   * A node skipped because the store stopped being repairable here (left the host, went offline, is rebuilding) counts
-  * as incomplete: that may last only until the next tick, so the sweep reports needsAnotherPass = true and the store
-  * keeps its short scan interval. If the store has left for good it drops out of the repairable set anyway.
+  * as incomplete: that may last only until the next tick, so the sweep reports needsAnotherPass = true and the store's
+  * next sweep comes at the short retry interval (ScanState.nextSweep). If the store has left for good it drops out of the repairable set anyway.
   */
 final case class SweepResult(nodes: Int, reconciled: Int, incomplete: Int, walkComplete: Boolean):
   def needsAnotherPass: Boolean = reconciled > 0 || incomplete > 0 || !walkComplete

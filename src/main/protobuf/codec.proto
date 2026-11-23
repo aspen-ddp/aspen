@@ -825,6 +825,7 @@ message RepairPolicy {
   uint32 scanIntervalCapSeconds = 2;
   uint32 minErrorEntryAgeForDeletionSeconds = 3;
   uint32 proofAfterDeferrals = 4;
+  uint32 bootstrapSweepIntervalSeconds = 5;
 }
 
 message HostRepairLimits {

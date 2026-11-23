@@ -28,7 +28,9 @@ case class MetadataReadTimedOut(what: String, after: Duration)
   * bounded-parallelism gate. Each store paces itself: quiet stores back off toward the cap,
   * stores with entries snap back to the floor. That keeps the steady-state cost of a host with
   * thousands of quiet stores proportional to the cap rather than to the store count, while a
-  * store that is actually behind is revisited promptly.
+  * store that is actually behind is revisited promptly. A store of the bootstrap pool also sweeps its copies of the
+  * bootstrap pool's own tree nodes on a schedule of its own (RepairPolicy.bootstrapSweepInterval), so the scan
+  * back-off never stretches the window in which a missed untracked write to them stays unhealed.
   *
   * @param clock monotonic milliseconds; injectable so pacing is testable without sleeping
   */
@@ -45,6 +47,8 @@ class RepairService(client: AspenClient,
   private val rand = Random()
 
   private var scanStates: Map[StoreId, ScanState] = Map()
+  /** Each bootstrap store's next bootstrap tree sweep, monotonic-clock milliseconds */
+  private var sweepDue: Map[StoreId, Long] = Map()
   /** Each store's lock deferrals, kept across its scans and dropped with its ScanState when it leaves */
   private var deferrals: Map[StoreId, DeferralState] = Map()
   private var policyCache: Map[PoolId, RepairPolicy] = Map()
@@ -119,6 +123,8 @@ class RepairService(client: AspenClient,
 
   private[repair] def testingOnlyScanStates: Map[StoreId, ScanState] = synchronized { scanStates }
 
+  private[repair] def testingOnlySweepDue: Map[StoreId, Long] = synchronized { sweepDue }
+
   /** Policies are refreshed for the due set rather than for every repairable store, so per-tick
     * metadata cost tracks the work actually being done rather than the host's pool inventory. A
     * store admitted on this tick is therefore placed by ScanState.admit using whatever policy is
@@ -133,7 +139,7 @@ class RepairService(client: AspenClient,
     for
       _ <- refreshLimits()
       due = selectDue(repairable, now)
-      _ <- refreshPolicies(due.map(_.poolId).distinct)
+      _ <- refreshPolicies(due.map(_.storeId.poolId).distinct)
       _ <- runBoundedParallel(due, limitOf.maxConcurrentStoreScans)(scanOne)
     yield ()
 
@@ -173,29 +179,43 @@ class RepairService(client: AspenClient,
       case t: Throwable =>
         logger.debug(s"Repair limits read failed for host $hostId; keeping ${limitOf}: $t")
 
-  /** Drops states for departed stores, admits new ones, and returns the due set.
+  /** Drops states for departed stores, admits new ones, and returns the stores with a scan or a bootstrap tree sweep
+    * due.
     *
     * A newly admitted store is deliberately not due on the tick that admits it: admit() places
     * it at a random point inside the first floor interval so a host restart does not scan every
-    * store at once.
+    * store at once. A bootstrap store's first sweep is placed the same way (ScanState.admitSweep).
     */
-  private def selectDue(repairable: List[StoreId], now: Long): List[StoreId] = synchronized {
+  private def selectDue(repairable: List[StoreId], now: Long): List[Due] = synchronized {
     val live = repairable.toSet
     scanStates = scanStates.filter((storeId, _) => live.contains(storeId))
+    sweepDue = sweepDue.filter((storeId, _) => live.contains(storeId))
     deferrals = deferrals.filter((storeId, _) => live.contains(storeId))
 
-    repairable.filter: storeId =>
-      scanStates.get(storeId) match
+    repairable.flatMap: storeId =>
+      val scan = scanStates.get(storeId) match
         case Some(state) => state.nextDue <= now
         case None =>
           scanStates = scanStates + (storeId -> ScanState.admit(now, policyOf(storeId.poolId), rand))
           false
+      val sweep = storeId.poolId == PoolId.BootstrapPoolId && (sweepDue.get(storeId) match
+        case Some(due) => due <= now
+        case None =>
+          sweepDue = sweepDue + (storeId -> ScanState.admitSweep(now, policyOf(storeId.poolId), rand))
+          false)
+      if scan || sweep then Some(Due(storeId, scan, sweep)) else None
   }
 
-  /** runBoundedParallel fails fast, so every store's scan is recovered here: one bad store must
-    * not abort the sweep for the rest.
+  /** runBoundedParallel fails fast, so every store's scan and sweep is recovered here: one bad store must not abort
+    * the tick for the rest. When both are due the sweep runs after the entry scan settles (success or failure).
     */
-  private def scanOne(storeId: StoreId): Future[Unit] =
+  private def scanOne(due: Due): Future[Unit] =
+    for
+      _ <- if due.scan then scanEntries(due.storeId) else Future.unit
+      _ <- if due.sweep then sweepTrees(due.storeId) else Future.unit
+    yield ()
+
+  private def scanEntries(storeId: StoreId): Future[Unit] =
     val policy = policyOf(storeId.poolId)
     val scanControl = ScanControl()
 
@@ -221,37 +241,42 @@ class RepairService(client: AspenClient,
         logger.warn(s"Repair scan of $storeId failed: $t")
         false
 
-    // The bootstrap pool's trees are also written by untracked marker and deletion writes, so a store of it sweeps
-    // every node after its entry scan settles, whether or not the scan succeeded. A sweep that failed or timed out
-    // counts as needing another pass.
-    def sweepNeedsAnotherPass: Future[Boolean] =
-      if storeId.poolId != PoolId.BootstrapPoolId then
-        Future.successful(false)
-      else
-        val sweepControl = ScanControl()
-        Future.unit
-          .flatMap(_ => withDeadline(sweepDeadline, SweepTimedOut(storeId, sweepDeadline)):
-            sweepStore(storeId, policy, sweepControl))
-          .map(_.needsAnotherPass)
-          .recover:
-            case t: SweepTimedOut =>
-              // As for a cut-off scan: it stops at its next node and the DeferralState is kept
-              sweepControl.cancel()
-              logger.warn(s"Repair sweep of $storeId failed: $t")
-              true
-            case t: Throwable =>
-              logger.warn(s"Repair sweep of $storeId failed: $t")
-              true
-
-    val settled = recovered.flatMap(foundEntries => sweepNeedsAnotherPass.map(foundEntries || _))
-
-    settled.map: foundEntries =>
+    recovered.map: foundEntries =>
       synchronized:
         scanStates.get(storeId).foreach: prev =>
           scanStates = scanStates +
             (storeId -> ScanState.advance(prev, clock(), foundEntries, policy, rand))
 
+  /** The bootstrap pool's trees are also written by untracked marker and deletion writes, so a store of it sweeps every
+    * node on its own schedule. A sweep that failed or timed out counts as needing another pass.
+    */
+  private def sweepTrees(storeId: StoreId): Future[Unit] =
+    val policy = policyOf(storeId.poolId)
+    val sweepControl = ScanControl()
+
+    val needsAnotherPass = Future.unit
+      .flatMap(_ => withDeadline(sweepDeadline, SweepTimedOut(storeId, sweepDeadline)):
+        sweepStore(storeId, policy, sweepControl))
+      .map(_.needsAnotherPass)
+      .recover:
+        case t: SweepTimedOut =>
+          // As for a cut-off scan: it stops at its next node and the DeferralState is kept
+          sweepControl.cancel()
+          logger.warn(s"Repair sweep of $storeId failed: $t")
+          true
+        case t: Throwable =>
+          logger.warn(s"Repair sweep of $storeId failed: $t")
+          true
+
+    needsAnotherPass.map: again =>
+      synchronized:
+        if sweepDue.contains(storeId) then
+          sweepDue = sweepDue + (storeId -> ScanState.nextSweep(clock(), again, policy, rand))
+
 object RepairService:
+
+  /** A store with an entry scan, a bootstrap tree sweep, or both due on this tick */
+  private case class Due(storeId: StoreId, scan: Boolean, sweep: Boolean)
 
   /** schedulePeriodic fixes its period at construction and pool policies differ, so the tick is
     * a constant rather than a per-pool value. A pool whose floor is set below this is rounded up
@@ -278,7 +303,9 @@ object RepairService:
   val ScanDeadline: FiniteDuration = FiniteDuration(90, SECONDS)
 
   /** The sweep of a bootstrap store's tree nodes runs as its own step so the entry scan cannot starve it. A cut-off
-    * sweep counts as needing another pass and the next one starts from the beginning.
+    * sweep counts as needing another pass and the next one starts from the beginning. While the bootstrap pool is
+    * unreadable each sweep runs to this deadline, so a bootstrap store holds a scan slot for most of each retry
+    * interval; there are only IDA-width bootstrap stores.
     */
   val SweepDeadline: FiniteDuration = FiniteDuration(90, SECONDS)
 

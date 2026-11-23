@@ -7,6 +7,7 @@ import java.util.concurrent.{Executors, ThreadFactory}
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.mutable
+import org.aspen_ddp.aspen.server.host.DeviceIo
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.FiniteDuration
 import scala.util.{Failure, Success, Try}
@@ -71,8 +72,13 @@ class FsifBackend(val storeId: StoreId,
                   tuning: FsifTuning = FsifTuning(),
                   onFatal: Throwable => Unit = _ => (),
                   scheduler: RetryScheduler = SharedRetryScheduler,
-                  serialEc: Option[ExecutionContext] = None) extends Backend:
+                  serialEc: Option[ExecutionContext] = None,
+                  readGate: Option[DeviceIo] = None) extends Backend:
   import FsifBackend.*
+
+  /** Each disk read task submitted to `io` is counted on the device (`beginRead`) until it has run (`endRead`), so the
+    * count is the device's queued plus running reads */
+  override def readsOverBound: Boolean = readGate.exists(_.readsOverBound)
 
   private type Reply = Either[Unit, CommitError.Value] => Unit
 
@@ -1575,18 +1581,23 @@ class FsifBackend(val storeId: StoreId,
       val issueLength = st.newestHeader.map(_.sliceLength).getOrElse(-1)
       val issueVersion = st.version
       val base = layout.slotOffset(slot)
+      readGate.foreach(_.beginRead())
       try
         io.execute(new IoTask(IoKind.Read, () => {
-          val r = Try {
-            val disk = SegmentHeader.decode(dataFile.read(base, SegmentHeader.Size))
-              .filter(h => h.sliceLength >= 0 && h.sliceLength <= layout.segmentPayloadSize)
-            val length = math.max(issueLength, disk.map(_.sliceLength).getOrElse(0))
-            (disk, if length > 0 then dataFile.read(base + SegmentHeader.Size, length) else Array.emptyByteArray)
-          }
+          val r =
+            try
+              Try {
+                val disk = SegmentHeader.decode(dataFile.read(base, SegmentHeader.Size))
+                  .filter(h => h.sliceLength >= 0 && h.sliceLength <= layout.segmentPayloadSize)
+                val length = math.max(issueLength, disk.map(_.sliceLength).getOrElse(0))
+                (disk, if length > 0 then dataFile.read(base + SegmentHeader.Size, length) else Array.emptyByteArray)
+              }
+            finally readGate.foreach(_.endRead())
           post(finishRead(pointer, x, st, issueVersion, retries, r))
         }))
       catch
         case NonFatal(t) =>
+          readGate.foreach(_.endRead()) // the task was rejected, so it never runs
           finishRead(pointer, x, st, issueVersion, retries, Failure(t))
 
   private def finishRead(pointer: ObjectPointer, x: Int, st: SlotState, issueVersion: Long,
@@ -1770,10 +1781,11 @@ object FsifBackend:
     */
   def open(storeId: StoreId, path: os.Path, layout: FsifLayout, io: ExecutionContext,
            onFatal: Throwable => Unit, tuning: FsifTuning = FsifTuning(),
-           serialEc: Option[ExecutionContext] = None): FsifBackend =
+           serialEc: Option[ExecutionContext] = None, readGate: Option[DeviceIo] = None): FsifBackend =
     if !FileStat.isDir(path) then
       throw new FsifRecovery.StoreLost(s"FSIF store $storeId: its directory $path is missing")
     val files = new NioFsifFiles(path)
     if FsifRecovery.isBlank(files) then
       throw new FsifRecovery.StoreLost(s"FSIF store $storeId at $path has no FSIF data: its files are absent or empty")
-    new FsifBackend(storeId, path, layout, files, io, tuning, onFatal, serialEc = serialEc)
+    new FsifBackend(storeId, path, layout, files, io, tuning, onFatal, serialEc = serialEc,
+      readGate = readGate)

@@ -29,7 +29,7 @@ import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrashRec
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.DeviceMarkers
-import org.aspen_ddp.aspen.server.host.{CopyLayout, StoreThreadPool}
+import org.aspen_ddp.aspen.server.host.{CopyLayout, DeviceIo, StoreThreadPool}
 import org.aspen_ddp.aspen.vdisk.{DiskCatalog, DiskHandle, DiskInfo, VDiskError}
 import org.aspen_ddp.aspen.vdisk.tcmu.{LinuxTcmuKernel, TcmuEvent, TcmuNetlink, TcmuService}
 import org.aspen_ddp.aspen.vdisk.tcmu.dbus.{HandlerLogic, TcmuDbusService}
@@ -144,6 +144,8 @@ object Main {
                   networkCacheDir:Option[os.Path]=None,
                   loadJars:Option[String]=None,
                   storeThreads:Option[Int]=None,
+                  deviceIoThreads:Int=DeviceIo.Config().dataThreads,
+                  deviceReadBound:Int=DeviceIo.Config().readBound,
                   outputClientConfig:Option[os.Path]=None)
 
   class ConfigError(msg: String) extends AspenError(msg)
@@ -464,7 +466,19 @@ object Main {
         text("The number of store threads; stores are spread over them by count " +
              "(default: a quarter of the CPUs, at most 4)").
         action((x, c) => c.copy(storeThreads = Some(x))).
-        validate(x => if x >= 1 then success else failure("--store-threads must be at least 1"))
+        validate(x => if x >= 1 then success else failure("--store-threads must be at least 1")),
+
+      opt[Int]("device-io-threads").valueName("<n>").
+        text("The number of data I/O threads each storage device gets, for its stores' reads and writes " +
+             s"(default: ${DeviceIo.Config().dataThreads})").
+        action((x, c) => c.copy(deviceIoThreads = x)).
+        validate(x => if x >= 1 then success else failure("--device-io-threads must be at least 1")),
+
+      opt[Int]("device-read-bound").valueName("<n>").
+        text("The most backend reads a storage device may have outstanding before its stores drop new client reads " +
+             s"unanswered (default: ${DeviceIo.Config().readBound})").
+        action((x, c) => c.copy(deviceReadBound = x)).
+        validate(x => if x >= 1 then success else failure("--device-read-bound must be at least 1"))
     )
 
   private def amoebafsArgs(p: ArgParser): List[OptionDef[?, Args]] =
@@ -1050,7 +1064,8 @@ object Main {
             case "bootstrap" => bootstrap(createIDA(cfg), cfg.hostDirectory, cfg.hostName, cfg.address,
                                           cfg.dataPort, cfg.httpPort, cfg.storeTransferPort,
                                           cfg.outputClientConfig.getOrElse(os.pwd / ClientConfig.configFilename))
-            case "host" => run_host(cfg.hostDirectory, cfg.loadJars, cfg.storeThreads)
+            case "host" => run_host(cfg.hostDirectory, cfg.loadJars, cfg.storeThreads,
+              DeviceIo.Config(dataThreads = cfg.deviceIoThreads, readBound = cfg.deviceReadBound))
             case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir)
             case "vdisk-server" => run_vdisk_server(session, cfg.networkCacheDir)
             // OBSOLETE: see the commented-out "debug" parser entry above.
@@ -1655,11 +1670,12 @@ object Main {
   def hostLogFile(hostDir: os.Path): os.Path = hostDir / "logs" / "host.log"
 
   /** Starts the `host` command: blocks forever once the host is running. */
-  def run_host(hostDir: os.Path, loadJars: Option[String], storeThreads: Option[Int]): Int = {
+  def run_host(hostDir: os.Path, loadJars: Option[String], storeThreads: Option[Int],
+               ioConfig: DeviceIo.Config = DeviceIo.Config()): Int = {
     configureLogging(Some(hostLogFile(hostDir)))
     Thread.setDefaultUncaughtExceptionHandler(logUncaughtExceptions(scribe.Logger.root))
 
-    val h = startHost(hostDir, loadJars, storeThreads)
+    val h = startHost(hostDir, loadJars, storeThreads, ioConfig)
 
     // The storage host is meant to run indefinitely. Blocking the main thread on the IO
     // thread is what keeps the process alive; the IO thread itself is a daemon thread.
@@ -1681,7 +1697,8 @@ object Main {
    */
   def startHost(hostDir: os.Path,
                 loadJars: Option[String] = None,
-                storeThreads: Option[Int] = None): RunningHost = {
+                storeThreads: Option[Int] = None,
+                ioConfig: DeviceIo.Config = DeviceIo.Config()): RunningHost = {
 
     val userTypeFactories = loadJars.map(UserJarLoader.load(hostDir, _)).getOrElse(Nil)
 
@@ -1760,7 +1777,7 @@ object Main {
       bootstrapCfg.aspenSystemId,
       hostDir,
       ec,
-      storeThreads.fold(new StoreThreadPool())(new StoreThreadPool(_)),
+      new StoreThreadPool(storeThreads.getOrElse(StoreThreadPool.DefaultThreads), ioConfig = ioConfig),
       objectCacheFactory,
       nodeNet,
       new BackgroundTaskManager(ec),

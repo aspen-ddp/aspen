@@ -48,6 +48,11 @@ trait Backend extends Logging {
   /** Writes are held because the device is full; reads go on. Readable from any thread. */
   def isWriteFrozen: Boolean = false
 
+  /** The device's backlog of outstanding backend reads is over its bound (DeviceIo.readsOverBound): the Frontend then
+    * drops new client reads before they create any state. Readable from any thread. False for a backend with no device.
+    */
+  def readsOverBound: Boolean = false
+
   def close(): Future[Unit]
 
   def estimateSize(): Long

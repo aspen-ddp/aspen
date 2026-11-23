@@ -376,6 +376,17 @@
   of them when holding ends. It runs once, through `reconcileForRepair` with
   `awaitSettle` off. Past `Frontend.RepairSettleWait` (1 s, `expireParkedRepairs` on the store heartbeat) it answers
   stale. Fail-stop and close fail it
+- Read bound (device-io-isolation design section 6): the device counts its outstanding backend reads
+  (`DeviceIo.beginRead`/`endRead`, across all its stores). `Backend.readsOverBound` (default false, readable from any
+  thread; FSIF and RocksDB delegate to their `DeviceIo`) is checked only where a client read enters,
+  `readObjectForNetwork`, before any state exists (no pending read, no parked read, no answer): over the bound the read
+  is dropped and the client reads the other stores. This also drops a read that would be served from the cache, which
+  keeps the entry check simple. Internal reads (`TransactionRead`, `SnapshotRead`, `ReconcileRead`, rebuild source
+  reads) and writes are never dropped or counted. Logged once per transition into and out of the state per store
+  (`dropForReadBound`). Counting: FSIF counts each disk read task from `io.execute` until the task has run (a rejected
+  task is ended at once; a retry is a new task), RocksDB counts each `getValue` attempt until its Future completes. Every
+  outcome ends the count; the Future always completes (a closed database fails it with `DBClosed`), and FSIF's close
+  waits for reads in flight. Limit: `--device-read-bound` (default 4096), threads `--device-io-threads` (default 4)
 - Parked reads (client 1-RTT commit design section 5): a client read whose `Read.awaitCommit` names a transaction
   holding a write lock on the object's in-memory state (`lockedWriteTransactions`) is parked (`parkRead`, keyed by
   object and `readUUID`: a resent read replaces its entry) instead of answered: the client knows that transaction

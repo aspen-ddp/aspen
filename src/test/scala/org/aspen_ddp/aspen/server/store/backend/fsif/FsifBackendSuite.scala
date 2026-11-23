@@ -94,7 +94,8 @@ class FsifBackendSuite extends FileBasedTests:
   private final class Harness(seed: Int = 0, val lay: FsifLayout = layout,
                               mkIo: () => ExecutionContext = () => InlineEc,
                               tuning: FsifTuning = FsifTuning(cowThreshold = 256),
-                              wrap: FsifFiles => FsifFiles = f => f):
+                              wrap: FsifFiles => FsifFiles = f => f,
+                              gate: Option[org.aspen_ddp.aspen.server.host.DeviceIo] = None):
     var files = new SimulatedFsifFiles(rng(seed))
     FsifRecovery.initialize(files, lay)
     val fatals = new ConcurrentLinkedQueue[Throwable]()
@@ -104,7 +105,8 @@ class FsifBackendSuite extends FileBasedTests:
     private var txn = 0
 
     private def open(): FsifBackend =
-      val b = new FsifBackend(storeId, tdir / "fsif", lay, wrap(files), io, tuning, t => fatals.add(t))
+      val b = new FsifBackend(storeId, tdir / "fsif", lay, wrap(files), io, tuning, t => fatals.add(t),
+        readGate = gate)
       b.setCompletionHandler(rec)
       b
 
@@ -412,6 +414,57 @@ class FsifBackendSuite extends FileBasedTests:
     h.commitOk(delete(ptr(30, oid(30)), 1))
     h.quiesce()
     journalSize shouldBe before
+
+  test("a read is counted on the device from submission until its disk task has run"):
+    val dio = new org.aspen_ddp.aspen.server.TestDeviceIo(tdir, readBound = 1)
+    val gateEc = new GateEc(isKind(FsifBackend.IoKind.Read))
+    val h = new Harness(mkIo = () => gateEc, gate = Some(dio))
+    val p = ptr(1, oid(1))
+    h.commitOk(alloc(p, bytes(50, 1), 1))
+    h.quiesce()
+    h.backend.readsOverBound shouldBe false
+    val held = h.issueRead(p)
+    h.pump()
+    gateEc.heldCount shouldBe 1
+    dio.reads.get shouldBe 1
+    h.backend.readsOverBound shouldBe true
+    gateEc.release()
+    h.await(held).isLeft shouldBe true
+    dio.reads.get shouldBe 0
+    h.backend.readsOverBound shouldBe false
+
+  test("a read whose disk task is rejected, and one that fails to read, are both uncounted"):
+    val dio = new org.aspen_ddp.aspen.server.TestDeviceIo(tdir, readBound = 1)
+    val reject = new AtomicBoolean(true)
+    val tearing = new AtomicBoolean(false)
+    val ec = new RejectingEc(r => reject.get && isKind(FsifBackend.IoKind.Read)(r))
+    val h = new Harness(mkIo = () => ec, gate = Some(dio),
+      tuning = FsifTuning(cowThreshold = 256, readRetryDelays = Nil))
+    val p = ptr(1, oid(1))
+    h.commitOk(alloc(p, bytes(50, 1), 1))
+    h.quiesce()
+    h.read(p) shouldBe Right(ReadError.CorruptedObject) // rejected, no retries left
+    dio.reads.get shouldBe 0
+    reject.set(false)
+    h.read(p).isLeft shouldBe true // completes normally afterwards
+    dio.reads.get shouldBe 0
+
+  test("closing with a read pending leaves the count at zero once the read's task has run"):
+    val dio = new org.aspen_ddp.aspen.server.TestDeviceIo(tdir, readBound = 1)
+    val gateEc = new GateEc(isKind(FsifBackend.IoKind.Read))
+    val h = new Harness(mkIo = () => gateEc, gate = Some(dio))
+    val p = ptr(1, oid(1))
+    h.commitOk(alloc(p, bytes(50, 1), 1))
+    h.quiesce()
+    val held = h.issueRead(p)
+    h.pump()
+    dio.reads.get shouldBe 1
+    val closed = h.backend.close() // waits for the read in flight
+    closed.isCompleted shouldBe false
+    gateEc.release()
+    Await.result(closed, Timeout)
+    h.await(held)
+    dio.reads.get shouldBe 0
 
   test("a read whose header read tears while the slot changes is retried, not reported corrupt"):
     val gate = new GateEc(isKind(FsifBackend.IoKind.Read))

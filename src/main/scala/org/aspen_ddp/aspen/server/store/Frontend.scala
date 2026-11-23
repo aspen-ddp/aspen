@@ -1830,10 +1830,27 @@ class Frontend(val storeId: StoreId,
       logger.trace(s"Store $storeId dropped read $readUUID: fail-stopped")
     else if holding then
       logger.trace(s"Store $storeId dropped read $readUUID: holding for recovered transactions")
+    else if dropForReadBound() then
+      logger.trace(s"Store $storeId dropped read $readUUID: its device's read backlog is over the bound")
     else
       parkedReads.remove(pointer.id, readUUID)
       if awaitCommit.isEmpty || !parkRead(clientId, readUUID, pointer, readType, awaitCommit) then
         readForNetwork(clientId, readUUID, pointer, readType)
+
+  /** True while the device's outstanding backend reads are over its bound (Backend.readsOverBound): a client read is
+    * then dropped unanswered, before it creates any state, and the client reads the other stores. Only client reads are
+    * dropped, never an internal one. Logs once per transition into and out of the state, not per read. */
+  private def dropForReadBound(): Boolean =
+    val over = backend.readsOverBound
+    if over != overReadBound then
+      overReadBound = over
+      if over then
+        logger.warn(s"Store $storeId: its device's read backlog is over the bound, dropping client reads")
+      else
+        logger.info(s"Store $storeId: its device's read backlog is back under the bound, serving client reads")
+    over
+
+  private var overReadBound = false
 
   /** Parks a re-read whose client knows a transaction committed that still holds a write lock on the object here
     * (Read.awaitCommit): answered now, it would only show the lock again, and the client would re-read until this

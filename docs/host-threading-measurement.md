@@ -99,7 +99,8 @@ improve, also add the busiest threads and where they spend their time as the nex
 
 The measurements are summarised under "Store commit delay" and "Adaptive store threading" in `Todo.txt`. The
 default is now a fixed pool of min(4, CPUs/4) store threads, stores spread over them by count; `--store-threads=<n>`
-sets the count. The adaptive policy (`StoreThreadPool.Adaptive`) is parked and can only be chosen in code: to measure
+sets the count. (Per-device I/O: `--device-io-threads=<n>` data threads per storage device, default 4, and
+`--device-read-bound=<n>` outstanding backend reads before a device's stores drop new client reads, default 4096.) The adaptive policy (`StoreThreadPool.Adaptive`) is parked and can only be chosen in code: to measure
 it again, pass `adaptive = Some(StoreThreadPool.Adaptive())` where `Main.startHost` builds the pool. It packs stores
 onto threads by load and adds threads only when work waits for them. Warm the pool up before capturing, as its runs
 in `results/` (`after-adaptive`, `after-packed`) did: run each job uncaptured until the host log shows no

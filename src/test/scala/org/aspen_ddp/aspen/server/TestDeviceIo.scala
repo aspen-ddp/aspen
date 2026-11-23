@@ -11,15 +11,17 @@ import org.aspen_ddp.aspen.server.host.{DeviceIo, DeviceIoObserver, JobHandle, J
  *  own, `DeviceControl.deviceIos`): `submit` runs the job in the caller before returning, so the Future is completed
  *  and a yield loop needs no real-time wait. It owns no threads, so nothing leaks; `dataEc` and `serialEc` are the
  *  global pool. */
-final class TestDeviceIo(val path: os.Path) extends DeviceIo:
+final class TestDeviceIo(val path: os.Path, readBound: Int = Int.MaxValue) extends DeviceIo:
+  /** Reads begun and not ended, as ThreadedDeviceIo counts them; over the bound once it reaches `readBound` */
+  val reads = new java.util.concurrent.atomic.AtomicInteger(0)
   val observer: DeviceIoObserver = new DeviceIoObserver
   def label: String = "test"
   def setDeviceId(id: StorageDeviceId): Unit = ()
   def dataEc: ExecutionContext = ExecutionContext.global
   def serialEc: ExecutionContext = ExecutionContext.global
-  def beginRead(): Unit = ()
-  def endRead(): Unit = ()
-  def readsOverBound: Boolean = false
+  def beginRead(): Unit = reads.incrementAndGet()
+  def endRead(): Unit = reads.decrementAndGet()
+  def readsOverBound: Boolean = reads.get() >= readBound
   def close(): Unit = ()
 
   def submit[T](kind: JobKind, store: Option[StoreId])(job: => T): JobHandle[T] =

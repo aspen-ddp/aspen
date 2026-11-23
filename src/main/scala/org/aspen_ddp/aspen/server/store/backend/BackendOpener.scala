@@ -48,7 +48,8 @@ class DefaultBackendOpener(ec: ExecutionContext) extends BackendOpener:
                       layout: FsifLayout,
                       onFatal: Throwable => Unit,
                       io: DeviceIo): Backend =
-    FsifBackend.open(storeId, storePath, layout, io.dataEc, onFatal, serialEc = Some(io.serialEc))
+    FsifBackend.open(storeId, storePath, layout, io.dataEc, onFatal, serialEc = Some(io.serialEc),
+      readGate = Some(io))
 
 object DefaultBackendOpener:
   /** Creates `storeCfg`'s store at `storePath` atomically, blocking: its backend initialized empty and closed, then

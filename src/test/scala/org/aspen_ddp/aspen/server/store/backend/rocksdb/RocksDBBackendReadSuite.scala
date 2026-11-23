@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.{Completion, CompletionHandler, Read, RetryScheduler}
 import org.aspen_ddp.aspen.server.TestDeviceIo
+import org.aspen_ddp.aspen.server.host.DeviceIo
 import org.rocksdb.{RocksDBException, Status}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -34,8 +35,8 @@ object RocksDBBackendReadSuite:
   /** Fails the first `failures.size` reads with the given errors, in order. Later reads return `stored` when given,
     * else read the database. */
   final class FailingReads(dir: os.Path, failures: Seq[Throwable], scheduler: RetryScheduler,
-                           stored: Option[Array[Byte]])
-    extends RocksDBBackend(dir, storeId, TestDeviceIo.of(dir), RetryScheduler.ReadRetryDelays, scheduler):
+                           stored: Option[Array[Byte]], io: DeviceIo)
+    extends RocksDBBackend(dir, storeId, io, RetryScheduler.ReadRetryDelays, scheduler):
     private val remaining = mutable.Queue(failures*)
     @volatile var attempts = 0
     override protected def getValue(key: Array[Byte]): Future[Option[Array[Byte]]] =
@@ -49,12 +50,13 @@ class RocksDBBackendReadSuite extends AnyFunSuite with Matchers:
 
   private def readOnce(failures: Seq[Throwable],
                        storedValue: Option[Array[Byte]] = None,
-                       store: Boolean = true): (Either[Any, ReadError.Value], FailingReads, ImmediateScheduler) =
+                       store: Boolean = true,
+                       io: Option[TestDeviceIo] = None): (Either[Any, ReadError.Value], FailingReads, ImmediateScheduler) =
     val dir = os.temp.dir()
     try
       RocksDBBackend.initializeStore(dir)
       val scheduler = ImmediateScheduler()
-      val backend = FailingReads(dir, failures, scheduler, storedValue)
+      val backend = FailingReads(dir, failures, scheduler, storedValue, io.getOrElse(TestDeviceIo.of(dir)))
       try
         if store then
           backend.bootstrapAllocate(objectId, ObjectType.Data,
@@ -98,3 +100,42 @@ class RocksDBBackendReadSuite extends AnyFunSuite with Matchers:
     val (result, _, scheduler) = readOnce(Nil, storedValue = Some(Array[Byte](0, 1)), store = false)
     result should be(Right(ReadError.CorruptedObject))
     scheduler.delays should be(empty)
+
+  test("every read attempt is counted on the device and ended, whether it succeeds, fails or is retried"):
+    val dir = os.temp.dir()
+    val io = new TestDeviceIo(dir, readBound = 1)
+    val ok = readOnce(Nil, io = Some(io))
+    ok._1.isLeft should be(true)
+    io.reads.get should be(0)
+    val retried = readOnce(Seq(status(Status.Code.IOError), new java.io.IOException("EMFILE")), io = Some(io))
+    retried._1.isLeft should be(true)
+    retried._2.attempts should be(3)
+    io.reads.get should be(0)
+    val corrupt = readOnce(Seq(status(Status.Code.Corruption)), io = Some(io))
+    corrupt._1 should be(Right(ReadError.CorruptedObject))
+    io.reads.get should be(0)
+    val exhausted = readOnce(Seq.fill(RetryScheduler.ReadRetryDelays.size + 1)(status(Status.Code.IOError)), io = Some(io))
+    exhausted._1 should be(Right(ReadError.CorruptedObject))
+    io.reads.get should be(0)
+    os.remove.all(dir)
+
+  test("a read of a closed database is ended, and the backend reports the device's bound"):
+    val dir = os.temp.dir()
+    try
+      RocksDBBackend.initializeStore(dir)
+      val io = new TestDeviceIo(dir, readBound = 1)
+      val backend = new RocksDBBackend(dir, storeId, io)
+      backend.readsOverBound should be(false)
+      io.beginRead()
+      backend.readsOverBound should be(true)
+      io.endRead()
+      val completed = Promise[Completion]()
+      backend.setCompletionHandler(new CompletionHandler:
+        override def complete(op: Completion): Unit = completed.trySuccess(op))
+      Await.result(backend.close(), 10.seconds)
+      backend.read(pointer)
+      Await.result(completed.future, 10.seconds) match
+        case r: Read => r.result should be(Right(ReadError.CorruptedObject))
+        case other => fail(s"Expected a Read, got $other")
+      io.reads.get should be(0)
+    finally os.remove.all(dir)

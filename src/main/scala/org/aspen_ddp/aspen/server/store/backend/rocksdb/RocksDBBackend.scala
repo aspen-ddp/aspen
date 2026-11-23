@@ -236,6 +236,8 @@ class RocksDBBackend(dbPath: os.Path,
   
   override def path: os.Path = dbPath
 
+  override def readsOverBound: Boolean = io.readsOverBound
+
   override def setCompletionHandler(handler: CompletionHandler): Unit = {
     chandler = Some(handler)
   }
@@ -312,11 +314,20 @@ class RocksDBBackend(dbPath: os.Path,
             logger.error(s"RocksDBBackend found corrupted object $objectId: $e")
             complete(Right(ReadError.CorruptedObject))
 
+    // Counted on the device from submission until the get has finished, whatever its outcome. The get is a Future on
+    // the device's data pool that always completes (a closed database fails it with DBClosed), so a count never leaks
+    io.beginRead()
     Try(getValue(tokey(objectId))) match
-      case Failure(err) => failed(err)
+      case Failure(err) =>
+        io.endRead()
+        failed(err)
       case Success(fget) => fget.onComplete:
-        case Failure(err) => failed(err)
-        case Success(oresult) => decoded(oresult)
+        case Failure(err) =>
+          io.endRead()
+          failed(err)
+        case Success(oresult) =>
+          io.endRead()
+          decoded(oresult)
 
   override def commit(state: CommitState, transactionId: TransactionId): Unit = {
     chandler.foreach { handler =>

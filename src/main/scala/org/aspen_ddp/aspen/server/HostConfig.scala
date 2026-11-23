@@ -20,7 +20,6 @@ object-cache-mb: 8192         # optional. Shared by all stores on the host. defa
 rocksdb:                      # optional, as is each entry. Shared by all RocksDB stores on the host
   memory-mb: 4096             # default: 25% of physical RAM
   write-buffer-mb: 1024       # default: 25% of memory-mb
-  max-background-threads: 8   # default: number of cores
 tls-certificate: |
   -----BEGIN CERTIFICATE-----
   ...
@@ -60,8 +59,7 @@ case class HostConfig(hostId: HostId,
     val rocksdbCfg =
       val entries = List(
         rocksdb.memoryMb.map(v => s"  memory-mb: $v\n"),
-        rocksdb.writeBufferMb.map(v => s"  write-buffer-mb: $v\n"),
-        rocksdb.maxBackgroundThreads.map(v => s"  max-background-threads: $v\n")).flatten
+        rocksdb.writeBufferMb.map(v => s"  write-buffer-mb: $v\n")).flatten
       if entries.isEmpty then
         ""
       else
@@ -83,23 +81,19 @@ object HostConfig extends YObject[HostConfig]:
 
   /** Host-wide RocksDB limits. Unspecified values are derived from the machine. See RocksDBBackend.ResourceConfig */
   case class RocksDBResources(memoryMb: Option[Int] = None,
-                              writeBufferMb: Option[Int] = None,
-                              maxBackgroundThreads: Option[Int] = None):
+                              writeBufferMb: Option[Int] = None):
     def resourceConfig: RocksDBBackend.ResourceConfig = RocksDBBackend.ResourceConfig.resolve(
       memoryMb.map(_.toLong * 1024 * 1024),
-      writeBufferMb.map(_.toLong * 1024 * 1024),
-      maxBackgroundThreads)
+      writeBufferMb.map(_.toLong * 1024 * 1024))
 
   object RocksDBResources extends YObject[RocksDBResources]:
     val memoryMb: Optional[Int]             = Optional("memory-mb", YInt)
     val writeBufferMb: Optional[Int]        = Optional("write-buffer-mb", YInt)
-    val maxBackgroundThreads: Optional[Int] = Optional("max-background-threads", YInt)
-    val attrs: List[Attr] = memoryMb :: writeBufferMb :: maxBackgroundThreads :: Nil
+    val attrs: List[Attr] = memoryMb :: writeBufferMb :: Nil
 
     def create(o: Object): RocksDBResources = RocksDBResources(
       memoryMb.get(o),
-      writeBufferMb.get(o),
-      maxBackgroundThreads.get(o))
+      writeBufferMb.get(o))
 
   val hostId: Required[HostId]         = Required("host-id", HostId.YHostId)
   val aspenSystemId: Required[UUID]    = Required("aspen-system-id", YUUID)

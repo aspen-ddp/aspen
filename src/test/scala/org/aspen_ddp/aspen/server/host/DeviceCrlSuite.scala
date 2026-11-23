@@ -19,7 +19,7 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
   TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.server.{DeviceMarkers, DurableFiles, GossipRetransmitter, Host, StorageDeviceConfig,
+import org.aspen_ddp.aspen.server.{TestDeviceIo, DeviceMarkers, DurableFiles, GossipRetransmitter, Host, StorageDeviceConfig,
   StorageDeviceManager, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrashRecoveryLogFactory, CrlAdmission, CrlCorrupt,
   StoreRecoveryState, TransactionRecoveryState}
@@ -181,7 +181,7 @@ private class FailingRocksOpener(ec: ExecutionContext) extends DefaultBackendOpe
     onFatals = onFatal :: onFatals
     storeCfg.backend match
       case _: StoreConfig.RocksDB =>
-        io.submit(JobKind.BackendOpen, Some(storeCfg.storeId))(new RocksDBBackend(storePath, storeCfg.storeId, ec):
+        io.submit(JobKind.BackendOpen, Some(storeCfg.storeId))(new RocksDBBackend(storePath, storeCfg.storeId, io):
           override def hasFailed: Boolean = super.hasFailed || FailingRocksOpener.this.failing).future
       case _ => super.open(storeCfg, storePath, onFatal, io)
 
@@ -278,7 +278,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     DefaultBackendOpener.createStore(StoreConfig(sid, StoreConfig.RocksDB(None), None, org.aspen_ddp.aspen.common.ida.Replication(3, 2)), storeDir,
       deviceDir / StoreCreation.CreatingDirectory)
     // Not the suite's serial context: bootstrapAllocate blocks on work it runs there
-    val initial = new RocksDBBackend(storeDir, sid, ExecutionContext.global)
+    val initial = new RocksDBBackend(storeDir, sid, TestDeviceIo.of(storeDir))
     initial.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
       DataBuffer(Array[Byte](0)))
     initial.close().map(_ => storeDir)
@@ -531,7 +531,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
     createCrl(deviceDir)
     val storeDir = writeStoreDir(deviceDir)
     // Not the suite's serial context: bootstrapAllocate blocks on work it runs there
-    val initial = new RocksDBBackend(storeDir, storeId, ExecutionContext.global)
+    val initial = new RocksDBBackend(storeDir, storeId, TestDeviceIo.of(storeDir))
     initial.bootstrapAllocate(oid, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
       DataBuffer(Array[Byte](0)))
 
@@ -2943,7 +2943,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       host.receiveTransactionMessage(TxPrepare(storeId, net.storeId0,
         overwriteTxd(TransactionId(new UUID(78, i)), 1, objectId = oids(i)), ProposalId.initialProposal(1),
         List(ObjectUpdate(oids(i), DataBuffer(data))), true))
-    val initial = new RocksDBBackend(storeDir, storeId, ExecutionContext.global)
+    val initial = new RocksDBBackend(storeDir, storeId, TestDeviceIo.of(storeDir))
     oids.foreach: o =>
       initial.bootstrapAllocate(o, ObjectType.Data, Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
         DataBuffer(Array[Byte](0)))

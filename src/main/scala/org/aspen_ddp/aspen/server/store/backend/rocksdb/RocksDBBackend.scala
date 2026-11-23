@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server.store.backend.rocksdb
 
 import org.aspen_ddp.aspen.server.FileStat
+import org.aspen_ddp.aspen.server.host.DeviceIo
 import org.aspen_ddp.aspen.server.store.backend.*
 import java.nio.ByteBuffer
 import org.aspen_ddp.aspen.common.DataBuffer
@@ -58,13 +59,11 @@ object RocksDBBackend extends Logging {
     *                             against this cache so this is the overall RocksDB memory budget.
     * @param writeBufferBytes     Portion of memoryBytes that the memtables of all databases may use before flushes
     *                             are forced.
-    * @param maxBackgroundThreads Upper bound on the flush plus compaction threads shared by all databases
     */
-  case class ResourceConfig(memoryBytes: Long, writeBufferBytes: Long, maxBackgroundThreads: Int) {
+  case class ResourceConfig(memoryBytes: Long, writeBufferBytes: Long) {
     require(memoryBytes > 0, s"RocksDB memory must be positive: $memoryBytes")
     require(writeBufferBytes > 0 && writeBufferBytes <= memoryBytes,
       s"RocksDB write buffer size must be positive and no larger than the memory budget: $writeBufferBytes")
-    require(maxBackgroundThreads >= 2, s"RocksDB requires at least 2 background threads: $maxBackgroundThreads")
   }
 
   object ResourceConfig {
@@ -75,27 +74,25 @@ object RocksDBBackend extends Logging {
 
     /** Fills in any unspecified values with defaults derived from the machine's RAM and core count */
     def resolve(memoryBytes: Option[Long] = None,
-                writeBufferBytes: Option[Long] = None,
-                maxBackgroundThreads: Option[Int] = None): ResourceConfig = {
+                writeBufferBytes: Option[Long] = None): ResourceConfig = {
       val memory = memoryBytes.getOrElse((physicalMemory() * DefaultMemoryFraction).toLong)
       ResourceConfig(
         memory,
-        writeBufferBytes.getOrElse((memory * DefaultWriteBufferFraction).toLong),
-        maxBackgroundThreads.getOrElse(math.max(2, Runtime.getRuntime.availableProcessors)))
+        writeBufferBytes.getOrElse((memory * DefaultWriteBufferFraction).toLong))
     }
   }
 
-  /** Splits the shared background threads into (compaction, flush) pool sizes.
-    *
-    * Each database runs one flush and one compaction at a time by default (max_background_jobs = 2) so the pools
-    * grow by two threads per open database until maxBackgroundThreads is reached. A quarter of the threads, and
-    * never less than one, serve flushes since a stalled flush blocks writes.
+  /** Background job slots that `openDatabases` open databases get from the process-wide default Env, as
+    * (compaction, flush) pool sizes. Every database is opened with max_background_jobs = 2, which RocksDB turns into
+    * at most one flush and one compaction at a time, so one slot of each kind per database lets every database always
+    * find a free thread even if the databases of a hung device hold theirs forever. Uncapped, minimum one each.
     */
-  def threadAllocation(openDatabases: Int, maxBackgroundThreads: Int): (Int, Int) = {
-    val total = math.max(2, math.min(maxBackgroundThreads, 2 * openDatabases))
-    val flush = math.max(1, total / 4)
-    (total - flush, flush)
-  }
+  def threadAllocation(openDatabases: Int): (Int, Int) =
+    val slots = math.max(1, openDatabases)
+    (slots, slots)
+
+  /** One flush and one compaction at most per database, see threadAllocation */
+  private val MaxBackgroundJobsPerDatabase = 2
 
   // All databases use RocksDB's default Env, whose background thread pools are process-wide. RocksDB only grows
   // those pools to what a single database needs so they are resized here as databases are opened and closed.
@@ -132,7 +129,7 @@ object RocksDBBackend extends Logging {
   }
 
   private def resizeThreadPools(): Unit = synchronized {
-    val (compaction, flush) = threadAllocation(openDatabases, currentConfig.maxBackgroundThreads)
+    val (compaction, flush) = threadAllocation(openDatabases)
     val env = Env.getDefault
     env.setBackgroundThreads(compaction, Priority.LOW)
     env.setBackgroundThreads(flush, Priority.HIGH)
@@ -148,7 +145,7 @@ object RocksDBBackend extends Logging {
         val cache = new LRUCache(cfg.memoryBytes)
         val m = (cache, new WriteBufferManager(cfg.writeBufferBytes, cache))
         logger.info(s"RocksDB shared resources: memory=${cfg.memoryBytes} writeBuffer=${cfg.writeBufferBytes} " +
-          s"bytes, maxBackgroundThreads=${cfg.maxBackgroundThreads}")
+          "bytes")
         sharedMemory = Some(m)
         m
     }
@@ -180,6 +177,7 @@ object RocksDBBackend extends Logging {
       .setCreateIfMissing(createIfMissing)
       .setTableFormatConfig(new BlockBasedTableConfig().setBlockCache(cache))
       .setWriteBufferManager(wbm)
+      .setMaxBackgroundJobs(MaxBackgroundJobsPerDatabase)
 
     // Opening may replay a large WAL so it is done outside the lock
     val db = try {
@@ -217,12 +215,13 @@ object RocksDBBackend extends Logging {
 
 class RocksDBBackend(dbPath: os.Path,
                      override val storeId: StoreId,
-                     val executionContext: ExecutionContext,
+                     io: DeviceIo,
                      readRetryDelays: Seq[FiniteDuration] = RetryScheduler.ReadRetryDelays,
                      scheduler: RetryScheduler = SharedRetryScheduler) extends Backend {
 
   import RocksDBBackend._
   
+  val executionContext: ExecutionContext = io.dataEc
   given ExecutionContext = executionContext
 
   private var chandler: Option[CompletionHandler] = None

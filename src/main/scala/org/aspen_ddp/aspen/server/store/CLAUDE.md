@@ -337,7 +337,15 @@
   its `serialEc` (threads `dev-<label>-io-N` / `-serial-N`), so a hung device stalls only its own stores; its
   `close()` closes the channels on the data pool. Compaction's truncate of free tail slots still runs inline on the
   serial executor (a device thread, so contained to its device; making it asynchronous would race the slot
-  allocator). RocksDB keeps the host's `ec` for its own work. `FsifBackend.sharedIo`/`sharedSerial` are for tests only
+  allocator). RocksDB's foreground work (reads, the write-batch commit, iteration, close) runs on the device's `dataEc`
+  (`RocksDBBackend(path, storeId, io: DeviceIo)`; `BufferedConsistentRocksDB`'s `ec` is `io.dataEc`). RocksJava 8.11.3
+  has no per-database or per-device background pool: every database uses `Env.getDefault()`, whose LOW (compaction)
+  and HIGH (flush) pools are process-wide. So each database is opened with `setMaxBackgroundJobs(2)` (at most one
+  flush and one compaction) and `RocksDBBackend.threadAllocation(openDbs)` sizes the pools to `(openDbs, openDbs)`,
+  minimum 1 each, uncapped (there is no `maxBackgroundThreads` setting): a hung device's databases can hold only their
+  own slots, so every other database always finds a free thread. The block cache and `WriteBufferManager` stay
+  host-wide, so a hung database's unflushable memtables keep their share of write-buffer memory and other databases
+  flush earlier: degraded, not hung. `FsifBackend.sharedIo`/`sharedSerial` are for tests only
 - Creation is atomic for every backend (`StoreCreation`, systemic-loss-protection 4.1, row D5): `BackendOpener.create`
   builds the store, backend initialized and closed plus its config, in a scratch directory under `<device>/creating/`,
   forces the tree and renames it to the store's path: for a store, a fresh Live copy `<device>/live/<copy>`

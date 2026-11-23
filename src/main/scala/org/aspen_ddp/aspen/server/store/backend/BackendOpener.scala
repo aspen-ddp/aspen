@@ -36,7 +36,7 @@ class DefaultBackendOpener(ec: ExecutionContext) extends BackendOpener:
     val storeId = storeCfg.storeId
     io.submit(JobKind.BackendOpen, Some(storeId)):
       storeCfg.backend match
-        case _: StoreConfig.RocksDB => new RocksDBBackend(storePath, storeId, ec)
+        case _: StoreConfig.RocksDB => new RocksDBBackend(storePath, storeId, io)
         case b: StoreConfig.Fsif =>
           openFsifBackend(storeId, storePath, FsifLayout(b.segmentPayloadSize, b.segmentCount), onFatal, io)
     .future

@@ -5,36 +5,47 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ReadErro
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.store.backend.{Completion, CompletionHandler, Read}
+import org.aspen_ddp.aspen.server.TestDeviceIo
+import org.aspen_ddp.aspen.server.host.{DeviceIo, ThreadedDeviceIo}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 class RocksDBBackendResourcesSuite extends AnyFunSuite with Matchers:
 
-  test("thread pools keep RocksDB's minimum of one compaction and one flush thread"):
-    RocksDBBackend.threadAllocation(0, 16) should be((1, 1))
-    RocksDBBackend.threadAllocation(1, 16) should be((1, 1))
-
-  test("thread pools grow by two threads per open database"):
-    RocksDBBackend.threadAllocation(2, 16) should be((3, 1))
-    RocksDBBackend.threadAllocation(4, 16) should be((6, 2))
-
-  test("thread pools are capped by maxBackgroundThreads"):
-    RocksDBBackend.threadAllocation(100, 16) should be((12, 4))
-    RocksDBBackend.threadAllocation(100, 2) should be((1, 1))
+  test("background pools cover every open database"):
+    RocksDBBackend.threadAllocation(0) should be((1, 1))
+    RocksDBBackend.threadAllocation(7) should be((7, 7))
+    RocksDBBackend.threadAllocation(40) should be((40, 40))
 
   test("resolve derives unspecified values from the machine"):
     val rc = ResourceConfig.resolve()
     rc.memoryBytes should be > 0L
     rc.writeBufferBytes should be((rc.memoryBytes * ResourceConfig.DefaultWriteBufferFraction).toLong)
-    rc.maxBackgroundThreads should be(math.max(2, Runtime.getRuntime.availableProcessors))
 
   test("resolve keeps explicitly specified values"):
-    ResourceConfig.resolve(Some(1000L), Some(100L), Some(4)) should be(ResourceConfig(1000L, 100L, 4))
+    ResourceConfig.resolve(Some(1000L), Some(100L)) should be(ResourceConfig(1000L, 100L))
 
   test("invalid limits are rejected"):
-    an [IllegalArgumentException] should be thrownBy ResourceConfig(0L, 0L, 4)
-    an [IllegalArgumentException] should be thrownBy ResourceConfig(100L, 200L, 4)
-    an [IllegalArgumentException] should be thrownBy ResourceConfig(100L, 50L, 1)
+    an [IllegalArgumentException] should be thrownBy ResourceConfig(0L, 0L)
+    an [IllegalArgumentException] should be thrownBy ResourceConfig(100L, 200L)
+
+  test("RocksDB writes run on the device data pool"):
+    val dir = os.temp.dir()
+    val io = new ThreadedDeviceIo(dir, DeviceIo.Config())
+    try
+      val storeId = StoreId(PoolId(new java.util.UUID(0, 3)), 0)
+      RocksDBBackend.initializeStore(dir)
+      val writer = new java.util.concurrent.atomic.AtomicReference[String]()
+      val db = new BufferedConsistentRocksDB(dir)(using io.dataEc):
+        override protected def writeBatch(opts: org.rocksdb.WriteOptions, batch: org.rocksdb.WriteBatch): Unit =
+          writer.set(Thread.currentThread.getName)
+          super.writeBatch(opts, batch)
+      scala.concurrent.Await.result(db.put(Array[Byte](1), Array[Byte](2)), scala.concurrent.duration.Duration(10, "s"))
+      writer.get should include("-io-")
+      scala.concurrent.Await.result(db.close(), scala.concurrent.duration.Duration(10, "s"))
+    finally
+      io.close()
+      os.remove.all(dir)
 
   test("decodeDBValue rejects an unknown object type byte"):
     an [RocksDBBackend.CorruptedObjectEncoding] should be thrownBy
@@ -45,7 +56,7 @@ class RocksDBBackendResourcesSuite extends AnyFunSuite with Matchers:
     try
       val storeId = StoreId(PoolId(new java.util.UUID(0, 1)), 0)
       RocksDBBackend.initializeStore(dir)
-      val backend = new RocksDBBackend(dir, storeId, scala.concurrent.ExecutionContext.global)
+      val backend = new RocksDBBackend(dir, storeId, TestDeviceIo.of(dir))
       val completed = scala.concurrent.Promise[Completion]()
       backend.setCompletionHandler(new CompletionHandler:
         override def complete(op: Completion): Unit = completed.trySuccess(op))
@@ -84,6 +95,6 @@ class RocksDBBackendResourcesSuite extends AnyFunSuite with Matchers:
       os.write(dir / "aspen-store-config.yaml", "store-id: x")
       val storeId = StoreId(PoolId(new java.util.UUID(0, 2)), 0)
       a[org.aspen_ddp.aspen.server.store.backend.BackendStateLost] should be thrownBy
-        new RocksDBBackend(dir, storeId, scala.concurrent.ExecutionContext.global)
+        new RocksDBBackend(dir, storeId, TestDeviceIo.of(dir))
       os.list(dir).map(_.last) should be(Seq("aspen-store-config.yaml"))
     finally os.remove.all(dir)

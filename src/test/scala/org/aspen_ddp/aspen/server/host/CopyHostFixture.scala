@@ -45,7 +45,7 @@ trait CopyHostFixture extends ControlFixture:
       opens.incrementAndGet()
       onFatals = onFatal :: onFatals
       def backend: Future[Backend] =
-        io.submit(JobKind.BackendOpen, Some(storeCfg.storeId))(new RocksDBBackend(storePath, storeCfg.storeId, executionContext):
+        io.submit(JobKind.BackendOpen, Some(storeCfg.storeId))(new RocksDBBackend(storePath, storeCfg.storeId, io):
           override def hasFailed: Boolean = super.hasFailed || TestOpener.this.failing
           override def close(): Future[Unit] = closeGate match
             case None => super.close()

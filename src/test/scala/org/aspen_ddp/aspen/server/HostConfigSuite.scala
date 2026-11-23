@@ -115,8 +115,8 @@ tls-private-key: |
       os.remove(f)
 
   test("rocksdb resource limits round-trip, including partially specified ones"):
-    val full = sample.copy(rocksdb = HostConfig.RocksDBResources(Some(4096), Some(1024), Some(8)))
-    val partial = sample.copy(rocksdb = HostConfig.RocksDBResources(maxBackgroundThreads = Some(6)))
+    val full = sample.copy(rocksdb = HostConfig.RocksDBResources(Some(4096), Some(1024)))
+    val partial = sample.copy(rocksdb = HostConfig.RocksDBResources(writeBufferMb = Some(6)))
     for cfg <- List(full, partial) do
       val f = os.temp(prefix = "aspen-host-config-rocksdb", suffix = ".yaml")
       try
@@ -129,10 +129,9 @@ tls-private-key: |
     sample.yamlConfig should not include "rocksdb:"
 
   test("rocksdb resource limits convert megabytes to bytes and default the rest"):
-    val rc = HostConfig.RocksDBResources(memoryMb = Some(4096), maxBackgroundThreads = Some(8)).resourceConfig
+    val rc = HostConfig.RocksDBResources(memoryMb = Some(4096)).resourceConfig
     rc.memoryBytes should be(4096L * 1024 * 1024)
     rc.writeBufferBytes should be(1024L * 1024 * 1024)
-    rc.maxBackgroundThreads should be(8)
 
   test("object cache size round-trips and converts megabytes to bytes"):
     val cfg = sample.copy(objectCacheMb = Some(2048))

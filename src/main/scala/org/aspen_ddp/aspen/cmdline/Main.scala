@@ -1894,6 +1894,8 @@ object Main {
     // (CrlMissing)
     SimpleCRL.DeviceFactory().openCRL(bootstrapDevDir, storageDevConfig, holdsStores = false).shutdown()
 
+    val bootstrapIo = new org.aspen_ddp.aspen.server.host.ThreadedDeviceIo(bootstrapDevDir,
+      org.aspen_ddp.aspen.server.host.DeviceIo.Config())
     val bootstrapStores =
       for
         poolIndex <- 0 until bootstrapIda.width
@@ -1906,7 +1908,7 @@ object Main {
 
         println(s"Creating data store $storeId. Path $storeRoot")
         DefaultBackendOpener.createStore(storeConfig, storeRoot, bootstrapDevDir / StoreCreation.CreatingDirectory)
-        new RocksDBBackend(storeRoot, storeId, ec)
+        new RocksDBBackend(storeRoot, storeId, bootstrapIo)
 
     // The initial metadata pool's stores start empty: created here, opened by the host
     val metadataStoreIds =
@@ -1981,6 +1983,7 @@ object Main {
 
     // Released so a host started in this same process (as the tests do) can open them.
     Await.result(Future.sequence(bootstrapStores.map(_.close())), Duration(30, SECONDS))
+    bootstrapIo.close()
     sched.shutdownNow()
 
     0

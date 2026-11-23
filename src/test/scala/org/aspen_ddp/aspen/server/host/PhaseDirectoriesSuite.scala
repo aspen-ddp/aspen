@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.StartStoreTransfer
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.{DurableFiles, Host, StorageDeviceConfig, StoreConfig}
+import org.aspen_ddp.aspen.server.{TestDeviceIo, DurableFiles, Host, StorageDeviceConfig, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{RebuildOutcome, TransferOutcome}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
@@ -319,7 +319,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       // B's copy opening when A's backend is already served
       cfg = StoreConfig.loadStoreConfig(flatB / StoreConfig.configFilename)
       _ = host.control.copyRegistry.opening(localB, s, 1000, false, flatB) should be(true)
-      backend = new RocksDBBackend(flatB, s, executionContext):
+      backend = new RocksDBBackend(flatB, s, TestDeviceIo.of(flatB)):
         override def hasFailed: Boolean = true
         override def close(): Future[Unit] = gate.future.flatMap(_ => super.close())
       _ = host.control.loader.handleBackendOpened(Host.BackendOpened(localB, cfg, flatB, false, None,

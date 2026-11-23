@@ -6,6 +6,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.{Completion, CompletionHandler, Read, RetryScheduler}
+import org.aspen_ddp.aspen.server.TestDeviceIo
 import org.rocksdb.{RocksDBException, Status}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -34,7 +35,7 @@ object RocksDBBackendReadSuite:
     * else read the database. */
   final class FailingReads(dir: os.Path, failures: Seq[Throwable], scheduler: RetryScheduler,
                            stored: Option[Array[Byte]])
-    extends RocksDBBackend(dir, storeId, ExecutionContext.global, RetryScheduler.ReadRetryDelays, scheduler):
+    extends RocksDBBackend(dir, storeId, TestDeviceIo.of(dir), RetryScheduler.ReadRetryDelays, scheduler):
     private val remaining = mutable.Queue(failures*)
     @volatile var attempts = 0
     override protected def getValue(key: Array[Byte]): Future[Option[Array[Byte]]] =

@@ -37,11 +37,6 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
   // Devices whose relinquishDevice sequence is running. One at a time per device, for the same reason.
   private var relinquishingDevices: Set[StorageDeviceId] = Set()
 
-  // The stores each device's shutdown has closed cleanly in this process and nothing has loaded again since. A
-  // cancelled shutdown leaves them offline with nothing on disk to say so, so the reconcile loads them back
-  // (reloadClosedStores). Forgotten when the device is unloaded: a restart or an adoption loads them from disk.
-  private var closedForShutdown: Map[StorageDeviceId, Set[StoreId]] = Map()
-
   /** True while the shutdown sequence of `id` is running. */
   def isShuttingDown(id: StorageDeviceId): Boolean = shuttingDownDevices.contains(id)
 
@@ -118,7 +113,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
           // A restart arrived mid-shutdown. Removing shutdown.state lets the device load again
           // after a restart of this host. The check that follows runs the normal reconcile,
           // which loads each store this shutdown closed and that is Active again
-          // (reloadClosedStores).
+          // (CopyDecision.Load).
           logger.info(s"Shutdown of storage device $deviceId was cancelled by a restart")
           try DeviceMarkers.removeShutdownState(local.devicePath)
           catch case t: Throwable =>
@@ -210,25 +205,21 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  Nothing is written into the store's directory: the device CRL already on the drive holds its
    *  state, and the device as a whole is not loaded again while it reads Shutdown. A restart or an
    *  adoption loads the store from the plain directory and recovers its transactions from the
-   *  device CRL. A cancelled shutdown's stores are loaded again by the reconcile
-   *  (reloadClosedStores), which is why the stores closed cleanly are remembered.
+   *  device CRL. A cancelled shutdown's stores are loaded again by the reconcile: each is an Idle
+   *  Live copy under an Active entry, served nowhere (CopyDecision.Load).
    *
    *  Picked: every store loaded on the device that is not offline (storesToClose). One at a time,
    *  so each close has finished before the next starts.
    */
   private def closeStoresForShutdown(local: LocalStorageDeviceState): Future[Unit] =
-    val deviceId = local.storageDeviceId
     runSequentially(storesToClose(local)): storeId =>
       // A store whose backend failed while closing is moved to lost/ instead of closed
       // cleanly (see StoreRebuilds.failedOnClose), and an adopter takes it as Rebuilding.
       ctx.copyRegistry.closingFor(storeId, ClosePurpose.Shutdown)
-      ctx.closeStoreForShutdown(storeId).transform:
-        case Failure(_: StoreFailedOnClose) => Success(false)
-        case other => other.map(_ => true)
-      .map: clean =>
+      ctx.closeStoreForShutdown(storeId).recover:
+        case _: StoreFailedOnClose => ()
+      .map: _ =>
         ctx.copyRegistry.closeAskEnded(storeId)
-        if clean then
-          closedForShutdown += deviceId -> (closedForShutdown.getOrElse(deviceId, Set()) + storeId)
         ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
     .map(_ => ())
 
@@ -338,34 +329,6 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
   private def storesToClose(local: LocalStorageDeviceState): List[StoreId] =
     ctx.copyRegistry.openCopies(local).toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
 
-  /** Run by the reconcile of an Operational device that is not shutting down: loads each store a
-   *  cancelled shutdown of it closed, once its entry is Active with no transfer named. A store whose
-   *  copy has since left Live (moved to lost/ or outbound/) is left to the pass that
-   *  owns that phase. One that is no longer offline here was loaded by something else. Each is
-   *  offered to tryLoadStore once; a load that fails with its data intact leaves it offline and retried at the
-   *  device scans (its copy AwaitingRetry, StoreLoader.retryFailedLoads). */
-  def reloadClosedStores(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
-    val deviceId = local.storageDeviceId
-    closedForShutdown.get(deviceId).foreach: closed =>
-      // One loaded by something else since (served or opening), or gone, is dropped. One still closing, retiring or
-      // held by other work on the device is left to it (I3) and kept, for a later reconcile once that has ended
-      val free = ctx.copyRegistry.offlineCopies(local)
-      val held = closed.filter(storeId => !free.contains(storeId) && ctx.copyRegistry.heldOffline(local, storeId))
-      val (ready, notActive) = closed.filter(free.contains).partition: storeId =>
-        remote.stores.get(storeId).exists(ctx.copyRegistry.mayReinstateOut(_, storeId))
-      val notYet = notActive ++ held
-      if notYet.isEmpty then
-        closedForShutdown -= deviceId
-      else
-        closedForShutdown += deviceId -> notYet
-      // Live records only, by their record's phase: a copy in any other phase is its pass's
-      val live = ready.toList.flatMap: storeId =>
-        ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).filter(_.phase == Phase.Live)
-          .flatMap(_ => ctx.copyRegistry.pathOf(local, storeId)).map(storeId -> _)
-      live.sortBy((s, _) => (s.poolId.uuid, s.poolIndex)).foreach: (storeId, path) =>
-        logger.info(s"Loading store $storeId on device $deviceId again: the shutdown that closed it was cancelled")
-        ctx.tryLoadStore(local, path, Some(() => ctx.gossipStoreOnline(storeId)))
-
   /** Unloads a device whose Shutdown has committed, first closing any store loaded on it since
    *  the shutdown's own close: a rebuild or transfer in that flipped its entry Active before
    *  completeDeviceShutdown flipped it back may have loaded its store meanwhile. Unloaded with
@@ -409,7 +372,6 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  shutdown.state and leaves the device unloaded until a restart or adoption resolves it.
    */
   def unloadDevice(storageDeviceId: StorageDeviceId): Unit =
-    closedForShutdown -= storageDeviceId
     ctx.devices.devices.get(storageDeviceId).foreach: sds =>
       shutDownCrl(sds.devicePath, sds.crl)
       // Its last tree entry's stores, and the copies it holds: an unload before its first reconcile lists those

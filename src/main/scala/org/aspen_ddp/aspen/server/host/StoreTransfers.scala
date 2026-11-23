@@ -298,7 +298,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  (StoreLoader.ArrivedAtFile) is written durably first, while the copy is still Arrived and never loaded: it came
    *  from another host, whose clock may lead this one's, and its load floor must cover that. A failed write or move
    *  (NotMoved) leaves the copy Arrived and offline, for the Completed Transfers In pass to retry; an Unsynced move
-   *  leaves it Live and unsynced, which the next device check forces and loads (CopyDecision.LoadResynced). A copy
+   *  leaves it Live and unsynced, which the next device check forces and loads (CopyDecision.Load). A copy
    *  with no Arrived record is not moved (NotMoved) */
   private[host] def bringArrivedLive(sds: LocalStorageDeviceState, storeId: StoreId): MoveResult =
     registry.copiesOf(sds).flatMap(_.copies.get(storeId)) match

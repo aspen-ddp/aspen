@@ -45,12 +45,11 @@ object CopyDecision:
     dirPresent: Option[Boolean],    // registry.existence(local, storeId)
     configPresent: Option[Boolean], // registry.existence(local, storeId, Some(StoreConfig.configFilename))
     declaredMissing: Boolean,       // local.declaredMissing.contains(storeId)
-    heldForSync: Boolean,           // registry.heldForSyncOn(local).contains(storeId)
     tracked: List[TrackedIn])       // this store's pendingStartTransfers and transferInRetries, any device
 
   object StoreFacts:
     val none: StoreFacts = StoreFacts(false, false, false, false, false, false, false, false, Some(false), Some(false),
-                                      false, false, Nil)
+                                      false, Nil)
 
   final case class StoreInputs(deviceId: StorageDeviceId, storeId: StoreId,
                                entry: Option[StorageDeviceState.StoreEntry], copy: Option[CopyState],
@@ -78,8 +77,8 @@ object CopyDecision:
     case BringArrivedLive
     /** A rebuilt copy goes Live and is loaded */
     case BringRebuiltLive
-    /** A held Live copy is loaded */
-    case LoadResynced
+    /** An idle, synced Live copy under Active, served nowhere on the host, is loaded */
+    case Load
     /** The store is created */
     case Create
     /** A tracked transfer in is dropped */
@@ -203,12 +202,16 @@ object CopyDecision:
     if offline && rebuilt && active && !f.rebuildReadsOnHost then
       out += BringRebuiltLive
 
-    // A copy held back from loading for a move whose sync failed is loaded once it is synced again: the removal's own
-    // load was held back (an unsynced copy is never loaded), and the rule that made it keys off the phase it left.
-    // Only a Live copy still offline and free of work, whose entry is Active; one that is not yet stays held, for
-    // every later check, until a load opens it or it leaves its path or device.
-    if f.heldForSync && offline && in.copy.exists(!_.unsynced) && phase.contains(Phase.Live) && active then
-      out += LoadResynced
+    // An Idle, synced Live copy with no work, whose entry is Active and whose store is not being sent, is loaded,
+    // provided its store is not served, opening or held by a rebuild anywhere on the host, its config is there and it
+    // is not declared missing (D7). Nothing else serves such a copy: a load that a cancelled shutdown's close, or a
+    // move whose sync failed (an unsynced copy is never loaded), held back has no other pass to make it. A copy held
+    // offline on purpose is never in this state: its move to lost/ is pending, it has work, it awaits its load retry
+    // (AwaitingRetry, left to the retry), or its device is stopping serving, whose opens tryLoadStore refuses.
+    val idleLive = in.copy.exists(c => c.activity == ActivityKind.Idle && c.phase == Phase.Live && !c.unsynced)
+    if offline && idleLive && active && !f.sending && f.configPresent.contains(true) && !f.declaredMissing &&
+       !f.servedOnHost && !f.openingOnHost && !f.rebuildHoldsOnHost then
+      out += Load
 
     // New stores. Other work holds the store: its end checks the device again.
     if status.contains(StoreStatus.Initializing) && work.forall(_ == Work.Create) then
@@ -217,8 +220,8 @@ object CopyDecision:
     // An abort removes this device's TransferringIn entry and tells nobody, so this check is the only thing that
     // learns of it. Left alone, an attempt still waiting on bytes keeps retransmitting its request and holds the
     // store's receive attempt, which would make the transfer-in start skip a later transfer of the same store, so this
-    // runs before the transfer-in start (StartTransferIn). An attempt past promotion is not covered here; updateStateForTransferredStore sees the
-    // abort in the source's entry instead.
+    // runs before the transfer-in start (StartTransferIn). An attempt past promotion is not covered here;
+    // updateStateForTransferredStore sees the abort in the source's entry instead.
     //
     // The same store can be re-targeted at another device of this host. A receive attempt is held per store, so the
     // earlier attempt would block the new one until its own device's next check noticed the abort. This device's
@@ -243,7 +246,9 @@ object CopyDecision:
           out += CancelRebuild
       case _ => ()
 
-    // Starts, resumes or abandons the transfer in of each TransferringIn entry. Other work holds the store.
+    // Starts, resumes or abandons the transfer in of each TransferringIn entry. Other work holds the store. A
+    // TransferringIn store held by other work skips the readdress-and-resend of its pending start too: that work's end
+    // checks the device again, and the retransmit covers it meanwhile.
     if transferringIn && work.forall(_.isInstanceOf[Work.TransferIn]) then
       entry.flatMap(_.transferDevice).foreach: from =>
         out += StartTransferIn(from, entry.flatMap(_.transferId))

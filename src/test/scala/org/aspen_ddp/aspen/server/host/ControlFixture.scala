@@ -279,12 +279,29 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
     synchronized:
       shutdownWorkTimeouts += ((storageDeviceId, fn))
 
-  /** Records the call; does nothing else. A failure owed by `failFirstStoreLoad` is thrown before recording. */
+  /** Set by a test that counts offers of a copy across reconciles: each recorded offer of an idle Live copy then
+   *  claims it Opening (HostCopies.opening), as a real load's open does at once, so the reconcile does not offer it
+   *  again (CopyDecision.Load). Off by default: the open never ends, so the copy stays Opening */
+  val offersClaimOpening = new AtomicBoolean(false)
+
+  /** Records the call; does nothing else, unless `offersClaimOpening`. A failure owed by `failFirstStoreLoad` is
+   *  thrown before recording. */
   private def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: os.Path, onServed: Option[() => Unit]): Unit =
     synchronized:
       if storeLoadFailureOwed.getAndSet(false) then
         throw new RuntimeException(s"Simulated store load failure for $potentialStoreFile")
       storeLoadAttempts += ((sds.storageDeviceId, potentialStoreFile))
+    if offersClaimOpening.get then
+      val registry = attached.control.copyRegistry
+      CopyLayout.nameOf(potentialStoreFile).map(_._1).foreach: storeId =>
+        val copies = registry.copiesOf(sds)
+        // Only where the open's claim is granted: a Live record, Idle or awaiting a retry, no TransferOut work
+        val claimable = copies.exists: c =>
+          c.copies.get(storeId).exists(r => r.phase == Phase.Live &&
+            (r.activity == Activity.Idle || r.activity.isInstanceOf[Activity.AwaitingRetry])) &&
+            !c.work.get(storeId).exists(_.isInstanceOf[Work.TransferOut])
+        if claimable && registry.pathOf(sds, storeId).contains(potentialStoreFile) then
+          registry.opening(sds, storeId, openId = -1L, create = false, potentialStoreFile): Unit
 
   private def loadStoreById(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
     synchronized:

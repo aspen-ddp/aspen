@@ -666,6 +666,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       _ = writeClosedStore(deviceDir, s0)
       d1 = CopyFixtures.placeCopy(deviceDir, s1, Phase.Arrived(""))
       host = newHost(hostRoot)
+      // Counted across checks: an offer opens the copy, as a real load does, so a later check does not offer it again
+      _ = recorded(host).offersClaimOpening.set(true)
       _ <- resolve(host)
       st <- state(deviceA)
       // Its copy, registered Arrived at the device's load, is offline there, so the completed-transfers-in pass of

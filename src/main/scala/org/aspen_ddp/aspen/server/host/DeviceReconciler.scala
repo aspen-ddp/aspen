@@ -140,8 +140,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *
    *  An Operational device of this host has its leftover device-CRL entries dropped, then each of its stores decided
    *  in turn (reconcileStores: CopyDecision.decide over the store's inputs, read fresh at its turn, and its actions
-   *  carried out in order before the next store's inputs are read), the stores a cancelled shutdown closed loaded
-   *  again, the staging of rebuilds no longer listed swept, and its pending-delete copies released.
+   *  carried out in order before the next store's inputs are read), the staging of rebuilds no longer listed swept, and its pending-delete copies released.
    */
   private def reconcileDeviceState(local: LocalStorageDeviceState,
                                    remote: StorageDeviceState): Unit =
@@ -173,10 +172,9 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     else
       // Any entries a store transferred away left in the device CRL go
       dropLeftoverCrlState(local, remote)
+      // A store a cancelled shutdown closed, or whose load an unsynced move held back, is loaded by its decision
+      // (CopyDecision.Load)
       reconcileStores(local, remote)
-      // Cancelled shutdown: a shutdown cancelled by a restart leaves the stores it closed offline here, with nothing
-      // on disk to say so: their state stayed in the device CRL. Loaded again once Active.
-      ctx.shutdown.reloadClosedStores(local, remote)
       ctx.rebuilds.sweepUnlistedStaging(local, remote)
       // Pending deletes: retired copies whose store is Active on its owner device, and the remains of interrupted
       // deletes
@@ -192,6 +190,10 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  with its kept CRL entries. */
   private def reconcileStores(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     val declaredBefore = local.declaredMissing
+    // Read once: a store is in either set only by Rebuild work of its own, which only its own actions change, and each
+    // store has one turn, so the sets read now are what each store's turn would read
+    val rebuildReads = ctx.copyRegistry.rebuilding(HostCopies.RebuildReads)
+    val rebuildHolds = ctx.copyRegistry.rebuilding(HostCopies.RebuildHolds)
     var declared = Set.empty[StoreId]
     val copies = ctx.copyRegistry.copiesOf(local)
     val stores = remote.stores.keySet ++
@@ -200,18 +202,21 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       ctx.transfers.pendingStartTransfers.keySet ++
       ctx.transfers.transferInRetries.keySet
     stores.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
-      CopyDecision.decide(storeInputs(local, remote, storeId, declaredBefore)).foreach: action =>
-        action match
-          case CopyDecision.Action.DeclareMissing(_) => declared += storeId
-          case _ => ()
-        run(local, remote, storeId, action)
+      CopyDecision.decide(storeInputs(local, remote, storeId, declaredBefore, rebuildReads, rebuildHolds)).foreach:
+        action =>
+          action match
+            case CopyDecision.Action.DeclareMissing(_) => declared += storeId
+            case _ => ()
+          run(local, storeId, action)
     local.declaredMissing = declared
     ctx.copyRegistry.missingIs(local)
 
   /** The inputs of `storeId`'s decision on `local`, read now (CopyDecision.StoreFacts names each source).
-   *  `declaredBefore`: the stores declared missing before this reconcile's loop */
+   *  `declaredBefore`: the stores declared missing before this reconcile's loop. `rebuildReads`, `rebuildHolds`:
+   *  `rebuilding(RebuildReads)` and `rebuilding(RebuildHolds)`, read before the loop */
   private def storeInputs(local: LocalStorageDeviceState, remote: StorageDeviceState, storeId: StoreId,
-                          declaredBefore: Set[StoreId]): CopyDecision.StoreInputs =
+                          declaredBefore: Set[StoreId], rebuildReads: Set[StoreId],
+                          rebuildHolds: Set[StoreId]): CopyDecision.StoreInputs =
     val registry = ctx.copyRegistry
     val copies = registry.copiesOf(local)
     val copy = copies.flatMap(_.copies.get(storeId)).map: r =>
@@ -228,20 +233,18 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       retiringOnHost = ctx.copies.isRetiring(storeId),
       sending = ctx.storeTransferService.isTransferringOut(storeId),
       receivingOnHost = ctx.transfers.receiving.contains(storeId),
-      rebuildReadsOnHost = registry.rebuilding(HostCopies.RebuildReads).contains(storeId),
-      rebuildHoldsOnHost = registry.rebuilding(HostCopies.RebuildHolds).contains(storeId),
+      rebuildReadsOnHost = rebuildReads.contains(storeId),
+      rebuildHoldsOnHost = rebuildHolds.contains(storeId),
       rebuildHandle = ctx.rebuilds.hasRunningRebuild(storeId),
       dirPresent = registry.existence(local, storeId),
       configPresent = registry.existence(local, storeId, Some(StoreConfig.configFilename)),
       declaredMissing = declaredBefore.contains(storeId),
-      heldForSync = registry.heldForSyncOn(local).contains(storeId),
       tracked = tracked)
     CopyDecision.StoreInputs(local.storageDeviceId, storeId, remote.stores.get(storeId), copy,
       copies.flatMap(_.work.get(storeId)), facts)
 
   /** Carries out one of `storeId`'s actions on `local` (CopyDecision.decide has the rule for each) */
-  private def run(local: LocalStorageDeviceState, remote: StorageDeviceState, storeId: StoreId,
-                  action: CopyDecision.Action): Unit =
+  private def run(local: LocalStorageDeviceState, storeId: StoreId, action: CopyDecision.Action): Unit =
     import CopyDecision.Action.*
     val deviceId = local.storageDeviceId
     action match
@@ -284,9 +287,9 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                     s"Completing the rebuild and loading the store")
         if ctx.rebuilds.bringRebuiltLive(local, storeId) == MoveResult.Durable then
           ctx.copyRegistry.pathOf(local, storeId).foreach(ctx.tryLoadStore(local, _, None))
-      case LoadResynced =>
+      case Load =>
         // Its online gossip goes with the load, as a reinstated transfer out's does
-        logger.info(s"Loading store $storeId on device $deviceId: its move Live is durable now")
+        logger.info(s"Loading store $storeId on device $deviceId: its copy is Live, synced and served nowhere")
         ctx.copyRegistry.pathOf(local, storeId).foreach(
           ctx.tryLoadStore(local, _, Some(() => ctx.gossipStoreOnline(storeId))))
       case Create =>

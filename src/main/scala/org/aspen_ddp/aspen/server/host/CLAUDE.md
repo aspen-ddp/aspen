@@ -15,10 +15,9 @@
   `unsyncedPaths` until its attach). An unsynced copy is never loaded (`tryLoadStore`), shipped (`startOut`
   refuses), retired (`StoreCopies.retire` answers false) or received over (`startIn` waits). Each device check
   first forces every unsynced copy again (`CopyMoves.resync`, at the top of `reconcileDeviceState`). A copy moved
-  Live unsynced stays held for its load (`HostCopies.heldForSyncOn`) until a load opens or installs it, or it leaves
-  its path or device, and every operational check loads each held copy that is synced, Live, offline, free of work
-  and Active (`CopyDecision.LoadResynced`, with its online gossip): the pass that moved it will not see it again,
-  and a check that finds the entry not Active or work holding the copy only defers it
+  Live unsynced is loaded, once synced, by the reconcile's Live-copy load rule (`CopyDecision.Load`, with its online
+  gossip; see the reconcile below): the pass that moved it will not see it again, and a check that finds the entry not
+  Active or work holding the copy only defers it
 - Copy layout (store copy state machine, stage 2; spec "Device layout"): `CopyLayout` says where each copy lives. Each
   phase is a directory under the device root holding copies named `<storeId.directoryName>.<copyId>`
   (`copyName`/`parseName`; the store id comes from the name only), its parameter in the copy's own file for that phase,
@@ -94,7 +93,7 @@
   it from the registry; nothing lists the device): a Rebuilt copy of its own episode (`isRebuiltFor`) completes at once
   with its copy id; any other copy fails it. The flip then moves the copy: `Adopt` Rebuilt -> Live
   (`StoreRebuilds.bringRebuiltLive`, T3: a NotMoved copy stays Rebuilt for the Completed Rebuilds pass, which selects
-  offline Rebuilt records of Active entries; an Unsynced one is Live and held for `LoadResynced`), `AdoptOffline`
+  offline Rebuilt records of Active entries; an Unsynced one is Live, for `Load` once synced), `AdoptOffline`
   Rebuilt -> Parked in one move (`keepRebuiltStoreOffline`, T4; `moveUnattached` at its `rebuilt/` path when the device
   is already unloaded), `Discard` deletes it rename-first (`discardStoreDirectory`, `StoreCopies.delete`, T13),
   `Superseded`/`Unconfirmed`/`NotOwned` leave it Rebuilt. A Parked copy goes Live (T5) as an abandoned Outbound one
@@ -157,8 +156,8 @@
   The pool update's PoolRepointed moves the copy Live (T9, `StoreTransfers.bringArrivedLive(sds, storeId):
   MoveResult`, `arrived-at` written durably first, while it is Arrived); a NotMoved move leaves it Arrived and
   offline for the Completed Transfers In pass (offline Arrived records of Active entries, no receive attempt), an
-  Unsynced one leaves it Live for `LoadResynced`. `PoolRepointedOffline` leaves it Arrived. `startIn` decides from the
-  record: none, receive; Retired or unsynced, wait; `Arrived(tid)` of this transfer with a valid save file,
+  Unsynced one leaves it Live, for `Load` once synced. `PoolRepointedOffline` leaves it Arrived. `startIn` decides
+  from the record: none, receive; Retired or unsynced, wait; `Arrived(tid)` of this transfer with a valid save file,
   resume the pool update; Arrived of another transfer, or with an unusable save file, deleted rename-first (T13,
   `StoreCopies.delete`, the record removed) and received; any other phase, Live included, the earlier tenancy's,
   retired (`retireEarlierTenancy`, below; the "store path already exists" refusal is gone). The reconcile's tree
@@ -174,7 +173,7 @@
   no reader of a phase but the location. `adoptionClass` is a lookup on the phase (spec "Adoption"): live, arrived,
   rebuilt and parked copies are Clean, an outbound copy is Clean with a valid save file and CrlLost otherwise, a lost
   copy is CrlLost, an entry whose store has no copy in any phase is Unclean. `holdsOwnState` (Rebuilt),
-  `reloadClosedStores` (Live records only) and `startIn` (by the record, above) match on the record's phase.
+  `CopyDecision.Load` (Live records only) and `startIn` (by the record, above) match on the record's phase.
   `Transitions.phaseLegal` is the spec's table T1-T13 with P10 (Rebuilt, Parked -> Outbound) and an Outbound copy of
   another transfer moved back to Live before its new move.
 - Stage 2 decisions (spec, "Stage 2 decisions"; each is cited where it applies above): P1 an earlier copy is retired
@@ -248,8 +247,7 @@
   `answersUnknown` is `ready`, not installed, not silent. The view's `repairable` is `HostCopies.repairable`
   (Served, not Closing, no Rebuild work Running or Abandoned, `HostCopies.rebuilding(RebuildReads)`, and no TransferOut
   work on any device, not being sent: R20; a queued or discarding rebuild reads nothing, and a flip that keeps failing
-  keeps its work queued). `reloadClosedStores` keeps a closed copy still closing, retiring or held by other work for
-  a later reconcile. A throw of the
+  keeps its work queued). A throw of the
   silence path is a bug: in production it is logged at error and the store left silent (clients retransmit); with
   `HostCopies.strict` (`Host.Seams.strictCopyRegistry`, every ControlFixture host; implied by `verifyCopyRegistry`)
   it propagates as `SilenceFailure`, which `fact` and `claim` never swallow. Every lockstep drain of a strict host
@@ -273,7 +271,7 @@
   `DeviceReconciler.reconcileDeviceState` first forces unsynced copies (`CopyMoves.resync`) and retries failed moves to
   lost/ (`StoreRebuilds.retryPendingLost`); a Failed device is retired, one owned elsewhere relinquished and one
   shutting down handed to `shutDownDevice`. Otherwise the device-level steps run around the store loop:
-  `dropLeftoverCrlState`, then `reconcileStores`, then `DeviceShutdown.reloadClosedStores`, then
+  `dropLeftoverCrlState`, then `reconcileStores`, then
   `StoreRebuilds.sweepUnlistedStaging` (the `rebuilding/` staging of stores no longer listed), then
   `StoreCopies.release` (which asks `CopyDecision.release`). `reconcileStores` takes every store the entries name, that
   has a copy or work on the device, or whose transfer in the host tracks (`pendingStartTransfers`, `transferInRetries`,
@@ -287,9 +285,17 @@
   (DeclareMissing: `local.declaredMissing` is read as it was before the loop and set after it to exactly the stores
   declared, mirrored by `missingIs`), Lost CRL (RequestRebuild, or Recheck while sending), Abandoned Transfers Out
   (ReinstateOut, or Recheck while sending), Completed Transfers In (BringArrivedLive), Completed Rebuilds
-  (BringRebuiltLive), LoadResynced, Create, aborted transfers in (DropTransferIn), CancelRebuild (`cancelRebuild`),
-  StartTransferIn and StartRebuild. Only an offline copy is acted on (Idle or awaiting a load retry, not Retired, not
-  pendingLost, no work: `HostCopies.offlineCopies` is the same set); a work-starting action (Create, StartTransferIn,
+  (BringRebuiltLive), Load, Create, aborted transfers in (DropTransferIn), CancelRebuild (`cancelRebuild`),
+  StartTransferIn and StartRebuild. Load (D7) is the one Live-copy load rule: an Idle, synced Live copy with no
+  work, whose entry is Active and whose store is not being sent, is loaded, provided its store is not served, opening
+  or held by a rebuild (`rebuilding(RebuildHolds)`) anywhere on the host, its config stat answers present
+  (`Some(true)`; a stat that fails waits for one that answers) and it is not declared missing. It covers a cancelled
+  shutdown's closed stores and copies whose unsynced move held their load back, with no mark of either: a copy held
+  offline on purpose is never in that state (pendingLost, work, AwaitingRetry, or a device stopping serving, whose
+  opens `tryLoadStore` refuses). `rebuilding(RebuildReads)` and `rebuilding(RebuildHolds)` are read once before the
+  loop: a store is in them only by its own Rebuild work, which only its own actions change. Only an offline copy is
+  acted on (Idle or awaiting a load retry, not Retired, not pendingLost, no work: `HostCopies.offlineCopies` is the
+  same set); a work-starting action (Create, StartTransferIn,
   StartRebuild) is decided only where the store has no work or work of its own kind (I3). A copy that a transfer in,
   rebuild, create or transfer out owns, or that is closing or retiring, is left to that work, whose end checks the
   device again: `closeUnloaded` (fail-stop, failed CRL load, failed save-file removal) checks it once the close ends,
@@ -297,12 +303,15 @@
   the close, `rebuildWaitsForClose`, starts then). `retryFailedLoads` keeps a retry while its copy is neither served
   nor opening, whatever work holds it (`heldOffline`). Whether a copy a transfer out left offline may go back in service
   is one predicate, `HostCopies.mayReinstateOut(entry, storeId)` (`CopyDecision.noTransferOut`: Active, no destination
-  named; and not being sent), asked by decide's ReinstateOut case (which re-checks the device for one still sending),
-  `bringIntoService` and `reloadClosedStores`. A shutdown or relinquish closes the device's copies that
+  named; and not being sent), asked by decide's ReinstateOut case (which re-checks the device for one still sending)
+  and `bringIntoService`. A shutdown or relinquish closes the device's copies that
   are Served or Opening (`openCopies`, plus a create's open, whose copy has no record yet;
   `DeviceShutdown.storesToClose`). Tests place copies after a device's load with `ControlFixture.placedCopies`, and fake
-  a served copy with `servedHere` (the recording shutdown close ends it); `ControlFixture.awaitLoudly` waits on work
-  that crosses real-time hops and fails, naming what it waited for, when its time runs out. `LocalDevices.isLoaded(sds)`
+  a served copy with `servedHere` (the recording shutdown close ends it); the recording `tryLoadStore` opens
+  nothing, so its copy stays Idle and `Load` offers it again at the next check, unless the test sets
+  `RecordingSeams.offersClaimOpening` (each offer then claims the copy Opening, as a real open does);
+  `ControlFixture.awaitLoudly` waits on work that crosses real-time hops and fails, naming what it waited for, when
+  its time runs out. `LocalDevices.isLoaded(sds)`
   says whether a device state is still the loaded one. `CopyDecisionSuite` checks decide's invariants over every
   combination of its inputs; a test whose host reads the real tree through a recording host (copies the tree does not
   list) holds the device's checks with an armed lookup when a reconcile would act on them
@@ -485,7 +494,8 @@
   `shutdown.state` (its HostId) in the device dir, and commits Shutdown. Each device dir also has `owning-host`
   (`server.DeviceMarkers`), so the 10 s scan decides without the network; only a dir with `shutdown.state` needs a
   device-state lookup. On the same host a Shutdown device waits for `restartStorageDevice`; a restart that cancels a
-  shutdown in flight has the reconcile load the closed stores again (`DeviceShutdown.reloadClosedStores`). Another host
+  shutdown in flight has the reconcile load the closed stores again (`CopyDecision.Load`: each is an Idle Live copy
+  under an Active entry, served nowhere). Another host
   adopts it, in one transaction rewriting the device, its pool entries and both HostStates, then rewrites
   `owning-host` and loads it: it opens the device CRL and each store recovers its transactions from it
 - Adoption needs no shutdown: a drive pulled from a running or crashed host is in the state that host's crash leaves
@@ -632,7 +642,7 @@
   such a store offline (`server/rebuild/CLAUDE.md`). An `Adopt` whose move to Live fails leaves the copy offline on
   its device (its Rebuilt record), so the Completed Rebuilds pass retries the move and the load at each device check.
   A move whose directory sync failed leaves the copy Live and unsynced (CopyMoves), and the next device check forces
-  it and loads it (`LoadResynced`). Tests fail the rename through `CopyMoves.rename` and the sync through
+  it and loads it (`CopyDecision.Load`). Tests fail the rename through `CopyMoves.rename` and the sync through
   `CopyMoves.syncDirectory`
 - A failed rebuild pass or a permanently failed flip never re-checks its own device at once, which would restart the
   same store in a spin: it re-checks the other devices (the slot is host-wide) and schedules a backoff re-check of its

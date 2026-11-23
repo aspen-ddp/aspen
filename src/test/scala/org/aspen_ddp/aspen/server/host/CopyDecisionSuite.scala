@@ -88,11 +88,39 @@ class CopyDecisionSuite extends AnyFunSuite with Matchers:
     decide(in(active, copy(Phase.Rebuilt("e")), facts = f)) should be(List(BringRebuiltLive))
     decide(in(active, copy(Phase.Rebuilt("e")), facts = f.copy(rebuildReadsOnHost = true))) should be(Nil)
 
-  test("a held Live copy loads only once synced"):
-    val f = none.copy(configPresent = Some(true), heldForSync = true)
-    decide(in(active, copy(Phase.Live), facts = f)) should be(List(LoadResynced))
+  test("an idle synced Live copy under Active loads"):
+    decide(in(active, copy(Phase.Live), facts = none.copy(configPresent = Some(true)))) should be(List(Load))
+
+  test("a Live copy is not loaded unless every condition of the load rule holds"):
+    val f = none.copy(configPresent = Some(true))
+    // Not offline: it has work, a failed move to lost/ to retry, or it is open, closing or retiring
+    decide(in(active, copy(Phase.Live), Some(Work.TransferOut(Some(e1), TransferOutStage.Closing)),
+      facts = f)) should be(Nil)
+    decide(in(active, copy(Phase.Live, pendingLost = true), facts = f)) should be(Nil)
+    for a <- List(ActivityKind.Opening, ActivityKind.Served, ActivityKind.Closing, ActivityKind.Retiring) do
+      decide(in(active, copy(Phase.Live, a), facts = f)) should be(Nil)
+    // Not Live, or unsynced
+    decide(in(active, copy(Phase.Retired), facts = f)) should be(Nil)
     decide(in(active, copy(Phase.Live, unsynced = true), facts = f)) should be(Nil)
-    decide(in(active, copy(Phase.Live), facts = f.copy(heldForSync = false))) should be(Nil)
+    // Not Active, or being sent
+    for s <- StoreStatus.values.toList if s != StoreStatus.Active do
+      decide(in(entry(s), copy(Phase.Live), facts = f)) should not contain (Load)
+    decide(in(None, copy(Phase.Live), facts = f.copy(dirPresent = None))) should be(Nil)
+    decide(in(active, copy(Phase.Live), facts = f.copy(sending = true))) should be(Nil)
+    // Its config missing or unreadable
+    decide(in(active, copy(Phase.Live), facts = f.copy(configPresent = None))) should be(Nil)
+    decide(in(active, copy(Phase.Live), facts = f.copy(configPresent = Some(false)))) should be(
+      List(DeclareMissing(true)))
+    // Declared missing, served, opening or held by a rebuild elsewhere on the host
+    decide(in(active, copy(Phase.Live), facts = f.copy(declaredMissing = true))) should be(
+      List(DeclareMissing(false)))
+    decide(in(active, copy(Phase.Live), facts = f.copy(servedOnHost = true))) should be(Nil)
+    decide(in(active, copy(Phase.Live), facts = f.copy(openingOnHost = true))) should be(Nil)
+    decide(in(active, copy(Phase.Live), facts = f.copy(rebuildHoldsOnHost = true))) should be(Nil)
+
+  test("a copy awaiting its load retry is left to the retry"):
+    decide(in(active, copy(Phase.Live, ActivityKind.AwaitingRetry), facts = none.copy(configPresent = Some(true)))) should
+      be(Nil)
 
   test("an Initializing entry is created; other work holds it"):
     val init = entry(StoreStatus.Initializing)
@@ -169,7 +197,7 @@ class CopyDecisionSuite extends AnyFunSuite with Matchers:
       (f: StoreFacts) => f.copy(retiringOnHost = true), (f: StoreFacts) => f.copy(sending = true),
       (f: StoreFacts) => f.copy(receivingOnHost = true), (f: StoreFacts) => f.copy(rebuildReadsOnHost = true),
       (f: StoreFacts) => f.copy(rebuildHoldsOnHost = true), (f: StoreFacts) => f.copy(rebuildHandle = true),
-      (f: StoreFacts) => f.copy(declaredMissing = true), (f: StoreFacts) => f.copy(heldForSync = true))
+      (f: StoreFacts) => f.copy(declaredMissing = true))
     val allTrue = bools.foldLeft(StoreFacts.none)((f, set) => set(f)).copy(dirPresent = Some(true),
       configPresent = Some(true))
     val existence = List(None, Some(true), Some(false))
@@ -212,8 +240,9 @@ class CopyDecisionSuite extends AnyFunSuite with Matchers:
         if drops.size != drops.distinct.size then bad(input, s"A6 repeated drop $actions")
         var starts = 0
         actions.foreach:
-          case LoadResynced =>
-            if !(phase.contains(Phase.Live) && c.exists(!_.unsynced)) then bad(input, "A1 LoadResynced")
+          case Load =>
+            if !(phase.contains(Phase.Live) && c.exists(c => !c.unsynced && c.activity == ActivityKind.Idle)) then
+              bad(input, "A1 Load")
           case BringArrivedLive =>
             if !phase.exists(_.isInstanceOf[Phase.Arrived]) then bad(input, "A1 BringArrivedLive")
           case BringRebuiltLive =>
@@ -233,7 +262,7 @@ class CopyDecisionSuite extends AnyFunSuite with Matchers:
         if starts > 1 then bad(input, "A3 more than one start")
         actions.foreach: a =>
           val copyTouching = a match
-            case LoadResynced | BringArrivedLive | BringRebuiltLive | ReinstateOut | Retire | ForgetGoneCopy |
+            case Load | BringArrivedLive | BringRebuiltLive | ReinstateOut | Retire | ForgetGoneCopy |
                  RequestRebuild => true
             case _ => false
           if copyTouching && touchesCopy then bad(input, s"A2 $a")

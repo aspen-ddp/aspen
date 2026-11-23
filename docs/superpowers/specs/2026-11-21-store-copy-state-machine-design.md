@@ -337,8 +337,11 @@ RR > TO > TI > RC), so the items tied to the on-disk format wait for stage 2.
     promise. It also counts slots, and keeps a rebuild single flight across its device's unload, which drops the
     device's Work.
   - `closedForShutdown` (`DeviceShutdown`): a cancelled shutdown leaves the stores it closed offline with nothing on
-    disk to say so, and the record of a closed copy is Idle like any other offline copy. Stage 3's decision function
-    may make it a case of `reloadClosedStores`'s rule (the open question on Parked).
+    disk to say so, and the record of a closed copy is Idle like any other offline copy. **Removed in stage 3
+    (D7)**, with `HostCopies.heldForSync`: one Live-copy rule, `CopyDecision.Load`, loads an Idle, synced Live copy
+    with no work under an Active entry, not being sent, whose store is not served, opening or held by a rebuild on
+    the host, whose config is present and which is not declared missing. A copy held offline on purpose is never in
+    that state.
   - `declaredMissing` (mirrored as the device's `missing`), `transferInRetries`, and the retry backoffs, which are not
     copy state.
 

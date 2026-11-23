@@ -1562,6 +1562,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val sourceId = StorageDeviceId.BootstrapStorageDeviceId
     val deviceDir = writeDevice(hostRoot, "dev0", sourceId)
     val host = newHost(hostRoot)
+    // Offers are counted across checks: an offer opens the copy, as a real load does, so a later check (CopyDecision
+    // Load) does not offer it again
+    recorded(host).offersClaimOpening.set(true)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
 
     // What startStoreTransferOut leaves behind once the destination asks for the store: the
@@ -1591,7 +1594,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       markedBeforeAbort should be(true)
       outbound(deviceDir, movingStore) should be(false)
       storeDir / os.up should be(deviceDir / CopyLayout.OutboundDirectory)
-      recorded(host).storeLoadAttempts.toList.drop(before) should be(
+      // Of the moving store: the bootstrap stores the recording host holds no copies of are declared missing, rebuilt
+      // and loaded meanwhile (CopyDecision.Load), at whatever check reads the tree's entries for them
+      recorded(host).storeLoadAttempts.toList.drop(before).filter((_, p) =>
+        CopyLayout.parseName(p.last).exists(_._1 == movingStore)) should be(
         List((sourceId, CopyLayout.path(deviceDir, movingStore, CopyFixtures.copyIdOf(storeDir), Phase.Live))))
 
   /** A host owning the source of a transfer of `movingStore` whose send has begun through a real
@@ -1611,6 +1617,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", sourceId)
     val sends = new StagedSendService
     val host = newHost(hostRoot, transferService = sends)
+    // Offers are counted across checks: an offer opens the copy, as a real load does, so a later check (CopyDecision
+    // Load) does not offer it again
+    recorded(host).offersClaimOpening.set(true)
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
 
     // The recording seams never load the store, so closeStore has nothing to close; its copy,

@@ -1718,6 +1718,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       crl = host.control.devices.devices(deviceA).crl
       _ <- prepareInFlight(host, factory.opened.head, storeId, txid)
       // Closed without extraction: its state stays in the device CRL
+      // Under its TransferOut work from before its close, as startOut holds it, so no check loads the closed copy again
+      _ = transferOutWork(host, storeId, held = true)
       closed = host.closeStore(storeId)
       _ <- pumpUntil(host, closed.isCompleted)
       _ <- closed
@@ -1748,6 +1750,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       admission = host.control.devices.devices(deviceA).admission
       _ <- prepareInFlight(host, factory.opened.head, storeId, txid)
       // Closed without extraction: txid stays in the device CRL
+      // Under its TransferOut work from before its close, as startOut holds it, so no check loads the closed copy again
+      _ = transferOutWork(host, storeId, held = true)
       closed = host.closeStore(storeId)
       _ <- pumpUntil(host, closed.isCompleted)
       _ <- closed
@@ -1781,6 +1785,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       crl = host.control.devices.devices(deviceA).crl
       _ <- prepareInFlight(host, factory.opened.head, storeId, txid)
       // Closed without extraction: txid stays in the device CRL, a leftover beside the save file below
+      // Under its TransferOut work from before its close, as startOut holds it, so no check loads the closed copy again
+      _ = transferOutWork(host, storeId, held = true)
       closed = host.closeStore(storeId)
       _ <- pumpUntil(host, closed.isCompleted)
       _ <- closed
@@ -1877,6 +1883,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       crl = factory.opened.find(_.devicePath == sourceDir).get
       _ <- prepareInFlight(host, crl, storeId, txid)
       // Closed without extraction: txid stays in the source's device CRL
+      // Under its TransferOut work from before its close, as startOut holds it, so no check loads the closed copy again
+      _ = transferOutWork(host, storeId, held = true)
       closed = host.closeStore(storeId)
       _ <- pumpUntil(host, closed.isCompleted)
       _ <- closed
@@ -1918,6 +1926,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       stubDurable = Promise[Unit]()
       _ = crl.saveAppliedStub(storeId, stubbed, HLCTimestamp.now, () => stubDurable.trySuccess(()))
       _ <- stubDurable.future
+      // Under its TransferOut work from before its close, as startOut holds it, so no check loads the closed copy again
+      _ = transferOutWork(host, storeId, held = true)
       _ <-
         if loaded then
           Future.unit
@@ -2208,6 +2218,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- prepareInFlight(host, crl, storeId, txid)
       template = crl.getFullRecoveryState(storeId).head
       backend = host.control.router.loaded(storeId).backend
+      // Under its TransferOut work from before its close, as startOut holds it, so no check loads the closed copy again
+      _ = transferOutWork(host, storeId, held = true)
       _ <-
         if loaded then
           Future.unit
@@ -2251,7 +2263,9 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = host.loadStoreById(deviceA, storeId)
       _ <- pumpUntil(host, recovered(host, storeId, txid))
       afterReload = admission.admittedBytes
-      // A transfer out's extraction takes the entries out of the device CRL, and their count with them
+      // A transfer out's extraction takes the entries out of the device CRL, and their count with them. Under its
+      // TransferOut work, as startOut holds it, so no check loads the extracted copy again
+      _ = transferOutWork(host, storeId, held = true)
       extracted = host.control.transfersOut.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       _ <- pumpUntil(host, extracted.isCompleted)
       _ <- extracted
@@ -2277,12 +2291,13 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
       crl = factory.opened.head
       _ <- prepareInFlight(host, crl, storeId, txid)
+      // Under its TransferOut work from before its close, as startOut holds it, so no check loads the closed copy again
+      _ = transferOutWork(host, storeId, held = true)
       closed = host.closeStore(storeId)
       _ <- pumpUntil(host, closed.isCompleted)
       _ <- closed
       gate = Promise[Unit]()
       _ = crl.readGate = Some(gate.future)
-      _ = transferOutWork(host, storeId, held = true)
       extracting = host.control.transfersOut.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       _ <- pumpUntil(host, crl.readCalled.isCompleted)
       // A load offered while the extraction's read is outstanding: refused, it opens nothing
@@ -2314,13 +2329,14 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       host = newCrlHost(hostRoot, factory)
       _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
       crl = factory.opened.head
+      // Under its TransferOut work from before its close, as startOut holds it, so no check loads the closed copy again
+      _ = transferOutWork(host, storeId, held = true)
       closed = host.closeStore(storeId)
       _ <- pumpUntil(host, closed.isCompleted)
       _ <- closed
       _ = CrashRecoveryLog.saveStoreState(storeId, fileState, Backend.crlSaveFile(storeDir))
       gate = Promise[Unit]()
       _ = crl.dropGate = Some(gate.future)
-      _ = transferOutWork(host, storeId, held = true)
       extracting = host.control.transfersOut.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       _ <- pumpUntil(host, crl.dropCalls.get == 1)
       // A load offered while the extraction's drop is outstanding: refused, it opens nothing and drops nothing

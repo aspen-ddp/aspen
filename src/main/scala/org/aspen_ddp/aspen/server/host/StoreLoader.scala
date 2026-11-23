@@ -127,7 +127,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
               logger.info(s"Not loading store $storeId: its move to lost/ failed and is retried. $potentialStoreFile")
             else if ctx.copyRegistry.isUnsynced(sds, storeId) then
               // A move a crash could undo (CopyMoves): the next check of its device forces its directories
-              // and loads it (CopyDecision.LoadResynced)
+              // and loads it (CopyDecision.Load)
               logger.info(s"Not loading store $storeId yet: a move of its copy is not durable. $potentialStoreFile")
             else
               startOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)
@@ -146,7 +146,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  store is otherwise open or opening (an offer repeated over a served store), it is left offline and AwaitingRetry,
    *  as a failed open is, so the device scans offer it to tryLoadStore again with backoff. Without this, a load from a
    *  pass that moved its copy Live first (Completed Transfers In, Completed Rebuilds) or that offers it once (device
-   *  load, reloadClosedStores) would leave an Active store unserved and untracked until a restart. `onServed` is kept for the load that
+   *  load) would leave an Active store unserved and untracked until a restart. `onServed` is kept for the load that
    *  serves it. A path that names no copy is only logged. */
   private def awaitUnreadRetry(sds: LocalStorageDeviceState, storePath: os.Path, onServed: Option[() => Unit],
                                err: Throwable, ofLoad: Boolean = false): Unit =

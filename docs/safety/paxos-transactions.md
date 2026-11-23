@@ -69,7 +69,7 @@ votes on one object" argument rely on.
 | Status cache life | horizon + `MaxStartLead` + 8 heartbeats (30 s), after the last write; at most 4 M entries | `TransactionHorizon.statusCacheDuration`, `Host.txStatusCacheDuration` (asserted by `Host.checkStatusCacheDuration` to be at least horizon + `MaxStartLead` + `txHeartbeatTimeout` + one heartbeat), `TransactionStatusCache.DefaultMaxEntries` |
 | Expiry margin | `MaxStartLead` + `txHeartbeatTimeout` + one heartbeat (8 s) | `Frontend.expiryMargin` |
 | Host heartbeat / `txHeartbeatTimeout` | 1 s / 5 s | `cmdline/Main`, `Host.txHeartbeatTimeout` |
-| Driver retransmit | first send after 100 ms, then every 3 s (`maxDelay`); backoff on a new round doubles up to 3 s, random delay below it | `SimpleTransactionDriver`, `cmdline/Main` |
+| Driver retransmit | first send after 100 ms for the designated leader's first driver, after a random delay below 200 ms for every other (its constructor starts a new round); then every 3 s (`maxDelay`); backoff on a new round doubles up to 3 s, random delay below it | `SimpleTransactionDriver`, `cmdline/Main` |
 | Client retransmit | 1 s | `cmdline/Main`, `SimpleAspenClient` |
 | Prefer-abort wait | 5 s from the Tx's creation | `Frontend.MissingDataWait` |
 | Collision wait | 500 ms, checked at the store heartbeat: a wait for a lock holder built on, or for a colliding commit waiting in lock order | `Tx.CollisionWait` |
@@ -226,7 +226,8 @@ vote re-takes them, and the Frontend holds all transaction messages until every 
 here has loaded them and completed its load (`Frontend.recoverTransactions`, `recoveredTransactionLoaded`, `holding`); a recovered Tx that does not relock completes
 its load only after every recovered commit vote has relocked, so lock order (9.1) sees every holder. A recovered commit
 vote whose saved status restores Committed relocks too, and holds its locks and reservation until it applies. A Tx
-created after its outcome is known (`Tx.outcomeDecided`), a restored abort, and a recovered Tx without a commit vote
+created after its outcome is known (`Tx.outcomeDecided`), a live Tx whose resolution arrived before its objects
+loaded, a restored abort, and a recovered Tx without a commit vote
 take none. Details: `transaction-requirements.md` R13.
 
 **P13 Object data lives in the CRL until the backend commit succeeds.** `crl.dropTransactionObjectData` runs only once
@@ -411,7 +412,8 @@ outcome is unknown here, the acceptor is memoryless and some loaded object alrea
 "Withheld" means no response at all, which Paxos allows; drivers and the client retransmit. A withheld Tx holds no
 locks, so waits cannot form cycles. `lock()` runs right after the vote is decided and before it is durable; that is
 safe because locks are volatile and a crash before durability discards the vote with them (P3, P5). A Tx whose outcome
-was already known when it was created (`outcomeDecided`) still votes, but takes no locks.
+was already known when it was created (`outcomeDecided`), or when its objects loaded, still votes, but takes no
+locks; later code takes that vote for a locking one (transaction-requirements.md Q-W20).
 
 ### 6.2 Prefer-abort driver prepares
 
@@ -476,9 +478,9 @@ resolution learned from the UnackedCommits tree (`unackedCommitFound`, `unackedC
 resolved commit that would seed the host cache with a non-finalized `Committed` and lose `notOwedHere`.
 
 A recovered unresolved commit vote, of any transaction, looks up its UnackedCommits entry once loaded and again before
-accepting any abort (`Tx.needsUnackedCheck`, `holdAbort`, `Frontend.requestUnackedLookup`). Its store drives it at once
-(`Store.driveTransaction`), except while the store's CRL state is still loading (`Frontend.recoveryPending`). That is
-safe because, under the forget floor, no store that forgot T answers a driver, so Paxos cannot choose abort over a
+accepting any abort (`Tx.needsUnackedCheck`, `holdAbort`, `Frontend.requestUnackedLookup`). Its store drives it as any
+idle Tx (1.1), without waiting for the lookup (`Store.driveTransaction` gates only on `Frontend.recoveryPending`, the
+store's CRL state still loading). That is safe because, under the forget floor, no store that forgot T answers a driver, so Paxos cannot choose abort over a
 chosen commit. A found entry naming this incarnation applies the saved update and resolves committed without
 forgetting the Tx or writing a cache entry (`Tx.unackedCommitFound`); its driver gets the proof
 (`Store.giveProof`, at start or through `Frontend.onCommitProven`). A found entry naming no incarnation (the driver did
@@ -486,8 +488,9 @@ not count the voters, or heard two incarnations from the store) applies too (`Fr
 Tx holds its own commit vote, which may be the counted one, and a vote that did not count is a replay's, which passed
 T's pin. A recovered vote's failed re-check there is an update already applied, and its Insert of an absent key one
 never applied (9.1). A found entry of another incarnation resolves committed applying
-nothing (`Tx.unackedCommitNotOwed`; `notOwedHere`), its objects reported, its driver given the proof. An absent entry from a lookup started after the latest
-held abort releases the held aborts. A failed or unanswered lookup keeps them held; a failed one is retried at
+nothing (`Tx.unackedCommitNotOwed`; `notOwedHere`), its objects reported, its driver given the proof. An absent entry from a lookup started after the first
+held abort releases the held aborts (a later abort, a driver's retransmit, replaces the held message but does not
+push the counting lookup further away). A failed or unanswered lookup keeps them held; a failed one is retried at
 heartbeat, an unanswered one awaited (`Frontend.retryUnackedLookups`). Details: `transaction-recovery.md`.
 
 A recovered commit vote whose object fails to load with an error other than `ObjectNotFound` fail-stops the store, or
@@ -739,7 +742,8 @@ repair, no safety effect.
   Frontend creates a Tx with `outcomeDecided`: no locks, still votes, answers status queries with the cached outcome.
   The sender's recovery driver learns the outcome from its copy. The store's own copy arrives after the Tx and any
   driver exist, so the new Tx resolves from it and the store's own driver learns it. The designated leader drives such
-  a T on purpose: its deciding driver may have died on another host, and its own copy resolves the new driver at once.
+  a T on purpose: its deciding driver may have died on another host, and its own copy resolves the new driver at once. The copy to itself does not ask whether the entry is a same-host
+  sibling's or an earlier instance's of this store, which re-runs T's actions (transaction-recovery.md R-W13).
   The same relay is sent whenever a resolved entry exists, also to a store that holds a Tx (a duplicate there), and
   also below the floor, where the Frontend then refuses the prepare and the leader starts no driver. The copy to
   itself is withheld while the store's own Tx for T knows its outcome (`Tx.knownOutcome`): the entry may be that
@@ -750,7 +754,8 @@ repair, no safety effect.
   same host (`Store.onThisHost`): it shares the cache, and its own store's copy to itself is decided by the rule
   above. For a finalized entry the copy to itself always goes, late if committed,
   beside the `TxFinalized` to the sender (previous bullet). A non-finalized
-  `Committed` entry stems only from a Paxos, relayed or expiry-commit resolution, never from a tree-learned one, whose
+  `Committed` entry stems only from a Paxos, relayed or expiry-commit resolution (or one a recovered Tx restores from
+  its saved status, `Tx`'s constructor), never from a tree-learned one, whose
   saved status, and status replies until finalized (`Tx.statusForExpiry`), are `Unresolved` (6.4,
   transaction-recovery.md 7.2), so neither a relay nor a peer's expiry adoption spreads a non-late commit known only
   from the tree.
@@ -1023,7 +1028,7 @@ as a possibly counted voter (9.2), and a store that applies sends its `TxCommitt
 need not be that driver: the marks and entries may name stores that did apply, at the cost of repair passes and
 applied stubs on a rare path. Applying late is safe: a commit voter's locks have held its locked parts unchanged
 since its vote (in memory, or through its CRL record and the recovery hold), repair defers to a store's own locks even
-with a proof (`Reconcile.RepairSnapshot.proven`), a conflicting commit would need a locked voter, and writes T does
+with a proof (`server/store/Reconcile` `RepairSnapshot.proven`), a conflicting commit would need a locked voter, and writes T does
 not lock are order-independent. A discard (C, D, E) releases locks and objects, deletes the CRL state, forgets the Tx
 and leaves the status cache alone (`Frontend.expireTransaction`). An abort voter, a Tx with no vote, a prover or a muted
 Tx is discarded at once; a commit voter first looks up its UnackedCommits entry (`Tx.decideExpiryDiscard`): none found
@@ -1166,7 +1171,7 @@ transaction eventually resolves without operator action given a healthy quorum.
 | Store, before the vote's save completes | No record, or an older one; nothing was sent to a driver or the client | As if it never saw the prepare. T is below its load floor: the store joined T only below the join ceiling it ran under and below its clock plus `MaxStartLead`, the two bounds the floor takes the lesser of, so a retransmit is refused. |
 | Store, vote saved, response not sent | Record with vote and acceptor state; a commit vote re-locks | Retransmitted prepares get the persisted vote. |
 | Store, after an Accept is saved | Acceptor state recovered | P8 holds. |
-| Store, after learning commit, before applying | Recovered, usually `Unresolved`, with its vote and data; re-locks | Re-learns from a driver (driven at once), the caches, a proof or its UnackedCommits lookup. If every other store finalized and forgot, its entry applies it, and without one it acknowledged or did not count, so a late commit applies nothing. Past the floor its Tx ends by expiry, applying T through an entry. |
+| Store, after learning commit, before applying | Recovered, usually `Unresolved`, with its vote and data; re-locks | Re-learns from a driver (its own once idle), the caches, a proof or its UnackedCommits lookup. If every other store finalized and forgot, its entry applies it, and without one it acknowledged or did not count, so a late commit applies nothing. Past the floor its Tx ends by expiry, applying T through an entry. |
 | Store, after the in-memory apply, before the backend commit is durable | Data still in the CRL (P13) | As above. |
 | Store without a commit vote, after learning commit | Recovered with its abort or no vote | Applies nothing on the commit and reports its changed objects (9.1): it was marked unless it acknowledged a durable apply before the crash. |
 | Store, after the backend commit, before the CRL data drop | Recovered; objects show the update | `doCommit` skips already applied objects. |

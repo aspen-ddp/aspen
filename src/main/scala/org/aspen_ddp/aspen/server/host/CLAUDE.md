@@ -387,7 +387,8 @@
   `StoreRebuilds.requestRebuild`; the request is made again at each reconcile while the entry stays Active and the store
   unserved, even once its directory is back, so a failed request never leaves it offline until a restart. Its device-CRL
   entries stay (nothing durable records the declaration, and the directory may come back before the flip commits): the
-  rebuild's retire of a copy that is back saves them, the rebuilt copy's empty `crl_save.log` drops what is left, and a
+  rebuild's retire of a copy that is back at its recorded path saves them (one the device load never listed is not
+  seen: systemic-loss SL-W26), the rebuilt copy's empty `crl_save.log` drops what is left, and a
   re-placement's entry leaving the device makes them leftovers. Every load path starts from a directory, so nothing else
   would notice it while the pool counted it writable. `DeviceDiscovery` deletes `creating/` when it loads a device.
   Bootstrap (`cmdline`) creates its stores the same way (`DefaultBackendOpener.createStore`)
@@ -687,7 +688,8 @@
   rule above). A fail-stopped backend's CRL entries likewise stay live until the retire saves them
 - A device the tree records Failed is retired by its host's reconcile (`DeviceShutdown.retireFailedDevice`): a
   durable `failed` marker (`DeviceMarkers`), then unloaded as a relinquished device is. A device with the marker is
-  never loaded or claimed; nothing on it is deleted. The tombstone (`FailedStorageDeviceDurableTask`) nudges the
+  never loaded or claimed; nothing on it is deleted but a
+  rebuilt copy whose flip gets `Discard`, which never was the owner's. The tombstone (`FailedStorageDeviceDurableTask`) nudges the
   former host with `CheckStorageDevice`. A repair scan runs only while the store's pool entry names this host
   (`StoreRepairer`), so a superseded copy never consumes the current copy's ErrorTree entries
 - Metadata transactions retried after a `TransactionOutcomeUnknown` recognize their own commit (`client/CLAUDE.md`,

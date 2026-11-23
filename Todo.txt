@@ -1,8 +1,8 @@
 TODO
 ====
 
-Safety work list (from docs/safety/*, ninth pass, built 2026-11-21 against 2c8f4f51 + working tree)
-----------------------------------------------------------------------------------------------------
+Safety work list (from docs/safety/*, tenth pass, built 2026-11-22 against 045730e4 + working tree)
+---------------------------------------------------------------------------------------------------
 
 Every open weakness in docs/safety/* (the "## Open weaknesses" section at the end of each document) is listed below
 once, grouped where one change addresses several ids. Completed items are removed; their record is in git history.
@@ -58,13 +58,45 @@ rebuild-process.md B19.)
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-(no open items)
+2.1 [Q-W20] A VoteCommit decided with the outcome already known holds no locks, yet is treated as a locking voter.
+    CONFIRMED, S. Two paths: Frontend.createTx -> Tx.outcomeDecided for a prepare whose outcome the host status cache
+    holds unfinalized; and Tx.completeLoad deciding the vote after the resolution arrived (Tx.lock skips once txStatus
+    is not Unresolved). checkVoteCommitApplied and holdsUpdateOf then assume the vote's locks: usually a false
+    INVARIANT VIOLATION; rarely a content-locked key Delete makes awaitBlindInsertsDurable call persistWithoutUpdateOf
+    on T's unapplied update, a crash then recovers a vote that takes it as applied and acknowledges cleanly: an
+    unmarked permanent divergence, guarded only by timing against errorTimeout. Fix: a Tx whose outcome is known never
+    gives a commit vote (abort unchecked, as for NoClientPrepare; still prove from an object showing the update).
+    Same code neighbourhood as 5.1 (cached-outcome handling in Store.handleTransactionMessage / Frontend.createTx).
+
+2.2 [RP-W13] A repair snapshot's takenAt is compared against an inherited-growth guard set by another Frontend instance.
+    PLAUSIBLE, S. Frontend.repairSnapshotSeq restarts at 0 per instance; StoreRouter routes snapshotForRepair and
+    reconcileForRepair by StoreId at call time, so a snapshot taken before a same-host reopen (cancelled shutdown's
+    close + Load, StoreTransfersOut.reinstateAbandonedOut, inter-device transfer) can end the new instance's guard
+    (inheritedGrowthRepaired) from a read lacking the guarded growth: an overfilled KeyValue slice
+    (CommitError.SliceTooLarge). Fix: a per-instance epoch carried in RepairSnapshot; another instance's is stale.
+    Root cause shared with 5.1's second trigger: host state keyed by StoreId outlives the Frontend instance across a
+    same-host reopen (cross-document-review 2.2). Audit other StoreId-keyed host state for the same assumption.
 
 
 PRIORITY 3: systemic loss protection
 ------------------------------------
 
-(no open items)
+3.1 [SL-W26, RB-W25] The copy registry is never re-synchronised with the disk after the device load.
+    CONFIRMED, S. One root cause, two symptoms:
+    - SL-W26 (priority 3): a store directory absent at the device load but back later has no record, so
+      HostCopies.existence answers absent, the Missing Stores case declares it, and the rebuild never retires the
+      returned copy (retireForeignCopy, discardLostStore, RebuildingStore.start go by the record). The rebuilt copy's
+      first load drops the store's device-CRL entries unsaved; the returned copy stays in live/ unrecorded; at the
+      next device load retireDuplicates (D15) retires both and the healthy store is rebuilt again. A rolling restart
+      over partial mounts does this on every affected host at once.
+    - RB-W25 (priority 4): a recorded copy whose directory vanishes while the host runs keeps its record (CopyDecision
+      forgets a gone copy only with no entry); its Rebuilding retire's moveToLost is NotMoved, held in pendingLost and
+      retried forever, so the store is not rebuilt until a restart: one unit of write margin lost.
+    Fix: at the Missing Stores declaration and before a Rebuilding store's retire, list the store's copy paths in every
+    phase directory and replace its records with what is found (register a returned copy so its retire saves its
+    entries; drop the record of one a stat answers absent). Add a test for a directory vanishing and returning while
+    the host runs (DeviceCrlSuite covers only across a restart).
+
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
@@ -74,11 +106,20 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
 
+(RB-W25 is part of 3.1.)
+
 
 PRIORITY 5: performance and hygiene
 -----------------------------------
 
-(no open items)
+5.1 [R-W13] A store with no Tx self-relays a stale non-finalized commit from the shared status cache and re-runs T's
+    finalization actions. PLAUSIBLE, S. Store.handleTransactionMessage's relay sends the store itself a non-late
+    TxResolved when it holds no Tx with a known outcome, and the designated leader starts a driver; the onThisHost rule
+    suppresses only the reply. Triggers: (a) a same-host sibling's idle driver prepares to a leader that never got a
+    Tx; (b) a same-host reopen of a store whose old Tx wrote the non-finalized entry (see 2.2). The driver resolves
+    non-late and re-runs non-marker finalization actions after T was finalized; past errorTimeout the marker writes
+    voter-unknown marks, entries and stubs for every store. No safety effect. Fix: no self TxResolved of a
+    non-finalized entry, and no leader driver from it, when the sender is onThisHost (the store itself included).
 
 
 PRIORITY 6: coverage gaps (analysis and tests still to be written)

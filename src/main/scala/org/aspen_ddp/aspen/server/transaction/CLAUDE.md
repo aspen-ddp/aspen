@@ -134,8 +134,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   an entry durable means T committed, not that the other actions are done (they may be failing and retried): only an
   acceptor having forgotten T (on TxFinalized) implies that
 - A recovered unresolved commit vote looks its entry up (`UnackedCommitLookup`, from the
-  Host) once loaded and again before accepting any abort. It is driven at once (no driver only while the CRL loads,
-  `Frontend.recoveryPending`): under the forget floor no store that forgot T answers a driver, so Paxos cannot choose
+  Host) once loaded and again before accepting any abort. It is driven as any idle Tx is, without waiting for the lookup (no
+  driver only while the CRL loads, `Frontend.recoveryPending`): under the forget floor no store that forgot T answers a driver, so Paxos cannot choose
   abort over a chosen commit (paxos-transactions 6.4, 10.10). A found entry proves the commit to its own
   driver, at its start or, if one already runs, through `Frontend.onCommitProven` -> `Store.giveProof`; the Tx applies
   its saved update locally, logs

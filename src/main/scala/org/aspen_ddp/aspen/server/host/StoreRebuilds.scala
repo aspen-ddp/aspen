@@ -275,7 +275,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     val deviceId = local.storageDeviceId
     val held = StoreRebuilds.HeldRebuild(deviceId, episode, acceptLoss)
     // Host-wide by store id: a rebuild of the store runs (on any device), so nothing more starts for it. Its handle
-    // counts too: a rebuild running for a device unloaded under it (crlFailed and relinquish cancel nothing) has lost
+    // counts too: a rebuild running for a device unloaded under it (crlFailed cancels nothing; a cancel past the abort latch completes) has lost
     // its Work with the device's records, and still holds its slot until it releases it
     val runs = registry.rebuilding(HostCopies.RebuildReads).contains(storeId) || runningRebuilds.contains(storeId)
     // Nor queued while a transfer out is still closing it (and extracting its CRL state from its directory): that

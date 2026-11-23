@@ -247,7 +247,8 @@
   (`commit`, whose `deletedKeys` thunk is asked only when the index covers the object, and a repair write whose plan
   removes keys) for each other covering Tx whose update Inserts a deleted key: a concluded one until its deletion is
   durable; one that holds its update of the object here (`Tx.holdsUpdateOf`: it issued its commit, or voted commit,
-  whose lock puts the deletion after it) until its state is saved without that update (`persistWithoutUpdateOf`;
+  whose lock puts the deletion after it; a vote decided with the outcome known holds no lock, docs/safety
+  transaction-requirements Q-W20) until its state is saved without that update (`persistWithoutUpdateOf`;
   its recovered vote then finds the update missing and takes it as applied). A non-voter that has not applied holds
   an update the store lacks: nothing waits for it. `keyDeletions` keeps, per object and key, the latest start of a
   committed transaction whose Delete of the key applied here (a no-op over an absent key included; recorded by

@@ -26,7 +26,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | CRL | Store lifecycle | Entries leave the device CRL only after another durable copy exists or the store is unservable on disk; a store whose entry still names the device keeps them (2.2) |
 | Transaction requirements | CRL, recovery | Recovered commit votes, unresolved or with a restored committed resolution, re-take their locks and slice reservations before any message is handled, and a restored one holds them until it applies (transaction-requirements.md R13) |
 | Transaction requirements | CRL, recovery | A key's deletion (commit or repair write) reaches the backend only once no CRL state holding an applied blind Insert of the key remains (`Frontend.awaitBlindInsertsDurable`), so a recovered Insert of an absent key was never applied |
-| Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter whose re-check fails holds it already (2.3) |
+| Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter whose re-check fails holds it already (2.3). A vote decided with the outcome already known holds no lock, which nothing downstream expects (Q-W20, 2.3) |
 | Transaction requirements | Repair | Every repair write, and every complete reconcile pass that changes nothing (at its entry's minimum timestamp), tells every Tx of the object started before the timestamp it records (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert of an absent key applied after it reports the object; a non-voter's blind Insert of an absent key reports its object also where a committed Delete of the key started at or after its start applied here (`Frontend.keyDeletedSince`), and only while the Tx is in `Frontend.transactions` and its marker has not written; a later apply relies on the store's ErrorTree mark, which no reconcile of an object it changes consumes while its commit is held, waits in lock order, or waits for the save of object data it adopted from a late client prepare (`Frontend.settledForRepair`); a recovered Tx without a commit vote applies nothing on a commit and reports every object it changes (`Tx.doCommit`), since it may have acknowledged T before its crash and left no mark |
 | Requirements (lock order) | Recovery | Every recovered commit vote (unresolved, or with a restored committed resolution) has relocked before a recovered Tx that does not relock applies (`Frontend.recoveredTransactionLoaded`, transaction-recovery.md 7.2) |
 | Requirements (slice limit) | Repair, rebuild | The commit votes a store holds on a KeyValue object fit the KeyValue limit together (`Frontend.maxKVSliceSize`, `ObjectState.sliceReservations`, R16); a repair install keeps them fitting (`Frontend.repairFitsReservations`, repair-process.md M6a), and the union of every committed update, which repair and rebuild install unchecked, fits `maxSliceSize` because the KeyValue limit is `t / w` of it (R16), a rebuilt store admitting no growth of an object it may hold without an inherited commit until repaired (2.3) |
@@ -44,10 +44,12 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Rebuild completion | Transfers | A flip that finds the entry already Active adopts the copy without checking its episode (`DeviceMetadata.markRebuiltStoreActive`); a transfer in retires an earlier tenancy's copy before asking for bytes, so the copy is this episode's (2.2). A flip retried after `TransactionOutcomeUnknown` that finds the entry moved on (TransferringOut, absent) keeps the copy offline rather than discarding it (`Unconfirmed`, rebuild-process.md 5.7) |
 | Rebuild, CRL | Store lifecycle | A rebuilt copy's first load recovers nothing an earlier copy left under its id in the device CRL: it is a save-file load of the empty state `RebuildingStore.finish` writes, which drops those entries first (rebuild-process.md 5.6) |
 | Lost device CRL | Rebuild | A finished rebuild awaiting its flip (in `rebuilt/`) has never served, so it holds nothing in the device CRL and is not moved to `lost/` (`DeviceDiscovery.holdsOwnState`) |
-| Status-cache relay | Finalization actions | Every shipped action is safe to run again after T was finalized and forgotten, which a second driver's resent `TxResolved` makes happen (paxos-transactions.md 10.5; 2.6) |
+| Status-cache relay | Finalization actions | Every shipped action is safe to run again after T was finalized and forgotten, which a second driver's resent `TxResolved` makes happen (paxos-transactions.md 10.5; 2.6), and a relay's copy to the store itself of a same-host sibling's or earlier instance's entry (transaction-recovery.md R-W13) |
 | Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit; a tree-learned resolution is reported `Unresolved` until finalized (`Tx.statusForExpiry`) |
 | Expiry tallies | Recovery | A reported `votedCommit` stands for a voter holding T's locks, or for a committed T (a tree-learned or not-owed resolution, whose locks are released) (2.1) |
 | Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a reconcile case, or retried (2.2); one whose directory or config is missing is rebuilt, its device-CRL entries kept (2.2). A device load serves every `live/` copy without reading the tree, so the phase directories, `phase-param.*` files, the save file and the incarnation file are read with stats that tell a failure from an absence (`server.FileStat`), and an incarnation file is never written by a load (2.2) |
+| Repair (snapshot, then reconcile), status-cache self-relay | Host store routing | Both steps, and the cached entry, belong to the Frontend instance that answers: not upheld across a same-host reopen, which keeps the host's `StoreId` routing and status cache (2.2; repair-process.md RP-W13, transaction-recovery.md R-W13) |
+| Rebuild, Missing Stores, discard | Copy registry | Its records of a store's copies match the disk; it learns them only at the device load, so it does not see a copy that appears later or one that vanishes (2.2; systemic-loss-protection.md SL-W26, rebuild-process.md RB-W25) |
 | CRL admission | Host reconcile | A retained charge is released only once the records it covers have left the CRL or been counted again; the leftover drop releases only the charge it was issued for, unchanged since |
 | Systemic-loss protection | All of the above | Declarations of loss are independent and true (they are not checked; see that document) |
 
@@ -143,7 +145,7 @@ The premises other subsystems take from this:
 
 ### 2.2 Store identity: restarts, transfers, adoption, rebuild
 
-* Every restart, adoption and transfer-in builds a new Frontend, whose load floor (load plus `MaxStartLead`, the
+* Every restart, adoption, transfer-in and same-host reopen builds a new Frontend, whose load floor (load plus `MaxStartLead`, the
   host's join ceiling, or the arrival margin of `AcceptorSinceMargin` after a move between hosts) covers every T the
   store may have joined and forgotten in its previous life. `StoreLoader.ArrivedAtFile` is written durably before a
   moved store can load. The new load floor may sit below the old Frontend's floor (an arrival margin just past, a
@@ -151,6 +153,21 @@ The premises other subsystems take from this:
   everything below its own floor, so it joined nothing in the gap; repair's `mayJoinTransaction` consumes only entries
   of transactions the store joined. Every in-memory store state (`failedCommits`, inherited-vote progress) is lost
   with the Frontend; only what the CRL state, the save file and the copy's phase (its directory) carry survives.
+  A same-host reopen of a store that served (a cancelled shutdown's close and the reconcile's `Load`, an abandoned
+  transfer out's reinstatement, `StoreTransfersOut.reinstateAbandonedOut`, a transfer between two devices of the
+  host) also keeps what the host holds by `StoreId`, which outlives the instance: the status cache, the repair
+  service's state and its requests, which `StoreRouter` routes by `StoreId` when each step is posted, and the
+  admission charges retained for the store. A `ClosePurpose.Reload` close is not one of these: it closes only a store
+  that never recovered (a failed `loadStore`, a failed save-file removal), so it leaves no Tx and no cache entry of its
+  own. Two guards assume one instance and fail across a reopen: a cached non-finalized commit written by the earlier
+  instance's Tx is self-relayed to the new one as news (transaction-recovery.md R-W13, second trigger), and a repair
+  snapshot's `takenAt` from one instance is compared against an inherited-growth guard stamped by the next
+  (repair-process.md RP-W13). Every other host-side request answers through `Frontend.post` on the instance that
+  asked, and the CRL state the new instance recovers stands for the earlier one as a crash's would.
+  `StoreRouter.install` over a still-installed store, with no close, is reachable only in tests
+  (`TestNetwork.restartStore`): a production load needs the store's executor slot, which a served or closing instance
+  still holds (`HostThreading.AlreadyAssigned` leaves the load AwaitingRetry), and a legal move of its copy to Opening
+  (`HostCopies.opening`, `Transitions.activityLegal`).
 * A rebuilt store has a fresh `incarnation` and an `acceptor-since` (finish plus `AcceptorSinceMargin`, 10 s), both
   written durably before the rename that makes the directory appear, and both carried by transfers. Before
   `acceptor-since` it promises, votes and accepts nothing and answers expiry queries `amnesiac`, never as a non-holder
@@ -181,7 +198,10 @@ The premises other subsystems take from this:
   Active and unserved like every other store of the device, which the pool already counts as unserved since the
   device's stores were closed and gossiped offline; the restart's first reconcile moves the copy Live (the Completed
   Rebuilds case) and loads it, and its empty `crl_save.log` drops any earlier entries. No state is lost and nothing is served twice: the cost is the
-  device's outage, which the rebuild does not widen.
+  device's outage, which the rebuild does not widen. Nothing records the CRL failure in the tree: the device stays
+  Operational and its stores Active there, so an operator shutdown's `AspenClient.checkPoolsStayWritable` counts them
+  writable, as it counts any Active store whatever its host serves (operator alerting and device error handling are
+  in Backlog.txt).
 * `Store.close` and a reload over the same backend stop every driver of the store (`Store.shutdownDrivers`); a
   finalizer already running completes its idempotent actions and does not restart. A fail-stopped store's drivers run
   until its host's unload closes it, and `SimpleDriverRecoveryMixin` may start more meanwhile (`Store.driveTransaction`
@@ -222,6 +242,11 @@ The premises other subsystems take from this:
   Active and the device holds no Lost copy of the store (`CopyDecision.release`), whether or not the new copy is
   served: a store left in neither state would consume one unit of the pool's `w -
   t` margin for good.
+* The copy registry learns a device's copies only from the listing of its load (`DeviceDiscovery.loadOwnedDevice`,
+  `HostCopies.attach`) and the host's own moves; nothing re-reads a store's copies from disk while the device stays
+  loaded. Two weaknesses share that root: a copy missing at the load and back later is never seen
+  (systemic-loss-protection.md SL-W26), and a recorded copy whose directory vanishes holds its Rebuilding store's
+  rebuild for good (rebuild-process.md RB-W25).
 * A store's device-CRL entries never leave while its entry names the device and no retire has saved them: the leftover
   drop (`dropLeftoverCrlState`) takes only a store its device entry does not name. A store the Missing Stores case
   declares has nothing durable of that declaration, and its directory may come back (a restore or mount finishing late)
@@ -229,7 +254,9 @@ The premises other subsystems take from this:
   opens it then (`DeviceDiscovery.loadOwnedDevice` offers every `live/` copy to `tryLoadStore`, which reads no tree),
   and it recovers its own state. Its entries go when the rebuilt copy's empty `crl_save.log` is first loaded (5.6 of
   rebuild-process.md), when a retire saves them into a copy, or as leftovers once a re-placement takes the entry off the
-  device.
+  device. A directory that comes back while the host runs is not loaded and, unless the registry recorded it at the
+  device's load, not retired either, so the first of those drops its state unsaved (systemic-loss-protection.md
+  SL-W26).
 * A load retry (`StoreLoader.retryFailedLoads`, a copy left AwaitingRetry by a failed open, build or
   read) offers the store to `tryLoadStore`, which reads no tree, so the retry itself is held to the tree as the
   device's latest reconcile read it (`LocalStorageDeviceState.reconciledEntries`) and to the host's own work on the
@@ -351,7 +378,9 @@ The premises other subsystems take from this:
   here, and its commit, holding no locks here, waits in lock order (`Tx.awaitLockOrder`); a repair defers every key
   the store's own locks cover (`ObjectState.lockedKeys`, `Frontend.reconcileSettled`); a recovered deletion waits for
   the recovered vote to relock. The one exception, a recovered vote sharing the lock cast after T's update persisted
-  (transaction-requirements.md 10.5a), is one whose update is applied.
+  (transaction-requirements.md 10.5a), is one whose update is applied. A commit vote decided with the outcome already
+  known (`Tx.outcomeDecided`, or a resolution that arrived before its objects loaded) takes no lock, so a deletion can
+  apply before it and drop its unapplied update (transaction-requirements.md Q-W20).
 * A lock-order wait has no timer, and while it lasts every new vote whose locks the waiter collides with waits
   (`Tx.lockOrderBlocked`); other votes decide at once. A colliding vote waits at most `Tx.CollisionWait`, then votes
   abort naming the waiter, so waits at two stores that withhold the votes each other's holders need end in about
@@ -387,7 +416,8 @@ The premises other subsystems take from this:
   holds **inherited growth guards** (`Frontend.inheritedGrowthLock`): it votes abort (`InheritedGrowthLock`) on any
   update that grows a guarded KeyValue object, until a complete whole-object repair from a snapshot taken after the
   guard was set (`RepairSnapshot.takenAt`), whose read followed T's commit and so reflects it (repair-process.md
-  E1). The first held-vote round finds what to guard: the objects of the transactions its peers report unresolved
+  E1); both sequence numbers belong to one Frontend instance, which a same-host reopen between the snapshot and the
+  reconcile breaks (repair-process.md RP-W13, 2.2). The first held-vote round finds what to guard: the objects of the transactions its peers report unresolved
   (guarded once released) or committed and not finalized (`HeldVote.committed`; each commit voter holds a committed
   Tx until TxFinalized), and every KeyValue object with an ErrorTree or UnackedCommits entry against the store, read
   after the peers answered (`StoreRepairer.inheritedGrowthScan`): a T finalized before the round had its finalizer
@@ -488,7 +518,9 @@ floor the Frontend refuses the prepare and nothing is created but a rebuilt stor
 the store's own Tx's, so no self-relay is sent while that Tx is resolved: after a lost `TxFinalized` its idle driver
 would take it as a non-late commit and run T's finalization actions again; it learns the outcome from its peers. A
 sibling store of T on the same host shares the cache, so it relays no non-finalized entry to a sender on its host
-(`Store.onThisHost`). T's actions can still run after T was finalized and forgotten, from a second driver's resent
+(`Store.onThisHost`); the copy to itself has no such rule, so a store with no resolved Tx self-relays a same-host
+sibling's entry, or an earlier instance's of itself after a same-host reopen (transaction-recovery.md R-W13). T's
+actions can still run after T was finalized and forgotten, from a second driver's resent
 `TxResolved` (paxos-transactions.md 10.5). Each shipped action tolerates it: the allocation action finds its entry, or records a live object under a shared revision lock that fails
 once the object is deleted, and records nothing for one proven deleted; the deletion action removes the entry of an id
 never allocated again; the split action indexes the new node only if it still reads and its entry is absent, under
@@ -525,7 +557,9 @@ including same-tier finalizers (TKVL split, join, tail removal): ordinary back-p
 transactions finalize upward. Data-only devices give up a quarter of their headroom (Backlog.txt).
 
 **State kept outside admission's turnover.** A transaction's CRL state kept for a failed backend commit stays charged
-for the life of the loaded store.
+for the life of the loaded store. A store whose duplicate copies the device load retired (`DeviceDiscovery.retireDuplicates`)
+keeps its device-CRL entries counted as retained until its Lost copy's retire, before its rebuild, saves and drops
+them (crash-recovery-log.md, Duplicate copies).
 
 **Slice limit.** KeyValue growth is checked per store against what that store holds: the slice plus the growth its
 held commit votes reserve (`RequirementsChecker.checkKVSliceSize`), within the KeyValue limit
@@ -569,6 +603,11 @@ Terms the documents share mean the same in each:
   UnackedCommits entry past expiry is not one: its failed re-check is a live voter's invariant violation.
 * The collision wait is `Tx.CollisionWait`, 500 ms checked at the 1 s store heartbeat, so up to about 1.5 s, for a
   lock holder a vote builds on and for a colliding lock-order waiter alike.
+* A "reload" of a store in the sense of `ClosePurpose.Reload` closes only a store that never recovered; a store that
+  served and is opened again on the same host is a same-host reopen (2.2), which keeps the host's status cache and
+  the `StoreId` routing of repair requests.
+* A commit vote's locks: every `VoteCommit` decided before the outcome is known locks; one decided with it known
+  locks nothing (Q-W20). Statements that a commit voter holds its locks until it applies mean the former.
 * "Below the floor no Tx is created" excepts, everywhere it is said, a rebuilt store's muted Tx for a transaction
   started before its acceptor (2.1; repair-process.md 5.4, paxos-transactions.md 10.10, transaction-recovery.md 4.2).
 

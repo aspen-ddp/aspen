@@ -130,8 +130,9 @@ carry no timestamp, so they cannot be ordered this way; that is why unchecked on
 
 Traces (`appliedBy`): object revision == txid for `DataUpdate`, `VersionBump` and a KV update with a required
 revision; for a KV update without one, any current key carrying revision txid; an allocated object (`allocatedOver`)
-at revision txid. Traceless: `RefcountUpdate`, the locks, a KV update that only deletes or changes object-level
-fields, and one whose Inserts were all superseded. The UnackedCommits fallback does not depend on traces: the
+at revision txid. Traceless: `RefcountUpdate`, the locks, a KV update without a required revision whose operations
+are all key Deletes, and one whose Inserts were all superseded (an object-level change always carries a required
+revision outside an allocation's initial content, 2.5, so it leaves the revision as its trace). The UnackedCommits fallback does not depend on traces: the
 finalizer writes an entry for every counted commit voter that did not acknowledge, whatever its change
 (`client/internal/transaction/MissedUpdateFinalizationAction`).
 
@@ -168,7 +169,9 @@ revision, a `KeyRevision(k, _)` on a key the same update Inserts or Deletes, or 
 differs from the required one. The refcount pin relies on `ObjectRefcount.updateSerial` never returning to an earlier
 value, and both the builder (`RefcountSerialNotAdvanced`) and the stores refuse a `RefcountUpdate` whose new serial is
 not above the required one (`RefcountUpdate.advancesSerial`), except an allocation of the object (from `Allocating`)
-and one that sets the refcount it requires (a repair proof's rc -> rc, which writes no new value). Production callers
+and one that sets the refcount it requires (a repair proof's rc -> rc, which writes no new value).
+`ObjectRefcount.Allocating` equals `ObjectRefcount.Default` (serial 0, count 1), so the `RefcountUpdate` the builder
+adds for an allocation is itself an rc -> rc and no pin. Production callers
 derive the new refcount with `update`, `increment`, `decrement` or `setCount`, which add one to the serial, or name a
 higher serial (the amoebafs unlink). The builder records the key pin in the description as
 `KeyValueUpdate.pinned` (`Pins.writesCheckedKey`) and the client's claim as `TransactionDescription.replaySafe`.
@@ -619,7 +622,8 @@ the re-check after the wait only costs time.
   (`allocatedHere`), is an invariant violation. A committed write that does not depend on T, a deletion included,
   never applies over T's locks before T: it waits for T's vote in lock order (8.3, R15). So the causes left are a
   state discarded under the locks (`Frontend.discard`, `StaleObjectState`) and two conflicting commits, which the
-  quorum overlap excludes. A slice-size re-check is no cause: the votes a store holds together fit together (R16). It
+  quorum overlap excludes (a Tx that decides its vote with the outcome known, from the status cache or a
+  resolution that beat its object loads, votes commit without taking locks, so its skip is no violation, Q-W20). A slice-size re-check is no cause: the votes a store holds together fit together (R16). It
   is logged at error (`INVARIANT VIOLATION`), naming the transaction each object now
   shows, then skipped and reported in `objectCommitErrors`, so the finalizer marks the store; no state is kept and
   the store is not fail-stopped. An allocation the backend missed is reported: the store holds no copy, so no lock
@@ -650,7 +654,9 @@ applied (10.5c).
 
 A fail-stopped store drops every transaction message, read, repair and heartbeat, and `Store.onFailStop` has its host
 move its copy to `lost/` (when its backend closes) and unload it. Every fail-stop is a lost-store declaration (Backlog.txt, "System-level
-protection against correlated lost store declarations"), so only a thrown apply and a failed load fail-stop.
+protection against correlated lost store declarations"), so on the transaction path only a thrown apply and a failed
+load fail-stop (`Frontend.failStop`'s two callers, `Tx.issueCommits` and `Tx.objectLoadFailed`); the FSIF backend's
+own fail-stops on I/O failures are outside this document.
 
 Objects whose earlier backend commit failed (`failedHere`) are left out of the apply for every Tx, voter or not, and
 reported. Skipped objects of a non-voter are reported only. A recovered Tx that did not vote commit applies nothing on a commit and reports every object it changes
@@ -731,7 +737,8 @@ each other covering transaction T whose update Inserts one of those keys is hand
 * T is concluded (its deletion or stub queued, not known durable): the write waits for `crl.whenDurable`;
 * T holds its update of the object here (`Tx.holdsUpdateOf`: it issued its commit of the object, or it voted commit;
   a commit voter holds the key's lock from its vote until it applies, so a key deletion applies before it only as a
-  recovered vote sharing the lock, cast after T's update persisted, 10.5a): T's state is saved again without the
+  recovered vote sharing the lock, cast after T's update persisted, 10.5a; a Tx that decides its vote with the outcome known votes
+  commit without locks, Q-W20): T's state is saved again without the
   object's update (`persistWithoutUpdateOf`, after `CrlStateRecords.dropObject`), and the write waits for that save;
 * otherwise (a non-voter that has not applied): nothing waits. Its update is one the store does not hold and may yet
   apply. When the deletion follows T in the serial order (a Delete checked against a later write of the key that
@@ -750,8 +757,8 @@ over the absent key under a content lock (which lists only present keys). A dele
 timestamp is at least T's start, and the deletion's check requires its own timestamp to be at least that. The record
 keeps the latest deleting start per object and key, written by every apply that deletes keys (the keys are decoded
 only for an update flagged `deletesKeys`), and is kept while a transaction started before it may still apply here:
-above the forget floor, or while a Tx in `transactions` started at or before it is held (a held Tx applies below the
-floor too); it is pruned at `expiryHeartbeat`. A commit held here past its TxFinalized (in lock order or for its turn,
+above the forget floor, or while any Tx in `transactions` started at or before it (a held Tx applies below the floor
+too); it is pruned at `expiryHeartbeat`. A commit held here past its TxFinalized (in lock order or for its turn,
 `Frontend.deferredFinalizations`) is not in `transactions` and keeps no record alive, so its apply may miss a pruned
 deletion. It needs no report: it was finalized before it applied here, so no TxCommitted reached the finalizer within
 `errorTimeout` and the finalizer marked this store, and that mark's repair finds the object unsettled while the
@@ -776,8 +783,10 @@ it. So the Frontend records the latest object timestamp each repair write instal
 changes nothing the entry's minimum timestamp, which no deletion whose mark the entry's delete removes started after
 (`RepairSnapshot.minTimestamp`; the bootstrap sweep, deleting no entries, records nothing) (`repairInstalls`, kept
 while a transaction started before it may still
-join: pruned below the forget floor at `expiryHeartbeat`), and tells every held Tx of the object started before it, and
-every Tx created for the object later with an earlier start (`Tx.repairInstalled`). An apply of a blind Insert of a key
+join: pruned below the forget floor at `expiryHeartbeat`), and tells every Tx in `transactions` holding the object
+started before it, and every Tx created for the object later with an earlier start (`Tx.repairInstalled`). A commit
+held past its TxFinalized has left `transactions` and is not told: while it is held the object is unsettled for
+repair (`settledForRepair`), so no repair installs under it. An apply of a blind Insert of a key
 absent before the apply, on an object so marked, applies and reports the object in `objectCommitErrors`
 (`Tx.issueCommits`): the finalizer marks the store, and the mark's repair, once T can no longer join here, installs the
 object's current state. A recovered commit vote, whose marks were lost with the crash, reports the same apply when any
@@ -931,7 +940,8 @@ holder that never resolves (dead client, dead driver) is taken over by a recover
 * **Prepare after finalization:** ignored when the host's status cache holds T finalized.
 * **Prepare for a transaction the store does not hold:** refused outright below the forget floor (no Tx, no reply);
   above it a Tx is created, muted if T started before a rebuilt store's `acceptorSince` or too far ahead of the
-  host's clock. A cached resolved outcome makes the new Tx take no locks (`outcomeDecided`). See
+  host's clock. A cached resolved outcome makes the new Tx take no locks (`outcomeDecided`); with a client prepare it
+  still checks its requirements and may vote commit, a vote no outcome rests on (Q-W20). See
   paxos-transactions.md (horizon) and `server/store/CLAUDE.md`.
 * **Proofs:** a memoryless Tx whose objects already show the update sends a proof instead of an abort vote
   (`Tx.proveCommitted`, paxos-transactions.md).
@@ -967,4 +977,30 @@ adds the revision check.
 
 ## Open weaknesses
 
-(none)
+**Q-W20 A Tx that decides its vote with the outcome known votes commit without locks, and is treated as a locking
+commit voter.** CONFIRMED, effort S, priority 2. Mechanism: two paths give a `VoteCommit` that `Tx.lock` never locks.
+(a) `Frontend.createTx` calls `Tx.outcomeDecided` for a prepare whose transaction the host's status cache holds
+resolved but unfinalized; with a client prepare, `Tx.determineDisposition` skips the in-flight wait (`!outcomeKnown`)
+and checks the requirements, while `lock` takes nothing (`!outcomeKnown`). (b) A Tx whose `TxResolved` arrives before
+its objects load decides its vote in `Tx.completeLoad` with `oresolution` set (the in-flight wait skipped likewise),
+then `lock` takes nothing because `txStatus` is no longer `Unresolved`. Either vote is sent (`Tx.sendPrepareResponse`),
+but T is already decided, so no outcome rests on it. Later code keys on the disposition alone:
+`Tx.checkVoteCommitApplied` treats it as a live voter, and `Tx.holdsUpdateOf` as a Tx whose update is applied. Trigger
+(first effect): the Tx votes commit and, before it applies (its resolution not yet delivered, held for its turn, or
+waiting in lock order behind a holder that took its locks after the lockless vote, beside a later committed lockless
+transaction U, which `Frontend.locksReleased` wakes first, newest waiter first), U applies, nothing ordering it behind
+T, and raises the object timestamp, so T's re-check fails (`ObjectTimestampError`). Consequence: a false
+`INVARIANT VIOLATION` error, plus the skip-and-report repair pass a non-voter would cost anyway. Trigger (second
+effect): a committed D ordered before T that deletes a key T Inserts applies here first, T holding no lock to make it
+wait. Every key check tests the key's presence, so the one D whose check passes on the state T voted on and that
+commits before T is a Delete of the absent key under a content lock; `Frontend.awaitBlindInsertsDurable` still counts
+it (`deletedKeys` is every Delete of the update) and, `holdsUpdateOf` being true, saves T's state without its whole
+update of the object (`persistWithoutUpdateOf`). A crash after that save and before T's backend commit is durable
+recovers a commit vote without the data, which takes the object as applied (8.5, `recoveredApplied`) and
+acknowledges without reporting. Consequence: that store lacks T's whole update of the object, unmarked, if its
+recovered `TxCommitted` reaches T's current finalizer before the marker's `errorTimeout` (2 s from that finalizer's
+start; a takeover driver's finalizer starts its own), so a permanent replica divergence that costs one unit of `w - t`
+until a later write or repair of the object happens to cover it. Only that timing guards it, hence the priority.
+Fix direction: a Tx whose outcome is known when it decides gives no commit vote (vote abort unchecked, as for
+`NoClientPrepare`, still proving if an object shows the update), so every `VoteCommit` holds its locks until it
+applies; that removes both paths.

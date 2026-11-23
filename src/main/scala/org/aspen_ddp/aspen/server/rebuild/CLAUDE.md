@@ -97,7 +97,7 @@
   Abandoned: repairability, the Completed Rebuilds case, an earlier tenancy's retire, a second start), `RebuildHolds`
   (plus DiscardingLost: a load retry waits, `startOut` refuses), all stages for silence; `hasRebuildWork(store, device)`
   is any stage on one device. `startRebuild`'s host-wide "a rebuild of the store runs" also counts a running handle, so
-  a rebuild still running for a device unloaded under it (crlFailed and relinquish cancel nothing; its Work went with
+  a rebuild still running for a device unloaded under it (crlFailed cancels nothing, and a cancel past the abort latch completes; its Work went with
   the device's records) blocks a second rebuild of the store until it releases its slot. Slots (`maxConcurrentRebuilds`)
   count running rebuilds by handle and discards by work; a discard hands its slot to the rebuild with no gap
   (`startRebuild(handoff = true)`: DiscardingLost goes straight to Running, the discard's own slot not counted), and a

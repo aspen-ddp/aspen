@@ -321,7 +321,9 @@ bootstrap pool's own trees, healed by the bootstrap tree sweep instead, repair-p
 
 * `execute()` (when the finalizer is created) schedules `markMissedUpdates` after `errorTimeout` (2 s).
 * Fast path: `updateCommitErrors` completes the action, writing nothing, once every data store has reported and no
-  report names an object other than a lock-only one. It applies only before the marks are handed off.
+  report names an object other than a lock-only one. It applies only before the marks are handed off. It never skips
+  a `keptForReplay` store's entry: that store's `TxCommitted` names the changed object whose backend commit failed
+  (`Tx.commitComplete`), so the fast path does not fire.
 * `writeMissedUpdates` builds:
   * ErrorTree `MissedUpdate(store, object, type, storePointer, txd.startTimestamp)` for every hosted, non-lock-only
     object of each store with no `TxCommitted`, and for each non-lock-only object a store reported as an error;
@@ -460,10 +462,13 @@ StoreLoader (control thread)                    store executor
 build Store with deferRecovery=true             (not yet owned)
   Frontend.awaitRecovery()  [awaitingCrl=true]
 crl_save.log only: admission.tryChargeLoaded
-  (no room: not loaded, save file kept, retried
-  at the device scans)
+  (no room: not loaded, save file kept, the CRL
+  asked to grow, retried at the device scans)
 router.install(entry)                           ownership passes
 no save file:  router.recoverDeferred(store)  ->  readAndRecover(store)
+no save file, an earlier removal pending
+  (saveFileRemovalPending):
+               -> router.crlLoaded            ->  remove save file durably, readAndRecover(store)
 crl_save.log:  crl.dropStore, then loadStore(trs)
                (failed: UnloadFailedStore, the
                entries dropped, the file kept)
@@ -650,7 +655,9 @@ state, and Paxos, safe with offline acceptors, never chooses abort once commit w
 * It looks up its own entry once loaded (`Frontend.requestUnackedLookup`; the Host reads
   `unackedCommitsTree.get(UnackedCommitEntry.key(store, txid))` through its client and decodes the incarnation,
   `Host.unackedLookup`). An expiring live vote looks up only when an abort or a discard needs it.
-* It is driven at once, like any recovered Tx (no driver only while the CRL state loads).
+* It is driven as any idle Tx is (`Store.heartbeat` after `txHeartbeatTimeout`, or `SimpleDriverRecoveryMixin` after
+  `failedDriverDuration`), without waiting for the lookup: `Store.driveTransaction` gates only on
+  `Frontend.recoveryPending` (no driver while the CRL state loads).
 * It holds any abort resolution or abort `TxFinalized` until a lookup started after the first held abort finds no
   entry (`Tx.holdAbort`, `Frontend.unackedLookupComplete`, `firstCounting`); a later abort replaces the held message
   but does not move the wait. Then the held aborts are handled again and accepted (`Tx.unackedCommitAbsent`).
@@ -749,7 +756,8 @@ lookup that finds no entry.
 
 ```
  created (leader on a client prepare | any store on an idle Tx | expiry commit | a primary or learn-only store)
-   -> PREPARE: TxPrepare(proposalId) to every data store (every maxDelay; post-proof round: those not yet answered)
+   -> PREPARE: TxPrepare(proposalId) to every data store (every maxDelay while the round has no Accept; with one,
+      every third send to those not yet answered this round)
    -> votes per object (commit-certain / abort-certain / undecided); proof: never abort, post-proof round
    -> local proposal fixed; ACCEPT to primary-pool stores (+ prepares every third send); learn-only: no Accept
    -> learner: Accepted quorum   ==> resolved(c)         [or TxResolved / TxFinalized from a peer]
@@ -924,4 +932,39 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 
 ## Open weaknesses
 
-(none)
+**R-W13 A designated leader with no Tx self-relays a same-host sibling's stale non-finalized commit and re-runs T's
+finalization actions.** PLAUSIBLE, effort S, priority 5. Mechanism: `Store.handleTransactionMessage`'s relay of a
+resolved, non-finalized cache entry sends `TxResolved(committed, late = false)` to the store itself whenever the store
+holds no Tx with a known outcome (`frontend.transactions.get(txid).forall(_.knownOutcome.isEmpty)`), and the same
+prepare makes the designated leader start a driver (`driveTransaction`, the cached outcome not finalized). The
+`onThisHost` rule suppresses only the reply to a same-host sender; the self-send does not ask who sent the prepare, nor
+whose Tx wrote the entry (the host cache is shared, `Tx.resolved` records a non-finalized `Committed`). Trigger: T's
+designated leader store A never got a Tx for T (its client prepares were dropped: its device's CRL lane full, or
+the client cut off from A), so a recovery driver on another primary store decided T; store B of T on A's host
+resolved T committed and lost its `TxFinalized`; every other store finalized and forgot T. Inside the horizon B's idle
+driver (`Store.heartbeat`) prepares to A, which is above its floor: A sends itself the non-late commit, starts its
+leader driver and creates an `outcomeDecided` Tx (`Frontend.createTx`). A's driver takes the self-send as resolution
+(`receiveTxResolved` -> `onResolution(sendResolutionMessage = false)`) and starts a finalizer. Resolved, it sends only
+`TxResolved` (`SimpleTransactionDriver.sendPeerMessages`), never a prepare; its first send, delayed by a random part
+of the backoff (`nextRound`), normally comes after the local self-send, so no peer's finalized relay answers it.
+What cancels its finalizer is B's driver: it resolves late from the remote peers' relay and its `TxFinalized(late)`
+reaches A's driver (`receiveTxFinalized` -> `resolveLate`). Consequence: T's non-marker finalization actions, which
+execute at once (`RegisteredTransactionFinalizerFactory.Finalizer`), run again after T was finalized and forgotten,
+against `resolveLate`'s premise. If B's late `TxFinalized` does not reach A's driver within `errorTimeout` (B's remote
+peers slow or unreachable), the marker (voters unknown, no incarnations heard) also writes ErrorTree marks for every
+store of T and voter-unknown UnackedCommits entries for every store hosting a changed object, and A's `TxFinalized`
+lists them in `owed`, so each writes a stub: the effect the `onThisHost` rule removes from the reply to the sender,
+reached through the self-send. The shipped actions tolerate a late re-run and the entries are harmless at stores that saw T (5.4): extra
+repair passes, stubs and marker load, no safety effect. B's own driver is already taking T over, so the 10.2 fast takeover gains nothing here.
+Fix direction: in the relay, send no self `TxResolved` of a non-finalized entry, and start no leader driver from it,
+when the prepare's sender is on this host (`onThisHost(msg.from)`): the sender shares the cache and is itself the
+takeover; the takeover of a dead remote driver (a remote sender, or a client prepare) is unchanged.
+A second trigger reaches the same self-send with no sibling: a store that served and is opened again on the same host
+keeps the host status cache (a cancelled shutdown's close and the reconcile's `Load`, an abandoned transfer out's
+reinstatement, `StoreTransfersOut.reinstateAbandonedOut`; a `ClosePurpose.Reload` close is only of a store that never
+recovered, so it has no old Tx). This is the same root cause as repair-process RP-W13: host state keyed by `StoreId`
+outlives the Frontend instance (cross-document-review.md 2.2). If its old Tx resolved T committed (a non-finalized `Committed`
+entry), its saved status was `Unresolved`, and T's `TxFinalized` arrived only while it was unloaded, the recovered
+Tx has `knownOutcome = None`, so its own idle driver's prepare to itself (or any prepare while `recoveryPending`)
+receives the stale non-late `TxResolved` and re-runs T's finalization actions until peers' late relays cancel it.
+The fix direction covers it: the store itself is `onThisHost`.

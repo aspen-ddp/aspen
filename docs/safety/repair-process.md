@@ -374,6 +374,7 @@ orders first. A key already gone makes `deleteIfPresent` false and the callback 
 repairUpdate(store, ptr, minTimestamp, entryKey, policy, deferral, allowProof):
   snap = target.snapshot(store, ptr)              -- Frontend.snapshotForRepair, on the executor
   snap = snap.copy(only = deferral.deferredKeys(entryKey)            (only with allowProof),
+                   minTimestamp = minTimestamp,
                    awaitSettle = staleCount(entryKey) >= ParkAfterStalePasses (3)  (only with allowProof))
   os   = client.read(ptr)                         -- a full read: only full reads report locks
   first = reconcile(snap, os); if os.timestamp < minTimestamp: first.stale = true
@@ -637,7 +638,8 @@ passes since the entry's last complete pass, the repair sets `RepairSnapshot.awa
 complete pass (8.1). An unsettled store then parks the reconcile
 (`Frontend.parkRepair`; at most one per object, a newer one replacing an older, which answers stale) instead of
 answering stale. `commitTurnFree` runs it first, at the one moment the object is settled, before any waiting
-transaction is told; the end of holding retries every parked repair too, as does the completion of an adopted-data
+transaction is told (also when a committed transaction's lock-order wait ends, `Frontend.lockOrderWaitWakeVoters`);
+the end of holding retries every parked repair too, as does the completion of an adopted-data
 save (`Frontend.adoptedDataSaved`) for the objects it changes. It runs once, through the ordinary
 snapshot-checked reconcile, so a part the completing commit changed still comes back stale. One that never sees its
 object settle answers stale after `Frontend.RepairSettleWait` (1 s), checked on the store heartbeat
@@ -942,4 +944,23 @@ its read threshold stalls the scan until the deadline.
 
 ## 14. Open weaknesses
 
-(none)
+**RP-W13 A repair snapshot's `takenAt` is compared against a guard set by another Frontend instance.** PLAUSIBLE,
+effort S, priority 2. Mechanism: `Frontend.snapshotForRepair` numbers snapshots from `repairSnapshotSeq`, a per-instance
+counter that starts at 0 in every new `Frontend`, and `guardGrowth` stamps each inherited-growth guard with the same
+counter. `StoreRouter.snapshotForRepair` and `reconcileForRepair` route by `StoreId` at call time, so one
+`StoreRepairer.repairUpdate` can take its snapshot from one instance of the store and reconcile against the next (a
+reload in between). `Frontend.inheritedGrowthRepaired` then compares the old instance's `takenAt` with the new
+instance's guard stamp. Trigger: a rebuilt store B, still before its first held-vote round, snapshots a KeyValue object
+X for repair and the read starts before the other voters of an inherited growth T of X have voted. B is opened again on the
+same host (a cancelled shutdown's close and reload, a reinstated transfer out: cross-document-review.md 2.2, the
+root cause it shares with transaction-recovery R-W13), and the new instance (whose gate from the `inherited-votes` file has passed) runs its first held-vote round and guards X at a
+low sequence number. Then the read returns, lacking T and its locks, and its reconcile reaches the new instance. Its
+copy equals the snapshot, the pass is complete and whole-object, and the old `takenAt` exceeds the new stamp. Today only
+the timing prevents this: the gap from T's last possible vote to the gate (`RebuildingStore.inheritedVotesAfter`: the
+horizon plus two `AcceptorSinceMargin`s past the rebuild pass's start) against the 15 s `ObjectReadTimeout`. Under
+clock skew near the margin that gap can be shorter than one read. Consequence: the guard ends while B lacks T's growth,
+so B admits another growth of X near the KeyValue limit. The committed union can then overfill the slice, and repair
+and an FSIF rebuild cannot install X (`CommitError.SliceTooLarge`) until it shrinks (cross-document-review.md 2.3).
+Fix direction: give each `Frontend` instance an identity (a random epoch) that the snapshot carries, and treat a
+snapshot from another instance as stale in `reconcileForRepair`. That also confines `takenAt` to the sequence it was
+taken in.

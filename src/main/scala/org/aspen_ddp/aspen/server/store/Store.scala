@@ -191,7 +191,7 @@ class Store(val storageDeviceId: StorageDeviceId,
     * (Frontend.recoveryPending): a recovered Tx may be among it, and the driver must start above what its acceptor
     * promised or accepted (TransactionDriver.Start.highestSeen, paxos-transactions P2).
     *
-    * A recovered unresolved commit vote is driven at once, before its UnackedCommits lookup answers
+    * A recovered unresolved commit vote is driven like any idle Tx, without waiting for its UnackedCommits lookup
     * (paxos-transactions 6.4). Waiting for the lookup is unnecessary: it would only guard against a driver without
     * the entry's proof deciding abort on the fresh votes of stores that had finalized and forgotten the transaction.
     * The forget floor closes that: a store that forgot T refuses its prepares, or answers from its status cache, so

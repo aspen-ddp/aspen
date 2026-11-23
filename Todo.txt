@@ -1,2 +1,87 @@
 TODO
 ====
+
+Hung devices: isolate, detect, handle (from Backlog "Isolate every device's I/O, and detect and handle hung devices")
+  - Goal: a device that hangs (every read and write blocks indefinitely) stalls only its own stores. The rest of the
+    host keeps serving its other devices' stores, heartbeating and managing devices. Then the host notices the hang
+    and an operator is told, so the device can be dealt with.
+  - Three projects, in order. Each builds on the one before; the first pass is project 1 alone, but its design must
+    leave room for 2 and 3 without rework.
+  - Constraints that shape all three:
+    - A thread blocked in a hung syscall cannot be interrupted or reclaimed. Isolation means confining such threads
+      to the device's own small set and accepting that they stay stuck; it does not mean cancelling them.
+    - A process with threads in uninterruptible I/O may not exit, even on SIGKILL, until the I/O returns. Any
+      "restart the host" response (project 3) must account for that.
+    - No automatic fail-stop, store deletion or lost-store declaration on a hang (Backlog: "System-level protection
+      against correlated lost store declarations"). A bug or false positive must not cause a system-wide outage.
+
+  1. Isolation (first pass)
+    - Every thread that touches a device belongs to a small set dedicated to that device alone. Nothing shared across
+      devices (control thread, store threads, host `ec`, `aspen-client`, JVM-global pools, global locks) ever
+      performs or waits on device I/O.
+    - Inventory of today's violations (2026-11-23):
+      - FSIF `sharedIo` (`fsif-io-N`) and `sharedSerial` (`fsif-serial-N`) are JVM-global; `FsifOpenEc` is a
+        JVM-global cached pool.
+      - RocksDB data I/O (`BufferedConsistentRocksDB` writes/gets/iteration/close) runs on the host `ec` (3 threads,
+        `Main.scala`), which also runs heartbeats, `BackgroundTaskManager` timers, repair, and device-state
+        transactions. Three stuck writes stop the host's heartbeats.
+      - RocksDB flush and compaction run on `Env.getDefault`'s process-global background pools. Check whether
+        RocksJava can give each device its own Env/thread pools; if not, RocksDB needs another answer (e.g. a
+        separate Env per device, or accepting background-pool sharing and bounding its effect).
+      - Rebuild staging I/O (FSIF `rebuildWrite`/`rebuildFlush` Awaits, RocksDB put/flush, `RebuildState` saves,
+        `completeStaging`, `cleanupStaging`) runs on the `aspen-client` pool.
+      - The control thread does direct device I/O: RocksDB open/create (`DefaultBackendOpener`, inline), device CRL
+        open and recovery (`DeviceDiscovery.openDeviceCrl`, incl. the lost-CRL path), device scans (`config.yaml`,
+        markers, `CopyLayout.list`, sweeps), `crl_save.log` reads (`StoreLoader.handleLoad`), copy moves/retire/
+        release, `StoreCopies.delete`'s `os.remove.all`, rebuild and transfer staging cleanup, `DeviceMarkers`
+        writes, and statfs of every device every 20 s (`LocalDevices` usage).
+      - Store threads: `StoreRouter.crlLoaded` (remove + syncDirectory), transfer-out close's `saveStoreState`, FSIF
+        `estimateSize` stats.
+      - Global locks held across I/O: `CrlLock.held` (JVM-global monitor across makeDir/stat/FileChannel.open/
+        tryLock) and `StoreTransferManager.directoryLock` (across `os.remove.all`, which the control thread can wait
+        on via `cancelTransferIn`/`beginTransferIn`).
+      - Already per-device: the CRL writer, CRL thread, `crl-completions` and `crl-growth` threads.
+    - Shape: a per-device I/O context (one per loaded device, owned by the device's lifecycle) through which every
+      device operation runs: backend I/O and opens, the device CRL (incl. its open and recovery: this also covers
+      the Backlog "CRL recovery on the control thread" item), rebuilds, transfers, markers, DurableFiles, copy moves
+      and deletes, statfs. Results post back to the control thread or the store's executor as today.
+    - To facilitate project 2, the context is the single choke point for device I/O: it must be able to see each
+      operation's start and end (kind, store, size) without the callers changing again.
+    - Done when a test that hangs one device's I/O (a blocking fault-injection seam on the context) shows the host's
+      other devices' stores keep serving, the host keeps heartbeating, and device management for the other devices
+      continues.
+
+  2. Detection
+    - Judge health per device, below the backend where it is backend-neutral (the device is the one dependency every
+      backend shares), using the per-device context from project 1: in-flight operation age (a hang) and latency
+      (ailing hardware).
+    - Backends report context that explains legitimate slowness (RocksDB compaction or write stall, FSIF journal or
+      checkpoint work) so the monitor can discount it. `BackendTiming` may seed a per-device version.
+    - RocksDB can hit ENOSPC while the filesystem still shows free space, because what is left is too little for a
+      needed compaction.
+    - A device over its latency threshold alerts the operator (project 3), who decides by hand what to do.
+      Detection produces a device-level health state and evidence; it takes no action itself. Start conservative on
+      thresholds. Expose the state in show-* commands.
+    - Why there is no per-commit watchdog (Todo 4.2, transaction-requirements F12, decided 2026-11-15):
+      - The hang is not incorrect, and existing recovery tolerates it. A store with a commit in flight withholds its
+        vote only on that object. The other stores still vote; a transaction left undecided by the withheld vote is
+        never aborted by its driver (an undecided tally only waits), and once it is past the horizon plus the expiry
+        margin its waiting Txs end by the expiry rules A-G (`ExpiryTally`, server/transaction/CLAUDE.md "Expiry").
+      - No timeout works for every backend: compaction can make a commit legitimately slow by a large factor.
+      - `BackendCommitFailed` is sticky until the store reloads (`Frontend.failedCommits`), so a watchdog using it
+        would poison an object over one slow compaction. If a per-object signal is ever wanted, it must be
+        non-sticky: vote abort only while that commit is still in flight, and stop once it completes.
+      - Cost left unbounded: a transaction waiting on an in-flight commit to a hung device waits as long as the
+        device hangs (the per-device CRL design accepts that), and the hung commit keeps its transaction's CRL state
+        and the device `CrlAdmission` bytes, adding to the device's admission pressure.
+      - Not covered here: `RocksDBBackend.commit` completes only on success, so a failed put never completes. That is
+        a lost completion, not device slowness (Backlog "Full storage devices").
+
+  3. Handling and notification
+    - Tell an operator: depends on the Backlog "Operator alerts" item (durable `PendingAlerts` tree, sinks).
+    - Candidate response (from the Backlog): write `<host-root>/suspected-bad-device.yaml` naming the device and
+      restart the host process; at startup refuse to load that device's stores and run diagnostics to decide whether
+      to return it to service or alert. Must handle a process that cannot exit while threads are stuck in
+      uninterruptible I/O.
+    - Automatically failing the device or migrating its stores off it may come later, only with the same
+      false-positive and correlation caution as the lost-store item.

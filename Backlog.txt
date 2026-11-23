@@ -6,62 +6,9 @@ Backlog
 
 --- Mid Term ---
 
-Isolate every device's I/O, and detect and handle hung devices
-  - Devices can hang for long durations, and every read and write to a hung device can hang indefinitely.
-  - Today some I/O pools span devices: FSIF's I/O pools and the shared RocksDB engines. A single hung device can
-    freeze all of those threads and effectively hang the whole host.
-  - Every thread that touches a device must belong to a small set dedicated to that device alone, so a hung device
-    stalls only its own stores. This needs a comprehensive plan covering every path that reaches a device: backend
-    I/O, opens, the per-device CRL (docs/superpowers/specs/2026-11-07-per-device-crl-and-commit-ordering-design.md),
-    rebuilds, transfers, markers and DurableFiles.
-  - It also needs a plan for detecting device errors and hangs and taking appropriate action. One option:
-    - Write `<host-root>/suspected-bad-device.yaml` naming the device, then restart the host process. A restart is the
-      only guaranteed way to clear every thread and all in-memory state.
-    - At startup the host sees the file and refuses to load the device's stores.
-    - It then runs diagnostics to decide whether to put the device back into service or alert the user.
-  - Automatically failing the device is a possible option, but it needs a cautious, well-thought-out plan. A bug could
-    trigger false positives, and a systemic issue could fail stores automatically until pools drop below threshold
-    (see the correlated "lost store" item below).
-  - Until then, a transaction waiting on an in-flight commit to a hung device waits as long as the device hangs. The
-    per-device CRL design accepts that.
-  - This effort should probably address the next item in this document as well, moving the CRL recovery off of the
-    host control thread.
-  - Device CRL recovery currently runs on the host control thread
-    - DeviceDiscovery opens and recovers each device's CRL (up to num-streams x file size, 3 x 300 MB by default) on
-      aspen-host-control at startup and adoption. On HDD that can take seconds, stalling all other device management on
-      the host. Move the open off the control thread (as BackendOpener does for FSIF opens) and post the result back.
-      Fold into the device I/O isolation item above.
-    - Since 2026-11-15 (Todo 5.6, CRL F16) the open only reads: it no longer re-saves the live set, so what remains
-      on the control thread is recovery's reads of the walked entries.
-  - Per-device I/O latency monitoring (2026-11-15, from Todo 4.2):
-    - Ailing hardware delays, or permanently hangs, I/O for every store on the device, so health is judged per
-      device, not per store or per commit. Measure latency below the backend, where it is backend-neutral: the device
-      is the one dependency every backend shares. `BackendTiming` already records write stages per host and could
-      seed a per-device version.
-    - Backends may report context that explains legitimate slowness, so the monitor can discount it: RocksDB
-      compaction or a write stall, FSIF journal or checkpoint work. RocksDB can also hit ENOSPC while the filesystem
-      still shows free space, because what is left is too little for a needed compaction.
-    - A device over its latency threshold alerts the operator (see "Operator alerts"), who decides by hand what to
-      do. Start conservative. Automatically migrating the device's stores off it may come later, with the same
-      false-positive and correlation caution as the lost-store item. No automatic fail-stop or store deletion: a bug
-      or a false positive must not be able to cause a system-wide outage.
-  - Why there is no per-commit watchdog (Todo 4.2, transaction-requirements F12, decided 2026-11-15):
-    - The hang is not incorrect, and existing recovery tolerates it. A store with a commit in flight withholds its
-      vote only on that object. The other stores still vote; a transaction left undecided by the withheld vote is
-      never aborted by its driver (an undecided tally only waits), and once it is past the horizon plus the expiry
-      margin its waiting Txs end by the expiry rules A-G (`ExpiryTally`, server/transaction/CLAUDE.md "Expiry").
-    - No timeout works for every backend: compaction can make a commit legitimately slow by a large factor.
-    - `BackendCommitFailed` is sticky until the store reloads (`Frontend.failedCommits`), so a watchdog using it
-      would poison an object over one slow compaction. If a per-object signal is ever wanted, it must be non-sticky:
-      vote abort only while that commit is still in flight, and stop once it completes.
-    - Cost left unbounded: a hung commit keeps its transaction's CRL state and the device `CrlAdmission` bytes, which
-      adds to the device's admission pressure (Todo 4.3).
-    - Not covered here: `RocksDBBackend.commit` completes only on success, so a failed put never completes. That is
-      a lost completion, not device slowness (see "Full storage devices").
-
 Operator alerts
   - Today nothing tells an operator anything except log lines. Several designs need to alert one and let them decide
-    by hand rather than act automatically: hung or slow devices (above), the correlated lost-store check (S15, item
+    by hand rather than act automatically: hung or slow devices (Todo.txt "Hung devices"), the correlated lost-store check (S15, item
     3.1 above), full devices, and split decisions (`TransactionStatusCache.splitDecisions`).
   - Sketch: a system service backed by a durable `PendingAlerts` TKVL in system metadata (self-hosting, like the
     ErrorTree). Hosts and stores insert alerts in a transaction, keyed so a repeating condition updates one entry
@@ -319,7 +266,7 @@ Full storage devices: keep stores serving and route around them system-wide
     writes on ENOSPC, keep serving reads, retry until space returns.
   - (2026-11-14) Gaps against that policy, to fix together: `RocksDBBackend.commit` completes only on success
     (`fcommit.foreach`), so a failed put (ENOSPC) hangs its commit with no completion (there is deliberately no
-    hung-commit watchdog: see "Isolate every device's I/O ..."; a full store keeps serving, never fail-stops); the CRL writer's ENOSPC
+    hung-commit watchdog: see Todo.txt "Hung devices", project 2; a full store keeps serving, never fail-stops); the CRL writer's ENOSPC
     (Todo 1.8, CRL F7) must freeze the device's writes, not mark the device failed. Out of space is never a fail-stop
     or a lost-store declaration (see "System-level protection against correlated lost store declarations").
 

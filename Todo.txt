@@ -1,96 +1,12 @@
 TODO
 ====
 
-Safety work list (from docs/safety/*, eleventh pass, built 2026-11-23 against 6a9cdb70 + working tree)
-------------------------------------------------------------------------------------------------------
-
-The eleventh pass audited every document against the code and found no new weakness; its corrections are in the
-documents.
-
-Every open weakness in docs/safety/* (the "## Open weaknesses" section at the end of each document) is listed below
-once, grouped where one change addresses several ids. Completed items are removed; their record is in git history.
-Item numbers are stable (other documents may cite them), so gaps are expected. Priority is by the worst plausible
-consequence, then likelihood, then cost. A cheap fix with a large payoff moves up within its tier. All findings in
-this pass were derived by reading the code; none has a reproducing test yet. CONFIRMED = mechanism traced end to end;
-PLAUSIBLE = mechanism real, trigger uncertain.
-
-Ordering of consequence: lost committed data or a split decision > systemic loss of many stores > resurrection,
-overwritten update or permanent replica divergence > liveness (hangs, stalls) > performance > analysis/docs.
-
-Working rule for every item:
-  1. Re-read the finding and the code.
-  2. Reproduce it with a test (deterministic, LockstepThreading where possible). If it cannot be reproduced, record
-     why in the finding and remove or downgrade it.
-  3. Fix it, then remove the finding from the doc's Open weaknesses, fold the guard into the design text (present
-     tense, no history), and update the module CLAUDE.md.
-  4. If the fix narrows a finding rather than closing it, state the residual explicitly in the finding.
-
-As items are completed, remove them from this document but keep the numbers the same for remaining items.
-
-Effort: S = hours, M = a day or two, L = a design plus several days.
-Doc keys (weakness-id prefixes): CRL = crash-recovery-log, P = paxos-transactions, R = transaction-recovery,
-Q = transaction-requirements, RP = repair-process, RB = rebuild-process, SL = systemic-loss-protection,
-X = cross-document-review (its section 5 lists contradictions between documents).
-
-
-Store copy state machine (docs/superpowers/specs/2026-11-21-store-copy-state-machine-design.md)
-------------------------------------------------------------------------------------------------
-
-Stage 1 (the copy registry over today's markers, derived router silence, uniform marker durability), stage 2
-(phase directories: the layout, CopyMoves, copy ids, no marker files; SCM-2) and stage 3 (the reconcile as a decision
-function, CopyDecision; SCM-3) are done; the spec's "Stage 2 decisions" and "Stage 3 decisions" hold what they decided,
-and its open questions on Outbound and Parked are resolved (P8, P9). Every lockstep test host checks the registry
-against the disk at each drain (Host.Seams.verifyCopyRegistry).
-
-
-PRIORITY 0: design rules
-------------------------
-
-(no open items)
-
-
-PRIORITY 1: lost committed data, split decisions, device-wide loss
-------------------------------------------------------------------
-
-(no open items)
-
-(RB-W19, a running host serving a tombstoned device's stores through their rebuild, is an accepted limitation:
-rebuild-process.md B19.)
-
-
-PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
----------------------------------------------------------------------------
-
-(no open items)
-
-
-PRIORITY 3: systemic loss protection
-------------------------------------
-
-(no open items)
-
-(The correlated false "store lost" design item remains in Backlog.txt.)
-
-
-PRIORITY 4: liveness (hangs, stalls, livelocks)
------------------------------------------------
-
-(SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
-
-
-PRIORITY 5: performance and hygiene
------------------------------------
-
-(no open items)
-
-
-PRIORITY 6: coverage gaps (analysis and tests still to be written)
-------------------------------------------------------------------
-
-(no open items)
-
-
-PRIORITY 7: documentation corrections
--------------------------------------
-
-(no open items)
+Bootstrap tree sweep staleness window (accepted 2026-11-14, revisit). Writes to the bootstrap pool's own
+ErrorTree/UnackedCommits nodes run with missed-update tracking disabled (limitTracking), so a bootstrap store that
+misses one gets no entry. With opportunistic rebuild removed, only the bootstrap tree sweep in that store's repair
+scan heals it (docs/superpowers/specs/2026-11-14-opportunistic-rebuild-removal-design.md). A store whose scans come
+back clean backs off to scanIntervalCap (15 min), so a missed write can stay unhealed for about that long. Inside
+the window two bootstrap stores stale on different nodes can let a quorum read lose a just-written entry, which
+permanently loses another pool's missed-update record (X9). Suggested fix: give the sweep its own short interval
+(e.g. 1 min, a new RepairPolicy setting), independent of the scan back-off. Cost: one walk of the bootstrap trees
+per minute per bootstrap store; the trees are small.

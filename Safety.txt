@@ -1,0 +1,74 @@
+TODO
+====
+
+Safety work list (from docs/safety/*, eleventh pass, built 2026-11-23 against 6a9cdb70 + working tree)
+------------------------------------------------------------------------------------------------------
+
+The eleventh pass audited every document against the code and found no new weakness; its corrections are in the
+documents.
+
+Every open weakness in docs/safety/* (the "## Open weaknesses" section at the end of each document) is listed below
+once, grouped where one change addresses several ids. Completed items are removed; their record is in git history.
+Item numbers are stable (other documents may cite them), so gaps are expected. Priority is by the worst plausible
+consequence, then likelihood, then cost. A cheap fix with a large payoff moves up within its tier. All findings in
+this pass were derived by reading the code; none has a reproducing test yet. CONFIRMED = mechanism traced end to end;
+PLAUSIBLE = mechanism real, trigger uncertain.
+
+Ordering of consequence: lost committed data or a split decision > systemic loss of many stores > resurrection,
+overwritten update or permanent replica divergence > liveness (hangs, stalls) > performance > analysis/docs.
+
+Working rule for every item:
+  1. Re-read the finding and the code.
+  2. Reproduce it with a test (deterministic, LockstepThreading where possible). If it cannot be reproduced, record
+     why in the finding and remove or downgrade it.
+  3. Fix it, then remove the finding from the doc's Open weaknesses, fold the guard into the design text (present
+     tense, no history), and update the module CLAUDE.md.
+  4. If the fix narrows a finding rather than closing it, state the residual explicitly in the finding.
+
+As items are completed, remove them from this document but keep the numbers the same for remaining items.
+
+Effort: S = hours, M = a day or two, L = a design plus several days.
+Doc keys (weakness-id prefixes): CRL = crash-recovery-log, P = paxos-transactions, R = transaction-recovery,
+Q = transaction-requirements, RP = repair-process, RB = rebuild-process, SL = systemic-loss-protection,
+X = cross-document-review (its section 5 lists contradictions between documents).
+
+PRIORITY 1: lost committed data, split decisions, device-wide loss
+------------------------------------------------------------------
+
+(no open items)
+
+
+PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
+---------------------------------------------------------------------------
+
+(no open items)
+
+
+PRIORITY 3: systemic loss protection
+------------------------------------
+
+(no open items)
+
+
+PRIORITY 4: liveness (hangs, stalls, livelocks)
+-----------------------------------------------
+
+(no open items)
+
+
+PRIORITY 5: performance and hygiene
+-----------------------------------
+
+(no open items)
+
+
+PRIORITY 6: coverage gaps (analysis and tests still to be written)
+------------------------------------------------------------------
+
+(no open items)
+
+
+PRIORITY 7: documentation corrections
+-------------------------------------
+
+(no open items)

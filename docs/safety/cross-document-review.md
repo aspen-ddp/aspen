@@ -26,7 +26,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | CRL | Store lifecycle | Entries leave the device CRL only after another durable copy exists or the store is unservable on disk; a store whose entry still names the device keeps them (2.2) |
 | Transaction requirements | CRL, recovery | Recovered commit votes, unresolved or with a restored committed resolution, re-take their locks and slice reservations before any message is handled, and a restored one holds them until it applies (transaction-requirements.md R13) |
 | Transaction requirements | CRL, recovery | A key's deletion (commit or repair write) reaches the backend only once no CRL state holding an applied blind Insert of the key remains (`Frontend.awaitBlindInsertsDurable`), so a recovered Insert of an absent key was never applied |
-| Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter whose re-check fails holds it already (2.3). A vote decided with the outcome already known holds no lock, which nothing downstream expects (Q-W20, 2.3) |
+| Client reads | Requirements | Every commit voter applies a committed update or keeps its lock, applying in lock order (transaction-requirements.md 8.3); at most `w - r` copies lack it. A recovered voter whose re-check fails holds it already (2.3). A vote decided with the outcome already known is an abort (`OutcomeKnown`), so every commit vote holds its locks |
 | Transaction requirements | Repair | Every repair write, and every complete reconcile pass that changes nothing (at its entry's minimum timestamp), tells every Tx of the object started before the timestamp it records (`Frontend.recordRepairInstall`, `Tx.repairInstalled`), so a blind Insert of an absent key applied after it reports the object; a non-voter's blind Insert of an absent key reports its object also where a committed Delete of the key started at or after its start applied here (`Frontend.keyDeletedSince`), and only while the Tx is in `Frontend.transactions` and its marker has not written; a later apply relies on the store's ErrorTree mark, which no reconcile of an object it changes consumes while its commit is held, waits in lock order, or waits for the save of object data it adopted from a late client prepare (`Frontend.settledForRepair`); a recovered Tx without a commit vote applies nothing on a commit and reports every object it changes (`Tx.doCommit`), since it may have acknowledged T before its crash and left no mark |
 | Requirements (lock order) | Recovery | Every recovered commit vote (unresolved, or with a restored committed resolution) has relocked before a recovered Tx that does not relock applies (`Frontend.recoveredTransactionLoaded`, transaction-recovery.md 7.2) |
 | Requirements (slice limit) | Repair, rebuild | The commit votes a store holds on a KeyValue object fit the KeyValue limit together (`Frontend.maxKVSliceSize`, `ObjectState.sliceReservations`, R16); a repair install keeps them fitting (`Frontend.repairFitsReservations`, repair-process.md M6a), and the union of every committed update, which repair and rebuild install unchecked, fits `maxSliceSize` because the KeyValue limit is `t / w` of it (R16), a rebuilt store admitting no growth of an object it may hold without an inherited commit until repaired (2.3) |
@@ -378,9 +378,9 @@ The premises other subsystems take from this:
   here, and its commit, holding no locks here, waits in lock order (`Tx.awaitLockOrder`); a repair defers every key
   the store's own locks cover (`ObjectState.lockedKeys`, `Frontend.reconcileSettled`); a recovered deletion waits for
   the recovered vote to relock. The one exception, a recovered vote sharing the lock cast after T's update persisted
-  (transaction-requirements.md 10.5a), is one whose update is applied. A commit vote decided with the outcome already
-  known (`Tx.outcomeDecided`, or a resolution that arrived before its objects loaded) takes no lock, so a deletion can
-  apply before it and drop its unapplied update (transaction-requirements.md Q-W20).
+  (transaction-requirements.md 10.5a), is one whose update is applied. A Tx that decides its vote with the outcome
+  already known (`Tx.outcomeDecided`, or a resolution that arrived before its objects loaded) takes no lock and votes
+  abort (`OutcomeKnown`), so it is never taken as holding its update.
 * A lock-order wait has no timer, and while it lasts every new vote whose locks the waiter collides with waits
   (`Tx.lockOrderBlocked`); other votes decide at once. A colliding vote waits at most `Tx.CollisionWait`, then votes
   abort naming the waiter, so waits at two stores that withhold the votes each other's holders need end in about
@@ -606,8 +606,7 @@ Terms the documents share mean the same in each:
 * A "reload" of a store in the sense of `ClosePurpose.Reload` closes only a store that never recovered; a store that
   served and is opened again on the same host is a same-host reopen (2.2), which keeps the host's status cache and
   the `StoreId` routing of repair requests.
-* A commit vote's locks: every `VoteCommit` decided before the outcome is known locks; one decided with it known
-  locks nothing (Q-W20). Statements that a commit voter holds its locks until it applies mean the former.
+* A commit vote's locks: every `VoteCommit` locks; a vote decided with the outcome known is an abort (`OutcomeKnown`).
 * "Below the floor no Tx is created" excepts, everywhere it is said, a rebuilt store's muted Tx for a transaction
   started before its acceptor (2.1; repair-process.md 5.4, paxos-transactions.md 10.10, transaction-recovery.md 4.2).
 

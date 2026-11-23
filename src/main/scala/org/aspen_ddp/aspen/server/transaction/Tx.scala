@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitt
 import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyValueOperation, Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, PersistentState, Prepare, ProposalId}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, InheritedGrowthLock, InheritedVoteLock, DataUpdate, InvalidDescription, NoClientPrepare, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{BackendCommitFailed, InheritedGrowthLock, InheritedVoteLock, DataUpdate, InvalidDescription, NoClientPrepare, OutcomeKnown, KeyValueUpdate, ObjectUpdate, ExclusiveRevisionLock, SharedRevisionLock, VersionBump, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -1057,6 +1057,13 @@ class Tx( trs: TransactionRecoveryState,
       disposition = TransactionDisposition.VoteAbort
       if mayProve && appliedHere.nonEmpty then
         proveCommitted()
+    else if oresolution.nonEmpty || outcomeKnown then
+      // The outcome is known, so no outcome rests on this vote, and lock takes nothing: a commit vote here would hold
+      // no locks, yet everything after (checkVoteCommitApplied, holdsUpdateOf) takes a commit voter for one holding
+      // them until it applies. It votes abort unchecked; a commit still applies as a non-voter's does
+      waitingOn = Set()
+      awaitingInFlightCommits = Set()
+      decideDisposition(Map(), List(OutcomeKnown()))
     else if !clientPrepared then
       // Prefer-abort (see awaitingClientPrepare): only driver prepares were seen and the wait for the client's is over,
       // or the outcome is known. The requirements are not checked; an object showing the update still proves the commit

@@ -58,16 +58,6 @@ rebuild-process.md B19.)
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.1 [Q-W20] A VoteCommit decided with the outcome already known holds no locks, yet is treated as a locking voter.
-    CONFIRMED, S. Two paths: Frontend.createTx -> Tx.outcomeDecided for a prepare whose outcome the host status cache
-    holds unfinalized; and Tx.completeLoad deciding the vote after the resolution arrived (Tx.lock skips once txStatus
-    is not Unresolved). checkVoteCommitApplied and holdsUpdateOf then assume the vote's locks: usually a false
-    INVARIANT VIOLATION; rarely a content-locked key Delete makes awaitBlindInsertsDurable call persistWithoutUpdateOf
-    on T's unapplied update, a crash then recovers a vote that takes it as applied and acknowledges cleanly: an
-    unmarked permanent divergence, guarded only by timing against errorTimeout. Fix: a Tx whose outcome is known never
-    gives a commit vote (abort unchecked, as for NoClientPrepare; still prove from an object showing the update).
-    Same code neighbourhood as 5.1 (cached-outcome handling in Store.handleTransactionMessage / Frontend.createTx).
-
 2.2 [RP-W13] A repair snapshot's takenAt is compared against an inherited-growth guard set by another Frontend instance.
     PLAUSIBLE, S. Frontend.repairSnapshotSeq restarts at 0 per instance; StoreRouter routes snapshotForRepair and
     reconcileForRepair by StoreId at call time, so a snapshot taken before a same-host reopen (cancelled shutdown's

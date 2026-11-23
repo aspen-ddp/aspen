@@ -112,6 +112,10 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   (`Frontend.adoptedDataSaves`), since a `TxFinalized` during the save drops the Tx from `transactions`. A delayed duplicate client prepare of an
   aborted transaction cannot commit it: every store that took part remembers the abort for longer than it would join T,
   and refuses T past its forget floor (below)
+- A Tx that decides its vote with the outcome known (a resolution that beat its object loads, or `outcomeDecided`
+  from a resolved status-cache entry) votes abort unchecked (`OutcomeKnown`): no outcome rests on the vote and `lock`
+  takes nothing, so every `VoteCommit` holds its locks until it applies (`checkVoteCommitApplied`, `holdsUpdateOf`
+  rely on it). A commit still applies as a non-voter's does, and a clean apply leaves no ErrorTree mark
 - Description validation (transaction-requirements 2.5): a client-prepared Tx checks its description once,
   before its requirements (`DescriptionValidator`, `Tx.invalidDescription`). A refusal votes abort for every object
   (`InvalidDescription`, a non-object error, never waited out) and logs a warning. The check covers its pool's IDA

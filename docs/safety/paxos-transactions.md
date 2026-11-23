@@ -386,8 +386,12 @@ decided in `Tx.determineDisposition`, in this order:
 1. Muted (a rebuilt store and T started before its `acceptorSince`, or T started too far ahead of the host's clock,
    10.10): `VoteAbort`, never sent. Requirements are not checked and no locks are taken. It proves the commit if an
    object shows the update, and is otherwise forgotten unanswered once its objects load (`Frontend.forgetMuted`).
-2. No client prepare seen (prefer-abort, 6.2): `VoteAbort` with `NoClientPrepare`, requirements unchecked, once the
-   wait for the client's prepare is over or the outcome is known. It still proves the commit if an object shows it.
+2. Outcome known (a resolution that beat its object loads, or a resolved status-cache entry when the Tx was created,
+   `outcomeDecided`): `VoteAbort` with `OutcomeKnown`, requirements unchecked. No outcome rests on the vote, and a Tx
+   that knows its outcome takes no locks, so it gives no commit vote: every `VoteCommit` holds its locks until it
+   applies. A commit still applies here as a non-voter's does.
+2a. No client prepare seen (prefer-abort, 6.2): `VoteAbort` with `NoClientPrepare`, requirements unchecked, once the
+   wait for the client's prepare is over. It still proves the commit if an object shows it.
 3. Invalid description (6.5): `VoteAbort` with `InvalidDescription` for every object.
 4. A hosted object whose earlier backend commit failed or that was poisoned (`BackendCommitFailed`), or that a
    rebuilt store's inherited votes may lock (`InheritedVoteLock`, 10.10): `VoteAbort`.
@@ -412,8 +416,8 @@ outcome is unknown here, the acceptor is memoryless and some loaded object alrea
 "Withheld" means no response at all, which Paxos allows; drivers and the client retransmit. A withheld Tx holds no
 locks, so waits cannot form cycles. `lock()` runs right after the vote is decided and before it is durable; that is
 safe because locks are volatile and a crash before durability discards the vote with them (P3, P5). A Tx whose outcome
-was already known when it was created (`outcomeDecided`), or when its objects loaded, still votes, but takes no
-locks; later code takes that vote for a locking one (transaction-requirements.md Q-W20).
+was already known when it was created (`outcomeDecided`), or when its objects loaded, takes no locks and votes abort
+(step 2), so every commit vote is a locking one.
 
 ### 6.2 Prefer-abort driver prepares
 

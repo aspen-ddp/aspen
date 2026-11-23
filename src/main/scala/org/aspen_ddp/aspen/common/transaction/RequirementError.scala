@@ -57,6 +57,13 @@ case class ObjectExists() extends RequirementError
   */
 case class NoClientPrepare() extends RequirementError
 
+/** The store decides its vote with the transaction's outcome already known (a resolution that beat its object loads,
+  * or a resolved entry in the host's status cache when its prepare arrived). No outcome rests on the vote, and a Tx
+  * that knows its outcome takes no locks, so it votes abort without checking the requirements: every commit vote
+  * holds its locks until it applies (transaction-requirements 8.3). Purely local, like RequirementCheckFailure.
+  */
+case class OutcomeKnown() extends RequirementError
+
 /** A KeyValueUpdate's operations contain a key Delete but the update's deletesKeys flag is not set. Purely local,
   * like RequirementCheckFailure.
   */

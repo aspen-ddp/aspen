@@ -1718,11 +1718,31 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       val txd = lockTxd(txid1, List(overwrite(op1))).copy(startTimestamp = ago(FiniteDuration(6500, MILLISECONDS)))
       frontend.receiveTransactionMessage(clientPrepare(txd))
 
-      // Checked as usual, and the outcome known: no locks, the cached status kept
-      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      // The outcome known: no commit vote (it would hold no locks), the cached status kept
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
       frontend.transactions(txid1).holdsLocks shouldBe false
+      frontend.transactions(txid1).holdsUpdateOf(oid1) shouldBe false
       statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Committed)
       lockedWriteTransactions(frontend, net, op1) shouldBe empty
+  }
+
+  test("a Tx resolved before its objects load gives no commit vote, and still applies the commit") {
+    val backend = new DeferredCommitBackend
+    backend.deferReads = true
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, new TestCrl,
+      new TransactionStatusCache(), loadedAt = FrontendSuite.longLoaded)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
+    sendPrepare(frontend, lockTxd(txid1, List(overwrite(op1))))
+    resolve(frontend, net, txid1, committed = true)
+    backend.deliverReads()
+
+    // The vote is decided with the outcome known: one that locks nothing is no commit vote
+    votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+    while backend.heldCommits > 0 do backend.deliverOne()
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
+    net.sentTx.collect { case c: TxCommitted => c.objectCommitErrors } shouldBe List(Nil)
   }
 
   test("an unknown prepare inside the horizon with no status cache entry is checked afresh") {
@@ -2083,8 +2103,8 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.belowForgetFloor(txd) shouldBe false
       frontend.receiveTransactionMessage(clientPrepare(txd))
 
-      // Checked, the outcome known, no locks, the cached status kept
-      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+      // Taken part in, the outcome known: no commit vote, no locks, the cached status kept
+      votes(net).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
       frontend.transactions(txid1).holdsLocks shouldBe false
       statusCache.getStatus(txid1).map(_.status) shouldBe Some(TransactionStatus.Committed)
   }

@@ -44,7 +44,8 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
   private val retry = LoadRetry(null.asInstanceOf[LocalStorageDeviceState], os.root / "x", 1, 1)
   private val activities: List[Activity] = List(Activity.Idle, Activity.AwaitingRetry(retry), Activity.Opening(1L),
     Activity.Served, Activity.Closing(ClosePurpose.TransferOut), Activity.Closing(ClosePurpose.Shutdown),
-    Activity.Closing(ClosePurpose.Relinquish), Activity.Closing(ClosePurpose.FailStop), Activity.Retiring)
+    Activity.Closing(ClosePurpose.Relinquish), Activity.Closing(ClosePurpose.FailStop),
+    Activity.Closing(ClosePurpose.Unserved), Activity.Retiring)
 
   private def akind(a: Activity): String = a match
     case Activity.Idle => "Idle"
@@ -62,7 +63,10 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
     val pair = akind(from) -> akind(to)
     any.contains(pair) ||
       (pair == ("Idle" -> "Opening") && phase == Phase.Live) ||
-      (pair == ("Idle" -> "Retiring") && phase == Phase.Lost)
+      (pair == ("Idle" -> "Retiring") && phase == Phase.Lost) ||
+      // An unserved backend's close holds its Live copy (StoreRebuilds.retireUnserved)
+      (Set("Idle", "AwaitingRetry", "Opening").contains(akind(from)) &&
+        to == Activity.Closing(ClosePurpose.Unserved) && phase == Phase.Live)
 
   private val storeId = StoreId(PoolId(UUID.randomUUID()), 0)
   private val other = StoreId(PoolId(UUID.randomUUID()), 1)

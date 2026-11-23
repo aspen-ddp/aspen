@@ -107,8 +107,9 @@ class CopyDecisionSuite extends AnyFunSuite with Matchers:
       decide(in(entry(s), copy(Phase.Live), facts = f)) should not contain (Load)
     decide(in(None, copy(Phase.Live), facts = f.copy(dirPresent = None))) should be(Nil)
     decide(in(active, copy(Phase.Live), facts = f.copy(sending = true))) should be(Nil)
-    // Its config missing or unreadable
-    decide(in(active, copy(Phase.Live), facts = f.copy(configPresent = None))) should be(Nil)
+    // Its config known absent: declared missing instead. One whose stat fails is offered (R9): tryLoadStore holds it
+    // back with its load retry
+    decide(in(active, copy(Phase.Live), facts = f.copy(configPresent = None))) should be(List(Load))
     decide(in(active, copy(Phase.Live), facts = f.copy(configPresent = Some(false)))) should be(
       List(DeclareMissing(true)))
     // Declared missing, served, opening or held by a rebuild elsewhere on the host
@@ -243,6 +244,10 @@ class CopyDecisionSuite extends AnyFunSuite with Matchers:
           case Load =>
             if !(phase.contains(Phase.Live) && c.exists(c => !c.unsynced && c.activity == ActivityKind.Idle)) then
               bad(input, "A1 Load")
+            // D7's conjuncts
+            if !(e.exists(_.status == StoreStatus.Active) && !f.sending && !f.servedOnHost && !f.openingOnHost &&
+                 !f.rebuildHoldsOnHost && !f.declaredMissing && !f.configPresent.contains(false)) then
+              bad(input, "D7 Load")
           case BringArrivedLive =>
             if !phase.exists(_.isInstanceOf[Phase.Arrived]) then bad(input, "A1 BringArrivedLive")
           case BringRebuiltLive =>

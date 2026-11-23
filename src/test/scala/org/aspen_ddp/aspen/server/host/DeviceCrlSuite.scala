@@ -1897,6 +1897,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
       heldAfter = held(crl, storeId)
       otherSaveFile = os.exists(Backend.crlSaveFile(otherCopy))
+      _ = transferOutWork(host, storeId, held = false)
       _ = factory.shutdownAll()
     yield (saved, heldAfter, otherSaveFile)
 
@@ -1942,6 +1943,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- extracting
       saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
       heldAfter = crl.getAppliedStubs(storeId).keySet
+      _ = transferOutWork(host, storeId, held = false)
       _ = factory.shutdownAll()
       onDisk = heldStubsOnDisk(deviceDir, storeId)
     yield (saved, heldAfter, onDisk)
@@ -2242,6 +2244,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- advanceLog(crl, template)
       // A store stopped mid-close never closed its backend
       _ <- if loaded && crash then backend.close() else Future.unit
+      _ = transferOutWork(host, storeId, held = false)
       _ = factory.shutdownAll()
       saveFile = os.exists(Backend.crlSaveFile(storeDir))
     yield (outcome, heldAfter, heldOnDisk(deviceDir, storeId), saveFile)
@@ -2273,6 +2276,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(host, extracted.isCompleted)
       _ <- extracted
       afterExtraction = admission.admittedBytes
+      _ = transferOutWork(host, storeId, held = false)
       _ = factory.shutdownAll()
     yield
       counted should be > 0L

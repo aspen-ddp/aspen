@@ -843,16 +843,24 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   /** crlSaveFileLost's steps, for any store that must never serve: closes `backend` unserved and, once the close has
    *  ended (no move is made of an open backend's directory), moves the copy to lost/, leaves it offline, and checks
    *  the device so the reconcile flips its entry to Rebuilding. A crash before the move finds the same unusable state
-   *  at the next start and lands here again. */
+   *  at the next start and lands here again.
+   *
+   *  While the close runs its copy is held Closing(Unserved) (HostCopies.closingUnserved), not Idle: an Idle, synced
+   *  Live copy under Active is CopyDecision's Load state, and a load in that window would open a second backend on the
+   *  directory, which for a failed backend may serve, leaving the move below to find it Opening or Served and give
+   *  up. The hold ends just before the move. A copy a reload's earlier store still serves is not held: it is Served */
   def retireUnserved(storageDeviceId: StorageDeviceId, backend: Backend): Unit =
     val storeId = backend.storeId
     val tracked = closeStarted(storageDeviceId)
+    val held = registry.closingUnserved(storageDeviceId, storeId)
     val closed =
       try backend.close()
       catch case NonFatal(t) => Future.failed(t)
     closed.onComplete: result =>
       try
         result.failed.foreach(t => logger.warn(s"Failed to close the unserved backend of store $storeId: $t"))
+        if held then
+          registry.closeEnded(storageDeviceId, storeId)
         moveClosedToLost("retireUnserved", storageDeviceId, storeId, backend.path)
       finally closeDone(storageDeviceId, tracked)
 

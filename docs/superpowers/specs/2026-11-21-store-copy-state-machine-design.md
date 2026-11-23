@@ -201,7 +201,7 @@ enum Activity:   // volatile; Idle after every restart
   case AwaitingRetry(retry: LoadRetry)                  // storesAwaitingRetry, buildRetryWaits
   case Opening(openId: Long)                            // loading, opening, opensStarted
   case Served(store: Store)                             // installed in the router
-  case Closing(purpose: ClosePurpose)                   // TransferOut(tid) | Shutdown | Relinquish | FailStop | Reload
+  case Closing(purpose: ClosePurpose)                   // TransferOut(tid) | Shutdown | Relinquish | FailStop | Reload | Unserved
   case Retiring                                         // retiring, droppingCrlState
 
 enum Work:       // per (device, store); at most one
@@ -344,8 +344,8 @@ RR > TO > TI > RC), so the items tied to the on-disk format wait for stage 2.
     disk to say so, and the record of a closed copy is Idle like any other offline copy. **Removed in stage 3
     (D7)**, with `HostCopies.heldForSync`: one Live-copy rule, `CopyDecision.Load`, loads an Idle, synced Live copy
     with no work under an Active entry, not being sent, whose store is not served, opening or held by a rebuild on
-    the host, whose config is present and which is not declared missing. A copy held offline on purpose is never in
-    that state.
+    the host, whose config is not known absent (R9) and which is not declared missing. A copy held offline on purpose
+    is never in that state.
   - `declaredMissing` (mirrored as the device's `missing`), `transferInRetries`, and the retry backoffs, which are not
     copy state.
 
@@ -875,8 +875,9 @@ stated as what holds now. Where this block and the text above disagree, this blo
   `pending-delete/` (its per-copy rule is the pure `CopyDecision.release`).
 - **D7. One Live-copy rule, `Load`, replaces `closedForShutdown`, `heldForSync` and `reloadClosedStores`.** An Idle,
   synced Live copy with no work, under an Active entry, not being sent, whose store is not served, opening or held by a
-  rebuild anywhere on the host, whose config is present and which is not declared missing, is loaded. A copy held
-  offline on purpose (pendingLost, work, AwaitingRetry, a device that stops serving) is never in that state. This
+  rebuild anywhere on the host, whose config is not known absent (a stat that fails is offered: R9) and which is not
+  declared missing, is loaded. A copy held offline on purpose (pendingLost, work, AwaitingRetry, an unserved backend
+  closing, held `Closing(Unserved)` by `retireUnserved`, a device that stops serving) is never in that state. This
   settles the Todo's question: `closedForShutdown` became a case of the Live-copy rule.
 
 The exhaustive test (`CopyDecisionSuite`) runs every entry status, copy phase, activity and work and asserts I1-I5, the
@@ -891,10 +892,26 @@ store-copies release rule and "no Action loads a non-Live copy".
   reconcile is a re-read, not a delta. `rebuildWaitsForClose` (a predicate) replaces `deferRebuildUntilClosed` and
   `rebuildsAwaitingClose` is gone. Parked (pre-existing, unchanged): a rebuild of a store on another device of the host
   that waits for a transfer-out close is prompted only by the periodic device check.
-- **R6. A Live copy whose config stat fails waits** until the stat answers (it is not offered); a Live copy with no
-  config is a fixture-only state, since creates and moves are atomic.
+- **R6 (superseded by R9). A Live copy whose config stat fails waits** until the stat answers (it is not offered); a
+  Live copy with no config is a fixture-only state, since creates and moves are atomic. The configured-copy fixture
+  (`setUp(configured = ...)`) stays; the skip does not.
 - **R7. Test fixtures hold the work production holds.** A real load claims Opening at once, and production closes for
   transfer out only under TransferOut work; fixtures that closed a copy for transfer out hold that work, and release
   it at the end.
-- **R8. Reload copies are reloaded.** A copy closed with `ClosePurpose.Reload` (a failed CRL-state load, a failed
-  save-file removal) is left Idle, and `Load` reloads it at each device check while it stays so.
+- **R8. Reload copies are reloaded by their load retry.** A copy closed with `ClosePurpose.Reload` (a failed CRL-state
+  load, `handleUnloadFailed`; a failed save-file removal, `handleSaveFileRemovalFailed`) is not left Idle for `Load`:
+  each records a load retry, so the copy ends AwaitingRetry and `retryFailedLoads` reloads it under the retry's
+  backoff (a failed CRL load's doubles from the retry its open took), never at each device check.
+- **R9 (final review; supersedes R6). A config stat that fails does not stop `Load`.** Its conjunct is
+  `configPresent != Some(false)`: a copy whose stat fails is offered, and `tryLoadStore`, reading it again, holds it
+  back with its load retry (`awaitUnreadRetry`), retried on the device scans with backoff, as before stage 3. R6's skip
+  left it unserved until the next device check (hourly in production). `Some(false)` is `DeclareMissing`.
+- **R10 (final review). An unserved backend's close holds its copy.** `StoreRebuilds.retireUnserved` (a CRL save file
+  lost, a lost incarnation, never-fits, a backend failed before served) takes the copy's record to `Closing(Unserved)`
+  (a new `ClosePurpose`) before `backend.close()` (`HostCopies.closingUnserved`; `Transitions.activityLegal` allows
+  Idle, AwaitingRetry and Opening to `Closing(Unserved)` under Live, and nothing else to it but Served's
+  `Closing(_)`, so a router removal of an unserved copy is still a violation) and ends it (`closeEnded`) just before `moveClosedToLost`. Left Idle, the
+  copy was in `Load`'s state while the close ran, and a device check in that window opened a second backend on its
+  directory, which for a failed backend could serve, leaving the move to give up on a fail-stopped copy. The close is
+  counted by `closeStarted` as before, so every unload still waits for it.
+- R3 and R5 were review carry-overs with no design effect.

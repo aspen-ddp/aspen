@@ -47,7 +47,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Status-cache relay | Finalization actions | Every shipped action is safe to run again after T was finalized and forgotten, which a second driver's resent `TxResolved` makes happen (paxos-transactions.md 10.5; 2.6) |
 | Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit; a tree-learned resolution is reported `Unresolved` until finalized (`Tx.statusForExpiry`) |
 | Expiry tallies | Recovery | A reported `votedCommit` stands for a voter holding T's locks, or for a committed T (a tree-learned or not-owed resolution, whose locks are released) (2.1) |
-| Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a pass, or retried (2.2); one whose directory or config is missing is rebuilt, its device-CRL entries kept (2.2). A device load serves every `live/` copy without reading the tree, so the phase directories, `phase-param.*` files, the save file and the incarnation file are read with stats that tell a failure from an absence (`server.FileStat`), and an incarnation file is never written by a load (2.2) |
+| Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a reconcile case, or retried (2.2); one whose directory or config is missing is rebuilt, its device-CRL entries kept (2.2). A device load serves every `live/` copy without reading the tree, so the phase directories, `phase-param.*` files, the save file and the incarnation file are read with stats that tell a failure from an absence (`server.FileStat`), and an incarnation file is never written by a load (2.2) |
 | CRL admission | Host reconcile | A retained charge is released only once the records it covers have left the CRL or been counted again; the leftover drop releases only the charge it was issued for, unchanged since |
 | Systemic-loss protection | All of the above | Declarations of loss are independent and true (they are not checked; see that document) |
 
@@ -187,17 +187,17 @@ The premises other subsystems take from this:
   has no `failStopped` check, unlike `Store.heartbeat`): a proposer holds no acceptor state, so it decides only what
   the other stores' votes and accepts allow, its own store drops every message, and its finalizer marks that store.
 * A store whose entry names this device is served, or is an offline copy on the device (its copy-registry record,
-  `HostCopies.offlineCopies`), where a reconcile pass (lost
+  `HostCopies.offlineCopies`), where a reconcile case (lost
   CRL, abandoned transfer out, cancelled shutdown, completed transfer in or rebuild) or a load retry takes it up. A
   backend open that fails for anything but a lost state (out of space, an I/O, lock or resource error) leaves the store
   offline and retries the load at the device scans with backoff (the copy's AwaitingRetry, `StoreLoader.retryFailedLoads`,
   capped at `Host.LoadRetryCap`); a create that left nothing at the path is created again by the next device check
   instead; a retry whose store config cannot be read keeps its entry and tries again at the next scan. A rebuilt copy
-  whose move to `live/` fails after its flip stays an offline copy (its Rebuilt record); the Completed Rebuilds pass
+  whose move to `live/` fails after its flip stays an offline copy (its Rebuilt record); the Completed Rebuilds case
   retries the move and the load at each device check, and a move whose directory sync failed leaves the copy Live,
   unsynced and held for its load (`host.CopyMoves`), which every later device check that finds it synced, free and
   Active loads. A transferred-in copy moves from `arrived/` to `live/` the same way, after a durable `ArrivedAtFile`
-  (`StoreTransfers.bringArrivedLive`): a failed move leaves it Arrived for the Completed Transfers In pass, a failed
+  (`StoreTransfers.bringArrivedLive`): a failed move leaves it Arrived for the Completed Transfers In case, a failed
   sync the copy unsynced and held. A failed `crl.loadStore` (`UnloadFailedStore`) is not retried, but it fails only with the
   CRL itself, whose failure unloads the device (`DeviceShutdown.crlFailed`). A store whose `config.yaml` cannot be read
   by `StoreLoader.tryLoadStore` (`awaitUnreadRetry`), or whose load finds its executor slot still held
@@ -208,7 +208,7 @@ The premises other subsystems take from this:
   save file whose removal failed, a Store whose build throws) hands the callback to its copy's AwaitingRetry,
   and any other failure drops it, so peers never clear their offline mark for a store left offline. An Active entry on a loaded
   device with no `config.yaml` at its store path (the directory lost to a bad restore, a partial mount or a hand
-  removal, or its config gone), not served, opening or retiring, is found by the reconcile's Missing Stores pass
+  removal, or its config gone), not served, opening or retiring, is found by the reconcile's Missing Stores case
   (`DeviceReconciler.reconcileDeviceState`): the store is marked offline and a rebuild requested
   (`StoreRebuilds.requestRebuild`). Its device-CRL entries stay (below).
   `tryLoadStore` logs a store directory without a config at error, and an unreadable config is logged at error once per
@@ -216,7 +216,7 @@ The premises other subsystems take from this:
   Active, whether or not the new copy is served: a store left in neither state would consume one unit of the pool's `w -
   t` margin for good.
 * A store's device-CRL entries never leave while its entry names the device and no retire has saved them: the leftover
-  drop (`dropLeftoverCrlState`) takes only a store its device entry does not name. A store the Missing Stores pass
+  drop (`dropLeftoverCrlState`) takes only a store its device entry does not name. A store the Missing Stores case
   declares has nothing durable of that declaration, and its directory may come back (a restore or mount finishing late)
   before its Rebuilding flip commits, or after it and before the first reconcile's `retireForeignCopy`; a device load
   opens it then (`DeviceDiscovery.loadOwnedDevice` offers every child to `tryLoadStore`, which reads no tree), and it
@@ -235,8 +235,8 @@ The premises other subsystems take from this:
   `StoreLoader.tryLoadStore`), the save file and the incarnation file (`StoreLoader.handleLoad`). Each is tested with `server.FileStat`, which answers absent only for a
   stat that does (ENOENT, or a parent that is no directory) and throws otherwise, so a failed stat holds the load back
   (`awaitUnreadRetry`, with backoff) instead of serving a store without its phase or state. The passes that act on an
-  absence use it too: the Missing Stores pass and the leftover drop skip a store whose stat fails, a retire fails
-  rather than report a clear path, the Deleted Stores pass keeps the store offline, and the device CRL's open leaves the
+  absence use it too: the Missing Stores case and the leftover drop skip a store whose stat fails, a retire fails
+  rather than report a clear path, the Deleted Stores case keeps the store offline, and the device CRL's open leaves the
   device unloaded for the next scan rather than declare a `crl/` lost (a child whose config cannot be stat'd counts as
   a store). So do the opens they lead to: the CRL open's own tests (a failed stat throws, transient to
   `openDeviceCrl`, and no stream file is created under `mustExist`), the backend opens and FSIF recovery (an
@@ -261,13 +261,13 @@ The premises other subsystems take from this:
   they cannot see nor retiring a finished one; `startIn` neither resumes nor discards an arrived copy whose
   `phase-param.arrived` cannot be read, and refuses a path whose stat fails; `openDeviceCrl` throws before moving `crl/`;
   an unserved `backendFailed` treats the directory as present (moved to `lost/`).
-  A phase a reconcile pass looks for counts only from the registry's record, which a device load builds only from a
+  A phase a reconcile case looks for counts only from the registry's record, which a device load builds only from a
   listing that succeeded, so a failed listing leaves the device unloaded and no decision runs on it; `CopyDecision.Load`
   loads a Live record's store, the load then holding it back with its own `FileStat` tests. `StoreTransfersOut.extractUnloaded` tests the directory and the save file with `FileStat`, failing
   the extraction on a failed stat.
 * A lost device CRL moves every store copy to `lost/` except those that held nothing in it (`DeviceDiscovery.holdsOwnState`):
   a store whose valid `crl_save.log` is its whole state, and a finished rebuild awaiting its flip (in `rebuilt/`),
-  which `tryLoadStore` never serves, so its flip or the Completed Rebuilds pass loads it over the fresh CRL. A Rebuilt
+  which `tryLoadStore` never serves, so its flip or the Completed Rebuilds case loads it over the fresh CRL. A Rebuilt
   copy whose move to `live/` failed after its flip still holds nothing; it stays in `rebuilt/` and is not moved.
 * A rebuild's flip that finds the entry already Active returns `Adopt` without checking the episode
   (`DeviceMetadata.markRebuiltStoreActive`), and `AdoptOffline` likewise for an Offline entry. That is sound because a
@@ -281,13 +281,13 @@ The premises other subsystems take from this:
   flip settles after the store came to be served from another device here, leaves the store served there; and a
   removed copy's record goes alone, so the store stays silent while another device here holds a copy of it or Rebuild
   work silences it. A rebuilt copy carries an empty
-  `crl_save.log` (`RebuildingStore.writeEmptyCrlState`), so its first load (by the flip, the Completed Rebuilds pass,
+  `crl_save.log` (`RebuildingStore.writeEmptyCrlState`), so its first load (by the flip, the Completed Rebuilds case,
   a restart, a reinstatement or an adoption) drops whatever device-CRL entries an earlier copy left under its id
   (`StoreLoader.awaitCrlLoad`), and a transfer out of the unloaded copy ships the file and drops them
   (`StoreTransfersOut.extractUnloaded`). Such a transfer (an `Unconfirmed` copy whose entry went TransferringOut) ships the copy
   from `outbound/`; the destination takes it as any arrival, Arrived and then Live when its pool update commits
   (`StoreTransfers.recordTransferIn`), since its entry is then Active; a failed move leaves the copy offline for the
-  Completed Transfers In pass.
+  Completed Transfers In case.
 * Host-side client work (UnackedCommits lookups, held-vote queries, the repair service) runs
   on the host's `ec`, not a store executor or the control thread. It keeps no host state of its own beyond what it
   locks (`DeferralState`, `StoreRepairer`'s counters), reads store state only through `@volatile` snapshots

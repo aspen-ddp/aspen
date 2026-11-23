@@ -57,10 +57,15 @@ trait CopyHostFixture extends ControlFixture:
           case None => backend
           case Some(gate) => gate.flatMap(_ => backend)(using executionContext)
 
-  /** A CRL whose next `failReads` reads of a store's state and next `failDrops` drops fail */
+  /** A CRL whose next `failReads` reads of a store's state, next `failDrops` drops and next `failLoads` loads of a
+   *  saved state fail */
   protected class FlakyCrl extends TestNetwork.TestCRL:
     val failReads = new AtomicInteger(0)
     val failDrops = new AtomicInteger(0)
+    val failLoads = new AtomicInteger(0)
+    override def loadStore(storeId: StoreId, state: StoreRecoveryState): Future[Unit] =
+      if failLoads.getAndUpdate(n => math.max(0, n - 1)) > 0 then Future.failed(new java.io.IOException("injected load"))
+      else super.loadStore(storeId, state)
     override def readStoreState(storeId: StoreId): Future[StoreRecoveryState] =
       if failReads.getAndUpdate(n => math.max(0, n - 1)) > 0 then Future.failed(new java.io.IOException("injected read"))
       else super.readStoreState(storeId)
@@ -96,8 +101,9 @@ trait CopyHostFixture extends ControlFixture:
                        rename: Option[(os.Path, os.Path) => Unit] = None,
                        rebuilds: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
                        transfers: StoreTransferService = StoreTransferService.Disabled,
-                       threadingOf: ExecutionContext => LockstepThreading = new LockstepThreading(_)): Host =
-    newHost(hostRoot, storeRebuildFactory = rebuilds, transferService = transfers,
+                       threadingOf: ExecutionContext => LockstepThreading = new LockstepThreading(_),
+                       crlFactory: CrashRecoveryLogFactory = TestNetwork.TestCRL): Host =
+    newHost(hostRoot, storeRebuildFactory = rebuilds, transferService = transfers, crlFactory = crlFactory,
       adjustSeams = _.copy(tryLoadStore = None, loadStore = None, loadStoreById = None, backends = Some(opener),
         copyRename = rename), threadingOf = threadingOf)
 

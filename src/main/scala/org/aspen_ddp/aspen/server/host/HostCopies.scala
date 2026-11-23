@@ -416,6 +416,20 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         if copies.copies.contains(storeId) then
           activityFact("router remove", copies, storeId, Activity.Closing(purpose))
 
+  /** An unserved backend of `storeId` on device `id` that must never serve is about to close
+   *  (StoreRebuilds.retireUnserved): its Live copy, Opening, Idle or AwaitingRetry, is held Closing(Unserved) until
+   *  the close ends (closeEnded), so that no load opens a second backend on its directory while the first still
+   *  closes. A claim; returns whether the copy is held. A copy in any other activity (Served: a reload's earlier store
+   *  still serving it; Closing; Retiring), in another phase, or with no record is left as it is, and false returned */
+  def closingUnserved(id: StorageDeviceId, storeId: StoreId): Boolean =
+    device(id).flatMap(_.copies.get(storeId)) match
+      case Some(r) if r.phase == Phase.Live && (r.activity match
+          case Activity.Idle | Activity.AwaitingRetry(_) | Activity.Opening(_) => true
+          case _ => false) =>
+        claim("retireUnserved"):
+          device(id).foreach(_.setActivity(storeId, Activity.Closing(ClosePurpose.Unserved)))
+      case _ => false
+
   /** The close of `storeId`, loaded from device `id`, ended (StoreLoader: handleClose, closeUnloaded): its record is
    *  Idle, or AwaitingRetry if the loader recorded a retry for it while it closed */
   def closeEnded(id: StorageDeviceId, storeId: StoreId): Unit =

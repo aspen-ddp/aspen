@@ -44,7 +44,9 @@ object Host:
                                   admissionTier: AdmissionTier = AdmissionTier.Data) extends Event
   private[server] case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
   /** The CRL state of a loaded store failed to load: it is unloaded, if it is still the store installed */
-  private[server] case class UnloadFailedStore(storeId: StoreId, store: Store) extends Event
+  /** `previous`: the load retry the failed load's open took, which the unload's own retry backs off from */
+  private[server] case class UnloadFailedStore(storeId: StoreId, store: Store, previous: Option[LoadRetry] = None)
+    extends Event
   /** A loaded store's crl_save.log could not be removed durably (StoreRouter.crlLoaded): it is unloaded, its CRL
    *  entries kept, and its load retried, if it is still the store installed */
   private[server] case class SaveFileRemovalFailed(storeId: StoreId, store: Store) extends Event

@@ -254,7 +254,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       case TakeOutOfService =>
         ctx.rebuilds.retireUnlistedServed(local, storeId)
       case ForgetGoneCopy =>
-        ctx.copyRegistry.removed("retireUnowned: no directory", local, storeId)
+        ctx.copyRegistry.removed("forget gone copy: no directory", local, storeId)
       case Retire =>
         // Its copy's record, which keeps the store silent, goes only once its path is clear (the retire's move into
         // pending-delete), so a failed retire is retried by the next check. A copy that reaches pending-delete has

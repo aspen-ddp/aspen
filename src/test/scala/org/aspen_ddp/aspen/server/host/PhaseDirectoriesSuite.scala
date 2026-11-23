@@ -266,6 +266,90 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       heldPath should be(Some(flat))
       inLost(dev, s, flat)
 
+  // Final review I1: while an unserved backend that must never serve closes, its copy is held Closing(Unserved), not
+  // Idle, so a device check in the window does not load it (CopyDecision's Load) and open a second backend on the
+  // directory the first still closes
+  atest("a device check while an unserved failed backend closes opens no second backend"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val flat = rocksCopy(dev, s)
+    val opener = new TestOpener
+    val gate = Promise[Unit]()
+    opener.failing = true
+    opener.closeGate = Some(gate.future)
+    val host = realHost(hostRoot, opener)
+    val active = StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
+    for
+      _ <- pump(host, false, rounds = 20)
+      local = loadedDevices(host)(deviceA)
+      opensBefore = opener.opens.get
+      _ <- check(host, Map(s -> active))
+      _ <- pump(host, false, rounds = 20)
+      opensAfterCheck = opener.opens.get
+      heldActivity = recordOf(host, local, s).map(_.activity)
+      heldPhase = CopyFixtures.phaseOf(dev, s)
+      _ = gate.success(())
+      _ <- pump(host, CopyFixtures.phaseOf(dev, s).contains(Phase.Lost))
+    yield
+      opensBefore should be(1)
+      opensAfterCheck should be(1)
+      heldActivity should be(Some(Activity.Closing(ClosePurpose.Unserved)))
+      heldPhase should be(Some(Phase.Live))
+      opener.opens.get should be(1)
+      host.control.router.loaded.contains(s) should be(false)
+      inLost(dev, s, flat)
+      recordOf(host, local, s).map(_.activity) should be(Some(Activity.Idle))
+
+  // Final review M1: a copy closed for a failed CRL-state load (ClosePurpose.Reload) ends AwaitingRetry, not Idle, so
+  // its reload is paced by the load retry's backoff on the device scans, never made at each device check
+  atest("a failed CRL-state load is retried with backoff, not at every device check"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    val flat = rocksCopy(dev, s)
+    CrashRecoveryLog.saveStoreState(s, StoreRecoveryState.Empty, Backend.crlSaveFile(flat))
+    val factory = new FlakyCrlFactory
+    factory.crl.failLoads.set(Int.MaxValue)
+    val opener = new TestOpener
+    val host = realHost(hostRoot, opener, crlFactory = factory)
+    val active = StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
+    def local = loadedDevices(host)(deviceA)
+    def waitScans: Option[Int] = host.control.copyRegistry.retryOn(local, s).map(_.waitScans)
+    def awaiting(scans: Int): Boolean = waitScans.contains(scans) && !host.control.loader.isOpening(s)
+    for
+      _ <- pump(host, awaiting(1))
+      opensAtLoad = opener.opens.get
+      firstWait = waitScans
+      // Device checks leave it to its retry
+      _ <- check(host, Map(s -> active))
+      _ <- check(host, Map(s -> active))
+      _ <- pump(host, false, rounds = 20)
+      opensAfterChecks = opener.opens.get
+      // Its retry, due at the next scan, fails again and doubles its wait
+      _ = host.control.loader.retryFailedLoads()
+      _ <- pump(host, awaiting(2))
+      opensAfterRetry = opener.opens.get
+      secondWait = waitScans
+      // The next scan only counts down; the one after retries
+      _ = host.control.loader.retryFailedLoads()
+      _ <- pump(host, false, rounds = 20)
+      opensWhileWaiting = opener.opens.get
+      _ <- check(host, Map(s -> active))
+      opensAfterCheckWhileWaiting = opener.opens.get
+      _ = host.control.loader.retryFailedLoads()
+      _ <- pump(host, awaiting(4))
+    yield
+      opensAtLoad should be(1)
+      firstWait should be(Some(1))
+      opensAfterChecks should be(1)
+      opensAfterRetry should be(2)
+      secondWait should be(Some(2))
+      opensWhileWaiting should be(2)
+      opensAfterCheckWhileWaiting should be(2)
+      opener.opens.get should be(3)
+      waitScans should be(Some(4))
+      host.control.router.loaded.contains(s) should be(false)
+      os.exists(Backend.crlSaveFile(flat)) should be(true)
+
   atest("a failed backend opened while another serves the store moves to lost after its close"):
     given ExecutionContext = executionContext
     val (hostRoot, dev) = device()

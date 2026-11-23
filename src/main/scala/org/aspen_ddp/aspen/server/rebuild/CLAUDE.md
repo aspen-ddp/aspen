@@ -40,7 +40,7 @@
   the store outside `pending-delete/`. Tests build it with `CopyFixtures.existingCopy`. `StoreLoader.tryLoadStore`
   leaves a Rebuilt copy offline, and `StoreRebuilds` moves it once the flip commits: `Adopt` to Live before the load
   (`bringRebuiltLive`, T3), `AdoptOffline` to `parked/` in one move (`keepRebuiltStoreOffline`, T4), `Discard` deletes
-  it rename-first (T13). The reconcile's Completed Rebuilds pass moves an offline Rebuilt copy of an Active entry Live
+  it rename-first (T13). The reconcile's Completed Rebuilds case moves an offline Rebuilt copy of an Active entry Live
   after a crash. A copy of a Rebuilding store that is not this episode's Rebuilt copy (a copy finished for an earlier
   episode included), told by its record's phase, is retired as a lost copy (`StoreRebuilds.retireForeignCopy`: moved to
   `lost/`, then retired into `pending-delete/`, rebuilt). Such a copy, or one already in `lost/`, may have served since
@@ -94,7 +94,7 @@
   until its slot is released). `StoreRebuilds` keeps only what Work cannot hold: each running rebuild's handle and
   settled promise (`runningRebuilds`), the pending flips, requests and retry backoff. One predicate answers "is a
   rebuild registered", `HostCopies.rebuilding(stages)`, each caller naming its stages (R20): `RebuildReads` (Running,
-  Abandoned: repairability, the Completed Rebuilds pass, an earlier tenancy's retire, a second start), `RebuildHolds`
+  Abandoned: repairability, the Completed Rebuilds case, an earlier tenancy's retire, a second start), `RebuildHolds`
   (plus DiscardingLost: a load retry waits, `startOut` refuses), all stages for silence; `hasRebuildWork(store, device)`
   is any stage on one device. `startRebuild`'s host-wide "a rebuild of the store runs" also counts a running handle, so
   a rebuild still running for a device unloaded under it (crlFailed and relinquish cancel nothing; its Work went with
@@ -106,7 +106,7 @@
 - Silence (rebuild-process 6.2): `StoreRebuilds.startRebuild` registers the store's Rebuild work on its device at the
   first reconcile that sees its Rebuilding entry, and the work keeps the store silent
   (derived silence, `server/host/CLAUDE.md`), so its host drops its messages rather than answering UnknownStore. No
-  other path can unsilence it while the work is held (another device's Deleted Stores pass after a same-host
+  other path can unsilence it while the work is held (another device's Deleted Stores case after a same-host
   re-placement only removes that device's copy). `Adopt`, `AdoptOffline`, `Discard`, `Unconfirmed`, `NotOwned`, a
   cancel for an entry that left the device and `endQueuedRebuild` for a queued one end the work; whatever else names
   the store (the finished copy, until its load serves it; an unloaded device's entry) keeps it silent. Other outcomes
@@ -122,7 +122,7 @@
   reconcile (`discardLostStore`); an entry moved on meanwhile gets a fresh device check instead, and a failed one the
   backoff re-check of a failed pass. A new store's create work ends once its copy is served, before its flip commits, so
   a rebuild of a store whose backend failed right after its create never overlaps the create
-  (`StoreRebuilds.createNewStore`). A rebuild is neither requested (Lost CRL pass) nor started (`startRebuild`) while a
+  (`StoreRebuilds.createNewStore`). A rebuild is neither requested (Lost CRL case) nor started (`startRebuild`) while a
   send of the store is still registered (`isTransferringOut`, host-wide by store): its discard would move the directory
   being shipped. A device re-check follows. Nor is one started while a transfer out is still closing the store
   (`StoreTransfersOut.rebuildWaitsForClose`); the close's end, whatever its outcome, re-checks the device. Conversely,

@@ -666,7 +666,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                   ctx.devices.devices.get(storageDeviceId).foreach(
                     ctx.copyRegistry.retryDropped("LoadStore", _, storeId))
                 router.install(entry)
-                awaitCrlLoad(entry.store, trs, p)
+                awaitCrlLoad(entry.store, trs, p, previousRetry)
     // The open that queued this LoadStore ended unserved: its copy is Opening no more. Installed, it is Served
     if fromOpen && router.entry(backend.storeId).forall(_.store.backend ne backend) then
       ctx.devices.devices.get(storageDeviceId).foreach(ctx.copyRegistry.openEnded("load ended", _, backend.storeId))
@@ -724,8 +724,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   /** The rest of a LoadStore once its store is installed: with no saved state, recovers it from the device CRL and
    *  completes `p` at once; otherwise completes `p` once the CRL holds `trs` and the store has recovered from it. Its
-   *  transactions are recreated, and its transaction messages handled, only once it has recovered. */
-  private def awaitCrlLoad(store: Store, trs: Option[StoreRecoveryState], p: Promise[Unit]): Unit =
+   *  transactions are recreated, and its transaction messages handled, only once it has recovered. `previous`: the
+   *  load retry the load's open took, which a failed CRL load's retry backs off from (handleUnloadFailed) */
+  private def awaitCrlLoad(store: Store, trs: Option[StoreRecoveryState], p: Promise[Unit],
+                           previous: Option[LoadRetry]): Unit =
     val storeId = store.storeId
     trs match
       // An earlier load's removal of the save file failed (StoreRouter.crlLoaded): its state is in the device CRL,
@@ -754,18 +756,22 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             // not serve without the state the file holds.
             logger.error(s"Failed to load the CRL state of store $storeId. Taking it " +
                          s"offline. Error: $err")
-            ctx.post(UnloadFailedStore(storeId, store))
+            ctx.post(UnloadFailedStore(storeId, store, previous))
             p.failure(err)
 
   /** Unloads a store whose CRL state failed to load, if it is still the one installed. Its close runs on its
    *  executor (closeUnloaded). */
   def handleUnloadFailed(e: UnloadFailedStore): Unit =
-    val UnloadFailedStore(storeId, store) = e
+    val UnloadFailedStore(storeId, store, previous) = e
     router.entry(storeId).filter(_.store eq store).foreach: entry =>
-      // Its copy stays where it is, to load again: no fail-stop. Closed with ClosePurpose.Reload it is left Idle, and
-      // CopyDecision's Load case reloads it at each device check while it stays so (an Active entry, no work)
+      // Its copy stays where it is, to load again: no fail-stop. Closed with ClosePurpose.Reload it ends
+      // AwaitingRetry, not Idle: retried at the device scans, 1, 2, 4 ... scans apart per failure in a row (from the
+      // retry its open took), capped at LoadRetryCap, never at each device check by CopyDecision's Load
       ctx.copyRegistry.closingFor(storeId, ClosePurpose.Reload)
       router.remove(storeId)
+      ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
+        val waitScans = nextWait(previous)
+        awaitRetry("CRL load failed", storeId, LoadRetry(sds, store.backend.path, waitScans, waitScans))
       // Drops whatever part of the saved state did reach the CRL. The save file is not
       // rewritten from it: the file on disk is still the whole state.
       // The save file on disk still holds the whole state, so the entries may go for good

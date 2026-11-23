@@ -203,13 +203,17 @@ object CopyDecision:
       out += BringRebuiltLive
 
     // An Idle, synced Live copy with no work, whose entry is Active and whose store is not being sent, is loaded,
-    // provided its store is not served, opening or held by a rebuild anywhere on the host, its config is there and it
-    // is not declared missing (D7). Nothing else serves such a copy: a load that a cancelled shutdown's close, or a
-    // move whose sync failed (an unsynced copy is never loaded), held back has no other pass to make it. A copy held
-    // offline on purpose is never in this state: its move to lost/ is pending, it has work, it awaits its load retry
-    // (AwaitingRetry, left to the retry), or its device is stopping serving, whose opens tryLoadStore refuses.
+    // provided its store is not served, opening or held by a rebuild anywhere on the host, its config is not known
+    // absent and it is not declared missing (D7). A config whose stat fails (None) is offered: tryLoadStore reads it
+    // again and, while it fails, holds the copy back with its load retry, retried on the device scans with backoff
+    // (R9, superseding R6); skipping it would leave it unserved until the next device check. Nothing else serves
+    // such a copy: a load that a cancelled shutdown's close, or a move whose sync failed (an unsynced copy is never
+    // loaded), held back has no other rule to make it. A copy held offline on purpose is never in this state: its
+    // move to lost/ is pending, it has work, it awaits its load retry (AwaitingRetry, left to the retry), its
+    // unserved backend is closing (Closing(Unserved), StoreRebuilds.retireUnserved), or its device is stopping
+    // serving, whose opens tryLoadStore refuses.
     val idleLive = in.copy.exists(c => c.activity == ActivityKind.Idle && c.phase == Phase.Live && !c.unsynced)
-    if offline && idleLive && active && !f.sending && f.configPresent.contains(true) && !f.declaredMissing &&
+    if offline && idleLive && active && !f.sending && !f.configPresent.contains(false) && !f.declaredMissing &&
        !f.servedOnHost && !f.openingOnHost && !f.rebuildHoldsOnHost then
       out += Load
 

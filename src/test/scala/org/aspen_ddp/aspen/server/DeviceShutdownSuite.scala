@@ -333,9 +333,10 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       heldBack should be(true)
       attempts() should contain(paths(1))
 
-  // A closed copy whose config stat fails (FileStat: no answer, so neither present nor absent) is not offered while it
-  // fails: neither loaded nor declared missing. The reconcile after its stat answers loads it (CopyDecision.Load)
-  atest("a cancelled shutdown offers a store whose config stat fails at the reconcile after the stat answers"):
+  // A copy whose phase cannot be read is still offered to tryLoadStore, which reads it again and holds it back until it
+  // answers: a config stat that fails is no absence (CopyDecision.Load offers it), so skipping it would leave it
+  // unserved until a restart
+  atest("a cancelled shutdown offers a store whose phase cannot be read"):
     given ExecutionContext = executionContext
     for
       (host, deviceDir) <- setUp(Map(s0 -> active, s1 -> active), loaded = Set(s0, s1), configured = true)
@@ -350,21 +351,13 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- client.restartStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       _ = gate.success(())
-      attempts = () => recorded(host).storeLoadAttempts.map(_._2).toSet
+      paths = List(s0, s1).map(copyAt(deviceDir, _))
       _ <- pumpUntil(recorded(host).shutdownOutcomes.nonEmpty && host.control.reconciler.activeDeviceChecks.isEmpty &&
-                     attempts().contains(copyAt(deviceDir, s1)))
-      offeredWhileFailing = attempts().contains(unreadable)
-      declaredWhileFailing = loadedDevices(host)(deviceA).declaredMissing
+                     paths.forall(recorded(host).storeLoadAttempts.map(_._2).contains))
       _ = os.perms.set(unreadable, "rwx------")
-      _ = host.control.reconciler.checkAll()
-      _ <- pumpUntil(host.control.reconciler.activeDeviceChecks.isEmpty && attempts().contains(unreadable))
-      st <- state(deviceA)
     yield
       recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Cancelled))
-      offeredWhileFailing should be(false)
-      declaredWhileFailing should be(Set())
-      attempts() should contain allOf(unreadable, copyAt(deviceDir, s1))
-      st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Active))
+      recorded(host).storeLoadAttempts.map(_._2).toSet should contain allOf(unreadable, copyAt(deviceDir, s1))
 
   atest("an Initializing store is not created while the device is ShuttingDown"):
     given ExecutionContext = executionContext

@@ -5,10 +5,11 @@
 directories replacing the per-copy marker files) is done, 2026-11-22 (plan
 `docs/superpowers/plans/2026-11-22-store-copy-state-machine-stage2.md`, commits `e104a53d..59c39437` on branch
 `state_refactor`, plus test-only flake fixes `44e08ebe`, `34739243` and `ad7eedb1`); its decisions are in "Stage 2
-decisions" below, with an amendment pointer where each changes the text. Stage 3 (the reconcile as a decision function) is done, 2026-11-22 (plan
-`docs/superpowers/plans/2026-11-22-store-copy-state-machine-stage3.md`, commits `b46456b4..` on branch `state_refactor`);
-its decisions are in "Stage 3 decisions" below. The stage 1 audit findings below are kept as history. The sections below describe the design as drafted;
-the four marker files they name are history after stage 2.
+decisions" below, with an amendment pointer where each changes the text. Stage 3 (the reconcile as a decision
+function) is done, 2026-11-22 (plan `docs/superpowers/plans/2026-11-22-store-copy-state-machine-stage3.md`, commits
+`b46456b4..836428bb` on branch `state_refactor`, then this status line); its decisions are in "Stage 3 decisions"
+below. The stage 1 audit findings below are kept as history. The sections below describe the design as drafted; the
+four marker files they name are history after stage 2.
 
 ## Intent
 

@@ -803,7 +803,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             // thread. A throw leaves the device unloaded.
             val crl = openDeviceCrl(storageDevicePath, sdCfg, listing)
             val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath, crl,
-              new CrlAdmission(crl.admissionLimitBytes))
+              new CrlAdmission(crl.admissionLimitBytes), Some(ctx.deviceIos.forPath(storageDevicePath)))
             // A growth raises the limit the stores admit against; registered before any store loads
             crl.onAdmissionLimitRaised(sds.admission.raiseLimit)
             // Everything the CRL holds is counted, retained for its store, before any store loads: a store that loads

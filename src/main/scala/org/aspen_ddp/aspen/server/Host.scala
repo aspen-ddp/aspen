@@ -524,6 +524,8 @@ class Host(val client: AspenClient,
     post(Exit())
     // Lets the control thread exit once it has handled Exit; it is not a daemon thread.
     threading.shutdown()
+    // Without waiting: a hung device's threads are daemons and are never joined
+    deviceControl.deviceIos.closeAll()
     services.shutdown()
     pendingStartTask.cancel()
     heartbeatTask.cancel()

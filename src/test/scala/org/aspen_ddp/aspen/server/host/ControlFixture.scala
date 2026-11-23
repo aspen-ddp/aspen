@@ -662,6 +662,15 @@ trait ControlFixture:
     case t: Host.EventTask => t.event.isInstanceOf[Host.DeviceOwnershipResolved]
     case _ => false
 
+  /** Holds `path`'s device lane: its management jobs wait unrun and its data and serial tasks block, until
+   *  `releaseDevice`. */
+  protected def holdDevice(host: Host, path: os.Path): Unit = lockstep(host).hold(path)
+
+  protected def releaseDevice(host: Host, path: os.Path): Unit = lockstep(host).release(path)
+
+  /** The kinds of the management jobs held on `path`, in submission order. */
+  protected def heldJobs(host: Host, path: os.Path): List[JobKind] = lockstep(host).held(path)
+
   private def lockstep(host: Host): LockstepThreading = host.threading match
     case t: LockstepThreading => t
     case other => throw new IllegalStateException(s"Needs LockstepThreading, not ${other.getClass.getSimpleName}")

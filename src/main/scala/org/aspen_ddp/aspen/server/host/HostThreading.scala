@@ -20,10 +20,12 @@ import scala.concurrent.ExecutionContext
  *     `given` is the control context, so a callback with no context named does not compile into "runs somewhere on a
  *     pool". Work that must run elsewhere (a backend open the BackendOpener runs off the caller, client transactions)
  *     names its context explicitly, and its result comes back through a control-context callback.
- *  2. **Never block the control thread on a Future** (`Await`, `.get` on a Java future, a `LinkedBlockingQueue.take`
- *     waiting for another thread's answer). The thread would deadlock against its own callbacks. Slow local disk
- *     work (device marker and phase-param files, directory moves, fsyncs through `DurableFiles`) is allowed there, because those operations
- *     are rare.
+ *  2. **The control thread performs no device I/O, and never blocks on a Future** (`Await`, `.get` on a Java future,
+ *     a `LinkedBlockingQueue.take` waiting for another thread's answer; the thread would deadlock against its own
+ *     callbacks). Anything that touches a device (its directory, markers, copies, configs, free-space queries, the
+ *     CRL or backend opens) is submitted to that device's `DeviceIo` lane (`DeviceIos.forPath(path)`), and its
+ *     result returns through a control-context callback, so a hung device stalls only its own work. The
+ *     `DeviceIoUsageSuite` ratchet counts the direct disk calls left in control code and may only go down.
  *  3. **State owned by the control thread is never read from other threads.** Other threads that need an answer
  *     either post a request and receive a Future, or read an immutable snapshot that the control thread publishes
  *     through a `@volatile` field (see `HostStoreView` below).
@@ -78,6 +80,10 @@ trait HostThreading:
   /** Begins running posted work; until then it waits. Lockstep: nothing to start, as only a drain runs work. */
   def start(): Unit
   def shutdown(): Unit
+  /** Builds the DeviceIo (management lane and data and serial pools) for the device directory at `path`. Called by
+   *  `DeviceIos`, the registry that owns every DeviceIo of a host. StoreThreadPool and SingleThreadThreading: a
+   *  `ThreadedDeviceIo` on its own daemon threads. Lockstep: a `LockstepDeviceIo`. */
+  def newDeviceIo(path: os.Path): DeviceIo
 
 /** A single-threaded FIFO executor for a store: tasks run one at a time, in posting order. */
 trait StoreExecutor extends ExecutionContext

@@ -96,6 +96,8 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val joinCeiling: JoinCeiling = JoinCeiling.Unbounded):
   given ExecutionContext = threading.control
 
+  /** Every device's DeviceIo (control-owned), built over this host's threading */
+  lazy val deviceIos: DeviceIos = new DeviceIos(threading, rootDir)
   lazy val router: StoreRouter = new StoreRouter(this)
   lazy val loader: StoreLoader = new StoreLoader(this)
   lazy val discovery: DeviceDiscovery = new DeviceDiscovery(this)

@@ -15,7 +15,7 @@ import scala.concurrent.ExecutionContext
  *
  *  Work posted before `start` waits for it. The thread is not a daemon: `shutdown` stops it once the work already
  *  queued has run, and anything posted after that is dropped. */
-class SingleThreadThreading extends HostThreading:
+class SingleThreadThreading(ioConfig: DeviceIo.Config = DeviceIo.Config()) extends HostThreading:
   private val loop = new SerialLoop("aspen-host-control", daemon = false)
 
   override def control: ExecutionContext = loop
@@ -23,6 +23,7 @@ class SingleThreadThreading extends HostThreading:
   override def dispatch: Executor = loop
   override def assign(storeId: StoreId, deviceId: StorageDeviceId): StoreExecutor = HostThreading.InlineStoreExecutor
   override def release(storeId: StoreId): Unit = ()
+  override def newDeviceIo(path: os.Path): DeviceIo = new ThreadedDeviceIo(path, ioConfig)
 
   override def start(): Unit = loop.start()
 

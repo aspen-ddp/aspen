@@ -466,6 +466,21 @@
   `Host.localDevice` for the repair fence's `RepairTarget.localDevice`) or the router's concurrent map
   (`hasTransactions`, `logTransactionStatus`); store and control state stay apart: control posts store work to the
   executor (`StoreRouter.onStore`) and gets results back through a Future whose callbacks name the control context
+- Device I/O isolation (`DeviceIo`, `DeviceIos`; spec `docs/superpowers/specs/2026-11-23-device-io-isolation-design.md`):
+  each device directory has a `DeviceIo`: a serial management lane (`submit(kind, store)`, one thread, cancellable
+  while queued), a data pool and a serial pool (`dataEc`, `serialEc`) and an observer of what it runs, all on daemon
+  threads of that device, so a hung device stalls only its own work. `HostThreading.newDeviceIo(path)` builds it
+  (`ThreadedDeviceIo` for StoreThreadPool and SingleThreadThreading, configured by `DeviceIo.Config`;
+  `LockstepDeviceIo` under lockstep). `DeviceControl.deviceIos` (`DeviceIos`, control-owned) keeps one per path from
+  first sight, so a reload reuses it (`forPath`, `get`, `forget` only with nothing in flight, `hostRoot`, `all`);
+  `Host.shutdown` closes them all without waiting. `LocalStorageDeviceState.io` is its device's. Control code does no
+  device I/O itself (rule 2 of `HostThreading`): `DeviceIoUsageSuite` scans `server/host`, `rebuild` and `transfer`
+  for the forbidden direct disk calls and requires each file's count to equal its `baseline` literal (files named
+  `*Disk.scala` and the DeviceIo classes are exempt), so a task that moves calls behind a lane lowers its entries in
+  the same commit. Lockstep: only management jobs go on the FIFO (with the other posted tasks, so order is the drain's);
+  data and serial tasks run on real threads. `LockstepThreading.hold(path)` parks the path's later management jobs on a
+  side queue and blocks its data and serial tasks, `held(path)` lists the held jobs, `release(path)` queues them again
+  in order and frees the threads; `ControlFixture.holdDevice`/`releaseDevice`/`heldJobs` wrap them
 - Callbacks name the control context. Work run elsewhere (backend opens, client transactions on the host's `ec`) names
   its context; timers and other non-Future callbacks post to `controlEvents` before touching control state
 - Tests use `LockstepThreading`: everything posted waits on one FIFO drained by `testingOnlyHandleEvents`, stores run

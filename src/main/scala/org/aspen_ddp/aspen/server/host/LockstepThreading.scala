@@ -3,7 +3,8 @@ package org.aspen_ddp.aspen.server.host
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
 
-import java.util.concurrent.{Executor, LinkedBlockingQueue}
+import java.util.concurrent.{CountDownLatch, Executor, LinkedBlockingQueue}
+import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.ExecutionContext
 import scala.jdk.CollectionConverters.*
 
@@ -29,6 +30,43 @@ class LockstepThreading(ec: ExecutionContext) extends HostThreading:
   /** Nothing to stop: work still queued runs if a test drains again, as before the host had a threading. */
   override def shutdown(): Unit = ()
 
+  override def newDeviceIo(path: os.Path): DeviceIo = new LockstepDeviceIo(path, this, DeviceIo.Config())
+
+  private val holdLock = new Object
+  private var holds = Map.empty[os.Path, CountDownLatch]
+  private var heldTasks = Map.empty[os.Path, Vector[LockstepThreading.DeviceTask]]
+
+  /** A management-lane job of `path`'s DeviceIo: on the FIFO, or on the path's side queue while it is held. */
+  private[host] def enqueueDevice(path: os.Path, task: LockstepThreading.DeviceTask): Unit =
+    holdLock.synchronized:
+      if holds.contains(path) then heldTasks += path -> (heldTasks.getOrElse(path, Vector()) :+ task)
+      else queue.put(task)
+
+  /** Blocks the calling (device) thread while `path` is held. */
+  private[host] def awaitReleased(path: os.Path): Unit =
+    val latch = holdLock.synchronized(holds.get(path))
+    latch.foreach(_.await())
+
+  /** Testing hook: from now on `path`'s management jobs wait on a side queue, and its data and serial tasks block,
+   *  until `release`. Jobs already on the FIFO are not affected. */
+  def hold(path: os.Path): Unit =
+    holdLock.synchronized:
+      if !holds.contains(path) then holds += path -> new CountDownLatch(1)
+
+  /** Testing hook: puts the path's held jobs on the FIFO in submission order and frees its blocked threads. */
+  def release(path: os.Path): Unit =
+    val latch = holdLock.synchronized:
+      heldTasks.getOrElse(path, Vector()).foreach(queue.put)
+      heldTasks -= path
+      val l = holds.get(path)
+      holds -= path
+      l
+    latch.foreach(_.countDown())
+
+  /** Testing hook: the kinds of `path`'s held management jobs, in submission order. */
+  def held(path: os.Path): List[JobKind] =
+    holdLock.synchronized(heldTasks.getOrElse(path, Vector()).map(_.kind).toList)
+
   /** Runs queued tasks, including any they post, until the queue is empty. A task's exception is not caught: it
    *  propagates to the caller and every later task stays queued for the next drain, as testingOnlyHandleEvents
    *  always behaved. */
@@ -53,3 +91,8 @@ class LockstepThreading(ec: ExecutionContext) extends HostThreading:
         it.remove()
         removed = task :: removed
     removed.reverse
+
+object LockstepThreading:
+  /** One management-lane job of a LockstepDeviceIo. `state`: 0 queued, 1 running, 2 cancelled. */
+  abstract class DeviceTask(val kind: JobKind) extends Runnable:
+    val state = new AtomicInteger(0)

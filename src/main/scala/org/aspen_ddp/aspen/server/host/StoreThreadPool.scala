@@ -54,7 +54,8 @@ import scala.concurrent.duration.*
 class StoreThreadPool(
     maxThreads: Int = StoreThreadPool.DefaultThreads,
     adaptive: Option[StoreThreadPool.Adaptive] = None,
-    nanoClock: () => Long = () => System.nanoTime()) extends HostThreading with Logging:
+    nanoClock: () => Long = () => System.nanoTime(),
+    ioConfig: DeviceIo.Config = DeviceIo.Config()) extends HostThreading with Logging:
 
   private val minThreads = adaptive.fold(maxThreads)(_.minThreads)
   private val config = adaptive.fold(StoreBalancer.Config())(_.config)
@@ -136,6 +137,8 @@ class StoreThreadPool(
         t.scheduleAtFixedRate(() => controlLoop.execute(() => check()), period.toNanos, period.toNanos,
           TimeUnit.NANOSECONDS)
         timer = Some(t)
+
+  override def newDeviceIo(path: os.Path): DeviceIo = new ThreadedDeviceIo(path, ioConfig)
 
   override def shutdown(): Unit =
     shut = true

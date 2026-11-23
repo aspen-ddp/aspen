@@ -413,8 +413,8 @@ consume it: its later blind Insert of an absent key could then write back a key 
 A rebuilt store also answers stale, before any of this, for a KeyValue object under its inherited-vote lock
 (`Frontend.inheritedVoteLock`: every object until its first held-vote round completes, then the objects of inherited
 transactions not yet released), and turns a complete result into a stale one for an object it
-guards against growth unless the pass is whole-object and its snapshot was taken after the guard was set
-(`RepairSnapshot.takenAt`), when the guard ends (`Frontend.inheritedGrowthRepaired`; 10.3,
+guards against growth unless the pass is whole-object and its snapshot was taken by this instance after the guard was
+set (`RepairSnapshot.takenAt`, `takenBy`), when the guard ends (`Frontend.inheritedGrowthRepaired`; 10.3,
 cross-document-review.md 2.3). The entry so outlives the guard, which only a repair can end. A stale result defers
 nothing by a lock, so the next pass is whole-object.
 
@@ -774,7 +774,12 @@ of its objects the scan listed. Until the first round's scan answers, every obje
 so every KeyValue reconcile answers stale (6.2) and no KeyValue entry is consumed by a reconcile while the guards are
 being found. A guard ends only at a complete whole-object reconcile from a snapshot the store numbered after the guard
 was set (`repairSnapshotSeq`, `RepairSnapshot.takenAt`, `inheritedGrowthRepaired`): the repair read began after that
-snapshot, so after the transaction committed, and by E1 reflects it. Any other complete result for a guarded object is
+snapshot, so after the transaction committed, and by E1 reflects it. The sequence is the Frontend instance's own and
+restarts at 0 in each, while `StoreRouter` routes a repair's snapshot and its reconcile by `StoreId` when each is
+posted, so a same-host reopen of the store (cross-document-review.md 2.2) can put them on different instances. Each
+instance therefore stamps its snapshots with a random epoch (`Frontend.repairEpoch`, `RepairSnapshot.takenBy`), and a
+snapshot from another instance ends no guard: its read may have begun before the new instance's gate, so before the
+transaction's last vote. Any other complete result for a guarded object is
 turned stale, so its entry stays for a pass that can end the guard. The release does not wait for the entry's
 completion gate (6.4), which concerns the entry's own misses, not the guard's transaction. The inherited-votes file
 stays while any guard does: a reload repeats the round and finds what is still guarded through the entries the guards
@@ -944,23 +949,4 @@ its read threshold stalls the scan until the deadline.
 
 ## 14. Open weaknesses
 
-**RP-W13 A repair snapshot's `takenAt` is compared against a guard set by another Frontend instance.** PLAUSIBLE,
-effort S, priority 2. Mechanism: `Frontend.snapshotForRepair` numbers snapshots from `repairSnapshotSeq`, a per-instance
-counter that starts at 0 in every new `Frontend`, and `guardGrowth` stamps each inherited-growth guard with the same
-counter. `StoreRouter.snapshotForRepair` and `reconcileForRepair` route by `StoreId` at call time, so one
-`StoreRepairer.repairUpdate` can take its snapshot from one instance of the store and reconcile against the next (a
-reload in between). `Frontend.inheritedGrowthRepaired` then compares the old instance's `takenAt` with the new
-instance's guard stamp. Trigger: a rebuilt store B, still before its first held-vote round, snapshots a KeyValue object
-X for repair and the read starts before the other voters of an inherited growth T of X have voted. B is opened again on the
-same host (a cancelled shutdown's close and reload, a reinstated transfer out: cross-document-review.md 2.2, the
-root cause it shares with transaction-recovery R-W13), and the new instance (whose gate from the `inherited-votes` file has passed) runs its first held-vote round and guards X at a
-low sequence number. Then the read returns, lacking T and its locks, and its reconcile reaches the new instance. Its
-copy equals the snapshot, the pass is complete and whole-object, and the old `takenAt` exceeds the new stamp. Today only
-the timing prevents this: the gap from T's last possible vote to the gate (`RebuildingStore.inheritedVotesAfter`: the
-horizon plus two `AcceptorSinceMargin`s past the rebuild pass's start) against the 15 s `ObjectReadTimeout`. Under
-clock skew near the margin that gap can be shorter than one read. Consequence: the guard ends while B lacks T's growth,
-so B admits another growth of X near the KeyValue limit. The committed union can then overfill the slice, and repair
-and an FSIF rebuild cannot install X (`CommitError.SliceTooLarge`) until it shrinks (cross-document-review.md 2.3).
-Fix direction: give each `Frontend` instance an identity (a random epoch) that the snapshot carries, and treat a
-snapshot from another instance as stale in `reconcileForRepair`. That also confines `takenAt` to the sequence it was
-taken in.
+(no open items)

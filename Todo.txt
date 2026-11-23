@@ -58,14 +58,7 @@ rebuild-process.md B19.)
 PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 ---------------------------------------------------------------------------
 
-2.2 [RP-W13] A repair snapshot's takenAt is compared against an inherited-growth guard set by another Frontend instance.
-    PLAUSIBLE, S. Frontend.repairSnapshotSeq restarts at 0 per instance; StoreRouter routes snapshotForRepair and
-    reconcileForRepair by StoreId at call time, so a snapshot taken before a same-host reopen (cancelled shutdown's
-    close + Load, StoreTransfersOut.reinstateAbandonedOut, inter-device transfer) can end the new instance's guard
-    (inheritedGrowthRepaired) from a read lacking the guarded growth: an overfilled KeyValue slice
-    (CommitError.SliceTooLarge). Fix: a per-instance epoch carried in RepairSnapshot; another instance's is stale.
-    Root cause shared with 5.1's second trigger: host state keyed by StoreId outlives the Frontend instance across a
-    same-host reopen (cross-document-review 2.2). Audit other StoreId-keyed host state for the same assumption.
+(no open items)
 
 
 PRIORITY 3: systemic loss protection
@@ -106,9 +99,9 @@ PRIORITY 5: performance and hygiene
     finalization actions. PLAUSIBLE, S. Store.handleTransactionMessage's relay sends the store itself a non-late
     TxResolved when it holds no Tx with a known outcome, and the designated leader starts a driver; the onThisHost rule
     suppresses only the reply. Triggers: (a) a same-host sibling's idle driver prepares to a leader that never got a
-    Tx; (b) a same-host reopen of a store whose old Tx wrote the non-finalized entry (see 2.2). The driver resolves
-    non-late and re-runs non-marker finalization actions after T was finalized; past errorTimeout the marker writes
-    voter-unknown marks, entries and stubs for every store. No safety effect. Fix: no self TxResolved of a
+    Tx; (b) a same-host reopen of a store whose old Tx wrote the non-finalized entry (cross-document-review 2.2). The
+    driver resolves non-late and re-runs non-marker finalization actions after T was finalized; past errorTimeout the
+    marker writes voter-unknown marks, entries and stubs for every store. No safety effect. Fix: no self TxResolved of a
     non-finalized entry, and no leader driver from it, when the sender is onThisHost (the store itself included).
 
 

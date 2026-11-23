@@ -962,8 +962,8 @@ takeover; the takeover of a dead remote driver (a remote sender, or a client pre
 A second trigger reaches the same self-send with no sibling: a store that served and is opened again on the same host
 keeps the host status cache (a cancelled shutdown's close and the reconcile's `Load`, an abandoned transfer out's
 reinstatement, `StoreTransfersOut.reinstateAbandonedOut`; a `ClosePurpose.Reload` close is only of a store that never
-recovered, so it has no old Tx). This is the same root cause as repair-process RP-W13: host state keyed by `StoreId`
-outlives the Frontend instance (cross-document-review.md 2.2). If its old Tx resolved T committed (a non-finalized `Committed`
+recovered, so it has no old Tx). The root cause is host state keyed by `StoreId` that outlives the Frontend instance (cross-document-review.md
+2.2); a repair snapshot guards against the same thing by carrying its instance (`RepairSnapshot.takenBy`). If its old Tx resolved T committed (a non-finalized `Committed`
 entry), its saved status was `Unresolved`, and T's `TxFinalized` arrived only while it was unloaded, the recovered
 Tx has `knownOutcome = None`, so its own idle driver's prepare to itself (or any prepare while `recoveryPending`)
 receives the stale non-late `TxResolved` and re-runs T's finalization actions until peers' late relays cancel it.

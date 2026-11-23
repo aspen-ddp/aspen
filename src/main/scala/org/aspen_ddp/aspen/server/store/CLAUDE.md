@@ -120,8 +120,9 @@
   `RequirementsChecker.check` in `Tx.determineDisposition`, computed with `sliceGrowth` only while a guard is held); a
   non-growing one passes. `reconcileForRepair`: a KeyValue object under the inherited-vote lock (all of them before
   the first round) answers stale; a guarded one's complete result is stale unless the pass is whole-object and its
-  snapshot is later than the guard (`RepairSnapshot.takenAt`, numbered by `snapshotForRepair`), which ends the guard
-  (`inheritedGrowthRepaired`). A guarded object's deletion, once it persists (a refcount-zero commit's backend success,
+  snapshot is this instance's and later than the guard (`RepairSnapshot.takenAt`, numbered by `snapshotForRepair`;
+  `takenBy`, the instance's `repairEpoch`: the sequence restarts in each instance, and a repair's reconcile can reach a
+  later instance after a same-host reopen), which ends the guard (`inheritedGrowthRepaired`). A guarded object's deletion, once it persists (a refcount-zero commit's backend success,
   or `deleteObjectForRepair`), ends its guard instead, since no repair of it follows (`inheritedGrowthDeleted`); one
   persisted before the first round's scan answers is left out of what the scan lists. A failed scan keeps every
   object locked and repeats the round. Nothing is persisted beyond the inherited-votes file: a reload repeats the round, the guarded objects' entries still there

@@ -418,7 +418,9 @@ class Frontend(val storeId: StoreId,
   // The scan first marks every KeyValue object of the reported transactions (missed at HLCTimestamp.Zero), so each
   // object has an entry whatever T's outcome, and repair comes to it. A guard ends at a complete whole-object repair
   // from a snapshot taken after the guard was set (inheritedGrowthRepaired): that read began after T committed, so it
-  // reflects T (repair-process.md E1). A repair that cannot release a guard, or of a KeyValue object under the
+  // reflects T (repair-process.md E1). "After" is in this instance's snapshot sequence: a snapshot carries the instance
+  // that took it (RepairSnapshot.takenBy), and one from an earlier instance of the store (a same-host reopen while the
+  // repair read) releases nothing, since its read may predate the gate. A repair that cannot release a guard, or of a KeyValue object under the
   // inherited-vote lock (every object until the first round completes), answers stale, so the entry stays for the
   // repair that can: an entry consumed while the round runs could otherwise leave a guard no repair ever ends. A
   // deleted object is never repaired again, so its guard ends when the deletion persists (inheritedGrowthDeleted). Only
@@ -437,6 +439,9 @@ class Frontend(val storeId: StoreId,
   private var inheritedGrowthDeletedEarly: Set[ObjectId] = Set()
   /** Counts repair snapshots (snapshotForRepair, RepairSnapshot.takenAt) */
   private var repairSnapshotSeq: Long = 0L
+  /** This instance's identity in its repair snapshots (RepairSnapshot.takenBy): its sequence restarts at 0, so a
+    * snapshot another instance of the store took (before a same-host reopen) is ordered against no guard here */
+  private val repairEpoch: UUID = UUID.randomUUID()
 
   /** A growing update of `oid` votes abort (InheritedGrowthLock): see Inherited growth */
   def inheritedGrowthLock(oid: ObjectId): Boolean = inheritedGrowthLocks.contains(oid)
@@ -485,13 +490,14 @@ class Frontend(val storeId: StoreId,
           setInheritedVotes(unresolved)
 
   /** The result of a repair of `objectId`, which is guarded against growth. A complete whole-object repair from a
-    * snapshot taken after the guard was set releases it; any other complete one answers stale instead, keeping its
+    * snapshot this instance took after the guard was set releases it; any other complete one answers stale instead, keeping its
     * entry for a repair that can release the guard */
   private def inheritedGrowthRepaired(objectId: ObjectId, snapshot: RepairSnapshot, result: Try[ReconcileResult],
                                       p: Promise[ReconcileResult]): Unit =
     result match
       case Success(r) if r.complete && inheritedGrowthLocks.contains(objectId) =>
-        if snapshot.only.isEmpty && inheritedGrowthLocks.get(objectId).exists(snapshot.takenAt > _) then
+        if snapshot.only.isEmpty && snapshot.takenBy.contains(repairEpoch) &&
+           inheritedGrowthLocks.get(objectId).exists(snapshot.takenAt > _) then
           inheritedGrowthLocks -= objectId
           logger.info(s"Store $storeId: object $objectId is repaired, so no longer guarded against growth")
           removeInheritedStateWhenDone()
@@ -1917,7 +1923,7 @@ class Frontend(val storeId: StoreId,
     repairSnapshotSeq += 1
     val takenAt = repairSnapshotSeq
     val p = Promise[RepairSnapshot]()
-    stamped.completeWith(p.future.map(_.copy(takenAt = takenAt))(using ExecutionContext.parasitic))
+    stamped.completeWith(p.future.map(_.copy(takenAt = takenAt, takenBy = Some(repairEpoch)))(using ExecutionContext.parasitic))
     if stopped then p.failure(new IllegalStateException(s"Store $storeId fail-stopped"))
     else servableState(objectId) match
       case Some(os) => p.success(RepairSnapshot.of(os))

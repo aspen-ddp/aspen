@@ -1398,6 +1398,12 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val clock = new TestClock(System.currentTimeMillis())
     val dir = os.temp.dir(deleteOnExit = true)
     RebuildingStore.writeInheritedVotes(dir, after)
+    val (frontend, query) = openRebuilt(dir, clock)
+    f(frontend, query, dir, clock)
+
+  /** A Frontend over the rebuilt store in `dir` (acceptor started 2 s ago), reading its inherited-votes file. Each call
+    * is a new instance of the store, as a same-host reopen makes */
+  private def openRebuilt(dir: os.Path, clock: TestClock): (Frontend, ManualHeldVoteQuery) =
     val backend = new MapBackend(storeId):
       override def path: os.Path = dir
     val query = new ManualHeldVoteQuery
@@ -1409,7 +1415,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       wallClockMillis = () => clock.now)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     populate(backend)
-    f(frontend, query, dir, clock)
+    (frontend, query)
 
   /** This store's vote on a fresh transaction (started after the acceptor) with `reqs` */
   private def voteOn(frontend: Frontend, txid: TransactionId, reqs: List[TransactionRequirement])
@@ -1635,6 +1641,26 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.inheritedVoteTransactions shouldBe Some(Set())
       frontend.holdsInheritedGrowthLocks shouldBe false
       os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe false
+  }
+
+  test("a repair snapshot from an earlier instance of the store does not release a reopened instance's growth guard") {
+    // RP-W13: the snapshot is taken by one instance, the store is reopened on the same host, and the reconcile
+    // (routed by StoreId) reaches the new instance, whose sequence restarted below the old snapshot's
+    withInheritedVotesClock(0L): (old, _, dir, clock) =>
+      (1 to 5).foreach(_ => repairSnapshot(old, kvPtr))
+      val oldSnapshot = repairSnapshot(old, kvPtr)
+      val (reopened, query) = openRebuilt(dir, clock)
+      query.autoScan = Some(Success(Set(oid2)))
+      reopened.retryHeldVoteQuery()
+      query.answer(Success(Nil))
+      reopened.inheritedGrowthLock(oid2) shouldBe true
+      repairKV(reopened, oldSnapshot).stale shouldBe true
+      reopened.inheritedGrowthLock(oid2) shouldBe true
+      voteKV(reopened, txid1, 1, growing) shouldBe TransactionDisposition.VoteAbort
+      os.exists(dir / RebuildingStore.InheritedVotesFile) shouldBe true
+      withClue("the reopened instance's own later snapshot still releases it: "):
+        repairKV(reopened, repairSnapshot(reopened, kvPtr)).complete shouldBe true
+      reopened.inheritedGrowthLock(oid2) shouldBe false
   }
 
   test("a narrowed repair does not release a growth guard, and answers stale so the next pass is whole") {

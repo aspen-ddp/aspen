@@ -6,6 +6,8 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 
+import java.util.UUID
+
 /** A store's copy of an object as repair recorded it: per key its revision, and the object's revision, refcount,
   * timestamp and object-level parts. Taken on the store's executor before the repair reads the object, and again
   * before it installs, so that anything the store applied in between is left alone. See Reconcile.
@@ -36,7 +38,11 @@ final case class RepairSnapshot(objectId: ObjectId, revision: ObjectRevision, re
                                 /** When the store recorded it, in its own sequence (Frontend.snapshotForRepair): a
                                   * repair reads only after its snapshot, so a later snapshot means a later read. Used
                                   * only to release a rebuilt store's inherited-growth lock (Frontend.inheritedGrowthLocks) */
-                                takenAt: Long = 0L):
+                                takenAt: Long = 0L,
+                                /** The Frontend instance that recorded it (Frontend.repairEpoch): `takenAt` orders
+                                  * only that instance's snapshots. A repair routes by StoreId, so its reconcile can
+                                  * reach a later instance of the store (a same-host reopen); None from no instance */
+                                takenBy: Option[UUID] = None):
 
   /** The store holds no copy: a live object never has a zero count */
   def isMissing: Boolean = refcount.count == 0

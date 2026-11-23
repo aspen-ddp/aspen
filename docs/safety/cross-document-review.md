@@ -48,7 +48,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Expiry adoption | Recovery | An outcome a status reply reports non-late stems from Paxos, a relay or an expiry commit; a tree-learned resolution is reported `Unresolved` until finalized (`Tx.statusForExpiry`) |
 | Expiry tallies | Recovery | A reported `votedCommit` stands for a voter holding T's locks, or for a committed T (a tree-learned or not-owed resolution, whose locks are released) (2.1) |
 | Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a reconcile case, or retried (2.2); one whose directory or config is missing is rebuilt, its device-CRL entries kept (2.2). A device load serves every `live/` copy without reading the tree, so the phase directories, `phase-param.*` files, the save file and the incarnation file are read with stats that tell a failure from an absence (`server.FileStat`), and an incarnation file is never written by a load (2.2) |
-| Repair (snapshot, then reconcile), status-cache self-relay | Host store routing | Both steps, and the cached entry, belong to the Frontend instance that answers: not upheld across a same-host reopen, which keeps the host's `StoreId` routing and status cache (2.2; repair-process.md RP-W13, transaction-recovery.md R-W13) |
+| Repair (snapshot, then reconcile), status-cache self-relay | Host store routing | Both steps, and the cached entry, belong to the Frontend instance that answers: not upheld across a same-host reopen, which keeps the host's `StoreId` routing and status cache (2.2; transaction-recovery.md R-W13; a repair snapshot carries its instance, `RepairSnapshot.takenBy`) |
 | Rebuild, Missing Stores, discard | Copy registry | Its records of a store's copies match the disk; it learns them only at the device load, so it does not see a copy that appears later or one that vanishes (2.2; systemic-loss-protection.md SL-W26, rebuild-process.md RB-W25) |
 | CRL admission | Host reconcile | A retained charge is released only once the records it covers have left the CRL or been counted again; the leftover drop releases only the charge it was issued for, unchanged since |
 | Systemic-loss protection | All of the above | Declarations of loss are independent and true (they are not checked; see that document) |
@@ -159,10 +159,10 @@ The premises other subsystems take from this:
   service's state and its requests, which `StoreRouter` routes by `StoreId` when each step is posted, and the
   admission charges retained for the store. A `ClosePurpose.Reload` close is not one of these: it closes only a store
   that never recovered (a failed `loadStore`, a failed save-file removal), so it leaves no Tx and no cache entry of its
-  own. Two guards assume one instance and fail across a reopen: a cached non-finalized commit written by the earlier
-  instance's Tx is self-relayed to the new one as news (transaction-recovery.md R-W13, second trigger), and a repair
-  snapshot's `takenAt` from one instance is compared against an inherited-growth guard stamped by the next
-  (repair-process.md RP-W13). Every other host-side request answers through `Frontend.post` on the instance that
+  own. A repair snapshot carries the instance that took it (`RepairSnapshot.takenBy`), so one taken before a reopen
+  ends no inherited-growth guard of the next instance (repair-process.md 10.3). One guard assumes one instance and
+  fails across a reopen: a cached non-finalized commit written by the earlier instance's Tx is self-relayed to the new
+  one as news (transaction-recovery.md R-W13, second trigger). Every other host-side request answers through `Frontend.post` on the instance that
   asked, and the CRL state the new instance recovers stands for the earlier one as a crash's would.
   `StoreRouter.install` over a still-installed store, with no close, is reachable only in tests
   (`TestNetwork.restartStore`): a production load needs the store's executor slot, which a served or closing instance
@@ -416,8 +416,8 @@ The premises other subsystems take from this:
   holds **inherited growth guards** (`Frontend.inheritedGrowthLock`): it votes abort (`InheritedGrowthLock`) on any
   update that grows a guarded KeyValue object, until a complete whole-object repair from a snapshot taken after the
   guard was set (`RepairSnapshot.takenAt`), whose read followed T's commit and so reflects it (repair-process.md
-  E1); both sequence numbers belong to one Frontend instance, which a same-host reopen between the snapshot and the
-  reconcile breaks (repair-process.md RP-W13, 2.2). The first held-vote round finds what to guard: the objects of the transactions its peers report unresolved
+  E1); both sequence numbers belong to one Frontend instance, and a snapshot another instance took (a same-host
+  reopen between the snapshot and the reconcile, 2.2) ends no guard (`RepairSnapshot.takenBy`). The first held-vote round finds what to guard: the objects of the transactions its peers report unresolved
   (guarded once released) or committed and not finalized (`HeldVote.committed`; each commit voter holds a committed
   Tx until TxFinalized), and every KeyValue object with an ErrorTree or UnackedCommits entry against the store, read
   after the peers answered (`StoreRepairer.inheritedGrowthScan`): a T finalized before the round had its finalizer

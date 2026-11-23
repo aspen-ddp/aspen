@@ -392,12 +392,12 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def retryOn(sds: LocalStorageDeviceState, storeId: StoreId): Option[LoadRetry] =
     copiesOf(sds).flatMap(_.copies.get(storeId)).collect { case CopyRecord(_, _, _, _, Activity.AwaitingRetry(r)) => r }
 
-  /** A retry of `storeId` the loader holds on any loaded device: a record's AwaitingRetry, or one parked until its
-   *  record is Idle again */
   /** Whether the copy of `storeId` awaits a load retry on its record, not parked behind a close or retire: the retry
    *  the next device scan considers (retries) */
   def retryReady(storeId: StoreId): Boolean = retries.exists(_._1 == storeId)
 
+  /** A retry of `storeId` the loader holds on any loaded device: a record's AwaitingRetry, or one parked until its
+   *  record is Idle again */
   def retryOf(storeId: StoreId): Option[LoadRetry] =
     retries.collectFirst { case (s, r) if s == storeId => r }
       .orElse(parkedRetries.toList.sortBy(_._1._1.uuid).collectFirst { case ((_, s), r) if s == storeId => r })

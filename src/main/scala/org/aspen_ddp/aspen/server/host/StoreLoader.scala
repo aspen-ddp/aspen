@@ -734,13 +734,18 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val storeId = backend.storeId
     val held = !replaced && ctx.copyRegistry.closingUnserved(storageDeviceId, storeId, "abandonLoad",
       keepRetry = true)
+    // Its device's unload waits for the close (StoreRebuilds.closeStarted): unloaded and loaded again meanwhile, the
+    // device's Idle Live copy would be a Load candidate, opening a second backend over the closing one
+    val tracked = Option.when(ctx.devices.devices.contains(storageDeviceId))(ctx.rebuilds.closeStarted(storageDeviceId))
     val closed =
       try backend.close()
       catch case NonFatal(t) => Future.failed(t)
     closed.onComplete: result =>
-      result.failed.foreach(t => logger.warn(s"Failed to close the unserved backend of store $storeId: $t"))
-      if held then
-        ctx.copyRegistry.closeEnded(storageDeviceId, storeId)
+      try
+        result.failed.foreach(t => logger.warn(s"Failed to close the unserved backend of store $storeId: $t"))
+        if held then
+          ctx.copyRegistry.closeEnded(storageDeviceId, storeId)
+      finally tracked.foreach(ctx.rebuilds.closeDone(storageDeviceId, _))
 
   /** The rest of a LoadStore once its store is installed: with no saved state, recovers it from the device CRL and
    *  completes `p` at once; otherwise completes `p` once the CRL holds `trs` and the store has recovered from it. Its

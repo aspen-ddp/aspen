@@ -627,6 +627,39 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
               fsif(host).opens should be(opensBefore + 1)
               host.control.loader.awaitingRetryReady(storeId) should be(None)
 
+  // The abandoned load's close is one of the closes a device's unload waits for (StoreRebuilds.closeStarted): unloaded
+  // before it ends, a reload of the device would offer its Idle Live copy to a second open over the closing backend
+  atest("a device is not unloaded while a failed load's unserved backend is still closing"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+      val file = storeDir / StoreIncarnationFile.FileName
+      os.write.over(file, "not a uuid")
+      val gate = Promise[Unit]()
+      fsif(host).closeGate = Some(gate.future)
+      load(host)
+      awaitLoudly("the failed LoadStore to start closing its unserved backend") {
+        host.testingOnlyHandleEvents()
+        fsif(host).gatedCloses == 1
+      }.flatMap: _ =>
+        fsif(host).closeGate = None
+        host.control.rebuilds.closesRunning(deviceA) should be(true)
+        val local = host.control.devices.devices(deviceA)
+        // Nothing is open on the device: only the unserved close holds its unload back
+        host.control.shutdown.crlFailed(local, new Exception("injected CRL failure"))
+        host.testingOnlyHandleEvents()
+        host.control.devices.isLoaded(local) should be(true)
+        gate.success(())
+        awaitLoudly("the device's unload once the close has ended") {
+          host.testingOnlyHandleEvents()
+          !host.control.devices.isLoaded(local)
+        }.map: _ =>
+          host.control.rebuilds.closesRunning(deviceA) should be(false)
+          host.getStoreIds should not contain storeId
+
   /** Holds every FSIF open of `host` until the test runs it */
   private def holdOpens(host: Host): java.util.concurrent.ConcurrentLinkedQueue[Runnable] =
     val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()

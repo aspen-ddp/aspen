@@ -812,13 +812,14 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       if ctx.moves.isPendingLost(local, storeId) then
         moveToLost("retry move to lost", local, storeId): Unit
 
-  // The closes on each device whose end may move their copy to lost/ (closeStarted): a store's close (handleClose,
-  // closeUnloaded) and an unserved backend's (retireUnserved, handleBackendOpened). Every unload of a device waits for
-  // them (DeviceShutdown.unloadOnceClosed), so their move is made on the attached device
+  // The closes running on each device (closeStarted): a store's close (handleClose, closeUnloaded) and an unserved
+  // backend's (retireUnserved, handleBackendOpened's failed backend, StoreLoader.closeAbandoned). Every unload of a
+  // device waits for them (DeviceShutdown.unloadOnceClosed): a move to lost/ their end makes is made on the attached
+  // device, and no reload of the device opens a backend over one still closing
   private var lostCloses: Map[StorageDeviceId, Set[Promise[Unit]]] = Map()
 
-  /** A close on device `deviceId` whose end may move its copy to lost/ begins: the device is not unloaded until the
-   *  returned promise is given back to closeDone, after that move */
+  /** A close on device `deviceId` begins (a store's, or an unserved backend's): the device is not unloaded until the
+   *  returned promise is given back to closeDone, after any move to lost/ its end makes */
   private[host] def closeStarted(deviceId: StorageDeviceId): Promise[Unit] =
     val p = Promise[Unit]()
     lostCloses += deviceId -> (lostCloses.getOrElse(deviceId, Set()) + p)
@@ -831,7 +832,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     p.trySuccess(())
 
   /** Whether a close on device `deviceId` whose end may move its copy to lost/ is still running */
-  private[host] def closesRunning(deviceId: StorageDeviceId): Boolean = lostCloses.contains(deviceId)
+  private[server] def closesRunning(deviceId: StorageDeviceId): Boolean = lostCloses.contains(deviceId)
 
   /** Completes once every close on device `deviceId` running now (closeStarted) has ended */
   private[host] def closesEnded(deviceId: StorageDeviceId): Future[Unit] =

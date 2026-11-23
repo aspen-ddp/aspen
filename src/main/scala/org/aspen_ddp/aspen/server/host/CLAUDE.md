@@ -153,10 +153,10 @@
   between a FailStop close and its move leaves the copy where it was, and the restart loads it as after any crash (its
   CRL holds what the backend had not applied; a backend still broken fails again). Every unload of a device (a
   shutdown's `closeThenUnload`, a relinquish or a Failed retirement's `stopServing`, `crlFailed`) waits for the closes
-  on it whose end may move a copy to lost/ (`StoreRebuilds.closeStarted`/`closeDone`: `handleClose`, `closeUnloaded`,
-  `retireUnserved`, a failed unserved backend's close in `handleBackendOpened`) through
-  `DeviceShutdown.unloadOnceClosed`, so every such move is made on the attached device and an adopter never reads a
-  fail-stopped copy as clean. A relinquish, a Failed retirement and a CRL failure then unload whatever is open, so no
+  running on it (`StoreRebuilds.closeStarted`/`closeDone`: `handleClose`, `closeUnloaded`, `retireUnserved`, a failed
+  unserved backend's close in `handleBackendOpened`, an abandoned load's in `StoreLoader.closeAbandoned`) through
+  `DeviceShutdown.unloadOnceClosed`, so every move to lost/ is made on the attached device, an adopter never reads a
+  fail-stopped copy as clean, and no reload of the device opens a backend over one still closing. A relinquish, a Failed retirement and a CRL failure then unload whatever is open, so no
   store opens on such a device meanwhile (`DeviceShutdown.isStoppingServing`: `StoreLoader.startOpen` refuses, and
   `retryFailedLoads` skips it). Each close takes `closeStarted` last, and its end runs `closeDone` (and completes a
   `handleClose` caller) whatever its callback meets, so a throw there never wedges the device's unloads.
@@ -437,9 +437,10 @@
   build; and a LoadStore that cannot be queued) records its retry first, then holds its copy Closing(Unserved) while
   its unserved backend closes (`HostCopies.closingUnserved` with `keepRetry`: the retry parked, taken back at
   `closeEnded`), so the retry never opens a second backend over a directory the first still holds (a RocksDB lock, an
-  FSIF backend's files). Tests that scan for a retry wait for `StoreLoader.awaitingRetryReady` (the retry on the
-  copy's record, not parked behind a close); `awaitingRetryHasCallback` also counts a parked one. `tryLoadStore` reads no tree, so a retry is held to the
-  entries the device's latest reconcile read (`LocalStorageDeviceState.reconciledEntries`, set by
+  FSIF backend's files); the close is tracked (`StoreRebuilds.closeStarted`), so its device's unload waits for it.
+  Tests that scan for a retry wait for `StoreLoader.awaitingRetryReady` (the retry on the copy's record, not parked
+  behind a close); `awaitingRetryHasCallback` also counts a parked one. `tryLoadStore` reads no tree, so a retry is
+  held to the entries the device's latest reconcile read (`LocalStorageDeviceState.reconciledEntries`, set by
   `reconcileDeviceState`) and to the host's own work: it waits while that entry is neither Active nor Offline, the store
   is `declaredMissing` or a rebuild of it discards or runs (`HostCopies.rebuilding(RebuildHolds)`), its copy is unsynced
   (CopyMoves), its open is refused while the store has TransferOut work on the device (from `startOut`'s close until its

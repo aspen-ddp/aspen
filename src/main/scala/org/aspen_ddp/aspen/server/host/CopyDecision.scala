@@ -216,8 +216,8 @@ object CopyDecision:
     // such a copy: a load that a cancelled shutdown's close, or a move whose sync failed (an unsynced copy is never
     // loaded), held back has no other rule to make it. A copy held offline on purpose is never in this state: its
     // move to lost/ is pending, it has work, it awaits its load retry (AwaitingRetry, left to the retry), its
-    // unserved backend is closing (Closing(Unserved), StoreRebuilds.retireUnserved), or its device is stopping
-    // serving, whose opens tryLoadStore refuses.
+    // unserved backend is closing (Closing(Unserved), StoreRebuilds.retireUnserved, StoreLoader.abandonLoad), or its
+    // device is stopping serving, whose opens tryLoadStore refuses.
     val idleLive = in.copy.exists(c => c.activity == ActivityKind.Idle && c.phase == Phase.Live && !c.unsynced)
     if offline && idleLive && active && !f.sending && !f.configPresent.contains(false) && !f.declaredMissing &&
        !f.servedOnHost && !f.openingOnHost && !f.rebuildHoldsOnHost then

@@ -187,7 +187,7 @@ object StoreRouterSuite:
     /** A loaded device, onto which `storeId` is loaded (its copy is learned at its LoadStore) */
     def addDevice(storeId: StoreId): LocalStorageDeviceState = onControl:
       val dir = os.temp.dir()
-      val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl)
+      val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, ctx.deviceIos.forPath(dir))
       ctx.copyRegistry.attach(sds)
       ctx.devices.devices += deviceId -> sds
       sds
@@ -503,7 +503,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
     withRouter(crl): fx =>
       fx.onControl:
         val dir = os.temp.dir()
-        val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
+        val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, fx.ctx.deviceIos.forPath(dir), admission)
         fx.ctx.copyRegistry.attach(sds)
         fx.ctx.devices.devices += deviceId -> sds
       intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, copyDir(s0)))))
@@ -547,7 +547,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
     withRouter(crl): fx =>
       fx.onControl:
         val dir = os.temp.dir()
-        val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
+        val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, fx.ctx.deviceIos.forPath(dir), admission)
         fx.ctx.copyRegistry.attach(sds)
         fx.ctx.devices.devices += deviceId -> sds
       val first = bootstrappedBackend(s0)
@@ -586,7 +586,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
   private def addCountingDevice(fx: Fixture, storeId: StoreId, crl: CrashRecoveryLog,
                                 admission: CrlAdmission): LocalStorageDeviceState = fx.onControl:
     val dir = os.temp.dir()
-    val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, admission)
+    val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, fx.ctx.deviceIos.forPath(dir), admission)
     fx.ctx.copyRegistry.attach(sds)
     fx.ctx.devices.devices += deviceId -> sds
     sds

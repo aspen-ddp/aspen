@@ -256,7 +256,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
     val ctx = control()
     ctx.copyRegistry.strict = true
     val dev = os.temp.dir(dir = root, prefix = "dev", deleteOnExit = false)
-    val sds = new LocalStorageDeviceState(StorageDeviceId(UUID.randomUUID()), dev, dev / "config", null)
+    val sds = new LocalStorageDeviceState(StorageDeviceId(UUID.randomUUID()), dev, dev / "config", null, ctx.deviceIos.forPath(dev))
     val path = CopyFixtures.placeCopy(dev, storeId, from)
     ctx.copyRegistry.attach(sds, CopyLayout.list(dev))
     if from == Phase.Retired then

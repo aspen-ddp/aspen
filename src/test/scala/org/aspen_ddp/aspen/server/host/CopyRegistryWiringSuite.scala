@@ -216,7 +216,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     os.perms.set(closed, "rw-------")
     try
       val sds = new LocalStorageDeviceState(deviceB, other, other / StorageDeviceConfig.configFilename,
-        new org.aspen_ddp.aspen.TestNetwork.TestCRL)
+        new org.aspen_ddp.aspen.TestNetwork.TestCRL, host.control.deviceIos.forPath(other))
       os.makeDir.all(other / "not-a-store")
       noException should be thrownBy host.control.copyRegistry.attach(sds, CopyLayout.list(other))
       phases(host, deviceB) should be(Map(sid(0) -> Phase.Live))
@@ -824,7 +824,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val crl = new HeldDeleteCrl
     val sends = new StagedSendService
     val host = newHost(hostRoot, transferService = sends, verifyCopyRegistry = true)
-    val local = new LocalStorageDeviceState(source, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl)
+    val local = new LocalStorageDeviceState(source, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl, host.control.deviceIos.forPath(deviceDir))
     injectLoadedDevice(host, local)
     host.control.loader.tryLoadStore(local, storePath)
     val seen = watch(host, shipped)

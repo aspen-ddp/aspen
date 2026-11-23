@@ -527,7 +527,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val devDir = hostRoot / "injected-device"
     CopyFixtures.placeCopy(devDir, storeId, Phase.Arrived(""), configured = false)
     val local = new LocalStorageDeviceState(
-      deviceA, devDir, devDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL())
+      deviceA, devDir, devDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(devDir))
     injectLoadedDevice(host, local)
 
     val p1 = recorded(host).armLookup(deviceA)

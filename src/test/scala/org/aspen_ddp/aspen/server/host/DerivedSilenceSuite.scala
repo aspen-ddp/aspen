@@ -216,7 +216,7 @@ class DerivedSilenceSuite extends IntegrationTestSuite with ControlFixture:
       val dev = hostRoot / os.up / "injected-device"
       os.makeDir.all(dev)
       CopyFixtures.placeCopy(dev, s, phase)
-      val local = new LocalStorageDeviceState(deviceA, dev, dev / "dummy.file", new org.aspen_ddp.aspen.TestNetwork.TestCRL())
+      val local = new LocalStorageDeviceState(deviceA, dev, dev / "dummy.file", new org.aspen_ddp.aspen.TestNetwork.TestCRL(), host.control.deviceIos.forPath(dev))
       injectLoadedDevice(host, local)
       host.control.copyRegistry.work("test", deviceA, s, w => w.ordinal == work.ordinal, Some(work))
       val armed = recorded(host).armLookup(deviceA)

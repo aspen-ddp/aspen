@@ -362,7 +362,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       // Inject the device as loaded and trigger reconciliation
       _ = injectLoadedDevice(host, new LocalStorageDeviceState(
-        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL()))
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir)))
       armed = recorded(host).armLookup(realDeviceId)
       _ = host.control.reconciler.checkAll()
       readState = deviceState(realDeviceId, Map(rebuilding(rebuilt)))
@@ -425,7 +425,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
           tx.update(ptr, None, None, reqs, List(Insert(StorageDeviceState.StateKey, newState.encode())))
       _ <- waitForTransactionsToComplete()
       local = new LocalStorageDeviceState(
-        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL())
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir))
       _ = injectLoadedDevice(host, local)
       armed = recorded(host).armLookup(realDeviceId)
       _ = host.control.reconciler.checkAll()
@@ -479,7 +479,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
           tx.update(ptr, None, None, reqs, List(Insert(StorageDeviceState.StateKey, newState.encode())))
       _ <- waitForTransactionsToComplete()
       local = new LocalStorageDeviceState(
-        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL())
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir))
       _ = injectLoadedDevice(host, local)
       armed = recorded(host).armLookup(realDeviceId)
       _ = host.control.reconciler.checkAll()
@@ -532,7 +532,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       // As crlSaveFileLost leaves it: marked, and offline (its copy registered Lost at the device's load)
       _ = CopyFixtures.placeCopy(deviceDir, lost, Phase.Lost, configured = false)
       local = new LocalStorageDeviceState(
-        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL())
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir))
       _ = injectLoadedDevice(host, local)
       _ = host.control.reconciler.checkAll()
       _ <- completeRebuildsStarted(factory)
@@ -841,7 +841,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       realDeviceId <- client.createStorageDevice(HostId.BootstrapHostId, deviceSetId)
       _ <- setEntry(realDeviceId, earlier)
       _ = injectLoadedDevice(host, new LocalStorageDeviceState(
-        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL()))
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir)))
       armed = recorded(host).armLookup(realDeviceId)
       _ = host.control.reconciler.checkAll()
       _ = armed.success(deviceState(realDeviceId, Map(rebuildingIn(rebuilt, earlier))))
@@ -896,7 +896,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       realDeviceId <- client.createStorageDevice(HostId.BootstrapHostId, deviceSetId)
       _ <- setEntry(realDeviceId, earlier)
       _ = injectLoadedDevice(host, new LocalStorageDeviceState(
-        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL()))
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir)))
       armed = recorded(host).armLookup(realDeviceId)
       _ = host.control.reconciler.checkAll()
       _ = armed.success(deviceState(realDeviceId, Map(rebuildingIn(rebuilt, earlier))))
@@ -929,7 +929,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = hostRoot / "storage-devices" / "synth-d"
     os.makeDir.all(deviceDir)
     injectLoadedDevice(host, new LocalStorageDeviceState(
-      synthetic, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL()))
+      synthetic, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir)))
     def pending: List[os.Path] =
       val dir = deviceDir / RebuildingStore.PendingDeleteDirectory
       if os.exists(dir) then os.list(dir).toList else Nil
@@ -968,7 +968,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val synthetic = StorageDeviceId(UUID.fromString("cccccccc-0000-0000-0000-000000000005"))
     val deviceDir = hostRoot / "storage-devices" / "synth-e"
     os.makeDir.all(deviceDir)
-    val local = new LocalStorageDeviceState(synthetic, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL())
+    val local = new LocalStorageDeviceState(synthetic, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir))
     injectLoadedDevice(host, local)
 
     val first = recorded(host).armLookup(synthetic)
@@ -1006,7 +1006,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       val id = StorageDeviceId(UUID.fromString(s"cccccccc-0000-0000-0000-00000000010$n"))
       val dir = hostRoot / "storage-devices" / s"synth-w23-$n"
       os.makeDir.all(dir)
-      new LocalStorageDeviceState(id, dir, dir / "dummy.file", new TestNetwork.TestCRL())
+      new LocalStorageDeviceState(id, dir, dir / "dummy.file", new TestNetwork.TestCRL(), host.control.deviceIos.forPath(dir))
     val source = synthetic(0)
     val destination = synthetic(1)
     writeStoreConfig(source.devicePath, storeN(0))
@@ -1082,7 +1082,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.write(storePath / "marker.txt", "rebuilt store")
       // Inject device and trigger rebuild
       _ = injectLoadedDevice(host, new LocalStorageDeviceState(
-        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL()))
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename, new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir)))
       armed = recorded(host).armLookup(realDeviceId)
       _ = host.control.reconciler.checkAll()
       readState = deviceState(realDeviceId, Map(rebuilding(storeN(0))))
@@ -1118,9 +1118,9 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
 
     // Inject both devices manually (no writeDevice, so auto-scan won't find them)
     injectLoadedDevice(host, new LocalStorageDeviceState(
-      syntheticA, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL()))
+      syntheticA, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir)))
     injectLoadedDevice(host, new LocalStorageDeviceState(
-      syntheticB, deviceDir2, deviceDir2 / "dummy.file", new TestNetwork.TestCRL()))
+      syntheticB, deviceDir2, deviceDir2 / "dummy.file", new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir2)))
 
     val first = recorded(host).armLookup(syntheticA)
     host.control.reconciler.checkAll()
@@ -1190,7 +1190,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = hostRoot / "storage-devices" / "synth-c"
     os.makeDir.all(deviceDir)
     injectLoadedDevice(host, new LocalStorageDeviceState(
-      synthetic, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL()))
+      synthetic, deviceDir, deviceDir / "dummy.file", new TestNetwork.TestCRL(), host.control.deviceIos.forPath(deviceDir)))
     val rebuildingState = deviceState(synthetic, Map(rebuilding(storeN(0))))
 
     val first = recorded(host).armLookup(synthetic)

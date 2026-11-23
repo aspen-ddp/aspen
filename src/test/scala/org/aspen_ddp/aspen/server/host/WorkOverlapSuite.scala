@@ -160,7 +160,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val crl = new HeldDropCrl
     val factory = new HeldRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
-    val local = new LocalStorageDeviceState(deviceA, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl)
+    val local = new LocalStorageDeviceState(deviceA, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl, host.control.deviceIos.forPath(deviceDir))
     injectLoadedDevice(host, local)
     val e1 = UUID.randomUUID()
     val e2 = UUID.randomUUID()
@@ -192,7 +192,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
     val factory = new HeldRebuildFactory
     val transfers = new StagedTransferService
     val host = newHost(hostRoot, transferService = transfers, storeRebuildFactory = factory)
-    val local = new LocalStorageDeviceState(deviceA, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl)
+    val local = new LocalStorageDeviceState(deviceA, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl, host.control.deviceIos.forPath(deviceDir))
     injectLoadedDevice(host, local)
     // Its copy, registered Lost at the injection, is held back offline, as a device load holds a marked copy
 
@@ -368,7 +368,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       val crl = new HeldReadCrl
       val sends = new StagedSendService
       val host = newHost(hostRoot, transferService = sends)
-      val local = new LocalStorageDeviceState(source, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl)
+      val local = new LocalStorageDeviceState(source, deviceDir, deviceDir / StorageDeviceConfig.configFilename, crl, host.control.deviceIos.forPath(deviceDir))
       injectLoadedDevice(host, local)
       // Not loaded: its copy, registered at the injection, is offline
       if loaded then

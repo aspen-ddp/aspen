@@ -14,11 +14,9 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
                               val devicePath: os.Path,
                               val configFile: os.Path,
                               val crl: CrashRecoveryLog,
-                              val admission: CrlAdmission = CrlAdmission.Unlimited,
-                              /** The device's I/O lanes (DeviceIos.forPath). The default, for tests that build a
-                               *  state by hand, is a private ThreadedDeviceIo; production passes the registry's. */
-                              deviceIo: Option[DeviceIo] = None):
-  val io: DeviceIo = deviceIo.getOrElse(new ThreadedDeviceIo(devicePath, DeviceIo.Config()))
+                              /** The device's I/O lanes (`DeviceIos.forPath`) */
+                              val io: DeviceIo,
+                              val admission: CrlAdmission = CrlAdmission.Unlimited):
   /** The device's copy registry (HostCopies), attached at load. Updated on the control thread only */
   val copies: DeviceCopies = new DeviceCopies(storageDeviceId, devicePath, s => onCopyChange(s))
   /** Called after every change to `copies` (HostCopies.observer, for tests) */

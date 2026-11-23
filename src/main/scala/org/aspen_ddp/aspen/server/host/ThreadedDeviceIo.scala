@@ -12,7 +12,8 @@ import org.aspen_ddp.aspen.common.store.StoreId
 
 /** `gate` runs before every task on every thread of this DeviceIo; hang tests pass a latch await. */
 class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit = () => ()) extends DeviceIo, Logging:
-  @volatile private var currentLabel: String = path.last
+  private val baseName: String = path.segments.toList.lastOption.getOrElse("root")
+  @volatile private var currentLabel: String = baseName
   val observer: DeviceIoObserver = new DeviceIoObserver
 
   private final class Named(val role: String, val index: Int, val thread: Thread)
@@ -33,7 +34,7 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
   def label: String = currentLabel
 
   def setDeviceId(id: StorageDeviceId): Unit =
-    currentLabel = s"${path.last}-${id.uuid}"
+    currentLabel = s"$baseName-${id.uuid}"
     threads.forEach(n => n.thread.setName(threadName(n.role, n.index)))
 
   private val laneThread = new Thread(() => laneLoop(), threadName("mgmt", -1))

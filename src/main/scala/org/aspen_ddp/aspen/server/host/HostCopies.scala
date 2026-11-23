@@ -417,7 +417,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
           activityFact("router remove", copies, storeId, Activity.Closing(purpose))
 
   /** An unserved backend of `storeId` on device `id` that must never serve is about to close
-   *  (StoreRebuilds.retireUnserved): its Live copy, Opening, Idle or AwaitingRetry, is held Closing(Unserved) until
+   *  (StoreRebuilds.retireUnserved, or StoreLoader.handleBackendOpened for a failed backend opened while another
+   *  serves the store): its Live copy, Opening, Idle or AwaitingRetry, is held Closing(Unserved) until
    *  the close ends (closeEnded), so that no load opens a second backend on its directory while the first still
    *  closes. A claim; returns whether the copy is held. A copy in any other activity (Served: a reload's earlier store
    *  still serving it; Closing; Retiring), in another phase, or with no record is left as it is, and false returned */

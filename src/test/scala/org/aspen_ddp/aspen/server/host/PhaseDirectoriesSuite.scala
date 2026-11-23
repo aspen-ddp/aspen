@@ -300,6 +300,43 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       inLost(dev, s, flat)
       recordOf(host, local, s).map(_.activity) should be(Some(Activity.Idle))
 
+  // As above, for an open that ends with a failed backend while another backend serves the store
+  // (StoreLoader.handleBackendOpened): its copy is held Closing(Unserved) until the close ends, then moved to lost/
+  atest("a failed backend opened while another serves the store holds its copy until its close ends"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    rocksCopy(dev, s)
+    val devB = writeDevice(hostRoot, "dev1", deviceB)
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(devB))
+    // A stale copy on B, not loaded while A's serves the store
+    val flatB = rocksCopy(devB, s)
+    val opener = new TestOpener
+    val host = realHost(hostRoot, opener)
+    val gate = Promise[Unit]()
+    for
+      _ <- pump(host, host.control.router.loaded.contains(s) && loadedDevices(host).contains(deviceB))
+      localB = loadedDevices(host)(deviceB)
+      // B's copy opening when A's backend is already served
+      cfg = StoreConfig.loadStoreConfig(flatB / StoreConfig.configFilename)
+      _ = host.control.copyRegistry.opening(localB, s, 1000, false, flatB) should be(true)
+      backend = new RocksDBBackend(flatB, s, executionContext):
+        override def hasFailed: Boolean = true
+        override def close(): Future[Unit] = gate.future.flatMap(_ => super.close())
+      _ = host.control.loader.handleBackendOpened(Host.BackendOpened(localB, cfg, flatB, false, None,
+        Success(backend), None, None, inline = false))
+      _ <- pump(host, false, rounds = 20)
+      heldActivity = recordOf(host, localB, s).map(_.activity)
+      heldPhase = CopyFixtures.phaseOf(devB, s)
+      _ = gate.success(())
+      _ <- pump(host, CopyFixtures.phaseOf(devB, s).contains(Phase.Lost))
+    yield
+      heldActivity should be(Some(Activity.Closing(ClosePurpose.Unserved)))
+      heldPhase should be(Some(Phase.Live))
+      inLost(devB, s, flatB)
+      recordOf(host, localB, s).map(_.activity) should be(Some(Activity.Idle))
+      host.control.router.get(s).map(_.backend.path).exists(_.startsWith(dev)) should be(true)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
   // Final review M1: a copy closed for a failed CRL-state load (ClosePurpose.Reload) ends AwaitingRetry, not Idle, so
   // its reload is paced by the load retry's backoff on the device scans, never made at each device check
   atest("a failed CRL-state load is retried with backoff, not at every device check"):
@@ -375,9 +412,11 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       heldPhase should be(Some(Phase.Live))
       inLost(dev, s, flat)
 
-  // Final review M2.1: the copy's move to lost/ refused for its activity (a new open began before the failed backend's
-  // close ended) is not held for a retry at every check: the copy's own open or close path handles it
-  atest("a move to lost refused because a new open of the copy began is not held for retry"):
+  // Final review M2.1, as the failed unserved backend's hold (HostCopies.closingUnserved) leaves it: a new open of
+  // the copy while the failed backend closes is refused (Closing(Unserved) -> Opening), not raced with the move. No
+  // production path opens a held copy (CopyDecision's Load needs it Idle, and a retry is parked while it closes), so
+  // the open is asked for by hand and its refusal is a registry violation. The copy moves to lost/ once the close ends
+  atest("a new open of a failed unserved backend's copy while it closes is refused, and the copy moves to lost"):
     given ExecutionContext = executionContext
     val (hostRoot, dev) = device()
     val opener = new TestOpener
@@ -389,27 +428,24 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
     val sds = loadedDevices(host)(deviceA)
     val cfg = StoreConfig.loadStoreConfig(flat / StoreConfig.configFilename)
     val closing = Promise[Unit]()
-    val opening = Promise[Unit]()
     opener.failing = true
     opener.closeGate = Some(closing.future)
     host.control.loader.startOpen(sds, cfg, flat, create = false, None)
     for
       _ <- pump(host, false, rounds = 20)
-      // A second open of the copy begins while the failed backend closes, and stays opening
       _ = opener.failing = false
       _ = opener.closeGate = None
-      _ = opener.openGate = Some(opening.future)
+      opensBefore = opener.opens.get
       _ = host.control.loader.startOpen(sds, cfg, flat, create = false, None)
+      refusals = host.control.copyRegistry.takeRegistryErrors()
+      opensAfter = opener.opens.get
       _ = closing.success(())
-      _ <- pump(host, false, rounds = 20)
-      heldWhileOpening = host.control.moves.isPendingLost(sds, s)
-      phaseWhileOpening = CopyFixtures.phaseOf(dev, s)
-      _ = opening.success(())
-      _ <- pump(host, false, rounds = 20)
+      _ <- pump(host, CopyFixtures.phaseOf(dev, s).contains(Phase.Lost))
     yield
-      heldWhileOpening should be(false)
-      phaseWhileOpening should be(Some(Phase.Live))
+      refusals.exists(_.contains("Closing(Unserved) -> Opening")) should be(true)
+      opensAfter should be(opensBefore)
       host.control.moves.isPendingLost(sds, s) should be(false)
+      inLost(dev, s, flat)
 
   atest("a BackendStateLost open moves the copy to lost"):
     given ExecutionContext = executionContext

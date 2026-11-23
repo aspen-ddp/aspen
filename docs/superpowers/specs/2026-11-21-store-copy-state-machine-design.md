@@ -914,5 +914,7 @@ store-copies release rule and "no Action loads a non-Live copy".
   `Closing(_)`, so a router removal of an unserved copy is still a violation) and ends it (`closeEnded`) just before `moveClosedToLost`. Left Idle, the
   copy was in `Load`'s state while the close ran, and a device check in that window opened a second backend on its
   directory, which for a failed backend could serve, leaving the move to give up on a fail-stopped copy. The close is
-  counted by `closeStarted` as before, so every unload still waits for it.
+  counted by `closeStarted` as before, so every unload still waits for it. `StoreLoader.handleBackendOpened` holds
+  the same way a failed backend it closes unserved because another backend serves the store (from Opening, on a
+  registered device), ending the hold before its move to lost/.
 - R3 and R5 were review carry-overs with no design effect.

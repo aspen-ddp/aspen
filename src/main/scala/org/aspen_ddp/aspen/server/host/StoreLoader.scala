@@ -291,13 +291,20 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           try backend.close()
           catch case NonFatal(t) => Future.failed(t)
         created.foreach(_.tryFailure(new IllegalStateException(s"store $storeId was opened but not served")))
-        openEnded()
+        // A failed backend's copy is held Closing(Unserved) while it closes, as retireUnserved holds one: Idle, it
+        // would be CopyDecision's Load state once the other backend is gone, and a load in that window would open a
+        // second backend on the directory, which may serve, leaving the move below to find it Opening or Served
+        val held = tracked.isDefined && ctx.copyRegistry.closingUnserved(sds.storageDeviceId, storeId)
+        if !held then
+          openEnded()
         if failed then
           // Moved to lost/ once its backend has closed: never a move of an open backend's directory (P5). A device
           // unloaded before this open ended is left as its unload left it: the copy is where it was, and a backend
-          // still broken fails its next open again
+          // still broken fails its next open again. The hold ends just before the move
           closed.onComplete: _ =>
             try
+              if held then
+                ctx.copyRegistry.closeEnded(sds.storageDeviceId, storeId)
               if ctx.devices.isLoaded(sds) then
                 ctx.rebuilds.moveToLost("failed unserved backend", sds, storeId): Unit
                 ctx.reconciler.checkStorageDevice(sds.storageDeviceId)

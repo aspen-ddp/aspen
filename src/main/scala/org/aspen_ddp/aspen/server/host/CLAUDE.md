@@ -110,8 +110,9 @@
   has ended the close; `retireUnserved` (failed before served, lost incarnation, `crlSaveFileLost`) once the unserved
   backend's close completes, its Live copy held `Closing(Unserved)` meanwhile (`HostCopies.closingUnserved`, from
   Opening, Idle or AwaitingRetry; not a copy a reload's earlier store still serves) so that `Load` opens no second
-  backend on the directory, the hold ended (`closeEnded`) just before the move; `handleBackendOpened`'s failed
-  unserved backend likewise; a `BackendStateLost` open at once (no backend opened); `backendFailed` for a backend no longer served, unless its copy is Opening or Closing (its
+  backend on the directory, the hold ended (`closeEnded`) just before the move; `handleBackendOpened`'s failed unserved
+  backend (opened while another backend serves the store) likewise, held from Opening; a `BackendStateLost` open at once
+  (no backend opened); `backendFailed` for a backend no longer served, unless its copy is Opening or Closing (its
   LoadStore or its close's end retires it); a foreign copy `retireForeignCopy` finds closed, and retire step 1. A crash
   between a FailStop close and its move leaves the copy where it was, and the restart loads it as after any crash (its
   CRL holds what the backend had not applied; a backend still broken fails again). Every unload of a device (a

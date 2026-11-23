@@ -53,8 +53,10 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
       while !closed do
         val e = lane.take()
         try
-          gate()
-          if e.state.compareAndSet(Queued, Running) then e.run() else e.skip()
+          if e.state.compareAndSet(Queued, Running) then
+            gate()
+            e.run()
+          else e.skip()
         catch case t: Throwable => logger.error(s"device io lane task failed: $t")
     catch case _: InterruptedException => ()
 

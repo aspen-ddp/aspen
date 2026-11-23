@@ -62,7 +62,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   private var unsyncedPaths: Set[os.Path] = Set()
   // Copies held back from loading for a move whose sync failed (unsynced), by device and store: held until
   // a load opens or installs them, or they leave their path or device, so every later device check that finds one
-  // synced, free and Active loads it (DeviceReconciler.loadResynced), not only the check whose re-sync succeeded
+  // synced, free and Active loads it (CopyDecision.LoadResynced), not only the check whose re-sync succeeded
   private var heldForSync: Set[(StorageDeviceId, StoreId)] = Set()
 
   /** Tests: a throw of the silence path propagates rather than leaving the store silent (Host.Seams) */
@@ -533,10 +533,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def isRetiring(storeId: StoreId): Boolean =
     allCopies.exists(_.copies.get(storeId).exists(_.activity == Activity.Retiring))
 
-  /** Whether an entry says no transfer out of its store is outstanding: Active, no destination named. A copy in
-   *  outbound/ under it was left by a transfer that ended without completing */
-  def noTransferOut(entry: StorageDeviceState.StoreEntry): Boolean =
-    entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
+  /** Whether an entry says no transfer out of its store is outstanding (CopyDecision.noTransferOut) */
+  def noTransferOut(entry: StorageDeviceState.StoreEntry): Boolean = CopyDecision.noTransferOut(entry)
 
   /** Whether a copy of `storeId` left offline by a transfer out may be put back in service under `entry`: the tree says
    *  no transfer is outstanding (noTransferOut), and this process is not sending it (a drain may restore the entry

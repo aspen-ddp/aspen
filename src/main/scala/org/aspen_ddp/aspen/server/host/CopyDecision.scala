@@ -216,8 +216,8 @@ object CopyDecision:
 
     // An abort removes this device's TransferringIn entry and tells nobody, so this check is the only thing that
     // learns of it. Left alone, an attempt still waiting on bytes keeps retransmitting its request and holds the
-    // store's receive attempt, which would make the transfer-in start skip a later transfer of the same store. Before
-    // that for that reason. An attempt past promotion is not covered here; updateStateForTransferredStore sees the
+    // store's receive attempt, which would make the transfer-in start skip a later transfer of the same store, so this
+    // runs before the transfer-in start (StartTransferIn). An attempt past promotion is not covered here; updateStateForTransferredStore sees the
     // abort in the source's entry instead.
     //
     // The same store can be re-targeted at another device of this host. A receive attempt is held per store, so the
@@ -225,7 +225,8 @@ object CopyDecision:
     // entry is the newer word on who receives the store, so the other device's attempt is dropped here instead of a
     // poll later.
     val transferringIn = status.contains(StoreStatus.TransferringIn)
-    in.facts.tracked.foreach: t =>
+    // One drop per (from, to): a store may be tracked in both pendingStartTransfers and transferInRetries
+    in.facts.tracked.distinct.foreach: t =>
       if t.toDevice == in.deviceId then
         if !(transferringIn && entry.exists(_.transferDevice.contains(t.fromDevice))) then
           out += DropTransferIn(t.fromDevice, t.toDevice)
@@ -247,15 +248,17 @@ object CopyDecision:
       entry.flatMap(_.transferDevice).foreach: from =>
         out += StartTransferIn(from, entry.flatMap(_.transferId))
 
-    // Starts the rebuild of each Rebuilding entry. Other work holds the store.
+    // Starts the rebuild of each Rebuilding entry. Other work holds the store, and its end checks the device again (a
+    // transfer out's close too, whatever its outcome: StoreTransfersOut), which starts it.
     if rebuilding && work.forall(_.isInstanceOf[Work.Rebuild]) then
       entry.foreach: e =>
         out += StartRebuild(e.rebuildEpisode, e.acceptLoss)
 
     out.result()
 
-  /** Whether an entry says no transfer out of its store is outstanding: Active, no destination named */
-  private def noTransferOut(entry: StorageDeviceState.StoreEntry): Boolean =
+  /** Whether an entry says no transfer out of its store is outstanding: Active, no destination named. A copy in
+   *  outbound/ under it was left by a transfer that ended without completing */
+  def noTransferOut(entry: StorageDeviceState.StoreEntry): Boolean =
     entry.status == StoreStatus.Active && entry.transferDevice.isEmpty
 
   enum ReleaseDecision:

@@ -90,7 +90,7 @@
   files), and a warning for a store with no recorded usage. The remedy for either is re-placement,
   `transfer-store` on the Rebuilding store (`server/host/CLAUDE.md`)
 - Rebuild work lives only in the copy registry: `Work.Rebuild(episode, stage)` on its device, stage Queued (waiting for
-  a slot), DiscardingLost (its lost copy's retire), Running, or Abandoned (cancelled by `abandonUnlisted`, still running
+  a slot), DiscardingLost (its lost copy's retire), Running, or Abandoned (cancelled by `cancelRebuild`, still running
   until its slot is released). `StoreRebuilds` keeps only what Work cannot hold: each running rebuild's handle and
   settled promise (`runningRebuilds`), the pending flips, requests and retry backoff. One predicate answers "is a
   rebuild registered", `HostCopies.rebuilding(stages)`, each caller naming its stages (R20): `RebuildReads` (Running,
@@ -108,10 +108,11 @@
   (derived silence, `server/host/CLAUDE.md`), so its host drops its messages rather than answering UnknownStore. No
   other path can unsilence it while the work is held (another device's Deleted Stores pass after a same-host
   re-placement only removes that device's copy). `Adopt`, `AdoptOffline`, `Discard`, `Unconfirmed`, `NotOwned`, a
-  cancel for an entry that left the device and `abandonUnlisted` for a queued one end the work; whatever else names
+  cancel for an entry that left the device and `endQueuedRebuild` for a queued one end the work; whatever else names
   the store (the finished copy, until its load serves it; an unloaded device's entry) keeps it silent. Other outcomes
   (Superseded, a failed flip, pass or a shutdown's cancel) keep the work, queued, for the retry, until the entry
-  leaves Rebuilding: each reconcile first ends such work (`endUnlistedWork`), so its passes find the copy free (a
+  leaves Rebuilding: each reconcile first ends such work (`EndQueuedRebuild`, decide's first case), so the rest of its decision finds
+  the copy free (a
   copy with work on its device is left to that work). A queued or discarding rebuild never makes a store served
   elsewhere here unrepairable; a running one, or an abandoned one still running, does (R20)
 - One piece of host work per (device, store) at a time (I3): while a rebuild of a store is registered on a device
@@ -124,7 +125,7 @@
   (`StoreRebuilds.createNewStore`). A rebuild is neither requested (Lost CRL pass) nor started (`startRebuild`) while a
   send of the store is still registered (`isTransferringOut`, host-wide by store): its discard would move the directory
   being shipped. A device re-check follows. Nor is one started while a transfer out is still closing the store
-  (`StoreTransfersOut.deferRebuildUntilClosed`); the close's end re-checks the device. Conversely,
+  (`StoreTransfersOut.rebuildWaitsForClose`); the close's end, whatever its outcome, re-checks the device. Conversely,
   `StoreTransfersOut.startOut` refuses while a rebuild of the store is registered, its flip's retry included; the
   receiver's retransmit starts the transfer once it ends
 - A rebuild's staging store opens through the same `BackendOpener` as a normal load (passed by

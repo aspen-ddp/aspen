@@ -27,10 +27,6 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   // every open of the copy meanwhile (StoreLoader.startOpen, R12), so a store is never served from a save file whose
   // entries the extraction is still deleting from the device CRL
 
-  // Stores whose rebuild start waited for their close for a transfer out (deferRebuildUntilClosed): the close's end checks the
-  // device again, which starts it
-  private var rebuildsAwaitingClose: Set[StoreId] = Set()
-
   /** Claims the store's TransferOut work on `sds` at `stage` before a transfer out's close or abort starts (I3): false
    *  if other work holds the (device, store), and then nothing starts. An abort claimed during the close (a copy found
    *  lost while it closed) takes the close's work over */
@@ -45,12 +41,10 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
       ctx.copyRegistry.work("transfer out", sds.storageDeviceId, storeId, _.isInstanceOf[Work.TransferOut], None): Unit
 
   /** Whether a rebuild of the store must wait for its close for a transfer out (I3: a discard of its copy would move
-   *  the directory the close is extracting from). When it must, the close's end checks the source device again */
-  private[host] def deferRebuildUntilClosed(storeId: StoreId): Boolean =
-    val closing = ctx.copyRegistry.transferringOut(storeId, TransferOutStage.Closing)
-    if closing then
-      rebuildsAwaitingClose += storeId
-    closing
+   *  the directory the close is extracting from): TransferOut work Closing on any device. Every such close's end
+   *  checks the source device again, which starts the rebuild */
+  private[host] def rebuildWaitsForClose(storeId: StoreId): Boolean =
+    ctx.copyRegistry.transferringOut(storeId, TransferOutStage.Closing)
 
   /** Takes a store out of service for a transfer out, extracting its CRL state into its crl_save.log to travel with
    *  it: closes it (extractCrl) if it is open or opening, else extracts the state of the closed store from the
@@ -253,10 +247,11 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
           try closedForTransfer(m, devEntry, sourceDs, toHostState, wasLoaded, result)
           finally
             endWork(m.storeId, sourceDs, TransferOutStage.Closing)
-            if rebuildsAwaitingClose.contains(m.storeId) then
-              rebuildsAwaitingClose -= m.storeId
-              if ctx.devices.isLoaded(sourceDs) then
-                ctx.reconciler.checkStorageDevice(sourceDs.storageDeviceId)
+            // Whatever the close's outcome (moved into outbound/, failed, aborted), the source device is checked again:
+            // the work held the (device, store) (I3), so a decision the reconcile left to it (a rebuild waiting for
+            // the close) is taken now rather than at the periodic check. Checks coalesce
+            if ctx.devices.isLoaded(sourceDs) then
+              ctx.reconciler.checkStorageDevice(sourceDs.storageDeviceId)
 
   /** The phase of the record of `storeId`'s copy on `sds`, None without one */
   private def sourcePhase(sds: LocalStorageDeviceState, storeId: StoreId): Option[Phase] =

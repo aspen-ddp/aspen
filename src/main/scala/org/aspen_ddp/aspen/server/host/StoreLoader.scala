@@ -127,7 +127,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
               logger.info(s"Not loading store $storeId: its move to lost/ failed and is retried. $potentialStoreFile")
             else if ctx.copyRegistry.isUnsynced(sds, storeId) then
               // A move a crash could undo (CopyMoves): the next check of its device forces its directories
-              // and loads it (DeviceReconciler.loadResynced)
+              // and loads it (CopyDecision.LoadResynced)
               logger.info(s"Not loading store $storeId yet: a move of its copy is not durable. $potentialStoreFile")
             else
               startOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)

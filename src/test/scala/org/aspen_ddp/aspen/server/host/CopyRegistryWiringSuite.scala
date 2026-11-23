@@ -132,6 +132,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(shipped, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
+      // The close's end checks the device; that check, and any after it, is held: the tree lists none of the
+      // placed stores, and a reconcile would retire them
+      _ = recorded(host).armLookup(source)
       started <- host.control.transfersOut.startOut(StartStoreTransfer(host.hostId, client.clientId, source,
                    shipped, HLCTimestamp.now, UUID.randomUUID())).transform(Success(_))
       _ <- yieldUntil(sends.isTransferringOut(shipped))
@@ -431,6 +434,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
         _ <- waitForTransactionsToComplete()
         _ <- client.transferStore(shipped, net.secondDeviceId)
         _ <- waitForTransactionsToComplete()
+        // The close's end checks the device: held, as the tree's bootstrap stores have no copies here and a
+        // reconcile would rebuild them onto this device
+        _ = recorded(host).armLookup(source)
         started <- ask(host)
         _ <- pumpUntil(host, sends.isTransferringOut(shipped))
         outbound = phases(host, source)(shipped)

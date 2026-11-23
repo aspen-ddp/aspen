@@ -627,7 +627,11 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
               failures -= 1
               throw new java.io.IOException("injected sync")
             DurableFiles.syncDirectory(d)
+      // The close's end checks the device, whose resync would force the copy: held, so the retransmit below meets
+      // the copy unsynced
+      _ = recorded(host).armLookup(source)
       first <- askAndSettle(host)
+      checkedAfterFirst = host.control.reconciler.activeDeviceChecks.contains(source)
       shippedAfterFirst = sends.sources
       phaseAfterFirst = CopyFixtures.phaseOf(dev, shipped)
       unsyncedAfterFirst = recordOf(host, local, shipped).map(r => (r.phase, r.unsynced))
@@ -638,6 +642,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       third <- askAndSettle(host)
     yield
       first should be(Success(()))
+      checkedAfterFirst should be(true)
       failures should be(0)
       shippedAfterFirst should be(Vector())
       phaseAfterFirst should be(Some(Phase.Outbound(tid)))
@@ -1615,3 +1620,65 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       os.isFile(stray) should be(true)
       inDir(dev, CopyLayout.LostDirectory) should be(Nil)
       CopyFixtures.retiredCopies(dev, s) should be(Nil)
+
+  // ---- Stage 3, Task 2: the reconcile runs CopyDecision.decide per store ----
+
+  // D2: each store's inputs are read at its turn, after the actions of the stores before it. A's request for its
+  // rebuild (its Lost copy under Active) starts a receive attempt for B, which sorts after it: B's Arrived copy is
+  // then held by that attempt and not brought live, until a check after the attempt ends
+  atest("a reconcile reads each store's inputs at its turn"):
+    given ExecutionContext = executionContext
+    val a = s
+    val b = StoreId(s.poolId, 1)
+    val (hostRoot, dev) = device()
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(writeDevice(hostRoot, "dev1", deviceB)))
+    CopyFixtures.placeCopy(dev, a, Phase.Lost)
+    CopyFixtures.placeCopy(dev, b, Phase.Arrived(UUID.randomUUID().toString))
+    @volatile var hostRef: Host = null
+    @volatile var attemptStarted = false
+    def receiving(attempt: Option[UUID]): Boolean =
+      hostRef.control.copyRegistry.work("test receive attempt", deviceB, b, _.isInstanceOf[Work.TransferIn],
+        attempt.map(id => Work.TransferIn(None, TransferInStage.Receiving, Some(id))))
+    val host = newHost(hostRoot, adjustSeams = _.copy(rebuildRequestFailure = storeId =>
+      if storeId == a && !attemptStarted then
+        attemptStarted = true
+        receiving(Some(UUID.randomUUID())) should be(true)
+      Some(new Exception("injected: no rebuild request"))))
+    hostRef = host
+    host.testingOnlyHandleEvents()
+    val active = StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
+    val entries = Map(a -> active, b -> active)
+    val local = loadedDevices(host)(deviceA)
+    def loadsOfB = recorded(host).storeLoadAttempts.toList.filter((_, p) => CopyLayout.parseName(p.last).exists(_._1 == b))
+    for
+      _ <- check(host, entries)
+      startedInFirst = attemptStarted
+      phaseAfterFirst = recordOf(host, local, b).map(_.phase)
+      loadsAfterFirst = loadsOfB
+      _ = receiving(None) should be(true)
+      _ <- check(host, entries)
+    yield
+      startedInFirst should be(true)
+      phaseAfterFirst.exists(_.isInstanceOf[Phase.Arrived]) should be(true)
+      loadsAfterFirst should be(Nil)
+      recordOf(host, local, b).map(_.phase) should be(Some(Phase.Live))
+      loadsOfB should be(List((deviceA, CopyFixtures.livePathOf(dev, b))))
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())
+
+  atest("a tracked transfer in whose entry is gone is dropped"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = receivingDevice()
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
+    host.testingOnlyHandleEvents()
+    for
+      _ <- startMoving(host)
+      _ <- awaitBegun(host, transfers)
+      trackedBefore = host.control.transfers.pendingStartTransfers.contains(moving)
+      // The abort removed the device's entry for the store
+      _ <- check2(host, deviceState(net.secondDeviceId))
+    yield
+      trackedBefore should be(true)
+      host.control.transfers.pendingStartTransfers.contains(moving) should be(false)
+      host.control.transfers.receiving.contains(moving) should be(false)
+      host.control.copyRegistry.takeRegistryErrors() should be(Vector())

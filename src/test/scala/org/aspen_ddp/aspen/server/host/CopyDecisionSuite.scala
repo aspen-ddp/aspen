@@ -177,7 +177,9 @@ class CopyDecisionSuite extends AnyFunSuite with Matchers:
       (StoreFacts.none :: allTrue :: bools.map(_(StoreFacts.none))) :::
         existence.map(d => StoreFacts.none.copy(dirPresent = d)) :::
         existence.map(c => StoreFacts.none.copy(configPresent = c)) :::
-        List(List(TrackedIn(otherDevice, deviceId)), List(TrackedIn(otherDevice, thirdDevice))).map(t =>
+        List(List(TrackedIn(otherDevice, deviceId)), List(TrackedIn(otherDevice, thirdDevice)),
+          // Tracked in both pendingStartTransfers and transferInRetries for the same (from, to)
+          List(TrackedIn(otherDevice, deviceId), TrackedIn(otherDevice, deviceId))).map(t =>
           StoreFacts.none.copy(tracked = t))
 
     def bad(in: StoreInputs, what: String): Nothing =
@@ -185,6 +187,7 @@ class CopyDecisionSuite extends AnyFunSuite with Matchers:
 
     val start = System.nanoTime()
     var count = 0L
+    var emitted = Set.empty[Int]
     for e <- entries; c <- copies; w <- works do
       val d4Work = w match
         case Some(Work.Rebuild(_, RebuildStage.Queued)) if !e.exists(_.status == StoreStatus.Rebuilding) => None
@@ -198,6 +201,7 @@ class CopyDecisionSuite extends AnyFunSuite with Matchers:
         val input = StoreInputs(deviceId, storeId, e, c, w, f)
         val actions = decide(input)
         count += 1
+        emitted ++= actions.map(_.ordinal)
         if actions != decide(input) then bad(input, "A7 nondeterministic")
         val ordinals = actions.map(_.ordinal)
         if ordinals != ordinals.sorted then bad(input, s"A6 out of order $actions")
@@ -239,3 +243,7 @@ class CopyDecisionSuite extends AnyFunSuite with Matchers:
               if e.isDefined then bad(input, s"A4 $a")
             case _ => ()
     info(s"$count combinations in ${(System.nanoTime() - start) / 1000000} ms")
+    // Every Action is emitted by some combination, so none of the invariants above holds vacuously for one
+    val mirror = summon[scala.deriving.Mirror.SumOf[Action]]
+    val actionCount = scala.compiletime.constValue[Tuple.Size[mirror.MirroredElemLabels]]
+    emitted should be((0 until actionCount).toSet)

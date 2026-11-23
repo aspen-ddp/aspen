@@ -75,7 +75,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         setWork(storeId, deviceId, Some(Work.Rebuild(w.episode, RebuildStage.Queued)))
 
   /** Whether rebuild work for `storeId` is registered on `deviceId`, any stage: queued for a slot, discarding its lost
-   *  copy, or running, one cancelled (abandonUnlisted) included until its slot is released, since a rebuild past
+   *  copy, or running, one cancelled (cancelRebuild) included until its slot is released, since a rebuild past
    *  finish's latch re-check ignores the cancel and can still move a copy into rebuilt/. A transfer in of the
    *  store onto the device waits while it holds (StoreTransfers.startIn): one piece of work per (device, store) */
   private[host] def hasRebuildWork(storeId: StoreId, deviceId: StorageDeviceId): Boolean =
@@ -279,9 +279,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     // its Work with the device's records, and still holds its slot until it releases it
     val runs = registry.rebuilding(HostCopies.RebuildReads).contains(storeId) || runningRebuilds.contains(storeId)
     // Nor queued while a transfer out is still closing it (and extracting its CRL state from its directory): that
-    // close is the (device, store)'s one piece of work (I3), and its end checks the device again
-    // (StoreTransfersOut.deferRebuildUntilClosed). The close took the store out of service already
-    val closing = !runs && ctx.transfersOut.deferRebuildUntilClosed(storeId)
+    // close is the (device, store)'s one piece of work (I3), and its end, whatever its outcome, checks the device
+    // again (StoreTransfersOut.rebuildWaitsForClose). The close took the store out of service already. The reconcile
+    // does not even ask then (CopyDecision: other work holds the store); a direct caller is refused here
+    val closing = !runs && ctx.transfersOut.rebuildWaitsForClose(storeId)
     if closing then
       logger.debug(s"Not rebuilding store $storeId on device $deviceId yet: a transfer out is still closing it")
     // Silent from the first reconcile that sees the entry, a store queued for a slot included (rebuild-process 6.2).
@@ -301,8 +302,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     // check of the device and starve the stores queued behind them. An operator's remedy since the failure (a
     // re-placement to another device or episode, an accept-rebuild-loss) is not held back (rebuild-process 5.7)
     // A store still being shipped waits, re-checked shortly: a discard of its lost copy would move the directory the
-    // send may still be reading (I3, one piece of work per (device, store)). DeviceReconciler.flipLostCrlStores and the
-    // abandoned-transfers-out pass make the same check. Not asked while a rebuild of the store is registered: nothing
+    // send may still be reading (I3, one piece of work per (device, store)). CopyDecision's Lost and Outbound/Parked
+    // cases make the same check. Not asked while a rebuild of the store is registered: nothing
     // starts then anyway, and the rebuild's end checks the device again (a send cannot begin meanwhile, since startOut
     // refuses while the rebuild is registered), so a re-check would only repeat at every reconcile
     val shipping = !closing && !refused && !runs && ctx.storeTransferService.isTransferringOut(storeId)
@@ -329,7 +330,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       // Every completion branch runs it. The work ends here if its outcome ended it; otherwise (a failure retried after
       // its backoff, a superseded flip, a cancel for a shutdown) it is Queued again, which clears an Abandoned stage
       // too: an abandoned rebuild past finish's latch re-check, or with another cause latched, ignores the cancel and
-      // ends in some other outcome, and a stage left behind would stop abandonUnlisted cancelling a later rebuild of the
+      // ends in some other outcome, and a stage left behind would stop cancelRebuild cancelling a later rebuild of the
       // store here
       def release(): Unit =
         if runningRebuilds.get(storeId).exists(_.settled eq settled) then
@@ -503,7 +504,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
         case Failure(RebuildingStore.RebuildCancelled(_))
             if registry.rebuildWorkOn(deviceId, storeId).exists(_.stage == RebuildStage.Abandoned) =>
-          // Its entry left this device (abandonUnlisted). This device is checked once more: if the entry is
+          // Its entry left this device (cancelRebuild). This device is checked once more: if the entry is
           // still gone, that check deletes the staging copy; if it reads Rebuilding after all, the rebuild resumes
           try
             workEnds = true
@@ -538,30 +539,29 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             recheckOtherDevices()
             scheduleRebuildRetry(storeId, held)
 
-  /** Retires the rebuild work on `local` for stores whose entry on it is no longer Rebuilding: re-placed
-   *  elsewhere by AspenClient.replaceRebuild, or gone for another reason. A rebuild still running for one, or for an
-   *  earlier episode of an entry still Rebuilding here (re-placed away and back since it started), is cancelled; its
-   *  completion checks the device again, which starts the current episode. A staging directory for one with no rebuild running is
-   *  deleted: nothing will resume it, and a later rebuild of the store here starts over. Called by the reconcile of a
-   *  device this host owns and serves. */
-  def abandonUnlisted(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+  /** Cancels the running rebuild of `storeId` on `local`, whose entry there is no longer Rebuilding for the
+   *  rebuild's episode: re-placed elsewhere by AspenClient.replaceRebuild, gone for another reason, or re-placed away
+   *  and back since it started (the reconcile's CopyDecision.CancelRebuild, which checked the work is Running and the
+   *  handle there). Its work goes to Abandoned until its slot is released; its completion checks the device again,
+   *  which starts the current episode */
+  def cancelRebuild(local: LocalStorageDeviceState, storeId: StoreId): Unit =
+    val deviceId = local.storageDeviceId
+    registry.rebuildWorkOn(deviceId, storeId).foreach: w =>
+      runningRebuilds.get(storeId).foreach: r =>
+        logger.info(s"Cancelling the rebuild of store $storeId on device $deviceId: its entry there is no " +
+                    "longer Rebuilding for this rebuild's episode")
+        setWork(storeId, deviceId, Some(Work.Rebuild(w.episode, RebuildStage.Abandoned)))
+        r.sr.cancel()
+
+  /** Whether a rebuild of `storeId` holds its handle here (runningRebuilds): CopyDecision.StoreFacts.rebuildHandle */
+  private[server] def hasRunningRebuild(storeId: StoreId): Boolean = runningRebuilds.contains(storeId)
+
+  /** Deletes each rebuild staging directory on `local` of a store whose entry there is not Rebuilding and that no
+   *  rebuild reads: nothing will resume it, and a later rebuild of the store here starts over. Called by the reconcile
+   *  of a device this host owns and serves, after its stores' decisions */
+  def sweepUnlistedStaging(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     def listed(storeId: StoreId): Boolean =
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Rebuilding)
-
-    def current(storeId: StoreId, episode: Option[UUID]): Boolean =
-      remote.stores.get(storeId).exists: entry =>
-        entry.status == StorageDeviceState.StoreStatus.Rebuilding && entry.rebuildEpisode == episode
-
-    val deviceId = local.storageDeviceId
-    registry.rebuildWorks(deviceId).foreach: (storeId, w) =>
-      if w.stage == RebuildStage.Running && !current(storeId, w.episode) then
-        runningRebuilds.get(storeId).foreach: r =>
-          logger.info(s"Cancelling the rebuild of store $storeId on device $deviceId: its entry there is no " +
-                      "longer Rebuilding for this rebuild's episode")
-          setWork(storeId, deviceId, Some(Work.Rebuild(w.episode, RebuildStage.Abandoned)))
-          r.sr.cancel()
-
-    endUnlistedWork(local, remote)
 
     val stagingRoot = local.devicePath / RebuildingStore.RebuildDirectory
     val staged =
@@ -579,15 +579,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           try os.remove.all(dir)
           catch case t: Throwable => logger.warn(s"Failed to delete $dir. Retrying at a later check. Error: $t")
 
-  /** Ends the queued Rebuild work on `local` of each store whose entry there is no longer Rebuilding and whose rebuild
-   *  does not run (rebuild-process 6.2): a queued store whose entry left before it started, or the kept work of a
-   *  superseded or permanently failed flip. Run first in the reconcile, so the passes that leave a copy to its work
-   *  (HostCopies.offlineCopies) see the copy as no work's any more */
-  def endUnlistedWork(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
-    registry.rebuildWorks(local.storageDeviceId).foreach: (storeId, w) =>
-      if w.stage == RebuildStage.Queued &&
-         !remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Rebuilding) then
-        endRebuildWork(storeId, local.storageDeviceId)
+  /** Ends the queued Rebuild work of `storeId` on `local`, whose entry there is no longer Rebuilding and whose
+   *  rebuild does not run (rebuild-process 6.2; the reconcile's CopyDecision.EndQueuedRebuild, which checked): a
+   *  queued store whose entry left before it started, or the kept work of a superseded or permanently failed flip */
+  def endQueuedRebuild(local: LocalStorageDeviceState, storeId: StoreId): Unit =
+    endRebuildWork(storeId, local.storageDeviceId)
 
   /** Ends the Rebuild work this host holds for `storeId` on `deviceId` (rebuild-process 6.2). Whatever else names the
    *  store here (its copy, an unloaded device's entry) keeps it silent; nothing else does */

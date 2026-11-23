@@ -298,7 +298,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  (StoreLoader.ArrivedAtFile) is written durably first, while the copy is still Arrived and never loaded: it came
    *  from another host, whose clock may lead this one's, and its load floor must cover that. A failed write or move
    *  (NotMoved) leaves the copy Arrived and offline, for the Completed Transfers In pass to retry; an Unsynced move
-   *  leaves it Live and unsynced, which the next device check forces and loads (DeviceReconciler.loadResynced). A copy
+   *  leaves it Live and unsynced, which the next device check forces and loads (CopyDecision.LoadResynced). A copy
    *  with no Arrived record is not moved (NotMoved) */
   private[host] def bringArrivedLive(sds: LocalStorageDeviceState, storeId: StoreId): MoveResult =
     registry.copiesOf(sds).flatMap(_.copies.get(storeId)) match
@@ -407,7 +407,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     // One piece of work per (device, store) at a time: while rebuild work of the store is registered on the device
     // (queued, discarding its lost copy, running, or cancelled and not yet ended: one past finish's latch can still
     // move a copy into the path), nothing is received. The re-placement that moved the entry away cancels it
-    // (StoreRebuilds.abandonUnlisted, which the reconcile runs before this pass), and its end checks the device again.
+    // (StoreRebuilds.cancelRebuild: the reconcile's CancelRebuild, before its StartTransferIn), and its end checks the
+    // device again.
     if ctx.rebuilds.hasRebuildWork(storeId, toDeviceid) then
       logger.debug(s"Not transferring store $storeId onto device $toDeviceid yet: rebuild work of the store is " +
                    "still registered there. Retrying at a later check")
@@ -610,7 +611,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  store's device-CRL entries, StoreLoader.awaitCrlLoad) and before the transfer's metadata step can make the entry
    *  Active: a rebuild's flip finding an Active entry adopts it without an episode check
    *  (DeviceMetadata.markRebuiltStoreActive). For the same reason it waits while a rebuild of the store runs here: the
-   *  reconcile cancels one whose entry has moved (StoreRebuilds.abandonUnlisted), and one past its latch could still
+   *  reconcile cancels one whose entry has moved (StoreRebuilds.cancelRebuild), and one past its latch could still
    *  place a copy. A copy opening or closing on this device, or a store still opening, waits too. A copy served from
    *  this device is not the owner's: it is taken out of service (StoreRebuilds.takeOutOfService) and retired by the
    *  check its close's end makes. The store served from another device of this host is left: that is the source of

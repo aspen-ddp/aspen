@@ -1614,8 +1614,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
 
     // The recording seams never load the store, so closeStore has nothing to close; its copy,
-    // placed after the device's load, is registered by hand, offline as ShutdownStore leaves it.
-    val storeDir = CopyFixtures.placeCopy(deviceDir, movingStore, configured = false)
+    // placed after the device's load, is registered by hand, offline as ShutdownStore leaves it. It has its config,
+    // as every real copy does: without one, a check that reads its entry Active (the close's end checks the device)
+    // would declare it missing and race its rebuild against its reinstatement.
+    val storeDir = CopyFixtures.placeCopy(deviceDir, movingStore)
     val local = loadedDevices(host)(sourceId)
     placedCopies(host, local, movingStore)
 
@@ -1655,7 +1657,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     yield
       markedWhileSending should be(true)
       outbound(t.deviceDir, t.movingStore) should be(false)
-      recorded(t.host).storeLoadAttempts.toList.drop(before) should be(List((t.sourceId, t.storeDir)))
+      // Of the moving store: the bootstrap stores the recording host holds no copies of are declared missing and
+      // rebuilt meanwhile, at whatever check reads the tree's entries for them (a close's end checks the device too)
+      recorded(t.host).storeLoadAttempts.toList.drop(before).filter((_, p) =>
+        CopyLayout.parseName(p.last).exists(_._1 == t.movingStore)) should be(List((t.sourceId, t.storeDir)))
       t.host.control.reconciler.scheduledDeviceRechecks should be(Set())
 
   atest("a send begun after the abort's check still reinstates the source"):
@@ -1678,7 +1683,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     yield
       scheduled should be(Set(t.sourceId))
       outbound(t.deviceDir, t.movingStore) should be(false)
-      recorded(t.host).storeLoadAttempts.toList.drop(before) should be(List((t.sourceId, t.storeDir)))
+      // Of the moving store: the bootstrap stores the recording host holds no copies of are declared missing and
+      // rebuilt meanwhile, at whatever check reads the tree's entries for them (a close's end checks the device too)
+      recorded(t.host).storeLoadAttempts.toList.drop(before).filter((_, p) =>
+        CopyLayout.parseName(p.last).exists(_._1 == t.movingStore)) should be(List((t.sourceId, t.storeDir)))
 
   atest("a send that is still running when its re-check fires is re-checked again"):
     given ExecutionContext = executionContext

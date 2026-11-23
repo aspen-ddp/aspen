@@ -163,13 +163,13 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
         case None =>
           ctx.warn(copy, s"Keeping $copy: its name does not identify a store copy")
         case Some(storeId) =>
-          remote.stores.get(storeId) match
-            case Some(entry) =>
-              val lostHere = ctx.moves.isPendingLost(local, storeId) ||
-                ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase == Phase.Lost)
-              if entry.status == StorageDeviceState.StoreStatus.Active && !lostHere then
-                delete(copy, s"store $storeId is Active again on this device")
-            case None =>
+          val lostHere = ctx.moves.isPendingLost(local, storeId) ||
+            ctx.copyRegistry.copiesOf(local).flatMap(_.copies.get(storeId)).exists(_.phase == Phase.Lost)
+          CopyDecision.release(remote.stores.get(storeId), lostHere) match
+            case CopyDecision.ReleaseDecision.Release =>
+              delete(copy, s"store $storeId is Active again on this device")
+            case CopyDecision.ReleaseDecision.Keep => ()
+            case CopyDecision.ReleaseDecision.AskOwner =>
               releaseLookups += copy
               val factive =
                 try

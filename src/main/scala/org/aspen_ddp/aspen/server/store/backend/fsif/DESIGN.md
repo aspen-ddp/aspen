@@ -136,15 +136,16 @@ discarded. A store path therefore never holds a partly initialized store, and `o
   `advanceCheckpoint`, `maybeCheckpoint`, `compaction.drive`, `releaseThrottled`, `maybeForceData`, and
   `checkQuiesce`. The executor is lock-free and has no thread of its own (`SerialExecutor.scala`). Each drain runs
   at most 64 tasks before it yields.
-- **I/O runs on `io`.** On a host this is `FsifBackend.sharedIo`, `max(4, cpus)` daemon threads named
-  `fsif-io-N`. Results are posted back to the serial executor. A store on `sharedIo` drains its serial executor on
-  `sharedSerial`, `max(2, cpus)` threads named `fsif-serial-N`, so a device hung in fsync ties up io threads and
-  not every store's serial work. Tests pass one deterministic EC for both.
+- **I/O runs on `io`.** On a host this is the device's `DeviceIo.dataEc` (threads `dev-<label>-io-N`) and the serial
+  executor drains on its `serialEc` (`dev-<label>-serial-N`), so a device hung in fsync stalls only its own stores.
+  Results are posted back to the serial executor. `FsifBackend.sharedIo`/`sharedSerial` (`fsif-io-N`,
+  `fsif-serial-N`) remain for tests, which may also pass one deterministic EC for both. `close()` closes the channels
+  on `io`.
 - **ENOSPC retries** are scheduled on `backend.SharedRetryScheduler` (one `backend-retry` thread, shared with RocksDB's read retry).
-- **Recovery runs synchronously in the constructor.** The host therefore runs the open or create on
-  `DefaultBackendOpener.FsifOpenEc` (cached `fsif-open-N` threads), never on its control thread:
-  `DefaultBackendOpener.open` returns a Future run on `FsifOpenEc`, and `StoreLoader.startOpen`, called on the
-  control thread, gets the outcome back as a posted `BackendOpened`.
+- **Recovery runs synchronously in the constructor.** The host therefore runs the open or create as a job on
+  the device's management lane (`DeviceIo.submit(BackendOpen|BackendCreate, ...)`), never on its control thread:
+  `DefaultBackendOpener.open` returns that job's Future, and `StoreLoader.startOpen`, called on the control thread,
+  gets the outcome back as a posted `BackendOpened`.
 - **Exceptions to "post and return":** `rebuildWrite` writes the segment on the calling thread and uses
   `onSerialSync` (`Await`) for its bookkeeping. `rebuildFlush` blocks the calling thread as well. Compaction's
   truncate of free tail slots runs inline on the serial executor (section 5).
@@ -390,7 +391,7 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
 ### 2.13 Host integration
 
 - **Open and create** (`StoreLoader.startOpen`, `handleBackendOpened`, shared by every backend) run on
-  `FsifOpenEc`. A create (`BackendOpener.create`, `StoreCreation`) builds the store in `<device>/creating/` and
+  the device's management lane. A create (`BackendOpener.create`, `StoreCreation`) builds the store in `<device>/creating/` and
   renames it into place, then opens it as any load does; `open` never creates. While an open runs, its copy is Opening in the copy registry, which keeps
   the store silent until it is installed. A `ShutdownStore` that arrives meanwhile is deferred and
   replayed after the store is served.
@@ -826,7 +827,7 @@ held, not failed, and complete once it clears" (L2 cannot be reached).
   normally, and a copy-on-write, delete or re-allocation cancels the move.
 - **`bringIntoService` gossips early.** `DeviceDiscovery.bringIntoService` gossips `StoreMoved`
   (`gossipStoreOnline`) for every Active store right after `tryLoadDevice`. For FSIF stores the open is still
-  running on `FsifOpenEc`, and it may yet find the store lost or out of space. The reinstated-transfer path waits
+  running on the device's lane, and it may yet find the store lost or out of space. The reinstated-transfer path waits
   for `onServed`, but this restart and adoption path does not.
 - **StoreRepairer leaves errorTree entries behind** after a successful repair (pre-existing; `Backlog.txt`).
   Found during the FSIF integration test.

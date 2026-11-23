@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server.rebuild
 
-import org.aspen_ddp.aspen.server.host.{CopyFixtures, CopyLayout, Phase}
+import org.aspen_ddp.aspen.server.TestDeviceIo
+import org.aspen_ddp.aspen.server.host.{CopyFixtures, CopyLayout, DeviceIo, Phase}
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.scalatest.compatible
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, Transaction}
@@ -40,17 +41,17 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     @volatile var onFatals: List[Throwable => Unit] = Nil
     @volatile var lose: Boolean = false
 
-    def create(storeCfg: StoreConfig, storePath: os.Path, creatingRoot: os.Path): Future[Unit] =
+    def create(storeCfg: StoreConfig, storePath: os.Path, creatingRoot: os.Path, io: DeviceIo): Future[Unit] =
       creates = (storeCfg, storePath) :: creates
-      backends.create(storeCfg, storePath, creatingRoot)
+      backends.create(storeCfg, storePath, creatingRoot, io)
 
-    def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit): Future[Backend] =
+    def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit, io: DeviceIo): Future[Backend] =
       opens = (storeCfg, storePath) :: opens
       onFatals = onFatal :: onFatals
       if lose then
         Future.failed(new BackendStateLost("injected lost staging store"))
       else
-        backends.open(storeCfg, storePath, onFatal)
+        backends.open(storeCfg, storePath, onFatal, io)
 
   /** A bare device directory: no StorageDeviceConfig, since nothing here loads it as a device. */
   private def deviceDir(): os.Path =
@@ -82,7 +83,8 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     def loop(n: Int): Future[Option[Try[Unit]]] = rebuild.complete.value match
       case Some(outcome) => Future.successful(Some(outcome.map(_ => ())))
       case None if n == 0 => Future.successful(None)
-      case None => Future(()).flatMap(_ => loop(n - 1))
+      // Each yield pauses 1 ms: the staging store's open runs on its device's own threads, off this EC
+      case None => Future(Thread.sleep(1)).flatMap(_ => loop(n - 1))
     loop(maxYields)
 
   atest("a full walk restores every object and moves the store into place"):
@@ -91,7 +93,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       ids <- populate(20)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 5)
       _ <- rebuild.complete
 
@@ -198,7 +200,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       held <- allocateHeldWithoutEntry()
       listed <- client.currentAllocations(peers, 2, () => false)
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
       _ <- releaseBlocked()
@@ -243,7 +245,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ = tx.overwrite(locked.asInstanceOf[DataObjectPointer], before.revision, DataBuffer(Array[Byte](8)))
       tCommit = tx.commit()
       _ <- awaitVotes(tx.id, 5000)
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId))
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId))
       _ <- rebuild.complete
       pool <- client.getStoragePool(PoolId.BootstrapPoolId)
       lockedEntry <- pool.errorTree.get(MissedUpdateMarker.errorKey(storeId, locked.id))
@@ -285,7 +287,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       ptr <- pool.allocator.allocateDataObject(Array[Byte](3))(using tx)
       tCommit = tx.commit()
       _ <- awaitListedUnresolved(ptr.id, 5000)
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     pendingWaitLimit = scala.concurrent.duration.Duration.Zero)
       outcome <- outcomeOrStalled(rebuild)
       entry <- pool.errorTree.get(MissedUpdateMarker.errorKey(storeId, ptr.id))
@@ -308,7 +310,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(5)
       _ <- net.waitForTransactionsToComplete()
       held <- allocateHeldWithoutEntry()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     testingOnlyTrackRestoredKeys = true,
                                     testingOnlyAfterQuery = () => releaseBlocked())
       _ <- rebuild.complete
@@ -325,7 +327,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       held <- allocateHeldWithoutEntry()
       // The first pass lists the held allocation, walks, and is cut off before its sweep
-      first = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      first = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                   checkpointInterval = 1,
                                   testingOnlyAfterWalk = () => { firstRef.cancel(); Future.unit })
       _ = firstRef = first
@@ -339,7 +341,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // And the walk had passed its key
       st = RebuildState.load(staging).get
       _ = RebuildState.save(staging, st.copy(lastRestoredKey = Some(Key(Array.fill[Byte](16)(-1)))))
-      resumed = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      resumed = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     testingOnlyTrackRestoredKeys = true)
       _ <- resumed.complete
     yield
@@ -360,7 +362,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(5)
       _ <- net.waitForTransactionsToComplete()
       held <- allocateHeldWithoutEntry()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     testingOnlyTrackRestoredKeys = true,
                                     testingOnlyAfterQuery = () => delete(held).flatMap(_ => releaseBlocked()))
       _ <- rebuild.complete
@@ -378,7 +380,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       _ <- populate(5)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId))
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId))
       stalled <- outcomeOrStalled(rebuild)
       _ = net.dropClientResponse = _ => false
       _ <- rebuild.complete
@@ -397,7 +399,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       _ <- populate(5)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     peerQueryTimeout = 100.millis)
       outcome <- within(10.seconds, "the rebuild")(rebuild.complete.transform(scala.util.Success.apply))
     yield
@@ -414,7 +416,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       _ <- populate(5)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId))
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId))
       stalled <- outcomeOrStalled(rebuild)
       _ = rebuild.cancel()
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
@@ -431,7 +433,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(3)
       _ <- net.waitForTransactionsToComplete()
       before = HLCTimestamp.now
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId))
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId))
       _ <- rebuild.complete
       after = HLCTimestamp.now
     yield
@@ -449,7 +451,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(3)
       _ <- net.waitForTransactionsToComplete()
       before = System.currentTimeMillis()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
         horizon = horizon)
       _ <- rebuild.complete
       after = System.currentTimeMillis()
@@ -470,7 +472,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       _ <- populate(3)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId))
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId))
       _ <- rebuild.complete
     yield
       val written = os.read(CopyFixtures.copyPath(dev, storeId).get / StoreIncarnationFile.FileName).trim
@@ -499,7 +501,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       _ <- populate(3)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     testingOnlyTrackRestoredKeys = true)
       outcome <- outcomeOrStalled(rebuild)
     yield
@@ -545,7 +547,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       _ <- populate(20)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
     yield
@@ -563,7 +565,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(5)
       _ <- net.waitForTransactionsToComplete()
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
-                                    CopyFixtures.existingCopy(dev, storeId), Some(episode))
+                                    TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId), Some(episode))
       copyId <- rebuild.complete
     yield
       val copies = CopyLayout.list(dev).copies.filter(_.storeId == storeId)
@@ -592,7 +594,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(2)
       _ <- net.waitForTransactionsToComplete()
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
-                                    CopyFixtures.existingCopy(dev, storeId), Some(episode), syncDirectory = sync)
+                                    TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId), Some(episode), syncDirectory = sync)
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
     yield
       failed should be(1)
@@ -609,7 +611,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       val placed = place(dev)
       val opener = new RecordingOpener
       val rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener,
-                                        CopyFixtures.existingCopy(dev, storeId), Some(episode),
+                                        TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId), Some(episode),
                                         testingOnlyTrackRestoredKeys = true)
       rebuild.complete.transform(t => scala.util.Success((t, placed, opener)))
     for
@@ -638,7 +640,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
       _ = os.makeDir.all(staging)
       _ = os.write.over(staging / RebuildState.stateFilename, contents)
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 5,
                                     testingOnlyTrackRestoredKeys = true)
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
@@ -669,13 +671,13 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // Stage a checkpoint by hand with a key at a known rank, as a crashed pass would have left behind.
       staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
       pstate <- client.getStoragePoolState(storeId.poolId)
-      _ <- backends.create(StoreConfig.forPool(storeId, pstate), staging, dev / StoreCreation.CreatingDirectory)
+      _ <- backends.create(StoreConfig.forPool(storeId, pstate), staging, dev / StoreCreation.CreatingDirectory, TestDeviceIo.of(dev))
       allocatedKeys = ids.map(id => Key(id.toBytes))
       sorted = allocatedKeys.sortWith(ByteArrayKeyOrdering.lt)
       _ = RebuildState.save(staging, RebuildState(storeId, None, Some(sorted(9)), Nil, Nil))
 
       // The rebuild should resume from that key
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 5,
                                     testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
@@ -703,10 +705,10 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
       pstate <- client.getStoragePoolState(storeId.poolId)
-      _ <- backends.create(StoreConfig.forPool(storeId, pstate), staging, dev / StoreCreation.CreatingDirectory)
+      _ <- backends.create(StoreConfig.forPool(storeId, pstate), staging, dev / StoreCreation.CreatingDirectory, TestDeviceIo.of(dev))
       sorted = ids.map(id => Key(id.toBytes)).sortWith(ByteArrayKeyOrdering.lt)
       _ = RebuildState.save(staging, RebuildState(storeId, checkpointEpisode, Some(sorted(9)), Nil, Nil))
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     rebuildEpisode, checkpointInterval = 5, testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
     yield
@@ -741,10 +743,10 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       _ <- populate(5)
       _ <- net.waitForTransactionsToComplete()
-      later = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      later = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                   Some(UUID.randomUUID()), testingOnlyTrackRestoredKeys = true)
       refused <- later.complete.transform(scala.util.Success.apply)
-      own = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      own = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                 Some(earlier), testingOnlyTrackRestoredKeys = true)
       taken <- own.complete.transform(scala.util.Success.apply)
     yield
@@ -764,7 +766,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // A checkpoint every 5 objects rather than every 1000, so the walk actually checkpoints
       // without needing a thousand allocations.
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 5)
       _ <- rebuild.complete
     yield
@@ -781,7 +783,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       ids <- populate(20)
       _ <- net.waitForTransactionsToComplete()
       doomed = Key(ids.head.toBytes)
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 5,
                                     testingOnlyFailKeys = Set(doomed))
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
@@ -809,7 +811,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       ids <- populate(20)
       _ <- net.waitForTransactionsToComplete()
       outcome <- net.withObjectReadsSilenced(Set(ids.head)):
-        val rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+        val rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                           checkpointInterval = 5, objectReadTimeout = 200.millis)
         within(10.seconds, "the rebuild")(rebuild.complete.transform(scala.util.Success.apply))
     yield
@@ -827,7 +829,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       ids <- populate(20)
       _ <- net.waitForTransactionsToComplete()
       outcome <- net.withObjectReadsSilenced(ids.toSet):
-        val rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+        val rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                           checkpointInterval = 5, objectReadTimeout = 50.millis,
                                           maxConsecutiveReadTimeouts = 1)
         within(10.seconds, "the rebuild")(rebuild.complete.transform(scala.util.Success.apply))
@@ -848,7 +850,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       sorted = ids.sortWith((a, b) => ByteArrayKeyOrdering.lt(Key(a.toBytes), Key(b.toBytes)))
       silenced = Set(sorted.head, sorted.last)
       outcome <- net.withObjectReadsSilenced(silenced):
-        val rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+        val rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                           checkpointInterval = 5, objectReadTimeout = 50.millis,
                                           maxConsecutiveReadTimeouts = 2)
         within(10.seconds, "the rebuild")(rebuild.complete.transform(scala.util.Success.apply))
@@ -871,7 +873,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ = net.observeRead = r =>
             if silenced.contains(r.objectPointer.id) && rebuildRef != null then rebuildRef.cancel()
       outcome <- net.withObjectReadsSilenced(silenced):
-        rebuildRef = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+        rebuildRef = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                          objectReadTimeout = 200.millis)
         within(10.seconds, "the cancelled rebuild")(rebuildRef.complete.transform(scala.util.Success.apply))
       _ = net.observeRead = _ => ()
@@ -887,7 +889,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // Fail enough keys to exceed a low cap
       doomed = ids.take(15).map(id => Key(id.toBytes)).toSet
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 5,
                                     testingOnlyFailKeys = doomed,
                                     maxFailedObjects = 10)
@@ -932,7 +934,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
              client.getStoragePool(PoolId.BootstrapPoolId).flatMap: pool =>
                pool.allocationTree.set(bogusKey, Value(Array[Byte](-1, -1, -1)))
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 5)
       settled <- outcomeOrStalled(rebuild)
     yield
@@ -962,7 +964,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // Cancelled from inside the walk, after a checkpoint has been written, so the cancel
       // cannot race the walk finishing.
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 2,
                                     testingOnlyOnRestored = () =>
                                       restored += 1
@@ -972,7 +974,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // What the cancelled pass left behind, before a new one resumes from it
       checkpointed = RebuildState.load(staging).isDefined
       placed = CopyFixtures.copyPath(dev, storeId).isDefined
-      resumed = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId))
+      resumed = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId))
       _ <- resumed.complete
     yield
       outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
@@ -989,7 +991,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(6)
       _ <- net.waitForTransactionsToComplete()
       // As a fail-stop of the staging store's final I/O would: the abort arrives once the walk is done
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 2,
                                     testingOnlyOnFinishClosed = () => rebuildRef.cancel())
       _ = rebuildRef = rebuild
@@ -1013,7 +1015,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // Read counting starts the moment cancel() returns, inside the walk's own callback, and
       // covers everything up to the rebuild's completion.
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 2,
                                     testingOnlyOnRestored = () =>
                                       restored += 1
@@ -1037,7 +1039,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // Inject an out-of-space error on the first object
       doomed = Set(Key(ids.head.toBytes))
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 5,
                                     testingOnlyOutOfSpaceKeys = doomed)
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
@@ -1060,7 +1062,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(3)
       _ <- net.waitForTransactionsToComplete()
       pstate <- client.getStoragePoolState(storeId.poolId)
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener, CopyFixtures.existingCopy(dev, storeId))
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId))
       _ <- rebuild.complete
     yield
       val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
@@ -1084,11 +1086,11 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       sorted = ids.map(id => Key(id.toBytes)).sortWith(ByteArrayKeyOrdering.lt)
       _ = RebuildState.save(staging, RebuildState(storeId, None, Some(sorted(9)), Nil, Nil))
       _ = opener.lose = true
-      lost = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener, CopyFixtures.existingCopy(dev, storeId))
+      lost = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId))
       outcome <- lost.complete.transform(scala.util.Success.apply)
       stagingLeft = os.exists(staging)
       _ = opener.lose = false
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
     yield
@@ -1109,7 +1111,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       _ <- populate(20)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 2,
                                     testingOnlyOnRestored = () =>
                                       restored += 1
@@ -1125,12 +1127,12 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
   private final class FillingOpener extends BackendOpener:
     @volatile var full: Boolean = false
 
-    def create(storeCfg: StoreConfig, storePath: os.Path, creatingRoot: os.Path): Future[Unit] =
-      backends.create(storeCfg, storePath, creatingRoot)
+    def create(storeCfg: StoreConfig, storePath: os.Path, creatingRoot: os.Path, io: DeviceIo): Future[Unit] =
+      backends.create(storeCfg, storePath, creatingRoot, io)
 
-    def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit): Future[Backend] =
+    def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit, io: DeviceIo): Future[Backend] =
       given ExecutionContext = executionContext
-      backends.open(storeCfg, storePath, onFatal).map: b =>
+      backends.open(storeCfg, storePath, onFatal, io).map: b =>
         new Backend:
           val storeId: StoreId = b.storeId
           def path: os.Path = b.path
@@ -1166,7 +1168,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
         _ <- populate(6)
         _ <- net.waitForTransactionsToComplete()
         // The walk fit; the final flush is the write that finds the device full
-        rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener, CopyFixtures.existingCopy(dev, storeId),
+        rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                       checkpointInterval = 2,
                                       testingOnlyAfterWalk = () =>
                                         opener.full = true
@@ -1189,7 +1191,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(6)
       _ <- net.waitForTransactionsToComplete()
       // A directory where the episode's phase-param goes makes its write, the last before the move, fail
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId),
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     checkpointInterval = 2,
                                     testingOnlyOnFinishClosed = () =>
                                       os.makeDir.all(staging / CopyLayout.paramFile(Phase.Rebuilt("")).get / "x"))

@@ -2050,7 +2050,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val factory = new StoreRebuildFactory:
       def createRebuild(client: org.aspen_ddp.aspen.client.AspenClient, sid: StoreId, deviceId: StorageDeviceId,
-                        devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener,
+                        devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener, io: org.aspen_ddp.aspen.server.host.DeviceIo,
                         episode: Option[java.util.UUID], existingCopy: Option[(Phase, os.Path)]) =
         new org.aspen_ddp.aspen.server.rebuild.StoreRebuild:
           val storeId: StoreId = sid

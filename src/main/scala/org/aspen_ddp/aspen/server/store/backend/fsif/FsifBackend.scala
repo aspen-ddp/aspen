@@ -344,13 +344,15 @@ class FsifBackend(val storeId: StoreId,
         abandonHeld()
       quiescers += p
     }
+    // The channel closes run on `io` (the device's data pool in production), never on the serial thread that
+    // completed the quiesce
     p.future.transform { _ =>
       Try {
         dataFile.close()
         journalFile.close()
         checkpoint.flatMap(_.oldFile).foreach(_.close())
       }
-    }(using ExecutionContext.parasitic)
+    }(using io)
 
   /** The held data and active journal handles, plus the other journal and both index files (not held, so sized
     * without opening them) */
@@ -1686,8 +1688,8 @@ object FsifBackend:
   private[fsif] final class IoTask(val kind: IoKind, body: () => Unit) extends Runnable:
     def run(): Unit = body()
 
-  /** Host-wide I/O pool: max(4, availableProcessors) daemon threads named fsif-io-N */
-  lazy val sharedIo: ExecutionContext =
+  /** Tests only (production stores run on their device's DeviceIo pools). Host-wide I/O pool: max(4, availableProcessors) daemon threads named fsif-io-N */
+  private[aspen] lazy val sharedIo: ExecutionContext =
     val counter = new AtomicInteger(0)
     val factory: ThreadFactory = r =>
       val t = new Thread(r, s"fsif-io-${counter.getAndIncrement()}")
@@ -1700,7 +1702,7 @@ object FsifBackend:
     * named fsif-serial-N. Serial tasks leave reads, writes and forces to `sharedIo` (compaction's truncate of free tail
     * slots is the one call made inline), so a device hung in an fsync ties up io threads, not every store's serial work.
     */
-  lazy val sharedSerial: ExecutionContext =
+  private[aspen] lazy val sharedSerial: ExecutionContext =
     val counter = new AtomicInteger(0)
     val factory: ThreadFactory = r =>
       val t = new Thread(r, s"fsif-serial-${counter.getAndIncrement()}")
@@ -1741,10 +1743,11 @@ object FsifBackend:
     * @throws java.io.IOException    on an I/O error, including running out of space (FsifIo.isOutOfSpace)
     */
   def open(storeId: StoreId, path: os.Path, layout: FsifLayout, io: ExecutionContext,
-           onFatal: Throwable => Unit, tuning: FsifTuning = FsifTuning()): FsifBackend =
+           onFatal: Throwable => Unit, tuning: FsifTuning = FsifTuning(),
+           serialEc: Option[ExecutionContext] = None): FsifBackend =
     if !FileStat.isDir(path) then
       throw new FsifRecovery.StoreLost(s"FSIF store $storeId: its directory $path is missing")
     val files = new NioFsifFiles(path)
     if FsifRecovery.isBlank(files) then
       throw new FsifRecovery.StoreLost(s"FSIF store $storeId at $path has no FSIF data: its files are absent or empty")
-    new FsifBackend(storeId, path, layout, files, io, tuning, onFatal)
+    new FsifBackend(storeId, path, layout, files, io, tuning, onFatal, serialEc = serialEc)

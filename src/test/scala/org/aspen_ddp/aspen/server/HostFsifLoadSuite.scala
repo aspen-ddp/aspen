@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.server.host.{CopyFixtures, CopyLayout, Phase}
+import org.aspen_ddp.aspen.server.host.{CopyFixtures, CopyLayout, DeviceIo, JobKind, Phase}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -47,13 +47,18 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
   @volatile var lastBackend: Option[FsifBackend] = None
   /** LoadStores to fail by throwing from the loadStore seam, before anything is queued, as serveOpened then meets */
   @volatile var throwingLoadStores: Int = 0
-  /** Where FSIF opens run. Synchronous by default, so the open completes, and its outcome is handled, within the
-   *  load that starts it; a test may set the production pool, or one that holds the open, instead. */
-  @volatile var openEc: ExecutionContext = ExecutionContext.parasitic
-  /** Names of the threads FSIF opens ran on */
-  @volatile var openThreads: List[String] = Nil
+  /** While set, an open is queued here instead of submitted to its device's lane, until a test runs it: the open
+   *  then runs on the lane at the next drain. Unset (the default), opens are submitted at once. */
+  @volatile var openQueue: Option[java.util.concurrent.ConcurrentLinkedQueue[Runnable]] = None
 
-  override def fsifOpenEc: ExecutionContext = openEc
+  override def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit,
+                    io: DeviceIo): Future[Backend] =
+    openQueue match
+      case None => super.open(storeCfg, storePath, onFatal, io)
+      case Some(q) =>
+        val p = Promise[Backend]()
+        q.add(() => p.completeWith(super.open(storeCfg, storePath, onFatal, io)))
+        p.future
 
   /** Device states the metadata returns instead of reading the tree, which holds none of these devices */
   @volatile var deviceStates: Map[StorageDeviceId, StorageDeviceState] = Map()
@@ -111,7 +116,7 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
         def force(): Unit = outOfSpace(f.force())
         def close(): Unit = f.close()
 
-  override def create(storeCfg: StoreConfig, storePath: os.Path, creatingRoot: os.Path): Future[Unit] =
+  override def create(storeCfg: StoreConfig, storePath: os.Path, creatingRoot: os.Path, io: DeviceIo): Future[Unit] =
     creates += 1
     if outOfSpaceCreates > 0 then
       outOfSpaceCreates -= 1
@@ -119,12 +124,11 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
         os.write(dir / "partial", "x")
         throw new IOException("No space left on device")))
     else
-      super.create(storeCfg, storePath, creatingRoot)
+      super.create(storeCfg, storePath, creatingRoot, io)
 
   override def openFsifBackend(storeId: StoreId, path: os.Path, layout: FsifLayout,
-                               onFatal: Throwable => Unit): Backend =
+                               onFatal: Throwable => Unit, io: DeviceIo): Backend =
     opens += 1
-    openThreads = Thread.currentThread.getName :: openThreads
     if outOfSpaceOpens > 0 then
       outOfSpaceOpens -= 1
       throw new IOException("No space left on device")
@@ -133,10 +137,12 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
       throw new IOException("injected open failure")
     onFatals = onFatal :: onFatals
     if !os.isDir(path) || FsifRecovery.isBlank(new NioFsifFiles(path)) then
-      super.openFsifBackend(storeId, path, layout, onFatal) // StoreLost
+      super.openFsifBackend(storeId, path, layout, onFatal, io) // StoreLost
     else
-      val b = new FsifBackend(storeId, path, layout, new FullableFiles(path), FsifBackend.sharedIo, FsifTuning(),
-          onFatal):
+      val dataEc = io.dataEc
+      val serial = Some(io.serialEc)
+      val b = new FsifBackend(storeId, path, layout, new FullableFiles(path), dataEc, FsifTuning(),
+          onFatal, org.aspen_ddp.aspen.server.store.backend.SharedRetryScheduler, serial):
         override def hasFailed: Boolean = super.hasFailed || FsifSeams.this.reportFailed
       lastBackend = Some(b)
       b
@@ -469,28 +475,23 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         load(host)
         host.getStoreIds should contain(storeId)
 
-  atest("an FSIF store's recovery runs off the event thread and its outcome is served by an event"):
+  atest("an FSIF store's recovery runs as a device lane job and its outcome is served by an event"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
-      // Runs the open on another thread, and completes `opened` once that task (which posts BackendOpened) has ended
-      val opened = Promise[Unit]()
-      val pool = ExecutionContext.global
-      fsif(host).openEc = new ExecutionContext:
-        def execute(r: Runnable): Unit = pool.execute: () =>
-          try r.run()
-          finally opened.trySuccess(())
-        def reportFailure(t: Throwable): Unit = pool.reportFailure(t)
-      val eventThread = Thread.currentThread.getName
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+      // The open waits on the device's lane, not in the load that started it
+      holdDevice(host, deviceDir)
       load(host)
-      opened.future.map: _ =>
-        fsif(host).openThreads.head should not be eventThread
-        host.testingOnlyHandleEvents() // BackendOpened, then the LoadStore it queues
-        host.getStoreIds should contain(storeId)
-        host.control.router.silentStores should not contain storeId
+      heldJobs(host, deviceDir) should be(List(JobKind.BackendOpen))
+      host.getStoreIds should not contain storeId
+      host.control.router.silentStores should contain(storeId)
+      releaseDevice(host, deviceDir)
+      host.testingOnlyHandleEvents() // the open, then BackendOpened and the LoadStore it queues
+      host.getStoreIds should contain(storeId)
+      host.control.router.silentStores should not contain storeId
 
   atest("a close that arrives while an FSIF store is still opening waits for the open, then closes it served"):
     val hostRoot = newHostDir()
@@ -500,9 +501,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val storeDir = writeFsifStoreConfig(deviceDir)
     FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
       val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
-      fsif(host).openEc = new ExecutionContext:
-        def execute(r: Runnable): Unit = queued.add(r)
-        def reportFailure(t: Throwable): Unit = ()
+      fsif(host).openQueue = Some(queued)
       load(host)
       queued.size should be(1)
       load(host) // a second load while it opens starts no second open
@@ -547,7 +546,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         host.getStoreIds should not contain storeId
         host.control.router.silentStores should contain(storeId)
         // The retry opens the store again (its first backend was closed) and serves it
-        fsif(host).openEc = ExecutionContext.parasitic
+        fsif(host).openQueue = None
         host.control.loader.retryFailedLoads()
         host.testingOnlyHandleEvents()
         awaitLoudly("the retried load to serve the store")(
@@ -558,9 +557,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
   /** Holds every FSIF open of `host` until the test runs it */
   private def holdOpens(host: Host): java.util.concurrent.ConcurrentLinkedQueue[Runnable] =
     val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
-    fsif(host).openEc = new ExecutionContext:
-      def execute(r: Runnable): Unit = queued.add(r)
-      def reportFailure(t: Throwable): Unit = ()
+    fsif(host).openQueue = Some(queued)
     queued
 
   atest("a store is silent while its open runs, until its LoadStore installs it"):
@@ -720,9 +717,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       CopyFixtures.markCopy(deviceDir, storeId, Phase.Outbound(""))
       load(host) // skipped in outbound/: offline
       host.control.router.silentStores should contain(storeId)
-      fsif(host).openEc = new ExecutionContext:
-        def execute(r: Runnable): Unit = queued.add(r)
-        def reportFailure(t: Throwable): Unit = ()
+      fsif(host).openQueue = Some(queued)
       fsif(host).deviceStates = Map(deviceA -> deviceState(deviceA,
         Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
       host.control.reconciler.checkAll()
@@ -1001,9 +996,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
 
       // The open that succeeds, with a close deferred over it
       val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
-      fsif(host).openEc = new ExecutionContext:
-        def execute(r: Runnable): Unit = queued.add(r)
-        def reportFailure(t: Throwable): Unit = ()
+      fsif(host).openQueue = Some(queued)
       load(host)
       val closed = host.closeStore(storeId)
       host.testingOnlyHandleEvents()

@@ -40,15 +40,16 @@ trait CopyHostFixture extends ControlFixture:
     @volatile var openGate: Option[Future[Unit]] = None
     @volatile var onFatals: List[Throwable => Unit] = Nil
     val opens = new AtomicInteger(0)
-    override def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit): Future[Backend] =
+    override def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit,
+                       io: DeviceIo): Future[Backend] =
       opens.incrementAndGet()
       onFatals = onFatal :: onFatals
       def backend: Future[Backend] =
-        Future.fromTry(Try(new RocksDBBackend(storePath, storeCfg.storeId, executionContext):
+        io.submit(JobKind.BackendOpen, Some(storeCfg.storeId))(new RocksDBBackend(storePath, storeCfg.storeId, executionContext):
           override def hasFailed: Boolean = super.hasFailed || TestOpener.this.failing
           override def close(): Future[Unit] = closeGate match
             case None => super.close()
-            case Some(gate) => gate.flatMap(_ => super.close())(using executionContext)))
+            case Some(gate) => gate.flatMap(_ => super.close())(using executionContext)).future
       if stateLost then
         Future.failed(new BackendStateLost("injected: acknowledged state lost"))
       else
@@ -199,7 +200,7 @@ trait CopyHostFixture extends ControlFixture:
    *  real RocksDB store with its empty save file when `real`, else a config only), and completes with its copy id */
   protected class PlacingRebuilds(real: Boolean) extends StoreRebuildFactory:
     def createRebuild(client: org.aspen_ddp.aspen.client.AspenClient, storeId: StoreId, deviceId: StorageDeviceId,
-                      devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener,
+                      devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener, io: org.aspen_ddp.aspen.server.host.DeviceIo,
                       episode: Option[UUID], existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
       val id = storeId
       val rebuilt = Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode))
@@ -282,7 +283,7 @@ trait CopyHostFixture extends ControlFixture:
   protected class HeldRebuilds extends StoreRebuildFactory:
     val created = new java.util.concurrent.ConcurrentLinkedQueue[StoreId]()
     def createRebuild(client: org.aspen_ddp.aspen.client.AspenClient, storeId: StoreId, deviceId: StorageDeviceId,
-                      devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener,
+                      devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener, io: org.aspen_ddp.aspen.server.host.DeviceIo,
                       episode: Option[UUID], existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
       created.add(storeId)
       val id = storeId

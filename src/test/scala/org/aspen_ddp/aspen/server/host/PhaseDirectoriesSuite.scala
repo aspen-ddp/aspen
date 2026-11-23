@@ -323,7 +323,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
         override def hasFailed: Boolean = true
         override def close(): Future[Unit] = gate.future.flatMap(_ => super.close())
       _ = host.control.loader.handleBackendOpened(Host.BackendOpened(localB, cfg, flatB, false, None,
-        Success(backend), None, None, inline = false))
+        Success(backend), None, None))
       _ <- pump(host, false, rounds = 20)
       heldActivity = recordOf(host, localB, s).map(_.activity)
       heldPhase = CopyFixtures.phaseOf(devB, s)
@@ -939,7 +939,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
   private class UnforcedRebuilds extends StoreRebuildFactory:
     val placements = new AtomicInteger(0)
     def createRebuild(client: org.aspen_ddp.aspen.client.AspenClient, storeId: StoreId, deviceId: StorageDeviceId,
-                      devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener,
+                      devicePath: os.Path, backends: org.aspen_ddp.aspen.server.store.backend.BackendOpener, io: org.aspen_ddp.aspen.server.host.DeviceIo,
                       episode: Option[UUID], existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
       val id = storeId
       val rebuilt = Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode))

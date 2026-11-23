@@ -48,7 +48,7 @@ private class RecordingRebuildFactory extends StoreRebuildFactory:
                     storeId: StoreId,
                     storageDeviceId: StorageDeviceId,
                     devicePath: os.Path,
-                    backends: BackendOpener,
+                    backends: BackendOpener, io: org.aspen_ddp.aspen.server.host.DeviceIo,
                     episode: Option[UUID],
                     existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
     val r = new RecordedRebuild(storeId, storageDeviceId, episode, Some(devicePath))

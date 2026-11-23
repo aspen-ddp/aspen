@@ -117,11 +117,10 @@ object Host:
   /** A backend open (`create = false`, from tryLoadStore) or create (createNewStore) started by StoreLoader.startOpen
    *  has ended. `previous` is the store's out-of-space wait before the open, for the backoff; `created` is completed
    *  for a create once its store is loaded, or failed; `onServed` is tryLoadStore's, run only if the store is served.
-   *  `inline` is set when the open completed in startOpen itself, which then handles it without posting it. */
+   */
   private[server] case class BackendOpened(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                                 create: Boolean, previous: Option[LoadRetry], result: Try[Backend],
-                                created: Option[Promise[Unit]], onServed: Option[() => Unit],
-                                inline: Boolean = false) extends Event
+                                created: Option[Promise[Unit]], onServed: Option[() => Unit]) extends Event
   private[server] case class InitializeTaskExecutor() extends Event
   /** Posted by the constructor after its device scan, so it follows every LoadStore that scan queued: from then on
    *  the router answers messages for stores not loaded here (StoreRouter.markReady). */

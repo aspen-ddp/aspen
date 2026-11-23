@@ -25,8 +25,8 @@ import scala.util.control.NonFatal
  *
  *  Opens and serves the stores of the devices loaded on this host, and closes them.
  *
- *  The exception is backend opens, which run wherever the BackendOpener puts them: one that does not complete in the
- *  caller touches no host state and posts its outcome back as BackendOpened. Every backend takes the same path; none
+ *  The exception is backend opens, which run on the device's management lane (`DeviceIo`), touch no host state and
+ *  post their outcome back as BackendOpened. Every backend takes the same path; none
  *  is named here. Loads go back through `ctx.tryLoadStore`/`ctx.loadStore`, which call the overridable methods on
  *  Host. */
 class StoreLoader(ctx: DeviceControl) extends Logging:
@@ -194,9 +194,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     ctx.loadStore(sds.storageDeviceId, backend, storeCfg.effectiveMaxSliceSize.map(_.toLong), Some(storeCfg.ida),
       storeCfg.admissionTier)
 
-  /** Opens (or, with `create`, creates) a store's backend through the BackendOpener, which decides where the open
-   *  runs. An open that has completed by the time the opener returns (one run in the caller) is handled here and
-   *  now; any other's outcome is posted back as BackendOpened, so the control thread never waits on I/O or fsync.
+  /** Opens (or, with `create`, creates) a store's backend through the BackendOpener, on the device's management
+   *  lane (`sds.io`). The outcome is posted back as BackendOpened, so the control thread never waits on I/O or fsync.
    *  Meanwhile its copy is Opening, so a shutdown waits for it, no second open starts, and the store is silent rather
    *  than answered as not here.
    *
@@ -240,16 +239,14 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         refused("the copy registry refused its Opening")
       else
         val fopen =
-          try openBackend(storeCfg, storePath, create, sds.devicePath / StoreCreation.CreatingDirectory)
+          try openBackend(storeCfg, storePath, create, sds.devicePath / StoreCreation.CreatingDirectory, sds.io)
           catch case NonFatal(t) => Future.failed(t)
-        def opened(result: Try[Backend], inline: Boolean): BackendOpened =
-          BackendOpened(sds, storeCfg, storePath, create, previous, result, created, servedCallback, inline)
-        fopen.value match
-          case Some(result) => handleBackendOpened(opened(result, inline = true))
-          case None =>
-            // Leaves the control context: the open runs where the opener put it, and its result comes back as a
-            // posted BackendOpened. ExecutionContext.parasitic only posts, so nothing else runs off the control thread.
-            fopen.onComplete(result => ctx.post(opened(result, inline = false)))(using ExecutionContext.parasitic)
+        // The open runs on the device's management lane and its result comes back as a posted BackendOpened, so
+        // the control thread never waits on I/O or fsync. ExecutionContext.parasitic only posts, so nothing else
+        // runs off the control thread.
+        fopen.onComplete(result =>
+          ctx.post(BackendOpened(sds, storeCfg, storePath, create, previous, result, created, servedCallback))
+        )(using ExecutionContext.parasitic)
 
   /** The outcome of startOpen, on the control thread:
    *  - opened: the store is served (LoadStore, which retires a backend that failed-stop meanwhile), unless its
@@ -263,11 +260,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *    with backoff. So is one whose LoadStore could not be queued (serveOpened threw).
    *  ShutdownStore completions deferred meanwhile are then put again, after the LoadStore. The load's onServed
    *  callback, if any, waits for that LoadStore (awaitServed).
-   *
-   *  An `inline` outcome is handled within startOpen, where nothing can have changed since the open began; the
-   *  device may not be registered yet (DeviceDiscovery registers it once each store has been offered). */
+   *  Every outcome is a posted BackendOpened, handled after the control task that began the open has ended. */
   def handleBackendOpened(event: BackendOpened): Unit =
-    val BackendOpened(sds, storeCfg, storePath, create, previous, result, created, onServed, inline) = event
+    val BackendOpened(sds, storeCfg, storePath, create, previous, result, created, onServed) = event
     val storeId = storeCfg.storeId
     // Set when the store is served: it stays opening until its LoadStore is handled, which puts its deferred closes
     // again
@@ -281,7 +276,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     if create && result.isFailure && FileStat.existence(storePath).contains(false) then
       ctx.copyRegistry.createFailed(sds, storeId)
     result match
-      case Success(backend) if (!inline && !registered) || router.get(storeId).isDefined =>
+      case Success(backend) if !registered || router.get(storeId).isDefined =>
         logger.warn(s"Not serving store $storeId opened at $storePath: its device was unloaded or another " +
                     s"backend serves it meanwhile. Closing it")
         val failed = backend.hasFailed
@@ -438,15 +433,15 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  creates it there atomically (BackendOpener.create, scratch under `creatingRoot`). A backend's fail-stop is
    *  posted as BackendFailed. */
   private def openBackend(storeCfg: StoreConfig, storePath: os.Path, create: Boolean,
-                          creatingRoot: os.Path): Future[Backend] =
+                          creatingRoot: os.Path, io: DeviceIo): Future[Backend] =
     val ref = new AtomicReference[Backend]()
     // Called once, on a backend thread: it only posts BackendFailed to the control thread, so it never blocks there.
     val onFatal: Throwable => Unit = err => ctx.post(BackendFailed(storeCfg.storeId, ref, err))
     val created =
-      if create then ctx.backends.create(storeCfg, storePath, creatingRoot)
+      if create then ctx.backends.create(storeCfg, storePath, creatingRoot, io)
       else Future.unit
-    // parasitic: a create that completed in the caller (RocksDB) opens in the caller too, so the outcome stays inline
-    created.flatMap(_ => ctx.backends.open(storeCfg, storePath, onFatal))(using ExecutionContext.parasitic).map { backend =>
+    // parasitic: the open is submitted from the create's completion on the lane, and queues behind it there
+    created.flatMap(_ => ctx.backends.open(storeCfg, storePath, onFatal, io))(using ExecutionContext.parasitic).map { backend =>
       ref.set(backend)
       backend
     }(using ExecutionContext.parasitic)

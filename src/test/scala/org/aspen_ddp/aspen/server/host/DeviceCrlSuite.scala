@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server.host
 
+import org.aspen_ddp.aspen.server.host.{DeviceIo, JobKind}
+
 import org.aspen_ddp.aspen.server.store.backend.{DefaultBackendOpener, StoreCreation}
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
@@ -175,13 +177,13 @@ private class FailingRocksOpener(ec: ExecutionContext) extends DefaultBackendOpe
   @volatile var failing: Boolean = false
   /** The fail-stop callback of each backend opened, most recent first */
   @volatile var onFatals: List[Throwable => Unit] = Nil
-  override def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit): Future[Backend] =
+  override def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit, io: DeviceIo): Future[Backend] =
     onFatals = onFatal :: onFatals
     storeCfg.backend match
       case _: StoreConfig.RocksDB =>
-        Future.fromTry(scala.util.Try(new RocksDBBackend(storePath, storeCfg.storeId, ec):
-          override def hasFailed: Boolean = super.hasFailed || FailingRocksOpener.this.failing))
-      case _ => super.open(storeCfg, storePath, onFatal)
+        io.submit(JobKind.BackendOpen, Some(storeCfg.storeId))(new RocksDBBackend(storePath, storeCfg.storeId, ec):
+          override def hasFailed: Boolean = super.hasFailed || FailingRocksOpener.this.failing).future
+      case _ => super.open(storeCfg, storePath, onFatal, io)
 
 class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
 

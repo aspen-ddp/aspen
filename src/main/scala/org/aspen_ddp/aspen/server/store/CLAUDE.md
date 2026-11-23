@@ -332,6 +332,12 @@
   (`client/internal/allocation/CLAUDE.md`)
 - Opening is backend-neutral (`BackendOpener`; only `DefaultBackendOpener` names concrete backends): see
   `server/host/CLAUDE.md`
+- Backend executors: every `BackendOpener.open`/`create` takes the device's `DeviceIo` and runs as a job on its
+  management lane. An FSIF backend does its blocking I/O on that device's `dataEc` and drains its serial executor on
+  its `serialEc` (threads `dev-<label>-io-N` / `-serial-N`), so a hung device stalls only its own stores; its
+  `close()` closes the channels on the data pool. Compaction's truncate of free tail slots still runs inline on the
+  serial executor (a device thread, so contained to its device; making it asynchronous would race the slot
+  allocator). RocksDB keeps the host's `ec` for its own work. `FsifBackend.sharedIo`/`sharedSerial` are for tests only
 - Creation is atomic for every backend (`StoreCreation`, systemic-loss-protection 4.1, row D5): `BackendOpener.create`
   builds the store, backend initialized and closed plus its config, in a scratch directory under `<device>/creating/`,
   forces the tree and renames it to the store's path: for a store, a fresh Live copy `<device>/live/<copy>`

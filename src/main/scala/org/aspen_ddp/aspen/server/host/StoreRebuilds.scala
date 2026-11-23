@@ -319,7 +319,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       val existing = registry.copiesOf(local).flatMap(_.copies.get(storeId)).filter(_.phase != Phase.Retired)
         .map(r => (r.phase, CopyLayout.path(local.devicePath, storeId, r.copyId, r.phase)))
       val sr = ctx.storeRebuildFactory.createRebuild(
-        ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends, episode, existing)
+        ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends, local.io, episode, existing)
 
       val settled = Promise[Unit]()
 

@@ -38,7 +38,7 @@ class BackendRelocationSuite extends FileBasedTests:
 
   private def open(cfg: StoreConfig, path: os.Path): (Backend, Completions) =
     val opener = new DefaultBackendOpener(ExecutionContext.global)
-    val backend = Await.result(opener.open(cfg, path, _ => ()), Timeout)
+    val backend = Await.result(opener.open(cfg, path, _ => (), org.aspen_ddp.aspen.server.TestDeviceIo.of(path / os.up)), Timeout)
     val c = new Completions
     backend.setCompletionHandler(c)
     (backend, c)

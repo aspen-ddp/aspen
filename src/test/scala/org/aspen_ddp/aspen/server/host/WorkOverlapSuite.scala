@@ -45,7 +45,7 @@ private class HeldRebuildFactory extends StoreRebuildFactory:
   val created: mutable.ListBuffer[HeldRebuild] = mutable.ListBuffer()
 
   def createRebuild(client: AspenClient, storeId: StoreId, storageDeviceId: StorageDeviceId, devicePath: os.Path,
-                    backends: BackendOpener, episode: Option[UUID],
+                    backends: BackendOpener, io: org.aspen_ddp.aspen.server.host.DeviceIo, episode: Option[UUID],
                     existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
     val r = new HeldRebuild(storeId, episode, devicePath)
     synchronized(created += r)
@@ -508,8 +508,9 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       _ <- net.createDevice(deviceA)
       _ <- setDeviceState(deviceA)(_.setStoreEntry(moving, StorageDeviceState.StoreStatus.Active, None))
       _ <- waitForTransactionsToComplete()
-      // RocksDB opens inline: the LoadStore is queued on return
+      // The open is a lane job: run it, leaving the LoadStore it queues for the drain below
       _ = host.control.loader.tryLoadStore(local, storePath)
+      _ = runUntilLoadQueued(host)
       queued = recorded(host).loadStoreRequests.toList
       activityBefore = host.control.copyRegistry.copiesOf(local).flatMap(_.copies.get(moving)).map(_.activity)
       _ = host.control.loader.tryLoadStore(local, storePath)
@@ -603,9 +604,10 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
         case e: Host.EventTask => e.event.isInstanceOf[Host.LoadStore]
         case _ => false
 
-      // RocksDB opens inline: the LoadStore is queued on return. Taken out, so the close's ShutdownStore is handled
-      // first, inside the window
+      // The open is a lane job: run it, leaving the LoadStore it queues. Taken out, so the close's ShutdownStore is
+      // handled first, inside the window
       host.control.loader.tryLoadStore(local, storePath)
+      runUntilLoadQueued(host)
       val loads = lockstep.removeQueued(isLoad)
       val closed = closeIt(host, local)
       host.testingOnlyHandleEvents()

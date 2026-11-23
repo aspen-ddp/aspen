@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.DurableFiles
 import org.aspen_ddp.aspen.server.host.Phase
+import org.aspen_ddp.aspen.server.host.DeviceIo
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 
 import java.util.UUID
@@ -40,6 +41,7 @@ trait StoreRebuildFactory:
                     storageDeviceId: StorageDeviceId,
                     devicePath: os.Path,
                     backends: BackendOpener,
+                    io: DeviceIo,
                     episode: Option[UUID],
                     existingCopy: Option[(Phase, os.Path)]): StoreRebuild
 
@@ -50,6 +52,7 @@ object StoreRebuildFactory:
                       storageDeviceId: StorageDeviceId,
                       devicePath: os.Path,
                       backends: BackendOpener,
+                      io: DeviceIo,
                       episode: Option[UUID],
                       existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
-      new RebuildingStore(client, storeId, storageDeviceId, devicePath, backends, existingCopy, episode)
+      new RebuildingStore(client, storeId, storageDeviceId, devicePath, backends, io, existingCopy, episode)

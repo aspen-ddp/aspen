@@ -458,7 +458,7 @@ trait ControlFixture:
    *  Silent on exhaustion, like `yieldUntil`: the caller asserts the end state. */
   protected def completeRebuilds(host: Host,
                                  deviceId: StorageDeviceId,
-                                 maxRounds: Int = 500): Future[Unit] =
+                                 maxRounds: Int = 5000): Future[Unit] =
     given ExecutionContext = executionContext
     def anyRebuilding(): Future[Boolean] =
       client.getStorageDeviceState(deviceId).map: state =>
@@ -473,8 +473,9 @@ trait ControlFixture:
           case true =>
             host.control.reconciler.checkAll()
             for
-              // Yield so queued work -- the rebuild's own Future and its callbacks -- gets to run.
-              _ <- Future(())
+              // Yield so queued work -- the rebuild's own Future and its callbacks -- gets to run. 1 ms: a rebuild's
+              // staging store opens on its device's own threads
+              _ <- Future { Thread.sleep(1); host.testingOnlyHandleEvents() }
               _ <- waitForTransactionsToComplete()
               _ <- loop(rounds - 1)
             yield ()
@@ -667,6 +668,20 @@ trait ControlFixture:
   protected def holdDevice(host: Host, path: os.Path): Unit = lockstep(host).hold(path)
 
   protected def releaseDevice(host: Host, path: os.Path): Unit = lockstep(host).release(path)
+
+  /** Runs the queued tasks in order, stopping before the first queued LoadStore (left queued) or when none are
+   *  queued: a backend open is a lane job now, so a test that wants the opened store's LoadStore queued but not yet
+   *  handled runs the open, then BackendOpened, and stops. */
+  protected def runUntilLoadQueued(host: Host): Unit =
+    val ls = lockstep(host)
+    def isLoad(task: Runnable): Boolean = task match
+      case e: Host.EventTask => e.event.isInstanceOf[Host.LoadStore]
+      case _ => false
+    var go = true
+    while go do
+      ls.queuedItems.headOption match
+        case Some(t) if !isLoad(t) => ls.removeQueued(_ eq t).foreach(_.run())
+        case _ => go = false
 
   /** The kinds of the management jobs held on `path`, in submission order. */
   protected def heldJobs(host: Host, path: os.Path): List[JobKind] = lockstep(host).held(path)

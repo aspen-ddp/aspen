@@ -25,7 +25,7 @@ import scala.util.{Success, Try}
 private class PlacingRebuildFactory(writeConfig: (os.Path, StoreId) => os.Path)(using ec: ExecutionContext)
     extends StoreRebuildFactory:
   def createRebuild(client: AspenClient, storeId: StoreId, storageDeviceId: StorageDeviceId, devicePath: os.Path,
-                    backends: BackendOpener, episode: Option[UUID],
+                    backends: BackendOpener, io: org.aspen_ddp.aspen.server.host.DeviceIo, episode: Option[UUID],
                     existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
     val id = storeId
     // Placed off the control thread, as finish's move is, and completed right after it with the copy's id
@@ -303,7 +303,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       case _ => false
     host.control.rebuilds.createNewStore(local, created)
     for
-      _ <- yieldUntil(lockstep.queuedItems.exists(isLoad))
+      _ <- yieldUntil { runUntilLoadQueued(host); lockstep.queuedItems.exists(isLoad) }
       // Not installed: the bootstrap host serves this store. Its opened backend is closed instead
       loads = lockstep.removeQueued(isLoad)
       _ <- Future.sequence(loads.collect { case e: Host.EventTask => e.event }.collect {
@@ -607,8 +607,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     host.testingOnlyHandleEvents()
     val local = loadedDevices(host)(deviceA)
     // Opened elsewhere first: the load's own open fails on the backend's lock, its data intact
-    val held = new DefaultBackendOpener(executionContext).open(
-      StoreConfig.loadStoreConfig(storePath / StoreConfig.configFilename), storePath, _ => ()).value.get.get
+    val held = scala.concurrent.Await.result(new DefaultBackendOpener(executionContext).open(
+      StoreConfig.loadStoreConfig(storePath / StoreConfig.configFilename), storePath, _ => (),
+      org.aspen_ddp.aspen.server.TestDeviceIo.of(dev)), scala.concurrent.duration.Duration(10, "seconds"))
     val seen = watch(host, sid(0))
     host.control.loader.tryLoadStore(local, storePath)
     host.testingOnlyHandleEvents()

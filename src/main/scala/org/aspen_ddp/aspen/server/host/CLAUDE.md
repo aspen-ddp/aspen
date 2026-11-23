@@ -356,9 +356,15 @@
   calling thread; silent ones (derived, above) are not answered, nor are any until the startup scan's LoadStores
   are handled. A store whose load is under way is silent (its copy Opening), as are the stores of a device whose
   shutdown-marker lookup (or adoption) is deciding whether to load it
-- Backend opens are backend-neutral: `BackendOpener.open` (`server.store.backend`) returns a Future and decides where
-  the open runs (RocksDB inline, FSIF on `FsifOpenEc`); `StoreLoader.startOpen` handles an already-completed one inline
-  and otherwise posts `BackendOpened`. A store stays opening (`StoreLoader.isOpening`: its copy's Opening activity on
+- Backend opens are backend-neutral: `BackendOpener.open` and `create` (`server.store.backend`) take the
+  device's `DeviceIo` (`sds.io`) and always run as one of its management-lane jobs (`JobKind.BackendOpen` /
+  `BackendCreate`), never in the caller, whatever the backend; an FSIF backend's I/O then runs on that device's
+  `dataEc` and its serial drains on its `serialEc` (no host-wide FSIF pools remain in production:
+  `FsifBackend.sharedIo`/`sharedSerial` are `private[aspen]`, for tests). `StoreLoader.startOpen` therefore always
+  posts the outcome as `BackendOpened` (there is no inline completion; under lockstep it arrives when the FIFO is
+  drained, and `ControlFixture.runUntilLoadQueued` runs an open and stops before its LoadStore). A rebuild's staging
+  store opens the same way on the destination device's `DeviceIo` (`StoreRebuildFactory.createRebuild`'s `io`). A
+  backend open that hangs stalls only its own device's lane. A store stays opening (`StoreLoader.isOpening`: its copy's Opening activity on
   any device of the host) from `startOpen` until its open fails or the LoadStore `serveOpened` queued is handled
   (`handleLoad` installs it or gives up in that one task), so a second load offer in between (a duplicate
   `LoadStoreById`) starts no second open, and a ShutdownStore then waits for the install (`deferredCloses`) and closes

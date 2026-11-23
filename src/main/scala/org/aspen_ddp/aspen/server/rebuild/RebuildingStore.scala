@@ -14,6 +14,7 @@ import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.host.{CopyLayout, Phase}
 import org.aspen_ddp.aspen.server.store.{Frontend, StoreIncarnationFile}
+import org.aspen_ddp.aspen.server.host.DeviceIo
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, StoreCreation}
 import scribe.Logging
 
@@ -187,6 +188,8 @@ class RebuildingStore(client: AspenClient,
                       storageDeviceId: StorageDeviceId,
                       devicePath: os.Path,
                       backends: BackendOpener,
+                      /** The destination device's I/O: the staging store opens and runs on its lanes */
+                      io: DeviceIo,
                       /** The copy of the store on the device outside pending-delete/, if any, with its phase and path,
                         * from the copy registry (StoreRebuilds.startRebuild): start takes a Rebuilt copy of its own
                         * episode for done and fails on any other */
@@ -412,7 +415,7 @@ class RebuildingStore(client: AspenClient,
   private def createStaging(cfg: StoreConfig): Future[Unit] =
     try
       if FileStat.exists(stagingPath) then os.remove.all(stagingPath)
-      backends.create(cfg, stagingPath, devicePath / StoreCreation.CreatingDirectory)
+      backends.create(cfg, stagingPath, devicePath / StoreCreation.CreatingDirectory, io)
     catch case NonFatal(t) => Future.failed(t)
 
   /** Opens the staging store through the BackendOpener, which decides where the open runs: created just before on
@@ -426,7 +429,7 @@ class RebuildingStore(client: AspenClient,
       logger.error(s"Rebuild of $storeId: the staging store failed. Abandoning this pass. Error: $err")
       latchAbort(err)
     val fopen =
-      try backends.open(cfg, stagingPath, onFatal)
+      try backends.open(cfg, stagingPath, onFatal, io)
       catch case NonFatal(t) => Future.failed(t)
     fopen.recoverWith:
       case e: BackendStateLost =>

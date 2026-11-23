@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.rebuild
 
+import org.aspen_ddp.aspen.server.TestDeviceIo
 import org.aspen_ddp.aspen.server.host.{CopyFixtures, Phase}
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
@@ -32,7 +33,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
 
     def rebuild(failKeys: Set[Key], episode: Option[java.util.UUID],
                 outOfSpaceKeys: Set[Key] = Set()): RebuildingStore =
-      new RebuildingStore(client, storeId, net.secondDeviceId, dev, backends, CopyFixtures.existingCopy(dev, storeId), episode,
+      new RebuildingStore(client, storeId, net.secondDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId), episode,
                           testingOnlyFailKeys = failKeys, testingOnlyOutOfSpaceKeys = outOfSpaceKeys)
     val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
 
@@ -167,7 +168,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       earlier = first.stores(storeId).rebuildEpisode
 
       // The first episode's rebuild walks the whole tree, checkpointing, and is stopped (its host goes down)
-      stopped = new RebuildingStore(client, storeId, from, dev, backends, CopyFixtures.existingCopy(dev, storeId), earlier, checkpointInterval = 1,
+      stopped = new RebuildingStore(client, storeId, from, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId), earlier, checkpointInterval = 1,
                                     testingOnlyAfterWalk = () => Future.failed(new Exception("host down")))
       _ <- stopped.complete.transform(Success(_))
       staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
@@ -181,7 +182,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       back <- client.getStorageDeviceState(from)
       current = back.stores(storeId).rebuildEpisode
 
-      resumed = new RebuildingStore(client, storeId, from, dev, backends, CopyFixtures.existingCopy(dev, storeId), current,
+      resumed = new RebuildingStore(client, storeId, from, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId), current,
                                     testingOnlyTrackRestoredKeys = true)
       outcome <- resumed.complete.transform(Success(_))
     yield

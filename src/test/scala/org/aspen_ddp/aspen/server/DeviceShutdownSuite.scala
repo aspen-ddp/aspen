@@ -37,7 +37,7 @@ private class CancellableRebuildFactory extends StoreRebuildFactory:
                     storeId: StoreId,
                     storageDeviceId: StorageDeviceId,
                     devicePath: os.Path,
-                    backends: BackendOpener,
+                    backends: BackendOpener, io: org.aspen_ddp.aspen.server.host.DeviceIo,
                     episode: Option[UUID],
                     existingCopy: Option[(Phase, os.Path)]): StoreRebuild = synchronized:
     val r = new CancellableRebuild(storeId)
@@ -498,7 +498,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       (host, deviceDir) <- setUp(Map(creating -> StoreEntry(StoreStatus.Initializing, None)))
       gate = recorded(host).holdStoreLoads()
       _ = host.control.reconciler.checkAll()
-      _ <- pumpUntil(recorded(host).loadStoreRequests.nonEmpty)
+      _ <- pumpUntil({ host.testingOnlyHandleEvents(); recorded(host).loadStoreRequests.nonEmpty })
       _ <- client.shutdownStorageDevice(deviceA)
       _ <- waitForTransactionsToComplete()
       // The load completes and the flip runs against the ShuttingDown device.

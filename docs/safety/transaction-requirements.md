@@ -318,7 +318,7 @@ recovered votes on one lock both hold it (section 3, displaced holders).
 (section 4) by another transaction gets `TransactionCollision`, and the store votes abort or withholds its vote
 (section 8.4). Check and lock happen in one executor step, and a Tx touches state only on its store's executor.
 
-**R5 (no vote on stale local state).** A vote is decided only when no commit of any of the transaction's hosted
+**R5 (no vote on stale local state).** A checked vote is decided only when no commit of any of the transaction's hosted
 objects is in flight or held (section 8), so it is checked against exactly the state a recovery would produce. An
 object whose backend commit failed, or that a rebuilt store's inherited votes may lock, gets an abort vote
 (`BackendCommitFailed`, `InheritedVoteLock`).
@@ -526,9 +526,12 @@ commit per object.
 ### 8.3 Behaviour
 
 1. **Vote path** (`Tx.determineDisposition`, in this order): a frozen, unresolved Tx (past expiry) decides nothing; a
-   muted Tx votes abort without checking (it proves the commit if an object shows it); a Tx that has seen no client
-   prepare votes abort with `NoClientPrepare` without checking (prefer-abort; it is called only once the wait for the
-   client's prepare is over or the outcome is known); an invalid description votes `InvalidDescription`; a hosted object
+   muted Tx votes abort without checking (it proves the commit if an object shows it); a Tx that decides with the
+   outcome known (a resolution that beat its object loads, or `Tx.outcomeDecided` from a resolved status-cache entry)
+   votes abort with `OutcomeKnown` without checking or waiting: no outcome rests on the vote and `lock` takes nothing
+   when the outcome is known, so every `VoteCommit` holds its locks until it applies (`checkVoteCommitApplied` and
+   `Tx.holdsUpdateOf` rely on it); a Tx that has seen no client prepare votes abort with `NoClientPrepare` without
+   checking (prefer-abort; it is called only once the wait for the client's prepare is over); an invalid description votes `InvalidDescription`; a hosted object
    that is failed (`commitFailed`) or covered by a rebuilt store's inherited votes (`Frontend.inheritedVoteLock`,
    cross-document-review.md 2.3) votes abort, one error per such object; a hosted object with a commit in flight or held
    (`hasPendingCommit`), or whose locks a committed transaction waiting there to apply in lock order would collide with

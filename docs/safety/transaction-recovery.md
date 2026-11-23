@@ -131,7 +131,8 @@ Required relationships:
    unless the transaction starts too far ahead of the host's clock (`Frontend.startsTooFarAhead`) or is below the
    forget floor and not held (`Frontend.belowForgetFloor`). This includes client retransmissions, so a restarted
    leader gets a driver back at the next retransmit. An outcome cached but not finalized is driven on purpose: its
-   deciding driver ran on another host, and this takes over at once if that driver died.
+   deciding driver ran on another host, and this takes over at once if that driver died. It is not driven for a
+   driver's prepare from its own host (`sameHostDriver`, 4.2): that driver is itself the takeover.
 4. `Store.driveTransaction` is idempotent per store and starts nothing while the store's CRL state is still being
    loaded (`Frontend.recoveryPending`), since a recovered Tx may be among it and the driver must start above its
    acceptor's promises. It creates the driver through `txDriverFactory`, gives it a proof if the store's Tx proves
@@ -194,9 +195,11 @@ answers in this order:
    driver's from its own host, the store itself included (`fromClient = false`, `msg.from == msg.to` or
    `onThisHost`): the entry is then a sibling's, or an earlier instance's of this store after a same-host reopen (the
    host's status cache outlives the Frontend instance), and as stale to this store's drivers as its own Tx's would be.
-   The sending driver is itself the takeover and learns from its remote peers. A client's prepare names the
-   designated leader as its sender, so it is never such a prepare: the leader's takeover of a dead remote driver is
-   unchanged.
+   The sending driver is itself the takeover and learns from its remote peers or by Paxos: the acceptors that
+   decided T keep their state until `TxFinalized`, which also makes the cache entry finalized, so the relay is never the
+   only way a driver learns an outcome (a Tx created from the entry is resolved by the deciding driver's `TxResolved`
+   or `TxFinalized`, or its own driver's Paxos round). A client's prepare (`fromClient = true`) is never such a
+   prepare, whatever its sender: the leader's takeover of a dead remote driver is unchanged.
 3. **Live `Tx`** (`Tx.receivePrepare`): it answers with its fixed vote and an acceptor promise, sent only after the
    CRL save of that state completes (or after its objects load, then the save). A Tx that already applied the commit
    also resends `TxCommitted` to the proposer.
@@ -900,8 +903,8 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
   `TxResolved`+`TxFinalized(late)`; the driver resolves late, finalizes with no actions, and a commit voter that
   already applied looks its entry up only for its stub. The store's own host entry, a non-finalized `Committed` unless
   a store of T on the same host saw `TxFinalized`, does not answer the driver's prepare to its own store: the relay
-  sends no self `TxResolved` while the store's own Tx is resolved, and a sibling store of T on that host relays no
-  non-finalized entry to a sender on its own host.
+  sends no self `TxResolved` while the store's own Tx is resolved or for any driver's prepare from this host, and a
+  sibling store of T on that host relays no non-finalized entry to a sender on its own host (4.2).
   If the caches' window passes, nothing is re-decided: the Tx ends by expiry, concluding its known outcome once more
   than `w - t` primary acceptors no longer hold T.
 * **Clock skew**: no clock decides replay. Clocks remain in the forget floor's time leg (a step back of more than about

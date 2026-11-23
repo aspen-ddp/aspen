@@ -1,8 +1,11 @@
 TODO
 ====
 
-Safety work list (from docs/safety/*, tenth pass, built 2026-11-22 against 045730e4 + working tree)
----------------------------------------------------------------------------------------------------
+Safety work list (from docs/safety/*, eleventh pass, built 2026-11-23 against 6a9cdb70 + working tree)
+------------------------------------------------------------------------------------------------------
+
+The eleventh pass audited every document against the code and found no new weakness; its corrections are in the
+documents.
 
 Every open weakness in docs/safety/* (the "## Open weaknesses" section at the end of each document) is listed below
 once, grouped where one change addresses several ids. Completed items are removed; their record is in git history.

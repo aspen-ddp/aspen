@@ -287,7 +287,8 @@ durable copy exists or the store has been made unservable on disk.** The transfe
 durable (or, finding a valid save file already there, drops entries the file supersedes as a load would); the rebuild
 drops after the copy is in `lost/` (and the `lost-crl-state.log` copy is durable). A store the Missing Stores case finds Active
 with no directory or config is not dropped: nothing durable records that declaration, and a directory that comes back
-before the flip commits loads with its state. It needs no drop of its own: a rebuild retires a copy that
+before the flip commits loads with its state (the reconcile re-reads that store's copies from the disk, `HostCopies.reread`,
+where its config is known absent, and registers one found, which then loads). It needs no drop of its own: a rebuild retires a copy that
 reappears (`StoreRebuilds.retireForeignCopy`, which re-reads the store's copies from the disk first,
 `HostCopies.reread`, and `StoreCopies.retire`; one back while the rebuild runs has the rebuilt copy discarded before
 its flip, and the next pass retires it), and the rebuilt copy's empty

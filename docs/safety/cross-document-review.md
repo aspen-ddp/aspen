@@ -245,7 +245,7 @@ The premises other subsystems take from this:
 * The copy registry learns a device's copies from the listing of its load (`DeviceDiscovery.loadOwnedDevice`,
   `HostCopies.attach`) and the host's own moves. Where a store's copy may have come or gone since by hand (a mount or
   restore finishing late, a directory removed), its copies are read from the disk again (`HostCopies.reread`): by the
-  Missing Stores case, for an Active entry whose config is known absent; by a rebuild's `retireForeignCopy`, before
+  Missing Stores case, for an Active entry whose config is known absent or that has no record; by a rebuild's `retireForeignCopy`, before
   it retires; and before a failed move to `lost/` is retried. A record whose directory a stat answers absent is
   forgotten, releasing a failed move's hold, and a copy with no record is registered, so the rebuild retires it with
   its device-CRL entries. A rebuild's completion lists the store's copies before its flip: one back while it ran has
@@ -610,6 +610,9 @@ Terms the documents share mean the same in each:
   served and is opened again on the same host is a same-host reopen (2.2), which keeps the host's status cache and
   the `StoreId` routing of repair requests.
 * A commit vote's locks: every `VoteCommit` locks; a vote decided with the outcome known is an abort (`OutcomeKnown`).
+* A "same-host driver's prepare" (`Store.handleTransactionMessage`, `sameHostDriver`) is a driver's prepare
+  (`fromClient = false`) from the store itself or another store installed on its host; a client's prepare, which names
+  the designated leader as its sender, never is one (paxos-transactions.md 10.2, transaction-recovery.md 4.1, 4.2).
 * "Below the floor no Tx is created" excepts, everywhere it is said, a rebuilt store's muted Tx for a transaction
   started before its acceptor (2.1; repair-process.md 5.4, paxos-transactions.md 10.10, transaction-recovery.md 4.2).
 

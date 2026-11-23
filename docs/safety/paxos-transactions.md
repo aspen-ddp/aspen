@@ -410,8 +410,8 @@ decided in `Tx.determineDisposition`, in this order:
    inherited growth (`Frontend.inheritedGrowthLock`) a growing update of it votes abort (`InheritedGrowthLock`), never
    waited out; an update that grows nothing passes (10.10, the rebuilt store's inherited votes).
 
-Every abort decided at steps 2-6 (`Tx.decideDisposition`), whatever its cause, proves the commit instead when the
-outcome is unknown here, the acceptor is memoryless and some loaded object already shows T (6.3).
+Every abort decided at steps 2a-6 (`Tx.decideDisposition`), whatever its cause, proves the commit instead when the
+outcome is unknown here (step 2 has the outcome known, so it never proves), the acceptor is memoryless and some loaded object already shows T (6.3).
 
 "Withheld" means no response at all, which Paxos allows; drivers and the client retransmit. A withheld Tx holds no
 locks, so waits cannot form cycles. `lock()` runs right after the vote is decided and before it is durable; that is
@@ -743,12 +743,14 @@ repair, no safety effect.
   committed; the Frontend ignores the prepare and releases its admission.
 * Tx unknown, cache entry resolved but not finalized, T at or above the floor: the Store sends a `TxResolved` of the
   entry (late if the entry is) to the sender and to itself (once, when the sender is the store itself), and the
-  Frontend creates a Tx with `outcomeDecided`: no locks, still votes, answers status queries with the cached outcome.
+  Frontend creates a Tx with `outcomeDecided`: no locks, votes abort (`OutcomeKnown`, 6.1), answers status queries with
+  the cached outcome.
   The sender's recovery driver learns the outcome from its copy. The store's own copy arrives after the Tx and any
   driver exist, so the new Tx resolves from it and the store's own driver learns it. The designated leader drives such
   a T on purpose: its deciding driver may have died on another host, and its own copy resolves the new driver at once.
-  Neither happens for a driver's prepare from this host, the store itself included (`Store.handleTransactionMessage`,
-  `sameHostDriver`): the entry is then a same-host sibling's or an earlier instance's of this store, stale news that
+  Neither the copy to itself nor the leader's driver happens, for a non-finalized entry, when the prepare is a driver's
+  from this host, the store itself included (`Store.handleTransactionMessage`, `sameHostDriver`, `cachedUnfinalized`):
+  the entry is then a same-host sibling's or an earlier instance's of this store, stale news that
   would re-run T's actions, and the sending driver is the takeover (transaction-recovery.md 4.2). A client's prepare
   names its leader as sender and is never such a prepare.
   The same relay is sent whenever a resolved entry exists, also to a store that holds a Tx (a duplicate there), and
@@ -1123,6 +1125,7 @@ on each object `o`; each store has one vote, so `a_o <= w - c_o <= w - t`.
 | Expiry discard of a store owed the commit | A commit voter makes its UnackedCommits lookup before discarding; a finalized commit's entries are durable before any acceptor forgot T | `Frontend.decideExpiry`, `Tx.needsUnackedCheck` |
 | UnackedCommits held aborts | An abort proposal exists only as above (L1) | `Tx.heldAborts` |
 | `NoClientPrepare` votes | Cast only by stores that never saw the client's prepare, so not among the `c_o` voters; they count in `a_o <= w - c_o` | `Tx.awaitingClientPrepare` |
+| `OutcomeKnown` votes | Cast only by a Tx that had no vote when it learned the outcome, so not among the `c_o` voters; they count in `a_o <= w - c_o`, and a store with a commit vote never casts one | `Tx.determineDisposition` |
 | `InvalidDescription` votes | Every store of the pool votes abort, so `c_o = 0` there | `Tx.invalidDescription` |
 | A prover's saved abort vote | Not a commit voter; T committed; counts in `a_o` | `Tx.proveCommitted` |
 

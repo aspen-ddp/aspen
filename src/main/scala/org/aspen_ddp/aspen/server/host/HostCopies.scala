@@ -235,8 +235,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   /** Re-reads the copies of `storeId` on `sds` from the disk and makes its record match them. Otherwise the registry
    *  learns a device's copies only from its load's listing, so it would miss a directory that was absent at the load
    *  and came back (a partial mount or restore finishing late), and keep the record of one that vanished while the
-   *  host runs. Run where either matters, each a rare path: the Missing Stores case
-   *  (DeviceReconciler, for an Active entry whose config is known absent), before a Rebuilding store's retire
+   *  host runs. Run where either matters, each a rare path: the Missing Stores case (DeviceReconciler, for an
+   *  Active entry whose config is known absent or that has no record), before a Rebuilding store's retire
    *  (StoreRebuilds.retireForeignCopy, so the rebuild retires what is on disk, with its device-CRL entries), and
    *  before a failed move to lost/ is retried (StoreRebuilds.retryPendingLost).
    *

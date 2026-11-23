@@ -72,7 +72,7 @@ order) rooted in keys of the pool's state object.
 | Pool state object | Always in the bootstrap pool | CLAUDE.md; `common/metadata/CLAUDE.md` |
 | Tree handles | `pool.errorTree`, `pool.allocationTree`, `pool.unackedCommitsTree` | `client/internal/pool/SimpleStoragePool.scala` |
 | Node placement | Ordinary pool: the pool's metadata group. Metadata pool: the bootstrap pool. Bootstrap pool: itself | `common/metadata/CLAUDE.md`; `server/store/Bootstrap.scala` |
-| One tree per pool | A store's entries are the key range `[poolIndex, poolIndex+1)`; keys compare unsigned, and `poolIndex` is a byte, so `poolIndex+1` never wraps below 255 | `StoreRepairer.scan` |
+| One tree per pool | A store's entries are the key range `[poolIndex, poolIndex+1)`; keys compare unsigned, and `poolIndex` is below the IDA width (`IDA.MaxWidth`, 127), so `poolIndex+1` never wraps | `StoreRepairer.scan` |
 
 Repair of pool P reads P's trees from a metadata pool M: an unavailable or degraded M stops repair of P (12.7).
 Repair of M reads M's trees from the bootstrap pool. Repair of the bootstrap pool reads its own trees, which are also
@@ -460,7 +460,8 @@ recorded. Every Tx on the object started before the recorded
 timestamp, held now or created while the record lasts (`registerReplayHazards`), is told (`Tx.repairInstalled`), and
 its apply of a blind Insert of a key absent here reports the object, whether or not it voted commit here
 (`Tx.issueCommits`), since the installed or matched state may hold a deletion of the key this store never applied
-(transaction-requirements.md 9.4). A committed Delete the store applied as a no-op over the absent key is recorded
+(transaction-requirements.md 9.4). The record lives in one Frontend instance: a Tx recovered by a later instance (a reload) finds none, and
+instead reports on any write newer than its start (`Tx.blindReinsertObjects`, `recovered`). A committed Delete the store applied as a no-op over the absent key is recorded
 apart (`Frontend.keyDeletions`), so a non-voter's blind Insert of a key also reports after a deletion of it applied
 here. A Tx a no-op pass's record reports writes a mark carrying its own start, below the recorded timestamp, so the
 next pass of that mark records no higher: on a hot KeyValue object under concurrent inserts the reports die out
@@ -525,7 +526,7 @@ for each key not in locks.keys:
 wholeObject = snapshot.only.isEmpty; objectLevelLeft = locks.objectLevel || !wholeObject
 refcount = objectLevelLeft ? none : planRefcount
 min/max/left/right + revision: objectLevelLeft: none
-    equal to the read's and the store has a copy: none
+    equal to the read's, in revision too, and the store has a copy: none
     current differs from snapshot on them or on the revision: stale
     else install the read's (slices of left/right) and read.revision
 timestamp = wholeObject && read.timestamp > current.timestamp ? read.timestamp : none
@@ -949,4 +950,4 @@ its read threshold stalls the scan until the deadline.
 
 ## 14. Open weaknesses
 
-(no open items)
+(none)

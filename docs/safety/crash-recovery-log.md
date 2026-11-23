@@ -288,8 +288,9 @@ durable (or, finding a valid save file already there, drops entries the file sup
 drops after the copy is in `lost/` (and the `lost-crl-state.log` copy is durable). A store the Missing Stores case finds Active
 with no directory or config is not dropped: nothing durable records that declaration, and a directory that comes back
 before the flip commits loads with its state. It needs no drop of its own: a rebuild retires a copy that
-reappears at the path the copy registry recorded (`StoreRebuilds.retireForeignCopy`, `StoreCopies.retire`; a copy
-the device load never listed has no record and is not seen, systemic-loss-protection SL-W26), and the rebuilt copy's empty
+reappears (`StoreRebuilds.retireForeignCopy`, which re-reads the store's copies from the disk first,
+`HostCopies.reread`, and `StoreCopies.retire`; one back while the rebuild runs has the rebuilt copy discarded before
+its flip, and the next pass retires it), and the rebuilt copy's empty
 `crl_save.log` drops what is left at its first load (3.3, step 4). Every operation carries applied stubs with the
 transactions: the save file holds both kinds of entry (`codec.StoreCRLEntry.applied_stub`, with the start timestamp),
 and the deletions name `state.entryIds`.

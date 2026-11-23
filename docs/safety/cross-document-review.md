@@ -49,7 +49,7 @@ Contents: 1 the dependency map; 2 cross-subsystem invariants and the guards that
 | Expiry tallies | Recovery | A reported `votedCommit` stands for a voter holding T's locks, or for a committed T (a tree-learned or not-owed resolution, whose locks are released) (2.1) |
 | Host load paths | Store lifecycle | A store whose entry names the device is served, offline under a reconcile case, or retried (2.2); one whose directory or config is missing is rebuilt, its device-CRL entries kept (2.2). A device load serves every `live/` copy without reading the tree, so the phase directories, `phase-param.*` files, the save file and the incarnation file are read with stats that tell a failure from an absence (`server.FileStat`), and an incarnation file is never written by a load (2.2) |
 | Repair (snapshot, then reconcile), status-cache self-relay | Host store routing | Both steps, and the cached entry, belong to the Frontend instance that answers: not upheld across a same-host reopen, which keeps the host's `StoreId` routing and status cache (2.2; transaction-recovery.md R-W13; a repair snapshot carries its instance, `RepairSnapshot.takenBy`) |
-| Rebuild, Missing Stores, discard | Copy registry | Its records of a store's copies match the disk; it learns them only at the device load, so it does not see a copy that appears later or one that vanishes (2.2; systemic-loss-protection.md SL-W26, rebuild-process.md RB-W25) |
+| Rebuild, Missing Stores, discard | Copy registry | Its records of a store's copies match the disk: it learns them at the device load, and re-reads a store's from the disk where a copy may have appeared or vanished since (the Missing Stores case, a rebuild's retire, a failed move to `lost/`'s retry); a rebuild's completion lists them before its flip (2.2) |
 | CRL admission | Host reconcile | A retained charge is released only once the records it covers have left the CRL or been counted again; the leftover drop releases only the charge it was issued for, unchanged since |
 | Systemic-loss protection | All of the above | Declarations of loss are independent and true (they are not checked; see that document) |
 
@@ -242,11 +242,15 @@ The premises other subsystems take from this:
   Active and the device holds no Lost copy of the store (`CopyDecision.release`), whether or not the new copy is
   served: a store left in neither state would consume one unit of the pool's `w -
   t` margin for good.
-* The copy registry learns a device's copies only from the listing of its load (`DeviceDiscovery.loadOwnedDevice`,
-  `HostCopies.attach`) and the host's own moves; nothing re-reads a store's copies from disk while the device stays
-  loaded. Two weaknesses share that root: a copy missing at the load and back later is never seen
-  (systemic-loss-protection.md SL-W26), and a recorded copy whose directory vanishes holds its Rebuilding store's
-  rebuild for good (rebuild-process.md RB-W25).
+* The copy registry learns a device's copies from the listing of its load (`DeviceDiscovery.loadOwnedDevice`,
+  `HostCopies.attach`) and the host's own moves. Where a store's copy may have come or gone since by hand (a mount or
+  restore finishing late, a directory removed), its copies are read from the disk again (`HostCopies.reread`): by the
+  Missing Stores case, for an Active entry whose config is known absent; by a rebuild's `retireForeignCopy`, before
+  it retires; and before a failed move to `lost/` is retried. A record whose directory a stat answers absent is
+  forgotten, releasing a failed move's hold, and a copy with no record is registered, so the rebuild retires it with
+  its device-CRL entries. A rebuild's completion lists the store's copies before its flip: one back while it ran has
+  the rebuilt copy, never served, discarded unflipped, and the next pass retires it and rebuilds again
+  (systemic-loss-protection.md D13, rebuild-process.md T14).
 * A store's device-CRL entries never leave while its entry names the device and no retire has saved them: the leftover
   drop (`dropLeftoverCrlState`) takes only a store its device entry does not name. A store the Missing Stores case
   declares has nothing durable of that declaration, and its directory may come back (a restore or mount finishing late)
@@ -254,9 +258,8 @@ The premises other subsystems take from this:
   opens it then (`DeviceDiscovery.loadOwnedDevice` offers every `live/` copy to `tryLoadStore`, which reads no tree),
   and it recovers its own state. Its entries go when the rebuilt copy's empty `crl_save.log` is first loaded (5.6 of
   rebuild-process.md), when a retire saves them into a copy, or as leftovers once a re-placement takes the entry off the
-  device. A directory that comes back while the host runs is not loaded and, unless the registry recorded it at the
-  device's load, not retired either, so the first of those drops its state unsaved (systemic-loss-protection.md
-  SL-W26).
+  device. A directory that comes back while the host runs, once its store is declared, is not loaded: the rebuild retires it
+  first, saving them into it (systemic-loss-protection.md D13).
 * A load retry (`StoreLoader.retryFailedLoads`, a copy left AwaitingRetry by a failed open, build or
   read) offers the store to `tryLoadStore`, which reads no tree, so the retry itself is held to the tree as the
   device's latest reconcile read it (`LocalStorageDeviceState.reconciledEntries`) and to the host's own work on the

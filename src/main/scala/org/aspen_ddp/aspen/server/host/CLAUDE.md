@@ -196,7 +196,19 @@
   and copy id (a Retired one only while its move is unsynced, and not beside another copy of its store: P2's extras stay
   in `unsyncedPaths`, which keeps `release` off them); `detach` at unload. Every disk mutation site of a store path
   (create, rebuild finish's handler, transfer-in promotion, every move, retire into pending-delete, discards) updates it
-  right after its durable step. Every update is one of two kinds (R22): a **fact** (`HostCopies.fact`: something that
+  right after its durable step. A copy changed by hand while the device stays loaded (a directory absent at the load
+  and back later, a mount or restore finishing late; one removed) is read again from the disk where it matters
+  (`HostCopies.reread`, listing only that store's copies, `CopyLayout.copiesOf`): by the reconcile for an Active entry
+  whose config is known absent (the Missing Stores case: a copy back before the declaration is registered and loaded),
+  by `retireForeignCopy` before it retires (so the rebuild retires what is on disk, with its device-CRL entries), and
+  by `retryPendingLost` (a record whose directory a stat answers absent is forgotten, which releases the hold). It
+  forgets the record of an offline, synced copy whose directory is known gone, then registers the least copy id the
+  phase directories hold for a store with no record, leaving a record in use or unsynced, and a rebuild's finish in
+  flight, alone; a failed stat or listing changes nothing and its caller waits. A copy back while a rebuild runs (after
+  its retire) is found by the rebuild's completion, which lists the store's copies before its flip: the rebuilt copy,
+  never served, is discarded unflipped, its work queued again and the device re-checked, so the next pass retires the
+  returned copy and rebuilds again (a listing that fails waits, as an unsynced copy does). Every update is one of two
+  kinds (R22): a **fact** (`HostCopies.fact`: something that
   already happened, i.e. an install, a router removal, the end of a close, an open, a retire or a retry, a retire's
   start, a phase a move reached, a copy leaving its path) is applied even where the transition table refuses it
   (`DeviceCopies.applyActivity`/`applyPhase`; a refused phase is set to where the copy is, `CopyLayout.locate`), and the
@@ -267,7 +279,8 @@
   handler records it, recognised as a `rebuilt/` copy of the store reading that rebuild's `Rebuilt(episode)` phase
   (`StoreRebuilds.finishPlacing`; any other copy of the rebuilding store is checked); untracked records; and
   a device a test pulled from under its running host (`host.testingOnlySkipDiskCheck(deviceId)`; a device directory
-  that is merely missing is reported). A test that places a copy by hand after its device's load registers it
+  that is merely missing is reported); and a copy path a test moves by hand while the host runs, to show the host
+  re-reading it (`host.testingOnlySkipDiskCheckAt(path)`). A test that places a copy by hand after its device's load registers it
   before the next drain with `host.testingOnlyRescan(deviceId)` (`HostCopies.rescan`: each unrecorded store
   directory with its phase, as the load registers them) or `ControlFixture.placedCopies`; a fake rebuild places its
   copy as finish does (in `rebuilt/` with a config and its episode's `phase-param.rebuilt`) before completing with the
@@ -387,8 +400,7 @@
   `StoreRebuilds.requestRebuild`; the request is made again at each reconcile while the entry stays Active and the store
   unserved, even once its directory is back, so a failed request never leaves it offline until a restart. Its device-CRL
   entries stay (nothing durable records the declaration, and the directory may come back before the flip commits): the
-  rebuild's retire of a copy that is back at its recorded path saves them (one the device load never listed is not
-  seen: systemic-loss SL-W26), the rebuilt copy's empty `crl_save.log` drops what is left, and a
+  rebuild's retire of a copy that is back saves them, the rebuilt copy's empty `crl_save.log` drops what is left, and a
   re-placement's entry leaving the device makes them leftovers. Every load path starts from a directory, so nothing else
   would notice it while the pool counted it writable. `DeviceDiscovery` deletes `creating/` when it loads a device.
   Bootstrap (`cmdline`) creates its stores the same way (`DefaultBackendOpener.createStore`)

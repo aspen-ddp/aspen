@@ -203,6 +203,13 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       ctx.transfers.pendingStartTransfers.keySet ++
       ctx.transfers.transferInRetries.keySet
     stores.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
+      // An Active entry whose config is known absent at its record's path (or with no record) is the Missing Stores
+      // case's: its copies are re-read from the disk first, since the registry learns them only at the device load.
+      // A directory absent then and back now is registered (and loaded, unless already declared), and the record of
+      // one gone since its load is forgotten
+      if remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
+         ctx.copyRegistry.existence(local, storeId, Some(StoreConfig.configFilename)).contains(false) then
+        ctx.copyRegistry.reread("missing stores", local, storeId): Unit
       CopyDecision.decide(storeInputs(local, remote, storeId, declaredBefore, rebuildReads, rebuildHolds)).foreach:
         action =>
           action match

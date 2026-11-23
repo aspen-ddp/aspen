@@ -128,6 +128,22 @@ object CopyLayout:
 
   final case class Found(storeId: StoreId, copyId: UUID, phase: Phase, path: os.Path)
 
+  /** The copies of `storeId` on the device at `devicePath` outside pending-delete/, as `list` finds them, reading only
+   *  this store's: each phase directory's children named as a copy of it (one whose stat fails counts as a copy).
+   *  Throws a failed listing, stat or parameter read. A device path that is not a directory holds none */
+  def copiesOf(devicePath: os.Path, storeId: StoreId): List[Found] =
+    if !FileStat.isDir(devicePath) then
+      Nil
+    else
+      phaseDirectories.filter(_._1 != RebuildingStore.PendingDeleteDirectory).flatMap: (name, phaseOf) =>
+        val dir = devicePath / name
+        if !FileStat.isDir(dir) then
+          Nil
+        else
+          os.list(dir).toList.flatMap: child =>
+            parseName(child.last).filter((s, _) => s == storeId && Try(FileStat.isDir(child)).getOrElse(true))
+              .map((s, copyId) => Found(s, copyId, phaseOf(child), child))
+
   final case class Listing(copies: List[Found], strays: List[os.Path])
 
   /** Every copy on the device: the children of each phase directory. Throws a failed listing, stat or parameter

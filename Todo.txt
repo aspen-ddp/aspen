@@ -64,22 +64,7 @@ PRIORITY 2: resurrection, overwritten updates, permanent replica divergence
 PRIORITY 3: systemic loss protection
 ------------------------------------
 
-3.1 [SL-W26, RB-W25] The copy registry is never re-synchronised with the disk after the device load.
-    CONFIRMED, S. One root cause, two symptoms:
-    - SL-W26 (priority 3): a store directory absent at the device load but back later has no record, so
-      HostCopies.existence answers absent, the Missing Stores case declares it, and the rebuild never retires the
-      returned copy (retireForeignCopy, discardLostStore, RebuildingStore.start go by the record). The rebuilt copy's
-      first load drops the store's device-CRL entries unsaved; the returned copy stays in live/ unrecorded; at the
-      next device load retireDuplicates (D15) retires both and the healthy store is rebuilt again. A rolling restart
-      over partial mounts does this on every affected host at once.
-    - RB-W25 (priority 4): a recorded copy whose directory vanishes while the host runs keeps its record (CopyDecision
-      forgets a gone copy only with no entry); its Rebuilding retire's moveToLost is NotMoved, held in pendingLost and
-      retried forever, so the store is not rebuilt until a restart: one unit of write margin lost.
-    Fix: at the Missing Stores declaration and before a Rebuilding store's retire, list the store's copy paths in every
-    phase directory and replace its records with what is found (register a returned copy so its retire saves its
-    entries; drop the record of one a stat answers absent). Add a test for a directory vanishing and returning while
-    the host runs (DeviceCrlSuite covers only across a restart).
-
+(no open items)
 
 (The correlated false "store lost" design item remains in Backlog.txt.)
 
@@ -88,8 +73,6 @@ PRIORITY 4: liveness (hangs, stalls, livelocks)
 -----------------------------------------------
 
 (SL-W9, a device without room for the CRL replacing its lost one, is in Backlog.txt's systemic-loss entry.)
-
-(RB-W25 is part of 3.1.)
 
 
 PRIORITY 5: performance and hygiene

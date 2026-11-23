@@ -576,6 +576,12 @@ class Host(val client: AspenClient,
   private[aspen] def testingOnlySkipDiskCheck(deviceId: StorageDeviceId): Unit =
     deviceControl.copyRegistry.skipDiskCheck(deviceId)
 
+  /** Test-only, on the control thread: the drain's disk check skips the copy path `path` on any loaded device, which
+   *  the test moves by hand while the host runs (a directory that vanishes, or one coming back, before the host
+   *  re-reads it: HostCopies.reread) */
+  private[aspen] def testingOnlySkipDiskCheckAt(path: os.Path): Unit =
+    deviceControl.copyRegistry.skipDiskCheckAt(path)
+
   /** The components, for tests. */
   private[aspen] def control: DeviceControl = deviceControl
 

@@ -404,7 +404,30 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           unforced.foreach(ctx.moves.placedUnforced)
           ctx.copyRegistry.rebuilt("rebuild finish", local, storeId,
             Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)), copyId, unsynced = unforced.isDefined)
-          if registry.isUnsynced(local, storeId) then
+          // Another copy of the store on the device, back while the rebuild ran (a mount or restore finishing late,
+          // after the retire before this pass): its device-CRL entries must be saved into it before the rebuilt copy's
+          // first load drops them, and the device holds one copy of a store (P2). The rebuilt copy, never served, is
+          // discarded unflipped, and the next pass's retire (retireForeignCopy, which re-reads the disk) retires the
+          // returned copy with its entries before the store is rebuilt again. A listing that fails says nothing: the
+          // copy is not flipped yet, as an unsynced one is not
+          val others = Try(CopyLayout.copiesOf(local.devicePath, storeId).filter(_.copyId != copyId))
+          others.foreach: found =>
+            if found.nonEmpty then
+              logger.error(s"Rebuild of store $storeId on device ${local.storageDeviceId}: ${found.map(_.path)
+                .mkString(", ")} came back while it ran. Discarding the rebuilt copy, so that copy is retired with " +
+                "its CRL state and the store rebuilt again")
+              ctx.devices.discardStoreDirectory(storeId, local.storageDeviceId,
+                "Another copy of the store came back while it was rebuilt")
+                .foreach(sds => ctx.copyRegistry.removed("rebuild finish beside a returned copy", sds, storeId))
+          if !others.toOption.exists(_.isEmpty) then
+            try
+              others.failed.foreach: t =>
+                logger.warn(s"Rebuild of store $storeId on device ${local.storageDeviceId}: its device's copies of " +
+                            s"the store cannot be listed. Not flipping it yet: $t")
+            finally
+              release()
+              ctx.reconciler.scheduleDeviceRecheck(deviceId)
+          else if registry.isUnsynced(local, storeId) then
             // Not flipped over a copy a crash could still undo: the store would be Active with no copy, or its copy
             // back in staging. Its work is queued again, and the device check scheduled here forces it first
             // (CopyMoves.resync) and then restarts the rebuild, which takes this copy for done (RebuildingStore.start)
@@ -669,6 +692,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  next pass a first pass (dropStagingCheckpoint). No rebuild of the store runs here when this is called. Returns
    *  whether the rebuild may go on now. */
   private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
+    // The record is re-read from the disk first (HostCopies.reread): a copy back since the device's load is retired
+    // with its device-CRL entries, and the record of one gone since is forgotten, rather than its move to lost/
+    // failing for good. A re-read that fails waits for a later check
+    if !registry.reread("retireForeignCopy", local, storeId) then
+      return false
     val storePath = ctx.copyRegistry.pathOf(local, storeId)
     // Some(None): no copy or this episode's finished copy; Some(Some(lost)): another copy, Lost (in lost/) or not
     val found: Option[Option[Boolean]] =
@@ -779,7 +807,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  does, before its passes */
   def retryPendingLost(local: LocalStorageDeviceState): Unit =
     ctx.moves.pendingLost(local).toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
-      moveToLost("retry move to lost", local, storeId): Unit
+      // A copy whose directory is gone has its record forgotten, which releases the hold: no move can succeed
+      registry.reread("retry move to lost", local, storeId): Unit
+      if ctx.moves.isPendingLost(local, storeId) then
+        moveToLost("retry move to lost", local, storeId): Unit
 
   // The closes on each device whose end may move their copy to lost/ (closeStarted): a store's close (handleClose,
   // closeUnloaded) and an unserved backend's (retireUnserved, handleBackendOpened). Every unload of a device waits for

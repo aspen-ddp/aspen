@@ -2084,6 +2084,42 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       // Left in the device CRL: a restart, which may serve the copy where it is, recovers them
       heldOnDisk(deviceDir, storeId) should be(Set(txid))
 
+  atest("a copy whose move to lost/ fails and whose directory then vanishes is forgotten and rebuilt (RB-W25)"):
+    given ExecutionContext = executionContext
+    val factory = newFactory()
+    val opener = new FailingRocksOpener(executionContext)
+    val rebuilds = new RecordingRebuildFactory
+    @volatile var lostRenames = 0
+    val failingRename: (os.Path, os.Path) => Unit = (from, to) =>
+      if (to / os.up).last == CopyLayout.LostDirectory then
+        lostRenames += 1
+        throw new java.io.IOException("Input/output error")
+      DurableFiles.atomicRename(from, to)
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, factory, rebuilds = rebuilds,
+               seams = Host.Seams(backends = Some(opener), copyRename = Some(failingRename)))
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ = opener.onFatals.head(new java.io.IOException("Input/output error"))
+      _ <- pumpUntil(host, lostRenames > 0 && host.control.moves.isPendingLost(host.control.devices.devices(deviceA),
+                                                                               storeId))
+      // The recorded copy's directory vanishes while the host runs (a bad restore over the mounted device)
+      _ = host.testingOnlySkipDiskCheckAt(storeDir)
+      _ = os.remove.all(storeDir)
+      _ = host.control.reconciler.checkAll()
+      _ <- pumpWithTx(host, rebuilds.created.nonEmpty)
+      sds = host.control.devices.devices(deviceA)
+      held = host.control.moves.isPendingLost(sds, storeId)
+      record = host.control.copyRegistry.pathOf(sds, storeId)
+      state <- client.getStorageDeviceState(deviceA)
+      _ = factory.shutdownAll()
+    yield
+      // Its record is forgotten, which releases the hold, rather than the move retried at every check for good
+      held should be(false)
+      record should be(None)
+      state.stores.get(storeId).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      rebuilds.created.map(_.storeId).toList should be(List(storeId))
+
   atest("a store that fail-stops is unloaded and moved to lost/"):
     given ExecutionContext = executionContext
     val factory = newFactory()
@@ -2522,6 +2558,99 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       state.stores.get(storeId).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
       rebuilds.created.map(_.storeId).toList should be(List(storeId))
       silenced should be(true)
+
+  atest("a store directory absent at its device's load and back before its rebuild is retired with its CRL entries (SL-W26)"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    val failRequests = new java.util.concurrent.atomic.AtomicBoolean(true)
+    val requestsFailed = new java.util.concurrent.atomic.AtomicInteger(0)
+    val seams = Host.Seams(rebuildRequestFailure = _ =>
+      if failRequests.get then
+        requestsFailed.incrementAndGet()
+        Some(new RuntimeException("injected rebuild request failure"))
+      else None)
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      // Absent when the restarted host loads the device (a partial mount), so the load records no copy of the store
+      aside = deviceDir / os.up / "aside"
+      _ = os.move(storeDir, aside)
+      restarted = newCrlHost(hostRoot, second, seams = seams, rebuilds = rebuilds)
+      crl = second.opened.head
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, requestsFailed.get > 0 && restarted.control.reconciler.activeDeviceChecks.isEmpty)
+      // The mount finishes: the directory is back while the host runs, and nothing tells the registry (no rescan).
+      // The drain's disk check skips its path until a reconcile re-reads it
+      _ = restarted.testingOnlySkipDiskCheckAt(storeDir)
+      _ = os.move(aside, storeDir)
+      _ = failRequests.set(false)
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
+      state <- client.getStorageDeviceState(deviceA)
+      leftInCrl = held(crl, storeId)
+      pendingDir = deviceDir / RebuildingStore.PendingDeleteDirectory
+      retired = if os.exists(pendingDir) then os.list(pendingDir).toList else Nil
+      silenced = restarted.control.router.isOffline(storeId)
+      _ = second.shutdownAll()
+    yield
+      state.stores.get(storeId).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      rebuilds.created.map(_.storeId).toList should be(List(storeId))
+      silenced should be(true)
+      // The returned copy is retired before the rebuild, its entries saved into it, not left in live/ beside the
+      // rebuilt copy (whose first load would drop them, and whose next device load would retire both)
+      os.exists(storeDir) should be(false)
+      CopyFixtures.copyPath(deviceDir, storeId) should be(None)
+      retired should have size 1
+      os.exists(retired.head / RebuildingStore.LostCrlStateFile) should be(true)
+      leftInCrl should be(Set())
+
+  atest("a store directory back while its rebuild runs is retired with its CRL entries, the rebuilt copy discarded (SL-W26)"):
+    given ExecutionContext = executionContext
+    val first = newFactory()
+    val second = newFactory()
+    val rebuilds = new RecordingRebuildFactory
+    for
+      (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
+      host = newCrlHost(hostRoot, first)
+      _ <- pumpUntil(host, host.control.router.loaded.contains(storeId))
+      _ <- prepareInFlight(host, first.opened.head, storeId, txid)
+      _ <- host.control.router.loaded(storeId).backend.close()
+      _ = first.shutdownAll()
+      aside = deviceDir / os.up / "aside"
+      _ = os.move(storeDir, aside)
+      restarted = newCrlHost(hostRoot, second, rebuilds = rebuilds)
+      crl = second.opened.head
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, rebuilds.created.nonEmpty)
+      // The mount finishes while the rebuild runs, past its retire; then the rebuild finishes
+      _ = restarted.testingOnlySkipDiskCheckAt(storeDir)
+      _ = os.move(aside, storeDir)
+      _ = rebuilds.created.head.placeAndComplete()
+      _ <- pumpWithTx(restarted, restarted.control.copyRegistry.rebuilding(HostCopies.RebuildReads).isEmpty)
+      _ = restarted.control.reconciler.checkAll()
+      _ <- pumpWithTx(restarted, rebuilds.created.size >= 2)
+      state <- client.getStorageDeviceState(deviceA)
+      leftInCrl = held(crl, storeId)
+      pendingDir = deviceDir / RebuildingStore.PendingDeleteDirectory
+      retired = if os.exists(pendingDir) then os.list(pendingDir).toList else Nil
+      served = restarted.control.router.loaded.contains(storeId)
+      _ = second.shutdownAll()
+    yield
+      // Not flipped over the returned copy: the store is rebuilt again once that copy is retired with its entries
+      state.stores.get(storeId).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      served should be(false)
+      rebuilds.created.map(_.storeId).toList should be(List(storeId, storeId))
+      os.exists(storeDir) should be(false)
+      CopyFixtures.copyPath(deviceDir, storeId) should be(None)
+      retired should have size 1
+      os.exists(retired.head / RebuildingStore.LostCrlStateFile) should be(true)
+      leftInCrl should be(Set())
 
   atest("an Active store whose config cannot be stat'd is not taken for missing: no rebuild, its entries kept (X-W18)"):
     given ExecutionContext = executionContext

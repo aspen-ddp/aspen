@@ -45,7 +45,10 @@
   episode included), told by its record's phase, is retired as a lost copy (`StoreRebuilds.retireForeignCopy`: moved to
   `lost/`, then retired into `pending-delete/`, rebuilt). Such a copy, or one already in `lost/`, may have served since
   the first pass began, so the store's staging checkpoint is first removed durably (`dropStagingCheckpoint`) and the
-  next pass is a first pass: a resume would leave the walked objects' updates stale
+  next pass is a first pass: a resume would leave the walked objects' updates stale. The record is read again from the
+  disk first (`HostCopies.reread`), so a copy back since the device's load is retired with its device-CRL entries. One
+  back while the rebuild runs is found by its completion, which lists the store's copies before the flip and discards
+  the rebuilt copy unflipped, so the next pass retires the returned copy and rebuilds again (`host/CLAUDE.md`)
 - Pending allocations (rebuild-process 5.3): before each pass's walk, `queryPeers` asks the pool's other stores
   (`CurrentAllocationsRequest`) and waits, resending, for `width - writeThreshold + 1` answers, at most
   `peerQueryTimeout` (default `PeerQueryTimeout`, 60 s, noticed at the next resend): then the pass fails with

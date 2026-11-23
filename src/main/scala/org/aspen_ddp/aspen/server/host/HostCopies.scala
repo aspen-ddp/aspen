@@ -87,6 +87,13 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def skipDiskCheck(id: StorageDeviceId): Unit =
     diskCheckSkipped += id
 
+  // Copy paths a test moves by hand while the host runs (testingOnlySkipDiskCheckAt): the disk check skips them
+  private var diskCheckSkippedPaths: Set[os.Path] = Set()
+
+  /** Test-only: the disk check skips the copy path `path`, which the test moves by hand while the host runs */
+  def skipDiskCheckAt(path: os.Path): Unit =
+    diskCheckSkippedPaths += path
+
   /** Test-only: whether device `id` holds in rebuilt/ a copy of `storeId` that a running rebuild's finish placed
    *  there, its completion's handler not yet run: the handler records it (StoreRebuilds.finishPlacing). Its
    *  phase-param.rebuilt reads that rebuild's episode */
@@ -224,6 +231,57 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
                   !finishInFlight(sds.storageDeviceId, sds.devicePath, f.storeId) =>
           copies.register(f.storeId, f.phase, f.copyId)
           f.storeId
+
+  /** Re-reads the copies of `storeId` on `sds` from the disk and makes its record match them. Otherwise the registry
+   *  learns a device's copies only from its load's listing, so it would miss a directory that was absent at the load
+   *  and came back (a partial mount or restore finishing late), and keep the record of one that vanished while the
+   *  host runs. Run where either matters, each a rare path: the Missing Stores case
+   *  (DeviceReconciler, for an Active entry whose config is known absent), before a Rebuilding store's retire
+   *  (StoreRebuilds.retireForeignCopy, so the rebuild retires what is on disk, with its device-CRL entries), and
+   *  before a failed move to lost/ is retried (StoreRebuilds.retryPendingLost).
+   *
+   *  The record of an offline copy (Idle or AwaitingRetry), synced, whose directory a stat answers absent goes, as a
+   *  copy that left its path does (`removed`, which releases a failed move's hold). Then a store with no record has
+   *  a copy that the phase directories hold outside pending-delete/ registered with its phase (the least copy id where
+   *  several are there, as P2 keeps; each retire that follows rereads, so the rest are taken one by one), unsynced if
+   *  its path's move was not forced. A record in use (Opening, Served, Closing, Retiring) or unsynced is left as it
+   *  is, and so is a copy a running rebuild's finish placed whose completion's handler has not yet run
+   *  (finishInFlight). Returns false, changing nothing, where a stat, listing or parameter read failed: the caller
+   *  waits for a later check */
+  def reread(site: String, sds: LocalStorageDeviceState, storeId: StoreId): Boolean =
+    copiesOf(sds) match
+      case None => true
+      case Some(copies) =>
+        try
+          val record = copies.copies.get(storeId)
+          val inUse = record.exists(r => r.unsynced || !(r.activity == Activity.Idle ||
+                                                         r.activity.isInstanceOf[Activity.AwaitingRetry]))
+          if inUse || finishInFlight(sds.storageDeviceId, sds.devicePath, storeId) then
+            true
+          else
+            val gone = record.filter(r => FileStat.existence(recordPath(sds.devicePath, r)) match
+              case Some(present) => !present
+              case None => throw IllegalStateException(s"The copy of $storeId at ${recordPath(sds.devicePath, r)} " +
+                                                       "cannot be stat'd"))
+            val found = if record.isEmpty || gone.isDefined then CopyLayout.copiesOf(sds.devicePath, storeId) else Nil
+            gone.foreach: r =>
+              logger.warn(s"The copy of store $storeId at ${recordPath(sds.devicePath, r)} on device " +
+                          s"${sds.storageDeviceId} is gone. Forgetting its record ($site)")
+              removed(site, sds, storeId)
+            found.sortBy(_.copyId).headOption.foreach: f =>
+              logger.warn(s"The copy of store $storeId at ${f.path} on device ${sds.storageDeviceId} was not known " +
+                          s"to the copy registry. Registered ${f.phase} ($site)")
+              if found.size > 1 then
+                logger.error(s"Device ${sds.storageDeviceId} holds ${found.size} copies of store $storeId: " +
+                             s"${found.map(_.path).mkString(", ")}. Registered ${f.path}")
+              fact(site):
+                copies.register(storeId, f.phase, f.copyId, unsynced = unsyncedPaths.contains(f.path))
+                unsyncedPaths -= f.path
+            true
+        catch case NonFatal(t) =>
+          logger.warn(s"Could not re-read the copies of store $storeId on device ${sds.storageDeviceId} ($site). " +
+                      s"Leaving its record as it is: $t")
+          false
 
   /** As attach, listing the device itself (ControlFixture.injectLoadedDevice). A listing that fails registers none */
   def attach(sds: LocalStorageDeviceState): Unit =
@@ -800,7 +858,8 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
    *  Stats and reads that fail are skipped: they say nothing. A store path holding the copy a running rebuild's
    *  finish placed, its directory reading that rebuild's Rebuilt phase while its completion's handler has not yet run
    *  (finishInFlight), is skipped: finish places the copy off the control thread, ahead of the handler. A device a test
-   *  pulled from under the host (skipDiskCheck) is skipped. Empty when consistent. */
+   *  pulled from under the host (skipDiskCheck), and a copy path a test moves by hand while the host runs
+   *  (skipDiskCheckAt), are skipped. Empty when consistent. */
   def verifyAgainstDisk(): List[String] =
     ctx.devices.devices.toList.sortBy(_._1.uuid).flatMap: (id, sds) =>
       if !attached.get(id).exists(_ eq sds) then
@@ -821,14 +880,15 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         // for FSIF): its directory may not be there yet
         val dirMissing = records.values.toList.sortBy(_.storeId.directoryName).flatMap: r =>
           val path = recordPath(sds.devicePath, r)
-          if sds.copies.work.get(r.storeId).contains(Work.Create) then
+          if sds.copies.work.get(r.storeId).contains(Work.Create) || diskCheckSkippedPaths.contains(path) then
             Nil
           else if Try(FileStat.isDir(path)).toOption.contains(false) then
             List(s"device $id: record of ${r.storeId} (${r.phase}) has no directory at $path")
           else
             Nil
         val unrecorded = onDisk
-          .filterNot(f => records.get(f.storeId).exists(r => recordPath(sds.devicePath, r) == f.path))
+          .filterNot(f => diskCheckSkippedPaths.contains(f.path) ||
+                          records.get(f.storeId).exists(r => recordPath(sds.devicePath, r) == f.path))
           .map(f => s"device $id: directory ${f.path} (${f.phase}) has no record")
         dirMissing ++ unrecorded
 

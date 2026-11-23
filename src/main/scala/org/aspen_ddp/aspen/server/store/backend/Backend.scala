@@ -61,13 +61,25 @@ trait Backend extends Logging {
 
   def bootstrapOverwrite(objectId: ObjectId, data:DataBuffer): Unit
 
+  /** Rebuild only (the store is not live): writes `pointer`'s slice as the store's whole copy of the object,
+    * overwriting any earlier one. Never blocks the caller: the I/O runs on the backend's own (device) threads, and
+    * the Future completes once the write has been issued to the backend's storage exactly as far as the earlier
+    * blocking call had when it returned (not forced: only a later `rebuildFlush` makes it durable). An invalid
+    * pointer, an oversized slice or an out-of-space store fails the Future; nothing is thrown.
+    *
+    * Calls to `rebuildWrite` and `rebuildFlush` take effect in call order, one at a time, whether or not the caller
+    * waits for each Future: a flush covers every write called before it.
+    */
   def rebuildWrite(pointer: ObjectPointer,
                    objectType: ObjectType.Value,
                    metadata: Metadata,
-                   data:DataBuffer): Unit
+                   data:DataBuffer): Future[Unit]
 
-  /** Force all cached/in-memory data to stable storage before returning */
-  def rebuildFlush(): Unit
+  /** Rebuild only: forces every write called before it (`rebuildWrite`) to stable storage. When the Future succeeds
+    * they are as durable as when the earlier blocking call returned: a crash then loses none of them. Never blocks
+    * the caller; a failure (out of space, a fail-stop) fails the Future, and what it covered must be taken as lost.
+    */
+  def rebuildFlush(): Future[Unit]
 
   def read(pointer: ObjectPointer): Unit
 

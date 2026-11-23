@@ -70,21 +70,28 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
           alloc.allocateDataObject(Array[Byte](i.toByte)).map(_.id)
     Future.sequence(allocated)
 
-  /** The rebuild's outcome, or None if it has still not finished after `maxYields` turns of the
-   *  test's execution context.
+  /** The rebuild's outcome, or None if it has still not finished once `limit` has passed.
    *
    *  Never awaits an incomplete future. The failure mode this exists for is a rebuild whose
    *  future never completes at all, and awaiting one of those hangs the suite instead of
-   *  failing it.
+   *  failing it. Bounded by time, not turns: the staging writes run on the device's data threads (TestDeviceIo's
+   *  are the global pool), whose pace a loaded machine sets. It waits on the outcome itself, so it spins nothing.
    */
   private def outcomeOrStalled(rebuild: RebuildingStore,
-                               maxYields: Int = 5000): Future[Option[Try[Unit]]] =
+                               limit: FiniteDuration = 30.seconds): Future[Option[Try[Unit]]] =
+    given ExecutionContext = executionContext
+    val outcome = rebuild.complete.transform(t => scala.util.Success(Some(t.map(_ => ()))))
+    Future.firstCompletedOf(List(outcome, RebuildingStoreSuite.timer(limit).map(_ => None)))
+
+  /** The rebuild's outcome after `yields` turns of the test's execution context, None if it is still running: for a
+   *  test showing a rebuild does not complete while something holds it */
+  private def outcomeAfterYields(rebuild: RebuildingStore, yields: Int = 5000): Future[Option[Try[Unit]]] =
     given ExecutionContext = executionContext
     def loop(n: Int): Future[Option[Try[Unit]]] = rebuild.complete.value match
       case Some(outcome) => Future.successful(Some(outcome.map(_ => ())))
       case None if n == 0 => Future.successful(None)
       case None => Future(()).flatMap(_ => loop(n - 1))
-    loop(maxYields)
+    loop(yields)
 
   atest("a full walk restores every object and moves the store into place"):
     given ExecutionContext = executionContext
@@ -331,15 +338,15 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
                                   testingOnlyAfterWalk = () => { firstRef.cancel(); Future.unit })
       _ = firstRef = first
       outcome <- first.complete.transform(scala.util.Success.apply)
-      listed = RebuildState.load(staging).get.pendingAllocations
+      listed = RebuildDisk.load(staging).get.pendingAllocations
       // The entry lands and the transaction finalizes, so the next pass's peers list nothing. The entry's timestamp is
       // that of the transaction writing it, which may have started long before the walk did (a late decision), so
       // nothing about it tells the resume to look back
       _ <- landEntry(held)
       _ <- releaseBlocked()
       // And the walk had passed its key
-      st = RebuildState.load(staging).get
-      _ = RebuildState.save(staging, st.copy(lastRestoredKey = Some(Key(Array.fill[Byte](16)(-1)))))
+      st = RebuildDisk.load(staging).get
+      _ = RebuildDisk.save(staging, st.copy(lastRestoredKey = Some(Key(Array.fill[Byte](16)(-1)))))
       resumed = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     testingOnlyTrackRestoredKeys = true)
       _ <- resumed.complete
@@ -380,7 +387,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(5)
       _ <- net.waitForTransactionsToComplete()
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId))
-      stalled <- outcomeOrStalled(rebuild)
+      stalled <- outcomeAfterYields(rebuild)
       _ = net.dropClientResponse = _ => false
       _ <- rebuild.complete
     yield
@@ -416,7 +423,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(5)
       _ <- net.waitForTransactionsToComplete()
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId))
-      stalled <- outcomeOrStalled(rebuild)
+      stalled <- outcomeAfterYields(rebuild)
       _ = rebuild.cancel()
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
     yield
@@ -541,7 +548,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     // cleanupStaging rather than about a directory that was never there.
     val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
     os.makeDir.all(staging)
-    RebuildState.save(staging, RebuildState(storeId, None, Some(Key(Array[Byte](7))), Nil, Nil))
+    RebuildDisk.save(staging, RebuildState(storeId, None, Some(Key(Array[Byte](7))), Nil, Nil))
 
     for
       _ <- populate(20)
@@ -673,7 +680,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- backends.create(StoreConfig.forPool(storeId, pstate), staging, dev / StoreCreation.CreatingDirectory, TestDeviceIo.of(dev))
       allocatedKeys = ids.map(id => Key(id.toBytes))
       sorted = allocatedKeys.sortWith(ByteArrayKeyOrdering.lt)
-      _ = RebuildState.save(staging, RebuildState(storeId, None, Some(sorted(9)), Nil, Nil))
+      _ = RebuildDisk.save(staging, RebuildState(storeId, None, Some(sorted(9)), Nil, Nil))
 
       // The rebuild should resume from that key
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
@@ -706,7 +713,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       pstate <- client.getStoragePoolState(storeId.poolId)
       _ <- backends.create(StoreConfig.forPool(storeId, pstate), staging, dev / StoreCreation.CreatingDirectory, TestDeviceIo.of(dev))
       sorted = ids.map(id => Key(id.toBytes)).sortWith(ByteArrayKeyOrdering.lt)
-      _ = RebuildState.save(staging, RebuildState(storeId, checkpointEpisode, Some(sorted(9)), Nil, Nil))
+      _ = RebuildDisk.save(staging, RebuildState(storeId, checkpointEpisode, Some(sorted(9)), Nil, Nil))
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId),
                                     rebuildEpisode, checkpointInterval = 5, testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
@@ -793,7 +800,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // The staging directory and its checkpoint survive, so the next device check resumes.
       val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
       CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
-      val saved = RebuildState.load(staging).get
+      val saved = RebuildDisk.load(staging).get
       saved.failedObjects should be(List(ids.head))
       // The checkpoint advanced past it: one unreadable object cannot wedge the walk forever.
       saved.lastRestoredKey should not be None
@@ -816,7 +823,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     yield
       outcome.isFailure should be(true)
       CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
-      val saved = RebuildState.load(dev / RebuildingStore.RebuildDirectory / storeId.directoryName).get
+      val saved = RebuildDisk.load(dev / RebuildingStore.RebuildDirectory / storeId.directoryName).get
       saved.failedObjects should be(List(ids.head))
       saved.lastRestoredKey should not be None
 
@@ -836,7 +843,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       outcome.failed.get.getMessage should include("1 object reads in a row timed out")
       CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       // Aborted at the first timeout: the rest of the walk was skipped, and the checkpoint survives for the next pass
-      val saved = RebuildState.load(dev / RebuildingStore.RebuildDirectory / storeId.directoryName).get
+      val saved = RebuildDisk.load(dev / RebuildingStore.RebuildDirectory / storeId.directoryName).get
       saved.failedObjects.size should be(1)
 
   atest("a restored object ends a run of read timeouts"):
@@ -857,7 +864,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // Failed by retryFailures, with both objects recorded, not by the run's abort
       outcome.isFailure should be(true)
       outcome.failed.get.getMessage should not include("in a row timed out")
-      val saved = RebuildState.load(dev / RebuildingStore.RebuildDirectory / storeId.directoryName).get
+      val saved = RebuildDisk.load(dev / RebuildingStore.RebuildDirectory / storeId.directoryName).get
       saved.failedObjects.toSet should be(silenced)
 
   atest("a cancel ends a rebuild whose walk waits on a read that never completes"):
@@ -901,7 +908,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       os.exists(staging) should be(true)
       CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       // The checkpoint was written when the cap was hit
-      val saved = RebuildState.load(staging).get
+      val saved = RebuildDisk.load(staging).get
       saved.lastRestoredKey should not be None
 
       // The count is what makes this a test of the cap rather than a second copy of the test
@@ -950,7 +957,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
       CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       // Recorded as one more failed object, subject to the existing cap and retry machinery.
-      RebuildState.load(staging).get.failedObjects should be(List(bogusId))
+      RebuildDisk.load(staging).get.failedObjects should be(List(bogusId))
 
   atest("cancel stops a rebuild and leaves its checkpoint for resumption"):
     given ExecutionContext = executionContext
@@ -971,7 +978,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ = rebuildRef = rebuild
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
       // What the cancelled pass left behind, before a new one resumes from it
-      checkpointed = RebuildState.load(staging).isDefined
+      checkpointed = RebuildDisk.load(staging).isDefined
       placed = CopyFixtures.copyPath(dev, storeId).isDefined
       resumed = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId))
       _ <- resumed.complete
@@ -999,7 +1006,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
       CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       os.exists(staging) should be(true)
-      RebuildState.load(staging).isDefined should be(true)
+      RebuildDisk.load(staging).isDefined should be(true)
 
   // A shutdown waits for its cancelled rebuilds, so a cancelled walk must stop reading at once
   // rather than read the rest of the allocation tree as no-ops.
@@ -1050,7 +1057,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       os.exists(staging) should be(true)
       CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
       // failedObjects is EMPTY -- proving the latch alone failed the pass, not retryFailures()
-      val saved = RebuildState.load(staging).get
+      val saved = RebuildDisk.load(staging).get
       saved.failedObjects should be(Nil)
 
   atest("the staging store is created, then opened, through the BackendOpener with the pool's backend config"):
@@ -1083,7 +1090,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // A checkpoint part-way through, as a crashed pass leaves it
       _ = os.makeDir.all(staging)
       sorted = ids.map(id => Key(id.toBytes)).sortWith(ByteArrayKeyOrdering.lt)
-      _ = RebuildState.save(staging, RebuildState(storeId, None, Some(sorted(9)), Nil, Nil))
+      _ = RebuildDisk.save(staging, RebuildState(storeId, None, Some(sorted(9)), Nil, Nil))
       _ = opener.lose = true
       lost = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener, TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId))
       outcome <- lost.complete.transform(scala.util.Success.apply)
@@ -1119,7 +1126,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     yield
       outcome.failed.get should be(failure)
       CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
-      RebuildState.load(staging).isDefined should be(true)
+      RebuildDisk.load(staging).isDefined should be(true)
 
   /** Opens through the default opener, wrapping the backend so its rebuildFlush throws an out-of-space error while
    *  `full` is set */
@@ -1142,10 +1149,10 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
                                 data: DataBuffer): Unit = b.bootstrapAllocate(objectId, objectType, metadata, data)
           def bootstrapOverwrite(objectId: ObjectId, data: DataBuffer): Unit = b.bootstrapOverwrite(objectId, data)
           def rebuildWrite(pointer: ObjectPointer, objectType: ObjectType.Value, metadata: Metadata,
-                           data: DataBuffer): Unit = b.rebuildWrite(pointer, objectType, metadata, data)
-          def rebuildFlush(): Unit =
-            if full then throw new java.io.IOException("No space left on device")
-            b.rebuildFlush()
+                           data: DataBuffer): Future[Unit] = b.rebuildWrite(pointer, objectType, metadata, data)
+          def rebuildFlush(): Future[Unit] =
+            if full then Future.failed(new java.io.IOException("No space left on device"))
+            else b.rebuildFlush()
           def read(pointer: ObjectPointer): Unit = b.read(pointer)
           def commit(state: CommitState, transactionId: TransactionId): Unit = b.commit(state, transactionId)
           def repair(state: CommitState, complete: Promise[Unit]): Unit = b.repair(state, complete)
@@ -1180,7 +1187,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
         Backend.isOutOfSpace(outcome.failed.get) should be(true)
         alerts.toArray(Array.empty[scribe.Level]).toList should be(List(scribe.Level.Error))
         CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
-        RebuildState.load(staging).isDefined should be(true)
+        RebuildDisk.load(staging).isDefined should be(true)
 
   atest("a failed completion-file write in finish keeps the checkpoint for the next pass (RB-W10)"):
     given ExecutionContext = executionContext
@@ -1198,4 +1205,16 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     yield
       outcome.isFailure should be(true)
       CopyFixtures.copyPath(dev, storeId).isDefined should be(false)
-      RebuildState.load(staging).isDefined should be(true)
+      RebuildDisk.load(staging).isDefined should be(true)
+
+object RebuildingStoreSuite:
+  private val scheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor: r =>
+    val t = new Thread(r, "rebuild-suite-timer")
+    t.setDaemon(true)
+    t
+
+  /** Completes once `d` has passed, holding no thread meanwhile */
+  def timer(d: FiniteDuration): Future[Unit] =
+    val p = Promise[Unit]()
+    scheduler.schedule((() => p.trySuccess(())): Runnable, d.toMillis, java.util.concurrent.TimeUnit.MILLISECONDS)
+    p.future

@@ -220,8 +220,8 @@ class FsifCheckpointSuite extends FileBasedTests:
 
   test("rebuildFlush runs a checkpoint"):
     val h = new Harness
-    h.backend.rebuildWrite(ptr(3, oid(3)), ObjectType.Data, md(1), DataBuffer(bytes(70, 3)))
-    h.backend.rebuildFlush()
+    h.await(h.backend.rebuildWrite(ptr(3, oid(3)), ObjectType.Data, md(1), DataBuffer(bytes(70, 3))))
+    h.await(h.backend.rebuildFlush())
     h.backend.journalSeq shouldBe 1
     h.indexSeq("index.b") shouldBe Some(1)
     h.crash()

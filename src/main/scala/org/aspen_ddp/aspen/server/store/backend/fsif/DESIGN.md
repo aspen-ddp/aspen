@@ -146,9 +146,12 @@ discarded. A store path therefore never holds a partly initialized store, and `o
   the device's management lane (`DeviceIo.submit(BackendOpen|BackendCreate, ...)`), never on its control thread:
   `DefaultBackendOpener.open` returns that job's Future, and `StoreLoader.startOpen`, called on the control thread,
   gets the outcome back as a posted `BackendOpened`.
-- **Exceptions to "post and return":** `rebuildWrite` writes the segment on the calling thread and uses
-  `onSerialSync` (`Await`) for its bookkeeping. `rebuildFlush` blocks the calling thread as well. Compaction's
-  truncate of free tail slots runs inline on the serial executor (section 5).
+- **Rebuild writes post and return too:** `rebuildWrite` and `rebuildFlush` return Futures and never block their
+  caller. They run one at a time in call order (`RebuildSequence`): `rebuildWrite` takes the slot on serial and
+  writes the segment on `io` (`IoKind.RebuildWrite`), completing once the write returns (unforced);
+  `rebuildFlush` chains the data force, the Mappings' appends and the checkpoint on serial, completing once all are
+  durable. **Exception to "post and return":** compaction's truncate of free tail slots runs inline on the serial
+  executor (section 5).
 
 ### 2.5 Write paths
 

@@ -26,12 +26,11 @@ class DeviceIoUsageSuite extends AnyFunSuite with Matchers:
     "host/LocalDevices.scala" -> 3,
     "host/StoreCopies.scala" -> 15,
     "host/StoreLoader.scala" -> 11,
-    "host/StoreRebuilds.scala" -> 6,
+    "host/StoreRebuilds.scala" -> 5,
     "host/StoreRouter.scala" -> 2,
     "host/StoreTransfers.scala" -> 3,
     "host/StoreTransfersOut.scala" -> 4,
-    "rebuild/RebuildState.scala" -> 5,
-    "rebuild/RebuildingStore.scala" -> 22,
+    "rebuild/RebuildingStore.scala" -> 11,
     "rebuild/StoreRebuild.scala" -> 1,
     "transfer/StoreTransferManager.scala" -> 5
   )

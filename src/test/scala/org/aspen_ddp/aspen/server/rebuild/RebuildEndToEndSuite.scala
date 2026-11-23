@@ -67,13 +67,13 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
 
       // RB-W20: a resumed pass past the end of the tree, whose retry of a readable object hits a full destination.
       // The pass fails as out of space, not as an accepted loss of that object
-      _ = RebuildState.save(staging, RebuildState.load(staging).get.copy(
+      _ = RebuildDisk.save(staging, RebuildDisk.load(staging).get.copy(
             lastRestoredKey = Some(Key(Array.fill[Byte](16)(-1))), failedObjects = List(ids.head, ids(1))))
       full <- rebuild(Set(doomed), episode, outOfSpaceKeys = Set(Key(ids(1).toBytes))).complete.transform(Success(_))
       fullPool <- client.getStoragePool(PoolId.BootstrapPoolId)
       fullEntry <- fullPool.errorTree.get(MissedUpdateMarker.errorKey(storeId, ids(1)))
       fullLostEntry <- fullPool.errorTree.get(MissedUpdateMarker.errorKey(storeId, ids.head))
-      fullLeft = RebuildState.load(staging).map(_.failedObjects.toSet)
+      fullLeft = RebuildDisk.load(staging).map(_.failedObjects.toSet)
       fullPlaced = CopyFixtures.copyPath(dev, storeId).isDefined
 
       accepted <- rebuild(Set(doomed), episode).complete.transform(Success(_))
@@ -172,7 +172,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
                                     testingOnlyAfterWalk = () => Future.failed(new Exception("host down")))
       _ <- stopped.complete.transform(Success(_))
       staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
-      checkpoint = RebuildState.load(staging)
+      checkpoint = RebuildDisk.load(staging)
 
       // Re-placed away while its host is down, then back
       _ <- client.replaceRebuild(storeId, to)

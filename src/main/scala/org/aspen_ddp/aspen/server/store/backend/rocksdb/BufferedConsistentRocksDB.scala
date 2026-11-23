@@ -160,16 +160,31 @@ class BufferedConsistentRocksDB(val dbPath: os.Path)(using ec: ExecutionContext)
   }
 
 
-  def rebuildWrite(key: Array[Byte], value: Array[Byte]): Unit = synchronized {
-    db.put(key, value)
-  }
+  private val rebuildSequence = new RebuildSequence
 
-  def rebuildFlush(): Unit = synchronized {
-    val flushOptions = new FlushOptions()
-    flushOptions.setWaitForFlush(true)
-    flushOptions.setAllowWriteStall(true)
-    db.flush(flushOptions)
-  }
+  /** Rebuild only: a plain put (WAL, unsynced), on the database's ExecutionContext, after every earlier rebuild
+    * operation. The monitor is never held across the put: only beginOperation/endOperation take it, so a close waits
+    * for the put and one after the close fails with DBClosed. */
+  def rebuildWrite(key: Array[Byte], value: Array[Byte]): Future[Unit] =
+    rebuildSequence.next(() => Future(rebuildOperation(db.put(key, value))))
+
+  /** Rebuild only: flushes the memtables to SST files and waits for the flush, on the database's ExecutionContext,
+    * after every earlier rebuild operation (so every rebuildWrite called before it is durable when it completes). */
+  def rebuildFlush(): Future[Unit] =
+    rebuildSequence.next: () =>
+      Future:
+        rebuildOperation:
+          val flushOptions = new FlushOptions()
+          try
+            flushOptions.setWaitForFlush(true)
+            flushOptions.setAllowWriteStall(true)
+            db.flush(flushOptions)
+          finally flushOptions.close()
+
+  private def rebuildOperation(body: => Unit): Unit =
+    beginOperation()
+    try body
+    finally endOperation()
 
   def put(key: Array[Byte], value: Array[Byte]): Future[Unit] = synchronized {
     nextBatch.put(key, value)

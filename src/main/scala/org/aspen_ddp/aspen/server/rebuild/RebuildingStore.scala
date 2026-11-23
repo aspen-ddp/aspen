@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.host.{CopyLayout, Phase}
 import org.aspen_ddp.aspen.server.store.{Frontend, StoreIncarnationFile}
-import org.aspen_ddp.aspen.server.host.DeviceIo
+import org.aspen_ddp.aspen.server.host.{DeviceIo, JobKind}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, StoreCreation}
 import scribe.Logging
 
@@ -222,6 +222,8 @@ class RebuildingStore(client: AspenClient,
 
   import RebuildingStore.*
 
+  /** Composes the pass and runs its client reads. No disk work runs here: every staging touch is a `JobKind.Staging`
+   *  job on `io` (RebuildDisk) or a backend Future on `io`'s pools (rebuildWrite, rebuildFlush, close) */
   private given ExecutionContext = client.clientContext
 
   /** Every object read of the walk, the sweep and the retries: a read that never completes would hold the walk, the
@@ -310,9 +312,8 @@ class RebuildingStore(client: AspenClient,
             // A crash between the move and the flip. The store is already whole; there is nothing to
             // rebuild, only the flip left, and that is Host's job on completion.
             logger.info(s"Rebuild of $storeId: store already in place at $path")
-            cleanupStaging()
             CopyLayout.parseName(path.last) match
-              case Some((_, copyId)) => Future.successful(copyId)
+              case Some((_, copyId)) => cleanupStaging().map(_ => copyId)
               case None => Future.failed(new IllegalStateException(s"Rebuild of $storeId: $path is no copy name"))
           case Some((phase, path)) =>
             // Not this rebuild's output (any other phase, or Rebuilt for an earlier Rebuilding episode).
@@ -328,11 +329,13 @@ class RebuildingStore(client: AspenClient,
     f.onComplete: outcome =>
       closeBackend().onComplete(_ => completionPromise.tryComplete(outcome))
 
-  private def cleanupStaging(): Unit =
-    try
-      if FileStat.exists(stagingPath) then os.remove.all(stagingPath)
-    catch
-      case t: Throwable => logger.warn(s"Rebuild of $storeId: failed to remove $stagingPath: $t")
+  /** One device job on `io`; its Future completes on the device's thread */
+  private def staging[T](job: => T): Future[T] = io.submit(JobKind.Staging, Some(storeId))(job).future
+
+  /** Removes the staging directory, best effort: a failure is logged, and the Future succeeds either way */
+  private def cleanupStaging(): Future[Unit] =
+    staging(RebuildDisk.cleanup(stagingPath)).recover:
+      case t => logger.warn(s"Rebuild of $storeId: failed to remove $stagingPath: $t")
 
   /** Idempotent: finish() closes on the happy path, start()'s onComplete closes on every path. */
   private def closeBackend(): Future[Unit] =
@@ -355,9 +358,12 @@ class RebuildingStore(client: AspenClient,
     passStartMillis = System.currentTimeMillis()
     // The checkpoint is never deleted on restart -- reading it is what makes a restart a
     // resume.
+    staging(RebuildDisk.load(stagingPath)).flatMap(walkPass)
+
+  private def walkPass(checkpointed: Option[RebuildState]): Future[UUID] =
     // Only this episode's: a checkpoint left by an earlier Rebuilding episode of the store (re-placed away and
     // back since) describes a copy that missed everything written while the store lived elsewhere
-    val resume = RebuildState.load(stagingPath).filter: st =>
+    val resume = checkpointed.filter: st =>
       val own = st.episode == episode
       if !own then
         logger.warn(s"Rebuild of $storeId: discarding the staging checkpoint of an earlier Rebuilding episode " +
@@ -413,10 +419,8 @@ class RebuildingStore(client: AspenClient,
    *  device's `creating/`, then renamed to the staging path), after discarding whatever a pass that never
    *  checkpointed left there: without a checkpoint none of it is used. */
   private def createStaging(cfg: StoreConfig): Future[Unit] =
-    try
-      if FileStat.exists(stagingPath) then os.remove.all(stagingPath)
+    staging(RebuildDisk.cleanup(stagingPath)).flatMap: _ =>
       backends.create(cfg, stagingPath, devicePath / StoreCreation.CreatingDirectory, io)
-    catch case NonFatal(t) => Future.failed(t)
 
   /** Opens the staging store through the BackendOpener, which decides where the open runs: created just before on
    *  a first pass (createStaging), recovered on a resume. A fail-stop latches the
@@ -435,8 +439,7 @@ class RebuildingStore(client: AspenClient,
       case e: BackendStateLost =>
         logger.error(s"Rebuild of $storeId: the staging store cannot be recovered. Discarding it to start " +
                      s"over. Error: ${e.getMessage}")
-        cleanupStaging()
-        Future.failed(e)
+        cleanupStaging().flatMap(_ => Future.failed(e))
 
   /** Restores one object a peer listed as pending. None once restored (or when the restore cannot be attempted for a
    *  reason the abort latch already carries), else the read failure */
@@ -499,9 +502,8 @@ class RebuildingStore(client: AspenClient,
               // checkpoint on a full disk is fine -- losing it costs a restart from the last good
               // one, which is bounded. Losing the latch costs the store.
               latchOutOfSpace(err)
-              try checkpoint()
-              catch case t: Throwable => logger.warn(s"Rebuild of $storeId: checkpoint after ENOSPC failed: $t")
-              Future.unit
+              checkpoint().recover:
+                case t => logger.warn(s"Rebuild of $storeId: checkpoint after ENOSPC failed: $t")
             case scala.util.Failure(err) =>
               recordFailedKey(key, err)
       catch
@@ -569,16 +571,17 @@ class RebuildingStore(client: AspenClient,
     fos.flatMap: os =>
       val (objectType, metadata) = metadataOf(os)
       val localData = os.getRebuildDataForStore(storeId)
-      backend.rebuildWrite(ptr, objectType, metadata, localData.getOrElse(DataBuffer()))
-      if os.readLocks.keys.isEmpty && !os.readLocks.objectLevel then
-        Future.unit
-      else
-        // A reply held a write lock: a committed transaction its holder has not applied yet, which the lost store may
-        // have applied and acknowledged (so its finalizer marks nothing), may be missing from this copy. Recorded for
-        // repair before the restore completes, so the walk never checkpoints past an unrecorded copy. Missed at
-        // HLCTimestamp.Zero: the walk does not know the transaction, and repair defers while the lock is reported
-        client.missedUpdateMarker.mark(List(
-          RebuildingStore.missMark(storeId, ptr.id, ptr)))
+      backend.rebuildWrite(ptr, objectType, metadata, localData.getOrElse(DataBuffer())).flatMap: _ =>
+        if os.readLocks.keys.isEmpty && !os.readLocks.objectLevel then
+          Future.unit
+        else
+          // A reply held a write lock: a committed transaction its holder has not applied yet, which the lost store
+          // may have applied and acknowledged (so its finalizer marks nothing), may be missing from this copy.
+          // Recorded for repair before the restore completes, so the walk never checkpoints past an unrecorded copy.
+          // Missed at HLCTimestamp.Zero: the walk does not know the transaction, and repair defers while the lock is
+          // reported
+          client.missedUpdateMarker.mark(List(
+            RebuildingStore.missMark(storeId, ptr.id, ptr)))
 
   /** `advance`: the walk's position moves to `key` (false for the sweep, which leaves the checkpoint alone) */
   private def recordRestored(key: Key, advance: Boolean): Future[Unit] =
@@ -597,9 +600,9 @@ class RebuildingStore(client: AspenClient,
         else
           false
 
-    if checkpointNow then checkpointBestEffort("during the walk")
-    testingOnlyOnRestored()
-    Future.unit
+    // The walk waits for the checkpoint, so it never runs ahead of one in flight
+    val checkpointed = if checkpointNow then checkpointBestEffort("during the walk") else Future.unit
+    checkpointed.map(_ => testingOnlyOnRestored())
 
   private def recordFailure(objectId: ObjectId, err: Throwable): Future[Unit] =
     val (over, timedOut) = synchronized:
@@ -619,7 +622,6 @@ class RebuildingStore(client: AspenClient,
         s"Rebuild of $storeId aborted: $maxConsecutiveReadTimeouts object reads in a row timed out")
       latchAbort(cause)
       checkpointBestEffort("after consecutive read timeouts")
-      Future.unit
     else if over then
       // Something systemic is wrong -- the pool below its read threshold, most likely -- and
       // continuing only burns I/O. Abort with the checkpoint intact; the next device check
@@ -630,15 +632,16 @@ class RebuildingStore(client: AspenClient,
         s"Rebuild of $storeId aborted: more than $maxFailedObjects unreadable objects")
       latchAbort(cause)
       checkpointBestEffort("after max failures")
-      Future.unit
     else
       Future.unit
 
   /** Flush FIRST, then write the checkpoint. The reverse order would let a crash between the
-   *  two produce a checkpoint claiming objects that never reached stable storage. */
-  private def checkpoint(): Unit =
-    flushBackend()
-    saveCheckpoint()
+   *  two produce a checkpoint claiming objects that never reached stable storage. The walk's position is read
+   *  before the flush, so it names only objects the flush covers (every rebuildWrite called before it); the failed
+   *  and listed sets are read after, which can only add objects to retry or sweep. */
+  private def checkpoint(): Future[Unit] =
+    val k = synchronized(lastKey)
+    flushBackend().flatMap(_ => saveCheckpoint(k))
 
   /** Checkpoint without letting the throw out, classifying it the way a failed object write is
    *  classified.
@@ -651,23 +654,26 @@ class RebuildingStore(client: AspenClient,
    *  restoredSinceCheckpoint already reset and lastKey already advanced; on the abort paths it
    *  would unwind past a latch that has just been set.
    */
-  private def checkpointBestEffort(context: String): Unit =
-    try
-      checkpoint()
-    catch
-      case t: Throwable if isOutOfSpace(t) =>
+  private def checkpointBestEffort(context: String): Future[Unit] =
+    checkpoint().recover:
+      case t if isOutOfSpace(t) =>
         latchOutOfSpace(t)
-      case t: Throwable =>
+      case t =>
         logger.warn(s"Rebuild of $storeId: checkpoint $context failed: $t")
 
-  private def flushBackend(): Unit =
-    backend.rebuildFlush()
-    synchronized(checkpointTrace += "flush")
+  private def flushBackend(): Future[Unit] =
+    val b = synchronized(backend)
+    val flushed =
+      if b == null then Future.failed(new IllegalStateException(s"Rebuild of $storeId: staging store is closed"))
+      else
+        try b.rebuildFlush()
+        catch case NonFatal(t) => Future.failed(t)
+    flushed.map(_ => synchronized(checkpointTrace += "flush"))
 
-  private def saveCheckpoint(): Unit =
-    val (k, f, l) = synchronized((lastKey, failed, listedAllocations))
-    RebuildState.save(stagingPath, RebuildState(storeId, episode, k, f, l.values.toList))
-    synchronized(checkpointTrace += "checkpoint")
+  private def saveCheckpoint(k: Option[Key]): Future[Unit] =
+    val (f, l) = synchronized((failed, listedAllocations))
+    staging(RebuildDisk.save(stagingPath, RebuildState(storeId, episode, k, f, l.values.toList)))
+      .map(_ => synchronized(checkpointTrace += "checkpoint"))
 
   /** Retry everything the walk could not read. Anything still failing leaves the store
    *  Rebuilding for the next device check to pick up, unless an operator has accepted its loss (recordAcceptedLoss). */
@@ -714,10 +720,10 @@ class RebuildingStore(client: AspenClient,
                 // Best-effort for the same reason the walk path is: a device that fills up here has to
                 // produce the operator alert and the latch, not a generic warning. The pass fails
                 // either way, so the classification is the only thing at stake.
-                checkpointBestEffort("after retries")
-                Future.failed(new Exception(
-                  s"Rebuild of $storeId incomplete: ${remaining.size} objects still unreadable. If the pool cannot " +
-                  "supply them, `accept-rebuild-loss` lets the rebuild finish without them"))
+                checkpointBestEffort("after retries").flatMap: _ =>
+                  Future.failed(new Exception(
+                    s"Rebuild of $storeId incomplete: ${remaining.size} objects still unreadable. If the pool " +
+                    "cannot supply them, `accept-rebuild-loss` lets the rebuild finish without them"))
 
   /** Whether an operator has accepted the loss of the objects this rebuild cannot read: the store's entry on this
    *  device is Rebuilding with `acceptLoss` (AspenClient.acceptRebuildLoss). A failed read counts as no. */
@@ -758,8 +764,8 @@ class RebuildingStore(client: AspenClient,
                      s"repair: ${ids.mkString(", ")}")
     .recoverWith:
       case NonFatal(t) =>
-        checkpointBestEffort("after a failed loss record")
-        Future.failed(new Exception(s"Rebuild of $storeId: failed to record its accepted losses: $t", t))
+        checkpointBestEffort("after a failed loss record").flatMap: _ =>
+          Future.failed(new Exception(s"Rebuild of $storeId: failed to record its accepted losses: $t", t))
 
   /** Flush, close, write the completion files (its episode's phase-param.rebuilt last), drop the checkpoint, rename
    *  staging into rebuilt/ as a fresh copy id (T2), which the completion reports.
@@ -770,8 +776,10 @@ class RebuildingStore(client: AspenClient,
   private def finish(): Future[UUID] =
     val done =
       try
+        val inheritedAfter = inheritedVotesAfter(passStartMillis, horizon)
         backend.rebuildFlush()
-        closeBackend().map(_ => completeStaging())
+          .flatMap(_ => closeBackend())
+          .flatMap(_ => staging(completeStaging(inheritedAfter)))
       catch case NonFatal(t) => Future.failed(t)
     done.transform:
       case scala.util.Failure(err) if isOutOfSpace(err) =>
@@ -779,46 +787,12 @@ class RebuildingStore(client: AspenClient,
         scala.util.Failure(err)
       case other => other
 
-  /** finish's work once the staging backend is closed. Returns the fresh copy id the copy took in rebuilt/ */
-  private def completeStaging(): UUID =
+  /** finish's work once the staging backend is closed, as a device job: the abort latch's last check, then
+   *  RebuildDisk.complete. Returns the fresh copy id the copy took in rebuilt/ */
+  private def completeStaging(inheritedAfter: Long): UUID =
     testingOnlyOnFinishClosed()
     // An abort latched while the backend closed (a fail-stop of the staging store's last I/O, a cancel)
     // means the staging copy must not become the live store: the pass fails with the checkpoint left in place
     synchronized(abortCause).foreach(cause => throw cause)
-    // The rebuilt store has no Paxos state: it takes no part in transactions started before now (plus the margin)
-    writeAcceptorSince(stagingPath)
-    // Its old incarnation's commit votes may still count, with none of their locks held here: the store votes abort
-    // on what they may lock until its peers' held votes, complete from this time on, release them
-    writeInheritedVotes(stagingPath, inheritedVotesAfter(passStartMillis, horizon))
-    // A new life for the store, replacing any incarnation the staging directory carried
-    StoreIncarnationFile.writeFresh(stagingPath)
-    // Its whole transaction state: its first load drops whatever the device CRL holds under its id
-    writeEmptyCrlState(stagingPath, storeId)
-    // Last write before the move: the copy's episode, which its location in rebuilt/ reads (T2). Kept out of service
-    // there until its flip commits
-    val rebuilt = Phase.Rebuilt(rebuildCompleteContent(episode))
-    for
-      file <- CopyLayout.paramFile(rebuilt)
-      p <- CopyLayout.param(rebuilt)
-    do DurableFiles.write(stagingPath / file, p)
-    // The checkpoint, and a temp file a crash caught between its write and its rename, are kept out of the
-    // directory that is about to become a live store
-    RebuildState.removeAll(stagingPath)
-    // A fresh copy id, as every copy takes when it first enters a phase directory (P4)
-    val copyId = UUID.randomUUID()
-    val finalPath = CopyLayout.path(devicePath, storeId, copyId, rebuilt)
-    val dir = finalPath / os.up
-    if !FileStat.exists(dir) then
-      os.makeDir.all(dir)
-      DurableFiles.syncDirectory(devicePath)
-    // Durable before the store is reported in place: a device shut down and moved after this must come back with the
-    // store in rebuilt/, or an adopting host refuses it. A failed rename leaves staging whole for the next pass. One
-    // that landed but was not forced is in place all the same: reported (placedUnforced), so the host records it
-    // unsynced and flips it once a device check has forced it, rather than rebuild the store over it
-    try
-      DurableFiles.move(stagingPath, finalPath, syncDirectory)
-      logger.info(s"Rebuild of $storeId: store in place at $finalPath")
-    catch case t: DurableFiles.MoveNotForced =>
-      logger.error(s"Rebuild of $storeId: store in place at $finalPath, but its move could not be forced: $t")
-      unforcedPlacement = Some(t)
-    copyId
+    RebuildDisk.complete(stagingPath, devicePath, storeId, episode, inheritedAfter, syncDirectory,
+                         t => unforcedPlacement = Some(t))

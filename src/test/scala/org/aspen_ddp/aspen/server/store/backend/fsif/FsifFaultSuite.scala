@@ -195,6 +195,10 @@ class FsifFaultSuite extends FileBasedTests:
   private def guarded[A](body: => A): Try[A] =
     Try(Await.result(Future(body)(using ExecutionContext.global), Timeout))
 
+  /** guarded for a call that returns a Future: started on another thread, its outcome awaited with a timeout */
+  private def guardedF[A](body: => Future[A]): Try[A] =
+    Try(Await.result(Future.delegate(body)(using ExecutionContext.global), Timeout))
+
   private def isJournal(name: String): Boolean = name.startsWith("journal")
 
   // ---- The brief's four tests (the production timer, retrying every 10 ms) ----
@@ -422,19 +426,19 @@ class FsifFaultSuite extends FileBasedTests:
 
   test("after a data force fails with a rebuild write unmapped, that incarnation refuses further rebuild work"):
     val h = new Harness
-    h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1)))
+    h.await(h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1))))
     h.files.failNext(Fault.OutOfSpace, isData, Set(FaultOp.Force)) // drops the segment just written
-    val fl = guarded(h.backend.rebuildFlush())
+    val fl = guardedF(h.backend.rebuildFlush())
     FsifIo.isOutOfSpace(fl.failed.get) shouldBe true
     // Space is back, but a flush now would map a segment that is not on disk
-    val w = guarded(h.backend.rebuildWrite(ptr(2, oid(2)), ObjectType.Data, md(1), DataBuffer(bytes(30, 2))))
+    val w = guardedF(h.backend.rebuildWrite(ptr(2, oid(2)), ObjectType.Data, md(1), DataBuffer(bytes(30, 2))))
     FsifIo.isOutOfSpace(w.failed.get) shouldBe true
-    val again = guarded(h.backend.rebuildFlush())
+    val again = guardedF(h.backend.rebuildFlush())
     FsifIo.isOutOfSpace(again.failed.get) shouldBe true
     h.crash() // a new incarnation resumes the rebuild from scratch
     h.read(ptr(1, oid(1))) shouldBe Right(ReadError.ObjectNotFound)
-    h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1)))
-    guarded(h.backend.rebuildFlush()).get
+    h.await(h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1))))
+    guardedF(h.backend.rebuildFlush()).get
     h.crash()
     h.readData(ptr(1, oid(1))) shouldBe bytes(30, 1).toList
 
@@ -689,22 +693,22 @@ class FsifFaultSuite extends FileBasedTests:
       val h = new Harness
       val full = new AtomicBoolean(true)
       h.files.failWhile(Fault.OutOfSpace, isJournal)(full.get)
-      h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1)))
-      val r = guarded(h.backend.rebuildFlush()) // its Mappings' batch is held: frozen
+      h.await(h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1))))
+      val r = guardedF(h.backend.rebuildFlush()) // its Mappings' batch is held: frozen
       r.isFailure shouldBe true
       FsifIo.isOutOfSpace(r.failed.get) shouldBe true
       h.backend.isWriteFrozen shouldBe true
-      val w = guarded(h.backend.rebuildWrite(ptr(2, oid(2)), ObjectType.Data, md(1), DataBuffer(bytes(30, 2))))
+      val w = guardedF(h.backend.rebuildWrite(ptr(2, oid(2)), ObjectType.Data, md(1), DataBuffer(bytes(30, 2))))
       w.isFailure shouldBe true
       FsifIo.isOutOfSpace(w.failed.get) shouldBe true
-      val again = guarded(h.backend.rebuildFlush())
+      val again = guardedF(h.backend.rebuildFlush())
       again.isFailure shouldBe true
       FsifIo.isOutOfSpace(again.failed.get) shouldBe true
       // Once space returns, the held Mapping lands and a flush succeeds
       full.set(false)
       h.quiesce()
       h.backend.isWriteFrozen shouldBe false
-      guarded(h.backend.rebuildFlush()).get
+      guardedF(h.backend.rebuildFlush()).get
       h.crash()
       h.readData(ptr(1, oid(1))) shouldBe bytes(30, 1).toList
       h.read(ptr(2, oid(2))) shouldBe Right(ReadError.ObjectNotFound)
@@ -713,15 +717,15 @@ class FsifFaultSuite extends FileBasedTests:
       val h = new Harness
       val full = new AtomicBoolean(true)
       h.files.failWhile(Fault.OutOfSpace, _ == FsifRecovery.DataFile)(full.get)
-      val w = guarded(h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1))))
+      val w = guardedF(h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1))))
       w.isFailure shouldBe true
       FsifIo.isOutOfSpace(w.failed.get) shouldBe true
-      val fl = guarded(h.backend.rebuildFlush()) // data's force fails too
+      val fl = guardedF(h.backend.rebuildFlush()) // data's force fails too
       fl.isFailure shouldBe true
       FsifIo.isOutOfSpace(fl.failed.get) shouldBe true
       full.set(false)
-      h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1)))
-      guarded(h.backend.rebuildFlush()).get
+      h.await(h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1))))
+      guardedF(h.backend.rebuildFlush()).get
       h.fatals.isEmpty shouldBe true
       h.crash()
       h.readData(ptr(1, oid(1))) shouldBe bytes(30, 1).toList

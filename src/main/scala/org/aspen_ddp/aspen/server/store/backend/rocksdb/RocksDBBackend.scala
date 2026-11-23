@@ -17,6 +17,7 @@ import scribe.Logging
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.*
 import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 import scala.language.implicitConversions
 
 object RocksDBBackend extends Logging {
@@ -258,12 +259,14 @@ class RocksDBBackend(dbPath: os.Path,
   override def rebuildWrite(pointer: ObjectPointer,
                             objectType: ObjectType.Value,
                             metadata: Metadata,
-                            data: DataBuffer): Unit =
-    val key = tokey(pointer.id)
-    val value = encodeDBValue(objectType, metadata, data)
-    db.rebuildWrite(key, value)
+                            data: DataBuffer): Future[Unit] =
+    try
+      val key = tokey(pointer.id)
+      val value = encodeDBValue(objectType, metadata, data)
+      db.rebuildWrite(key, value)
+    catch case NonFatal(t) => Future.failed(t)
 
-  override def rebuildFlush(): Unit = db.rebuildFlush()
+  override def rebuildFlush(): Future[Unit] = db.rebuildFlush()
 
   /** Reads the stored value of a key. Overridable so tests may inject read failures. */
   protected def getValue(key: Array[Byte]): Future[Option[Array[Byte]]] = db.get(key)

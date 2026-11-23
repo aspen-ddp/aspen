@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.RebuildOutcome
-import org.aspen_ddp.aspen.server.rebuild.{RebuildState, RebuildingStore, StoreRebuild, StoreRebuildFactory}
+import org.aspen_ddp.aspen.server.rebuild.{RebuildDisk, RebuildState, RebuildingStore, StoreRebuild, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
 
 import java.util.UUID
@@ -574,7 +574,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with ControlFixture:
     val staging = deviceDir / RebuildingStore.RebuildDirectory / storeId.directoryName
     os.makeDir.all(staging)
     os.write.over(staging / "data", "walked")
-    RebuildState.save(staging, RebuildState(storeId, None, Some(Key(Array[Byte](1))), Nil, Nil))
+    RebuildDisk.save(staging, RebuildState(storeId, None, Some(Key(Array[Byte](1))), Nil, Nil))
     staging
 
   atest("a copy no rebuild produced discards the staging checkpoint before it is retired (RB-W21)"):

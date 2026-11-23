@@ -7,8 +7,8 @@ import java.util.concurrent.{Executors, ThreadFactory}
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.mutable
-import scala.concurrent.{Await, ExecutionContext, Future, Promise}
-import scala.concurrent.duration.{Duration, FiniteDuration}
+import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.duration.FiniteDuration
 import scala.util.{Failure, Success, Try}
 import scala.util.control.NonFatal
 
@@ -18,7 +18,7 @@ import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitError, CommitState, CompletionHandler, Read,
-  RepairSlotOccupied, RetryScheduler, SharedRetryScheduler, UpdateForm}
+  RebuildSequence, RepairSlotOccupied, RetryScheduler, SharedRetryScheduler, UpdateForm}
 
 /** A store backend that keeps every object slice in a fixed-size segment of one flat `data` file, located through an
   * in-memory index map that is journaled and checkpointed. See docs/superpowers/specs/2026-10-29-fsif-backend-design.md.
@@ -118,8 +118,8 @@ class FsifBackend(val storeId: StoreId,
   private val unmapping = mutable.HashMap[Int, Future[Unit]]()
   /** Rebuild writes whose Mapping is appended by the next rebuildFlush: ext -> (slot, id) */
   private val rebuildMaps = mutable.LinkedHashMap[Int, (Int, ObjectId)]()
-  /** Serializes rebuildWrite / rebuildFlush callers, whose segment writes run on the calling thread */
-  private val rebuildLock = new Object
+  /** Runs rebuildWrite / rebuildFlush one at a time, in call order */
+  private val rebuildSequence = new RebuildSequence
 
   // ---- Out-of-space freeze and backpressure, owned by serial ----
   /** Some operation's I/O failed with ENOSPC and has not yet succeeded on a retry */
@@ -394,106 +394,133 @@ class FsifBackend(val storeId: StoreId,
         release()
         reply(r)))
 
-  /** Rebuild only: the store is not live, so nothing else touches X's slot. Writes the segment in place on the
-    * calling thread and buffers the Mapping for `rebuildFlush`. Throws IllegalArgumentException on an invalid pointer
-    * or a slice larger than a segment, and an out-of-space IOException while writes are frozen or if the write itself
-    * hits ENOSPC (DESIGN.md 2.12: RebuildingStore handles it; the store does not wait for space).
+  /** Rebuild only: the store is not live, so nothing else touches X's slot. Takes the slot on serial, writes the
+    * segment in place on `io` (IoKind.RebuildWrite) and buffers the Mapping for `rebuildFlush`; the Future completes
+    * once the write has returned (unforced). Fails with IllegalArgumentException on an invalid pointer or a slice
+    * larger than a segment, and with an out-of-space IOException while writes are frozen or if the write itself hits
+    * ENOSPC (DESIGN.md 2.12: RebuildingStore handles it; the store does not wait for space). Rebuild writes and
+    * flushes run one at a time in call order (`rebuildSequence`).
     */
   override def rebuildWrite(pointer: ObjectPointer, objectType: ObjectType.Value, metadata: Metadata,
-                            data: DataBuffer): Unit =
-    val x = decodeStorePointer(pointer.storePointer, layout.segmentCount).getOrElse:
-      throw new IllegalArgumentException(s"invalid FSIF store pointer in $pointer")
-    if data.size > layout.segmentPayloadSize then
-      throw new IllegalArgumentException(
-        s"slice of ${data.size} bytes exceeds the segment payload size ${layout.segmentPayloadSize}")
-    val header = SegmentHeader.forSlice(objectType, pointer.id, x, metadata, data)
-    val segment = SegmentHeader.encode(header) ++ data.getByteArray
-    rebuildLock.synchronized:
-      throwIfRebuildLost()
-      val (slot, fresh) = onSerialSync:
-        throwIfFatal()
-        throwIfFrozen()
-        compaction.cancel(x) // the segment is written to X's slot directly, bypassing a move's copy
-        rebuildMaps.get(x) match
-          case Some((s, _)) =>
-            rebuildMaps(x) = (s, pointer.id)
-            (s, false)
-          case None =>
-            val mapped = index.slots(x) >= 0
-            val s = if mapped then index.slots(x) else allocateSlot()
-            rebuildMaps(x) = (s, pointer.id)
-            (s, !mapped)
-      try dataFile.write(layout.slotOffset(slot), segment)
-      catch
-        case NonFatal(t) =>
-          // A slot taken for this write alone is released, so the next flush never maps an unwritten segment.
-          // Otherwise the slot holds an earlier or mapped copy of X that the resumed rebuild writes again.
-          if fresh then
-            onSerialSync:
-              if rebuildMaps.get(x).exists(_._1 == slot) then
-                rebuildMaps.remove(x)
-                used.clear(slot)
-          throw t
+                            data: DataBuffer): Future[Unit] =
+    try
+      val x = decodeStorePointer(pointer.storePointer, layout.segmentCount).getOrElse:
+        throw new IllegalArgumentException(s"invalid FSIF store pointer in $pointer")
+      if data.size > layout.segmentPayloadSize then
+        throw new IllegalArgumentException(
+          s"slice of ${data.size} bytes exceeds the segment payload size ${layout.segmentPayloadSize}")
+      val header = SegmentHeader.forSlice(objectType, pointer.id, x, metadata, data)
+      val segment = SegmentHeader.encode(header) ++ data.getByteArray
+      rebuildSequence.next(() => startRebuildWrite(x, pointer.id, segment))
+    catch case NonFatal(t) => Future.failed(t)
 
-  /** Forces `data`, then appends and forces the buffered Mappings (durable-before-map), then checkpoints. Throws an
-    * out-of-space IOException if `data`'s force hits ENOSPC, or if the store is frozen before the Mappings are durable
-    * or the checkpoint has finished (DESIGN.md 2.12). Mappings already appended then stay held and land once space
-    * returns. A force failure may have dropped rebuild writes not yet mapped, so after one this incarnation throws
-    * on every later rebuildWrite and rebuildFlush.
+  private def startRebuildWrite(x: Int, id: ObjectId, segment: Array[Byte]): Future[Unit] =
+    if rebuildLost then
+      Future.failed(rebuildLostError())
+    else
+      val done = Promise[Unit]()
+      serial.execute: () =>
+        val claimed = Try:
+          throwIfFatal()
+          throwIfFrozen()
+          compaction.cancel(x) // the segment is written to X's slot directly, bypassing a move's copy
+          rebuildMaps.get(x) match
+            case Some((s, _)) =>
+              rebuildMaps(x) = (s, id)
+              (s, false)
+            case None =>
+              val mapped = index.slots(x) >= 0
+              val s = if mapped then index.slots(x) else allocateSlot()
+              rebuildMaps(x) = (s, id)
+              (s, !mapped)
+        claimed match
+          case Failure(t) => done.failure(t)
+          case Success((slot, fresh)) =>
+            // A slot taken for this write alone is released, so the next flush never maps an unwritten segment.
+            // Otherwise the slot holds an earlier or mapped copy of X that the resumed rebuild writes again.
+            def failed(t: Throwable): Unit =
+              if fresh then
+                serial.execute: () =>
+                  if rebuildMaps.get(x).exists(_._1 == slot) then
+                    rebuildMaps.remove(x)
+                    used.clear(slot)
+                  done.failure(t)
+              else
+                done.failure(t)
+            try
+              io.execute(new IoTask(IoKind.RebuildWrite, () =>
+                try
+                  dataFile.write(layout.slotOffset(slot), segment)
+                  done.success(())
+                catch case NonFatal(t) => failed(t)))
+            catch case NonFatal(t) => failed(t)
+      done.future
+
+  /** Forces `data`, then appends and forces the buffered Mappings (durable-before-map), then checkpoints, each step
+    * chained on serial and `io` (no caller waits). Fails with an out-of-space IOException if `data`'s force hits
+    * ENOSPC, or if the store is frozen before the Mappings are durable or the checkpoint has finished (DESIGN.md
+    * 2.12). Mappings already appended then stay held and land once space returns. A force failure may have dropped
+    * rebuild writes not yet mapped, so after one this incarnation fails every later rebuildWrite and rebuildFlush.
+    * Covers every rebuildWrite called before it (`rebuildSequence`).
     */
-  override def rebuildFlush(): Unit =
-    rebuildLock.synchronized:
-      throwIfRebuildLost()
+  override def rebuildFlush(): Future[Unit] = rebuildSequence.next(() => startRebuildFlush())
+
+  private def startRebuildFlush(): Future[Unit] =
+    given ExecutionContext = ExecutionContext.parasitic
+    if rebuildLost then
+      Future.failed(rebuildLostError())
+    else
       val forced = Promise[Unit]()
-      onSerialSync:
+      onSerial:
         throwIfFatal()
         forceData(IoKind.DataForce)(r => forced.tryComplete(r))
       // A failure with ENOSPC set rebuildLost (dataLost) if any rebuild write was waiting for this force
-      Await.result(forced.future, Duration.Inf)
-      val appended = Promise[Unit]()
-      onSerialSync:
-        throwIfFatal()
-        throwIfFrozen()
-        addFreezeWaiter(appended)
-        val maps = rebuildMaps.toList
-        rebuildMaps.clear()
-        maps.foreach:
-          case (x, (slot, id)) =>
-            compaction.cancel(x)
-            assign(x, slot, id)
-        if maps.isEmpty then
-          appended.success(())
-        else
-          // In chunks, each admitted under the journal's hard limit; they land in order, so the last one durable
-          // means all are. The one exception to "a held operation has mutated nothing": the assigns above run
-          // before the chunks are admitted. That is safe: the store is not live, data was forced before any assign
-          // (durable-before-map holds for any index snapshot), no Delta's cancellation depends on these Mappings,
-          // and a checkpoint's Barrier waits only on real appends.
-          val chunks = maps.map { case (x, (slot, id)) => JournalRecord.Mapping(x, slot, id) }
-            .grouped(RebuildMappingsPerAppend).toList
-          val done = chunks.map: records =>
-            val p = Promise[Unit]()
-            admitted(JournalFormat.BatchOverhead + records.size.toLong * JournalFormat.MappingRecordSize): release =>
-              if fatal.isDefined then
-                release()
-                p.tryFailure(new IOException(s"FSIF store $storeId has failed", fatal.get))
-              else
-                onDurable(appendRecords(records)): r =>
+      .flatMap(_ => forced.future)
+      .flatMap: _ =>
+        val appended = Promise[Unit]()
+        onSerial:
+          throwIfFatal()
+          throwIfFrozen()
+          addFreezeWaiter(appended)
+          val maps = rebuildMaps.toList
+          rebuildMaps.clear()
+          maps.foreach:
+            case (x, (slot, id)) =>
+              compaction.cancel(x)
+              assign(x, slot, id)
+          if maps.isEmpty then
+            appended.success(())
+          else
+            // In chunks, each admitted under the journal's hard limit; they land in order, so the last one durable
+            // means all are. The one exception to "a held operation has mutated nothing": the assigns above run
+            // before the chunks are admitted. That is safe: the store is not live, data was forced before any assign
+            // (durable-before-map holds for any index snapshot), no Delta's cancellation depends on these Mappings,
+            // and a checkpoint's Barrier waits only on real appends.
+            val chunks = maps.map { case (x, (slot, id)) => JournalRecord.Mapping(x, slot, id) }
+              .grouped(RebuildMappingsPerAppend).toList
+            val done = chunks.map: records =>
+              val p = Promise[Unit]()
+              admitted(JournalFormat.BatchOverhead + records.size.toLong * JournalFormat.MappingRecordSize): release =>
+                if fatal.isDefined then
                   release()
-                  p.tryComplete(r)
-            p.future
-          // A freeze may have failed it first
-          Future.sequence(done)(using implicitly, ExecutionContext.parasitic)
-            .onComplete(r => appended.tryComplete(r.map(_ => ())))(using ExecutionContext.parasitic)
-      // Completes when durable, on fail-stop, or with out-of-space when the store freezes
-      Await.result(appended.future, Duration.Inf)
-      val checkpointed = Promise[Unit]()
-      onSerialSync:
-        throwIfFatal()
-        throwIfFrozen()
-        addFreezeWaiter(checkpointed)
-        startCheckpoint().onComplete(r => checkpointed.tryComplete(r))(using ExecutionContext.parasitic)
-      Await.result(checkpointed.future, Duration.Inf)
+                  p.tryFailure(new IOException(s"FSIF store $storeId has failed", fatal.get))
+                else
+                  onDurable(appendRecords(records)): r =>
+                    release()
+                    p.tryComplete(r)
+              p.future
+            // A freeze may have failed it first
+            Future.sequence(done).onComplete(r => appended.tryComplete(r.map(_ => ())))
+        // Completes when durable, on fail-stop, or with out-of-space when the store freezes
+        .flatMap(_ => appended.future)
+      .flatMap: _ =>
+        val checkpointed = Promise[Unit]()
+        onSerial:
+          throwIfFatal()
+          throwIfFrozen()
+          addFreezeWaiter(checkpointed)
+          startCheckpoint().onComplete(r => checkpointed.tryComplete(r))
+        .flatMap(_ => checkpointed.future)
 
   // ---- Serial plumbing ----
 
@@ -525,10 +552,11 @@ class FsifBackend(val storeId: StoreId,
       maybeForceData()
       checkQuiesce()
 
-  private def onSerialSync[A](f: => A): A =
+  /** Runs `f` on serial (outside `guarded`, as a caller's bookkeeping); the Future carries its result or throw */
+  private def onSerial[A](f: => A): Future[A] =
     val p = Promise[A]()
     serial.execute(() => p.complete(Try(f)))
-    Await.result(p.future, Duration.Inf)
+    p.future
 
   private def throwIfFatal(): Unit =
     fatal.foreach(t => throw new IOException(s"FSIF store $storeId has failed", t))
@@ -537,10 +565,9 @@ class FsifBackend(val storeId: StoreId,
     if frozen then
       throw outOfSpace()
 
-  private def throwIfRebuildLost(): Unit =
-    if rebuildLost then
-      throw new IOException(s"No space left on device: a force of FSIF store $storeId's data failed, so rebuild " +
-        "writes since the last rebuildFlush may be lost; reopen the store to resume the rebuild")
+  private def rebuildLostError(): IOException =
+    new IOException(s"No space left on device: a force of FSIF store $storeId's data failed, so rebuild " +
+      "writes since the last rebuildFlush may be lost; reopen the store to resume the rebuild")
 
   /** Matches FsifIo.isOutOfSpace and RebuildingStore's out-of-space test */
   private def outOfSpace(): IOException =
@@ -1679,7 +1706,7 @@ object FsifBackend:
   final class OperationFailed(msg: String) extends Exception(msg)
 
   private[fsif] enum IoKind:
-    case Read, InPlace, Cow, Journal, Checkpoint, MoveRead, MoveWrite, MoveForce, DataForce
+    case Read, InPlace, Cow, Journal, Checkpoint, MoveRead, MoveWrite, MoveForce, DataForce, RebuildWrite
 
   /** Test counters: moves started, moves whose Map(X, f) is durable, and moves cancelled */
   private[fsif] final case class CompactionStats(started: Int, mapped: Int, cancelled: Int, readFailures: Int)

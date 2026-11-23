@@ -258,7 +258,7 @@ class FsifBackendSuite extends FileBasedTests:
         h.repair(overwrite(p, bytes(10, 2), 2)).isFailure shouldBe true
         h.repairDelete(p.id, b).isSuccess shouldBe true
         an[IllegalArgumentException] should be thrownBy
-          h.backend.rebuildWrite(p, ObjectType.Data, md(2), DataBuffer(bytes(10, 2)))
+          h.await(h.backend.rebuildWrite(p, ObjectType.Data, md(2), DataBuffer(bytes(10, 2))))
     h.readData(good).toList shouldBe bytes(10, 1).toList
     h.fatals.isEmpty shouldBe true
 
@@ -279,10 +279,10 @@ class FsifBackendSuite extends FileBasedTests:
     h.commit(append(a, aData, Array[Byte](1), 3)) shouldBe Right(CommitError.SliceTooLarge)
     h.repair(overwrite(a, big, 3)).isFailure shouldBe true
     an[IllegalArgumentException] should be thrownBy
-      h.backend.rebuildWrite(a, ObjectType.Data, md(3), DataBuffer(big))
+      h.await(h.backend.rebuildWrite(a, ObjectType.Data, md(3), DataBuffer(big)))
     an[IllegalArgumentException] should be thrownBy
-      h.backend.rebuildWrite(ptr(2, oid(3)), ObjectType.Data, md(3), DataBuffer(big))
-    h.backend.rebuildFlush()
+      h.await(h.backend.rebuildWrite(ptr(2, oid(3)), ObjectType.Data, md(3), DataBuffer(big)))
+    h.await(h.backend.rebuildFlush())
     h.quiesce()
     h.readData(a).toList shouldBe aData.toList
     h.readData(b).toList shouldBe bData.toList
@@ -652,11 +652,11 @@ class FsifBackendSuite extends FileBasedTests:
     val h = new Harness
     val a = ptr(10, oid(10))
     val b = ptr(11, oid(11))
-    h.backend.rebuildWrite(a, ObjectType.Data, md(1), DataBuffer(bytes(300, 1)))
-    h.backend.rebuildWrite(b, ObjectType.KeyValue, md(2), DataBuffer(bytes(30, 2)))
+    h.await(h.backend.rebuildWrite(a, ObjectType.Data, md(1), DataBuffer(bytes(300, 1))))
+    h.await(h.backend.rebuildWrite(b, ObjectType.KeyValue, md(2), DataBuffer(bytes(30, 2))))
     // A resumed walk revisits a key: it overwrites the same slot
-    h.backend.rebuildWrite(a, ObjectType.Data, md(3), DataBuffer(bytes(250, 3)))
-    h.backend.rebuildFlush()
+    h.await(h.backend.rebuildWrite(a, ObjectType.Data, md(3), DataBuffer(bytes(250, 3))))
+    h.await(h.backend.rebuildFlush())
     h.slotOccupant(0) shouldBe Some(oid(10))
     h.slotOccupant(1) shouldBe Some(oid(11))
     h.slotOccupant(2) shouldBe None

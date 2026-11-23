@@ -1,8 +1,19 @@
 ### Store rebuilds
 - Files: `RebuildingStore.scala` (the pass: walk, restore, retry, finish; the files a rebuilt copy carries),
   `PendingAllocationSweep.scala` (the peer query for allocations held unfinalized and the direct restore of those
-  objects, reaching the pass through callbacks), `RebuildState.scala` (checkpoint), `StoreRebuild.scala`.
+  objects, reaching the pass through callbacks), `RebuildState.scala` (checkpoint format), `RebuildDisk.scala` (all
+  staging disk work: the checkpoint's `save`/`load`/`removeAll`, `cleanup`, finish's `complete`), `StoreRebuild.scala`.
   `RebuildingStore.missMark` builds the ErrorTree mark (missed at `HLCTimestamp.Zero`) every rebuild record uses
+- Staging I/O runs on the destination device (`io`, the destination's `DeviceIo`): every `RebuildDisk` call is a
+  `JobKind.Staging` job on its management lane (`RebuildingStore.staging`), and the staging backend's writes, flushes
+  and close are Futures on its data/serial pools (`Backend.rebuildWrite`/`rebuildFlush`, `server/store/CLAUDE.md`).
+  Nothing waits (no `Await`); `client.clientContext` only composes the pass and runs the peer reads, so a hung
+  destination stalls only its rebuild, never the client pool or the control thread (the constructor's `start` does
+  no disk work: the checkpoint load, an in-place copy's staging cleanup and everything after are jobs). The walk
+  waits for each checkpoint (`recordRestored`'s Future), and a checkpoint reads the walk's position before its flush,
+  so it never names an object the flush does not cover. Every best-effort checkpoint before a failed pass completes
+  before the failure. `RebuildingStoreIoSuite` holds the destination in lockstep (`LockstepThreading.hold`) to show
+  the checkpoint waiting there and a staging write waiting on the data pool while client transactions commit
 - A rebuilt store lost its Paxos acceptor state. `RebuildingStore.finish` writes `acceptor-since` (finish time plus
   `AcceptorSinceMargin`, 10 s) into its directory; how the Frontend enforces it: `server/store/CLAUDE.md`. The
   margin covers `Frontend.MaxStartLead` (2 s) plus host-to-host clock skew; client clocks do not enter into it.

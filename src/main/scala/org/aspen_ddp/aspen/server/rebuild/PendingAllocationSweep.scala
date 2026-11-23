@@ -32,7 +32,7 @@ object PendingAllocationSweep:
   * @param aborted whether the pass is aborted, which ends every wait
   * @param abortCause the pass's abort cause, if latched
   * @param restore restores one object: None once restored, else the read failure (RebuildingStore.restorePending)
-  * @param checkpoint best-effort checkpoint of the pass's progress, given the context for its log line
+  * @param checkpoint best-effort checkpoint of the pass's progress, given the context for its log line; never fails
   */
 final class PendingAllocationSweep(storeId: StoreId,
                                    client: AspenClient,
@@ -41,7 +41,7 @@ final class PendingAllocationSweep(storeId: StoreId,
                                    aborted: () => Boolean,
                                    abortCause: () => Option[Throwable],
                                    restore: ObjectPointer => Future[Option[Throwable]],
-                                   checkpoint: String => Unit)
+                                   checkpoint: String => Future[Unit])
                                   (using ec: ExecutionContext) extends Logging:
 
   /** The allocations this pool's other stores hold unfinalized, by transaction, once `width - writeThreshold + 1` of
@@ -114,8 +114,7 @@ final class PendingAllocationSweep(storeId: StoreId,
         now <- queryPeers(ida).recoverWith:
                  case e: RebuildingStore.PeerQueryTimedOut =>
                    // The walk is done: keep its progress for the next pass, which sweeps the listed set again
-                   checkpoint("after a timed-out peer query")
-                   Future.failed(e)
+                   checkpoint("after a timed-out peer query").flatMap(_ => Future.failed(e))
         settled <- Future.sequence(pending.values.toList.map(p => settle(p, now.get(p.transactionId))))
         remaining = settled.flatten.map(p => p.transactionId -> p).toMap
         _ <- nextRound(ida, remaining, round, deadlineMillis)
@@ -146,5 +145,5 @@ final class PendingAllocationSweep(storeId: StoreId,
                 s"(${remaining.keys.take(5).mkString(", ")})")
     client.missedUpdateMarker.mark(marks).recoverWith:
       case NonFatal(t) =>
-        checkpoint("after a failed unsettled-allocation record")
-        Future.failed(new Exception(s"Rebuild of $storeId: failed to record its unsettled allocations: $t", t))
+        checkpoint("after a failed unsettled-allocation record").flatMap: _ =>
+          Future.failed(new Exception(s"Rebuild of $storeId: failed to record its unsettled allocations: $t", t))

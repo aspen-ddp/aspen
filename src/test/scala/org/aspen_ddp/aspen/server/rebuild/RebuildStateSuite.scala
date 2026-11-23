@@ -32,8 +32,8 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
   test("a state with no progress round-trips"):
     val dir = tmpDir()
     val state = RebuildState(storeId, None, None, Nil, Nil)
-    RebuildState.save(dir, state)
-    RebuildState.load(dir) should be(Some(state))
+    RebuildDisk.save(dir, state)
+    RebuildDisk.load(dir) should be(Some(state))
 
   test("a state with a checkpoint and failures round-trips"):
     val dir = tmpDir()
@@ -44,8 +44,8 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
       List(objectId("22222222-2222-2222-2222-222222222222"),
            objectId("33333333-3333-3333-3333-333333333333")),
       Nil)
-    RebuildState.save(dir, state)
-    val loaded = RebuildState.load(dir).get
+    RebuildDisk.save(dir, state)
+    val loaded = RebuildDisk.load(dir).get
     loaded.storeId should be(storeId)
     loaded.lastRestoredKey.map(_.bytes.toList) should be(Some(key.bytes.toList))
     loaded.failedObjects should be(state.failedObjects)
@@ -58,30 +58,30 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
     val pending = List(
       PendingAllocation(TransactionId(UUID.fromString("44444444-4444-4444-4444-444444444444")), true, List(data, kv)),
       PendingAllocation(TransactionId(UUID.fromString("77777777-7777-7777-7777-777777777777")), false, Nil))
-    RebuildState.save(dir, RebuildState(storeId, None, None, Nil, pending))
-    val loaded = RebuildState.load(dir).get.pendingAllocations
+    RebuildDisk.save(dir, RebuildState(storeId, None, None, Nil, pending))
+    val loaded = RebuildDisk.load(dir).get.pendingAllocations
     loaded.map(p => (p.transactionId, p.committed)) should be(pending.map(p => (p.transactionId, p.committed)))
     loaded.map(_.pointers.map(_.toArray.toList)) should be(pending.map(_.pointers.map(_.toArray.toList)))
 
   test("a checkpoint without its pending allocations does not load, so its pass starts over"):
     val dir = tmpDir()
     os.write(dir / RebuildState.stateFilename, s"store-id: $storeId\nfailed-objects: []\n")
-    RebuildState.load(dir) should be(None)
+    RebuildDisk.load(dir) should be(None)
 
   test("load returns None when no checkpoint exists"):
-    RebuildState.load(tmpDir()) should be(None)
+    RebuildDisk.load(tmpDir()) should be(None)
 
   test("save overwrites an existing checkpoint"):
     val dir = tmpDir()
-    RebuildState.save(dir, RebuildState(storeId, None, Some(Key(Array[Byte](1))), Nil, Nil))
-    RebuildState.save(dir, RebuildState(storeId, None, Some(Key(Array[Byte](2))), Nil, Nil))
-    RebuildState.load(dir).get.lastRestoredKey.map(_.bytes.toList) should be(Some(List[Byte](2)))
+    RebuildDisk.save(dir, RebuildState(storeId, None, Some(Key(Array[Byte](1))), Nil, Nil))
+    RebuildDisk.save(dir, RebuildState(storeId, None, Some(Key(Array[Byte](2))), Nil, Nil))
+    RebuildDisk.load(dir).get.lastRestoredKey.map(_.bytes.toList) should be(Some(List[Byte](2)))
 
   test("save replaces the checkpoint by rename rather than truncating it in place"):
     val dir = tmpDir()
-    RebuildState.save(dir, RebuildState(storeId, None, Some(Key(Array[Byte](1))), Nil, Nil))
+    RebuildDisk.save(dir, RebuildState(storeId, None, Some(Key(Array[Byte](1))), Nil, Nil))
     val first = fileKey(dir / RebuildState.stateFilename)
-    RebuildState.save(dir, RebuildState(storeId, None, Some(Key(Array[Byte](2))), Nil, Nil))
+    RebuildDisk.save(dir, RebuildState(storeId, None, Some(Key(Array[Byte](2))), Nil, Nil))
     val second = fileKey(dir / RebuildState.stateFilename)
 
     // Aspen is crash-only, so a crash between a truncate and the write that follows it is the
@@ -92,7 +92,7 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
     second should not be first
     // The scratch file is renamed away, not left behind.
     os.exists(dir / RebuildState.tempFilename) should be(false)
-    RebuildState.load(dir).get.lastRestoredKey.map(_.bytes.toList) should be(Some(List[Byte](2)))
+    RebuildDisk.load(dir).get.lastRestoredKey.map(_.bytes.toList) should be(Some(List[Byte](2)))
 
   test("load returns None for an unparsable checkpoint"):
     // A checkpoint torn by a crash predating the atomic save, in the shapes it can take: the
@@ -111,15 +111,15 @@ class RebuildStateSuite extends AnyFunSuite with Matchers:
       withClue(s"$name: ") {
         // Total, not throwing: load is the first statement of a rebuild pass, so a throw here
         // makes the store permanently unrebuildable without an operator deleting the file.
-        RebuildState.load(dir) should be(None)
+        RebuildDisk.load(dir) should be(None)
       }
 
   test("removeAll drops the checkpoint and any scratch file, and tolerates neither existing"):
     val dir = tmpDir()
-    RebuildState.removeAll(dir)
+    RebuildDisk.removeAll(dir)
     os.write.over(dir / RebuildState.stateFilename, "anything")
     os.write.over(dir / RebuildState.tempFilename, "anything")
-    RebuildState.removeAll(dir)
+    RebuildDisk.removeAll(dir)
     os.exists(dir / RebuildState.stateFilename) should be(false)
     os.exists(dir / RebuildState.tempFilename) should be(false)
 

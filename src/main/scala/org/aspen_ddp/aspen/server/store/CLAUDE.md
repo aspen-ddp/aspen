@@ -330,6 +330,14 @@
   fails with `backend.RepairSlotOccupied(objectId, occupant)`, which the repairer uses to drop a dead occupant
   (cross-document-review 2.4, repair and transactions). FSIF pools allocate through `FsifIndexAllocationStrategy`
   (`client/internal/allocation/CLAUDE.md`)
+- Rebuild entry points (`Backend.rebuildWrite`/`rebuildFlush`) return Futures and never block their caller; no
+  `Await` remains on any rebuild path (`RebuildingStoreIoSuite` scans for one). Each backend runs its rebuild calls
+  one at a time in call order (`backend.RebuildSequence`), so a flush covers every write called before it. A write's
+  Future completes once the write is issued as far as the old blocking call had gone (unforced: RocksDB's plain put,
+  FSIF's segment write on `io` with its Mapping buffered); a flush's once everything before it is durable (RocksDB:
+  memtable flush waited for; FSIF: data force, Mappings' appends, checkpoint, chained on serial). RocksDB runs both on
+  `io.dataEc` without holding the `BufferedConsistentRocksDB` monitor (only `beginOperation`/`endOperation`, so a close
+  waits for them). A bad pointer, oversized slice or out-of-space store fails the Future rather than throwing
 - Opening is backend-neutral (`BackendOpener`; only `DefaultBackendOpener` names concrete backends): see
   `server/host/CLAUDE.md`
 - Backend executors: every `BackendOpener.open`/`create` takes the device's `DeviceIo` and runs as a job on its

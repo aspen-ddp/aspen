@@ -1,15 +1,12 @@
 package org.aspen_ddp.aspen.server.rebuild
 
 import org.aspen_ddp.aspen.common.network.PendingAllocation
-import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
-import scribe.Logging
 
 import java.util.{HexFormat, UUID}
-import scala.util.control.NonFatal
 
 /** The `rebuild-state.yaml` checkpoint, written into a rebuild's staging directory.
  *
@@ -70,11 +67,13 @@ case class RebuildState(storeId: StoreId,
     s"store-id: $storeId\n" + episodeLine + keyLine + failedLines + pendingLines
 
 
-object RebuildState extends YObject[RebuildState] with Logging:
+/** The checkpoint's format. Its reads and writes are `RebuildDisk`'s (`save`, `load`, `removeAll`), run as jobs on
+ *  the destination device's DeviceIo */
+object RebuildState extends YObject[RebuildState]:
 
   val stateFilename = "rebuild-state.yaml"
 
-  /** Scratch name `save` writes before renaming onto `stateFilename`. Same directory, so the
+  /** Scratch name `RebuildDisk.save` writes before renaming onto `stateFilename`. Same directory, so the
    *  rename stays within one filesystem and is therefore atomic. */
   val tempFilename = s"$stateFilename.tmp"
 
@@ -112,52 +111,3 @@ object RebuildState extends YObject[RebuildState] with Logging:
       lastRestoredKey.get(o).map(s => Key(hex.parseHex(s))),
       failedObjects.get(o).map(u => ObjectId(u)),
       pendingAllocations.get(o))
-
-  def loadRebuildState(file: os.Path): RebuildState =
-    create(loadYamlFile(file))
-
-  /** Write the checkpoint into `path`, replacing any existing one.
-   *
-   *  Written to a temp name alongside it and renamed into place rather than overwritten. Aspen
-   *  is crash-only -- there is no clean shutdown -- so a crash between a truncate and the write
-   *  that follows it is the ordinary termination mode landing in an unlucky window, not an
-   *  exotic case, and it would leave an empty or partial `rebuild-state.yaml` behind. The temp
-   *  file is in the same directory, hence the same filesystem, so the rename is atomic: a
-   *  reader sees either the old checkpoint or the new one.
-   */
-  def save(path: os.Path, state: RebuildState): Unit =
-    os.write.over(path / tempFilename, state.yamlConfig)
-    os.move(path / tempFilename, path / stateFilename,
-            replaceExisting = true, atomicMove = true)
-
-  /** Delete the checkpoint from `path`, along with any temp file a crashed save left behind. Either may be missing:
-   *  `os.remove` without `checkExists` is `Files.deleteIfExists`, so a missing file is no error. */
-  def removeAll(path: os.Path): Unit =
-    os.remove(path / stateFilename)
-    os.remove(path / tempFilename)
-
-  /** Read the checkpoint from `path`, or None if there is none or it cannot be read.
-   *
-   *  Total by design. An unreadable checkpoint -- torn by a crash predating the atomic save
-   *  above, or corrupt on disk -- is reported as "no checkpoint" rather than thrown, because
-   *  `load` is the first statement of a rebuild pass and a throw there makes the store
-   *  permanently unrebuildable without an operator deleting the file by hand. The cost of
-   *  discarding it is a restart of the walk and nothing more: `rebuildWrite` is a plain
-   *  overwrite, so re-restoring already-restored objects is free. That is the correct direction
-   *  under the checkpoint rule -- lose work, never claim work that never reached stable storage.
-   *
-   *  A stat that fails is no absence (FileStat): it throws, failing the pass with the checkpoint kept for the next,
-   *  rather than discard the walk done so far.
-   */
-  def load(path: os.Path): Option[RebuildState] =
-    val f = path / stateFilename
-    if !FileStat.exists(f) then
-      None
-    else
-      try
-        Some(loadRebuildState(f))
-      catch
-        case NonFatal(t) =>
-          logger.warn(s"Discarding unreadable rebuild checkpoint $f; the rebuild will restart " +
-                      s"from the beginning: $t")
-          None

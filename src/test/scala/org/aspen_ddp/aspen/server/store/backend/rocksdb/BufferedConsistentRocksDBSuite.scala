@@ -166,7 +166,9 @@ class BufferedConsistentRocksDBSuite extends FileBasedTests:
 
       // Bypasses the write buffer entirely, so a read can only observe this value if the
       // completed batch is no longer being consulted by get()
-      db.rebuildWrite(key(1), value("direct"))
+      val fdirect = db.rebuildWrite(key(1), value("direct"))
+      ec.runAll()
+      Await.result(fdirect, 5.seconds)
 
       val fget = db.get(key(1))
       ec.runAll()

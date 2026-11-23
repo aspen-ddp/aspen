@@ -90,8 +90,8 @@
   whose Rebuilding case restarts the rebuild, which takes the copy for done and flips it (no second rebuild).
   `RebuildingStore.start`, run by its constructor on the control thread, reads the
   `existingCopy` it is given, `(phase, path)` of the store's record on the device (`StoreRebuilds.startRebuild` builds
-  it from the registry; nothing lists the device): a Rebuilt copy of its own episode (`isRebuiltFor`) completes at once
-  with its copy id; any other copy fails it. The flip then moves the copy: `Adopt` Rebuilt -> Live
+  it from the registry; nothing lists the device): a Rebuilt copy of its own episode (`isRebuiltFor`) completes with its
+  copy id once a staging job has removed any staging left beside it; any other copy fails it. The flip then moves the copy: `Adopt` Rebuilt -> Live
   (`StoreRebuilds.bringRebuiltLive`, T3: a NotMoved copy stays Rebuilt for the Completed Rebuilds case, which selects
   offline Rebuilt records of Active entries; an Unsynced one is Live, for `Load` once synced), `AdoptOffline`
   Rebuilt -> Parked in one move (`keepRebuiltStoreOffline`, T4; `moveUnattached` at its `rebuilt/` path when the device

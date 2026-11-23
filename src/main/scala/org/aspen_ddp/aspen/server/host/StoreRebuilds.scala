@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.RebuildOutcome
 import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, Host, StoreConfig}
-import org.aspen_ddp.aspen.server.rebuild.{RebuildState, RebuildingStore, StoreRebuild}
+import org.aspen_ddp.aspen.server.rebuild.{RebuildDisk, RebuildingStore, StoreRebuild}
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -740,7 +740,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       if FileStat.exists(staging) then
         logger.info(s"Discarding the rebuild staging copy of store $storeId at $staging: a copy at the store's path " +
                     "may have served since its first pass began, so the rebuild starts over")
-        RebuildState.removeAll(staging)
+        RebuildDisk.removeAll(staging)
         DurableFiles.syncDirectory(staging)
         try os.remove.all(staging)
         catch case NonFatal(t) => logger.warn(s"Failed to delete $staging. A first pass discards it. Error: $t")

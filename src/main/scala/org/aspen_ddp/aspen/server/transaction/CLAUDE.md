@@ -250,6 +250,14 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   A Tx that knows its outcome passes it (`known`): rule 1 then adopts only a finalized or late commit of a known
   commit, and otherwise it concludes once more than `w - t` primary stores are non-holders (no acceptor state and not
   amnesiac: a commit is forgotten only at TxFinalized), or holds
+- Finalization past expiry (paxos-transactions 10.10): a known commit whose whole expiry round held (checked as the
+  next round starts, so its peers had a heartbeat to answer) may be unfinalized with its driver dead: frozen holders
+  answer no takeover driver's Paxos, and once the caches forget T no relay tells it either. Unless a driver of its
+  store holds the outcome, the store's driver takes the Tx's own resolution and finalizes T
+  (`Frontend.onKnownCommitHeld` -> `Store.finalizeHeldCommit` -> `finalizeExpiryCommit`). Not gated on idleness:
+  outcome-less takeover drivers keep every holder busy. A live stalled driver so gains duplicate finalizers, and a
+  finalization whose TxFinalized was lost runs again: idempotent actions, rare path. HorizonIntegrationSuite "a
+  committed transaction whose driver dies mid-finalization past expiry is finalized by its holders"
 - `Discard`: an abort voter, a Tx with no vote, a prover or a muted Tx is discarded at once. A commit voter
   (`needsUnackedCheck`, which covers expiring Txs too) first looks up its entry: none found by a lookup started after
   the decision discards it; one found applies T and concludes it as a late commit; a failed lookup keeps it holding and
@@ -343,7 +351,8 @@ Designs: `docs/superpowers/specs/2026-11-13-transaction-horizon-design.md` (forg
   entry expires only once its transaction is below its store's floor. At high volume the cache is costly (about 175
   bytes per transaction, capped at `DefaultMaxEntries`); a size eviction is logged as an error (at most once per
   `EvictionLogPeriod`, 10 s, with the count) and raises the host's
-  eviction watermark. A driver that still learns nothing past the horizon meets refusals, and the Tx ends by expiry
+  eviction watermark. A driver that still learns nothing past the horizon meets refusals, and the Tx ends by expiry (a known commit by
+  its holders finalizing it, Finalization past expiry above)
 - The status cache is safety evidence, not only an optimization (paxos P17): a finalized entry is late-commit evidence
   (the relay reports it late) and finalization evidence (a prepare for a transaction the store does not hold is
   ignored), so an entry must never be wrong or downgraded. Its retention is not relied on: a lost entry's transaction

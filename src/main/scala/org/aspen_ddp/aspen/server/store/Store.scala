@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrlAdmis
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
-import org.aspen_ddp.aspen.server.transaction.{FinalizationStall, FinalizationStallReport, TransactionDriver, TransactionFinalizer, TransactionStatusCache}
+import org.aspen_ddp.aspen.server.transaction.{FinalizationStall, FinalizationStallReport, TransactionDriver, TransactionFinalizer, TransactionStatusCache, Tx}
 import scribe.Logging
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
@@ -108,7 +108,8 @@ class Store(val storageDeviceId: StorageDeviceId,
     onFailStop = err => onFailStop(this, err), incarnationOverride = incarnationOverride, poolIDA = poolIDA,
     admissionTier = admissionTier,
     onCommitProven = txid => transactionDrivers.get(txid).foreach(giveProof(txid, _)),
-    onExpiryCommit = txd => finalizeExpiryCommit(txd))
+    onExpiryCommit = txd => finalizeExpiryCommit(txd),
+    onKnownCommitHeld = tx => finalizeHeldCommit(tx))
 
   /** Expiry decided T committed at this store (ExpiryTally.Decision.Commit): a driver of this store takes the
     * resolution as any other store's, and its finalizer marks every store that does not acknowledge the commit, which
@@ -119,6 +120,22 @@ class Store(val storageDeviceId: StorageDeviceId,
     transactionDrivers.get(txd.transactionId).foreach: driver =>
       driver.receiveTxResolved(TxResolved(storeId, storeId, txd.transactionId, committed = true, late = false,
         proof = false))
+
+  /** An expiring Tx knows T committed, but its expiry round holds: at least the write threshold of T's primary stores
+    * may still hold it, so T's finalization may be unfinished (paxos-transactions 10.10, "Finalization past expiry").
+    * Its deciding driver may have died: past expiry every holder is frozen, so no takeover driver learns the outcome
+    * by Paxos, and once the status caches forget T no relay tells it either. Unless a driver of this store already
+    * holds the outcome, this store's driver takes the Tx's own resolution and finalizes T, as for an expiry commit.
+    * Not gated on the Tx looking idle: the other holders' outcome-less takeover drivers keep every holder busy. So a
+    * deciding driver still alive past expiry, its finalization stalled, gains one duplicate finalizer per holder, and
+    * a finalization already complete (its TxFinalized lost here) runs again; both are harmless (finalization actions
+    * are idempotent) and only on this rare path
+    */
+  private def finalizeHeldCommit(tx: Tx): Unit =
+    if !transactionDrivers.get(tx.transactionId).exists(_.hasOutcome) then
+      logger.warn(s"Store $storeId finalizes committed transaction ${tx.transactionId} past the transaction horizon: " +
+        s"no driver here is finalizing it and its peers still hold it")
+      finalizeExpiryCommit(tx.txd)
 
   /** Stops the store's transaction drivers first (paxos-transactions 7.5): left running, their timers would keep
     * re-preparing

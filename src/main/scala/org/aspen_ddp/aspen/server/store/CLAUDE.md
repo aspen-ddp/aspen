@@ -190,7 +190,8 @@
   (`ExpiryTally`): adopt an outcome, decide commit (resolve it at every store, apply it, and have the store's driver
   finalize it: `onExpiryCommit`), keep holding, or discard (`expireTransaction`: locks and objects released, CRL
   state deleted, status cache untouched; a commit vote only once a later UnackedCommits lookup finds no entry; a
-  resolved Tx concludes as finalized). Then
+  resolved Tx concludes as finalized; a known commit whose whole round held is finalized by the store's driver:
+  `onKnownCommitHeld`). Then
   `removeExpiredDrivers` stops each driver past the horizon with no outcome whose store holds no Tx for it. Store
   takes `heartbeatPeriod` and a `wallClockMillis` test seam for this
 

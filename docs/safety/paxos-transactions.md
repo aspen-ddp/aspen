@@ -722,7 +722,8 @@ A driver's `heartbeat` sends `TxHeartbeat` (not on its first tick) or, once fina
 that sees nothing from a primary-pool driver for `txHeartbeatTimeout` drives T itself, which is the recovery path for a
 lost `TxFinalized`: the new driver's prepares draw status-cache relays from the stores that finalized. The cache (30 s)
 outlasts the horizon plus that detection (P17). A store whose driver still learns nothing past the horizon meets
-refusals, and its Tx ends by expiry, a resolved one concluding its known outcome (`Tx.concludeKnownOutcome`).
+refusals, and its Tx ends by expiry, a resolved one concluding its known outcome (`Tx.concludeKnownOutcome`) or, while
+its peers still hold T, finalizing a known commit itself (10.10, finalization past expiry).
 
 ---
 
@@ -1077,6 +1078,20 @@ let the last holders of a chosen commit discard it beside one store that never h
 *Liveness* with every store replied and none amnesiac: every store is a commit voter or a provable non-voter, so A or E
 fires. Holding is the answer while stores are silent, and with every store replied only when `k_p + n_p >= t` or some
 lock-only pool has `vc <= w - t`.
+
+*Finalization past expiry.* A committed T must still be finalized if its driver dies past expiry. Its holders are
+frozen, so a takeover driver's prepares draw no promises (only `TxCommitted`), and once the status caches forget T
+(30 s after the resolution's write) no relay tells it the outcome, nor does a holder's own store relay its own entry
+(10.2). The holders' expiry rounds hold, `decideKnown` seeing at least `t` holders. So when a whole round of a Tx that
+knows T committed holds (checked as the next round starts, its peers given a heartbeat to answer), its store gives
+its driver the Tx's own resolution, unless a driver of the store already holds the outcome
+(`Frontend.onKnownCommitHeld` -> `Store.finalizeHeldCommit` -> `finalizeExpiryCommit`), and that driver finalizes T;
+its `TxFinalized` ends T at every holder. Safe: the Tx's resolution is a real outcome, and finalization actions are
+idempotent and at-least-once. Not gated on the Tx being idle, since the other holders' outcome-less takeover drivers
+keep it busy: a deciding driver still alive and stalled gains a duplicate finalizer per holder, and a finalization
+whose `TxFinalized` was lost here runs again (with marks and entries for stores that forgot T, the cost of repair
+passes), only on this path. HorizonIntegrationSuite "a committed transaction whose driver dies mid-finalization past
+expiry is finalized by its holders".
 
 *Drivers and the client past expiry.* A driver past the horizon plus the margin with no outcome is stopped and removed
 once its store holds no Tx for T (`Store.removeExpiredDrivers`); one with an outcome keeps finalizing.

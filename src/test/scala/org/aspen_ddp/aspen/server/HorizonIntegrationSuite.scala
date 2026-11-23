@@ -482,6 +482,48 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
         xAfter.revision shouldBe ObjectRevision(tx.id)
         xAfter.data.getByteArray.toSeq shouldBe Seq[Byte](2)
 
+  test("a committed transaction whose driver dies mid-finalization past expiry is finalized by its holders"):
+    // Every store learns T committed, but its leader, store 0, alone on its host, finalizes slowly (a stalled action),
+    // and its host crashes once T is past expiry: every holder is frozen, so its takeover drivers learn nothing by
+    // Paxos, and they share the bootstrap host's status cache, so no relay tells them either. Each holder knows T
+    // committed and more than `w - t` of its peers still hold it, so the finalization may be unfinished: the holders
+    // finalize it themselves (idempotent actions), and T is forgotten everywhere, store 0 included once it returns
+    val lead = 0
+    val hostA = net.newHost()
+    for
+      x <- allocateX()
+      xBefore <- client.read(x)
+      _ <- pump(net.moveStore(net.stores(lead), hostA, closeFirst = true), clock = false)
+      _ <- eventually("store 0 passed its load floor", clock = false)(net.loadFloorPassed(sid(lead)))
+      tx = client.newTransaction()
+      _ = net.unreachableStores = (1 until 5).map(sid).toSet
+      _ = net.FinalizerFactory.stalled = _.transactionId == tx.id
+      _ = tx.overwrite(x, xBefore.revision, DataBuffer(Array[Byte](2)))
+      result <- outcome(tx.commit(), clock = false)
+      _ = net.unreachableStores = Set()
+      _ = withClue("the client was told T committed: ")(result shouldBe a[Success[?]])
+      _ <- eventually("every store resolved T committed", clock = false):
+             (0 until 5).forall(i => frontend(i).flatMap(_.transactions.get(tx.id)).exists(_.knownOutcome.contains(true)))
+      txd = frontend(1).get.transactions(tx.id).txd
+      // Store 0's driver keeps the holders from looking idle until every holder is frozen
+      _ <- eventually("every holder is frozen past expiry", clock = true)((0 until 5).forall(i =>
+             frontend(i).exists(_.pastExpiry(txd))))
+      _ = withClue("T is unfinalized: ")(holders(tx.id) shouldBe Set(0, 1, 2, 3, 4))
+      // Store 0's host crashes: its driver and its stalled finalizer die with it
+      _ <- pump(hostA.control.loader.closeStore(sid(lead), extractCrl = false), clock = false)
+      _ = net.FinalizerFactory.stalled = _ => false
+      _ <- eventually("stores 1-4 finalized T and forgot it", clock = true):
+             (1 until 5).forall(i => !holds(i, tx.id)) && (crlStores(tx.id) -- Set(lead)).isEmpty &&
+               net.smgr.control.txStatusCache.getStatus(tx.id).exists(_.finalized)
+      // Store 0 returns on the bootstrap host with T in its CRL, and concludes it from its peers
+      _ <- pump(net.moveStore(net.stores(lead), net.smgr, closeFirst = false), clock = false)
+      _ <- eventually("store 0 forgot T", clock = true)(holders(tx.id).isEmpty && crlStores(tx.id).isEmpty)
+      _ <- settle(clock = true)
+      xAfter <- client.read(x)
+    yield
+      xAfter.revision shouldBe ObjectRevision(tx.id)
+      xAfter.data.getByteArray.toSeq shouldBe Seq[Byte](2)
+
   /** Delivers T's client prepare to store `i`, which forgot T, once it is served by `host` and loaded after T started:
     * it is refused there, though the host's status cache knows nothing of T and T is inside the horizon
     */

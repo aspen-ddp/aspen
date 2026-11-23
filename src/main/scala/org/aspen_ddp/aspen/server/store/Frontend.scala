@@ -208,7 +208,12 @@ class Frontend(val storeId: StoreId,
                  */
                onCommitProven: TransactionId => Unit = _ => (),
                /** Expiry decided T committed here (ExpiryTally.Decision.Commit): the Store has a driver finalize it */
-               onExpiryCommit: TransactionDescription => Unit = _ => ()) extends Logging {
+               onExpiryCommit: TransactionDescription => Unit = _ => (),
+               /** A whole expiry round of a Tx that knows T committed held (ExpiryTally.decideKnown): at least `t`
+                 * primary stores may still hold T, so its finalization may be unfinished, and past expiry no driver
+                 * learns the outcome from frozen peers. The Store finalizes it unless a driver of its own holds the
+                 * outcome (Store.finalizeHeldCommit) */
+               onKnownCommitHeld: Tx => Unit = _ => ()) extends Logging {
 
   /** The limit every growing KeyValue update must fit, at vote, apply re-check and a repair install beside held
     * reservations: maxSliceSize lowered to the pool IDA's IDA.maxKVSliceSize, so the union of committed updates repair
@@ -1268,6 +1273,10 @@ class Frontend(val storeId: StoreId,
           case Some(round) =>
             round.countdown -= 1
             if round.countdown <= 0 then
+              // A whole round, its peers given at least a heartbeat to answer, held a known commit: its finalization
+              // may be unfinished and its driver dead (onKnownCommitHeld)
+              if !round.decided && tx.knownOutcome.contains(true) then
+                onKnownCommitHeld(tx)
               startExpiryRound(tx, round)
 
   private def startExpiryRound(tx: Tx, round: ExpiryRound): Unit =

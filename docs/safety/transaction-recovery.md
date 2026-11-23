@@ -103,7 +103,8 @@ Required relationships:
 * **Takeover within the cache.** `txStatusCacheDuration >= horizon + MaxStartLead + txHeartbeatTimeout + heartbeat`,
   enforced by a `require` in `Host.checkStatusCacheDuration`: a Tx first created near the horizon still finds its
   peers' entries when its idle driver starts (30 s against a 5-6 s takeover). Missing the window decides nothing
-  wrongly: past the horizon the peers refuse the driver and the Tx ends by expiry.
+  wrongly: past the horizon the peers refuse the driver and the Tx ends by expiry; a known commit is finalized by
+  its holders then (paxos-transactions.md 10.10, finalization past expiry).
 * **Entries outlast joining.** An entry written when its store joined T (its clock then at least
   `start - MaxStartLead`) expires only once T is below that store's floor: `30 - 2 = 28 s > 20 s`. This relies on the
   host's wall clock not stepping back by more than the 8 s slack (paxos-transactions.md, transaction horizon).
@@ -187,7 +188,8 @@ answers in this order:
    store sends itself nothing when its own Tx for T is already resolved: that resolution is no news to its driver,
    and the idle driver a store starts after its `TxFinalized` was lost would take it as a non-late commit and run T's
    finalization actions again. That driver learns the outcome from its peers instead: late from their finalized relay
-   (`TxFinalized(late)`, then `resolveLate`), or by Paxos while they still hold T. Nor does a store relay a
+   (`TxFinalized(late)`, then `resolveLate`), or by Paxos while they still hold T and are not frozen
+   (past expiry its own store finalizes a known commit instead: paxos-transactions.md 10.10). Nor does a store relay a
    non-finalized entry to a sender on its own host (`Store.onThisHost`, the router's installed stores): that sender
    shares the cache, so its own store's relay already decided, under the rule above, what its driver may learn from
    the entry; a sibling store of T answering with the non-late entry would re-run T's actions. For the same reason a
@@ -806,7 +808,9 @@ lookup that finds no entry.
 * **Liveness of takeover.** A Tx with no driver activity for `txHeartbeatTimeout` gets a driver on its store within a
   heartbeat (unless its store's CRL state is loading). Only stores holding a Tx can drive: a transaction no store has
   heard of is never started (a client crash before any prepare arrives: nothing committed). Past the horizon a Tx
-  that cannot learn its outcome ends by expiry, or holds if undecidable.
+  that cannot learn its outcome ends by expiry, or holds if undecidable. A Tx that knows T committed but whose peers
+  still hold it past expiry cannot rely on a takeover driver (frozen peers answer no Paxos, the caches may have
+  forgotten T): its store finalizes T itself once a whole expiry round holds (paxos-transactions.md 10.10).
 * **Vote persistence.** A counted commit vote is in the voter's CRL until the voter learns the outcome, its backend
   commits succeed, or the voter is rebuilt. It survives host and store
   restarts and is relocked on load before any new transaction can touch the same objects. A state kept past

@@ -496,8 +496,12 @@ relay still answers from the cache. No driver starts while the CRL state loads; 
 objects are still loading may be driven at heartbeat, starting above its recovered promise, while its own replies
 wait in the held queue.
 
-A failed CRL read or recovery fail-stops the store (`Host.StoreFailStopped`, `StoreRebuilds.RecoveryFailed`), which
-ends in a rebuild: its counted commit votes are lost with it (rebuild-process.md).
+A failed CRL read or recovery fail-stops the store (`Host.StoreFailStopped`, `StoreRebuilds.RecoveryFailed`,
+`StoreRebuilds.handleFailStopped`), which ends in a rebuild: its counted commit votes are lost with it
+(rebuild-process.md). A failed load of a `crl_save.log` state is not a fail-stop: the store is unloaded with its copy
+left to load again, retried at the device scans (`StoreLoader.handleUnloadFailed`), and so is one whose save file could
+not be removed durably after its load (`Host.SaveFileRemovalFailed`, `StoreLoader.handleSaveFileRemovalFailed`); neither
+has recovered, so neither has served.
 
 ### 7.2 How a recovered Tx is rebuilt
 
@@ -845,7 +849,7 @@ Notation: L = designated leader store/driver; S = a participant store; D2 = a re
 | After `TxCommitted`, before `TxFinalized` | backend has T; CRL entry | Recovered Unresolved; no entry (it acknowledged). Driver or caches tell it committed; a late commit applies nothing |
 | After `TxFinalized`, CRL delete or stub not durable | possibly the old record | As the previous row; for an allocation a later deletion waited for the record's removal to be durable (7.4) |
 | After `TxFinalized`, state kept for a failed backend commit | the kept record, usually `Unresolved` | Recovered Unresolved; an entry (its `TxCommitted` set `keptForReplay`). The late commit, or expiry, finds it and re-applies through it: the backend commit is retried |
-| Rebuild instead of recovery (failed load, fail-stop) | CRL entries dropped; new incarnation | Counted votes are lost; the store is rebuilt from peers; old-incarnation entries apply nothing. Safe while losses stay within the write threshold's tolerance (systemic-loss-protection.md) |
+| Rebuild instead of recovery (failed recovery from the CRL, fail-stop) | CRL entries dropped; new incarnation | Counted votes are lost; the store is rebuilt from peers; old-incarnation entries apply nothing. Safe while losses stay within the write threshold's tolerance (systemic-loss-protection.md) |
 
 ### 10.3 Driver-side failures
 

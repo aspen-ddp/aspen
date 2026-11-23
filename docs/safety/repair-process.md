@@ -184,7 +184,7 @@ tick (`RepairService.TickPeriod`; stall report after 6 h).
 
 ```
 sweep():
-  repairable = target.repairableStoreIds   -- served, not offline / rebuilding / transferring out (HostStoreView.of)
+  repairable = target.repairableStoreIds   -- HostCopies.repairable, published in HostStoreView (4.4)
   refreshLimits()                          -- 15 s deadline (MetadataDeadline); keeps the last good value
   due = selectDue(repairable, now)         -- drops state of departed stores; admits new ones (not due this tick)
   refreshPolicies(pools of due)            -- per pool, 15 s deadline, last good or default
@@ -199,6 +199,12 @@ scanOne(store):
 
 A newly seen store is admitted at the floor, due at a random time inside the first floor interval. Because the tick
 is 30 s, a floor below 30 s acts as 30 s.
+
+`HostCopies.repairable` (the host's copy registry, republished into `HostStoreView.repairable` after every change)
+holds for a store that is Served here, not Closing, with no Rebuild work Running or Abandoned (`HostCopies.RebuildReads`:
+a running rebuild reads everything), no TransferOut work on any device, and not being sent by the store transfer
+service. A queued rebuild, or one discarding the lost copy, reads nothing yet and does not stop a served copy's scans.
+A store leaving the set loses its `ScanState` and `DeferralState` at the next tick, so it is admitted afresh (above) when repairable again.
 
 ### 4.2 Pacing (`ScanState`)
 
@@ -864,7 +870,7 @@ but the object was unreadable already.
 
 ### 12.6 Entry whose store has been rebuilt or transferred
 
-- Rebuilding: not repairable; entries stay. After promotion the next scans reconcile them (mostly no-ops, since the
+- Rebuilding (a Rebuild running or being abandoned) or transferring out: not repairable (4.1); entries stay. After promotion the next scans reconcile them (mostly no-ops, since the
   rebuild copied current state) and remove them, together with the entries the rebuild itself wrote at
   `HLCTimestamp.Zero` (2.6). Entries are keyed by pool index, so a rebuilt store inherits them harmlessly. A rebuilt
   store's KeyValue reconciles answer stale until its first held-vote round has found its growth guards, and a guarded

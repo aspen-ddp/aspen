@@ -524,8 +524,8 @@
   a valid save file instead of refusing the device, and adopts any copy in `lost/` as Rebuilding whatever files it
   holds. A network transfer validates the staged copy's save file before promotion and retries on failure, since the
   source still holds the state; a resume of a promoted copy's pool update (`StoreTransfers.startIn`) checks it again,
-  and a copy whose save file no longer validates is deleted and the transfer restarted, as is one whose
-  `phase-param.arrived` names another transfer
+  and an `arrived/` copy whose save file no longer validates is deleted and the transfer restarted, as is one whose
+  `phase-param.arrived` names another transfer (a copy in any other phase is retired instead, below)
 - A lost device CRL does the same to every store on the device: if `<device>/crl` is absent from a device holding store
   dirs, or holds no stream files there (`openCRL(..., holdsStores = true)` throws `CrlMissing`: a device's stores exist
   only once its CRL was opened, so an emptied `crl/` is never taken as a new CRL), or `openCRL` throws (a corrupt CRL,

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.store
 
-import org.aspen_ddp.aspen.server.host.JoinCeiling
+import org.aspen_ddp.aspen.server.host.{DeviceIo, JoinCeiling}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.HLCTimestamp
 
@@ -78,7 +78,12 @@ class Store(val storageDeviceId: StorageDeviceId,
             /** The store's CRL admission lane (Frontend.admissionTier) */
             admissionTier: AdmissionTier = AdmissionTier.Data,
             /** Whether a store is installed on this host, sharing its status cache (StoreRouter.get). Any thread */
-            onThisHost: StoreId => Boolean = _ => false) extends Logging {
+            onThisHost: StoreId => Boolean = _ => false,
+            /** The store's device's I/O lanes (LocalStorageDeviceState.io): the store's executor never does device
+              * I/O, so its disk work (the Frontend's, the router's save file removal, a transfer-out close's save) runs
+              * as jobs there. None runs such work inline: tests with in-memory backends
+              */
+            val deviceIo: Option[DeviceIo] = None) extends Logging {
 
   /** How long past the horizon an unresolved Tx starts its status queries: Frontend.expiryMargin */
   val expiryMargin: FiniteDuration = Frontend.expiryMargin(
@@ -109,7 +114,7 @@ class Store(val storageDeviceId: StorageDeviceId,
     admissionTier = admissionTier,
     onCommitProven = txid => transactionDrivers.get(txid).foreach(giveProof(txid, _)),
     onExpiryCommit = txd => finalizeExpiryCommit(txd),
-    onKnownCommitHeld = tx => finalizeHeldCommit(tx))
+    onKnownCommitHeld = tx => finalizeHeldCommit(tx), deviceIo = deviceIo)
 
   /** Expiry decided T committed at this store (ExpiryTally.Decision.Commit): a driver of this store takes the
     * resolution as any other store's, and its finalizer marks every store that does not acknowledge the commit, which

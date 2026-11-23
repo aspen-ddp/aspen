@@ -66,7 +66,7 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit,
 class FsifBackend(val storeId: StoreId,
                   val path: os.Path,
                   layout: FsifLayout,
-                  files: FsifFiles,
+                  rawFiles: FsifFiles,
                   io: ExecutionContext,
                   tuning: FsifTuning = FsifTuning(),
                   onFatal: Throwable => Unit = _ => (),
@@ -80,7 +80,9 @@ class FsifBackend(val storeId: StoreId,
     * hung device's fsyncs cannot starve every store's serial work), else on `io` itself (tests: one deterministic EC)
     */
   private val serial = new SerialExecutor(serialEc.getOrElse(if io eq FsifBackend.sharedIo then sharedSerial else io))
-  private val recovered = FsifRecovery.recover(files, layout)
+  private val recovered = FsifRecovery.recover(rawFiles, layout)
+  /** Every file of the store is opened and sized through this, so estimateSize does no I/O (SizeTrackedFiles) */
+  private val files = new SizeTrackedFiles(rawFiles)
   private val dataFile = files.open(FsifRecovery.DataFile)
   /** The journal the current writer appends to: its handle and name follow a checkpoint's journal switch */
   @volatile private var journalFile: FsifFile = files.open(recovered.activeJournal)
@@ -354,12 +356,9 @@ class FsifBackend(val storeId: StoreId,
       }
     }(using io)
 
-  /** The held data and active journal handles, plus the other journal and both index files (not held, so sized
-    * without opening them) */
-  override def estimateSize(): Long =
-    val active = activeJournal
-    val others = FsifRecovery.IndexFiles ++ FsifRecovery.JournalFiles.filter(_ != active)
-    dataFile.size + journalFile.size + others.map(files.size).sum
+  /** The sum of the store's files' sizes, tracked in memory (SizeTrackedFiles): it runs on the store's executor, which
+    * never does device I/O */
+  override def estimateSize(): Long = FsifRecovery.AllFiles.map(files.size).sum
 
   override def bootstrapAllocate(objectId: ObjectId, objectType: ObjectType.Value, metadata: Metadata,
                                  data: DataBuffer): Unit =

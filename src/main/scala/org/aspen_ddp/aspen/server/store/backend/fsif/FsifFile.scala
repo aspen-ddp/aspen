@@ -3,6 +3,8 @@ package org.aspen_ddp.aspen.server.store.backend.fsif
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
+import java.util.concurrent.atomic.AtomicLong
+import scala.util.control.NonFatal
 
 import org.aspen_ddp.aspen.server.{DurableFiles, FileStat}
 
@@ -86,3 +88,52 @@ private final class NioFsifFile(channel: FileChannel) extends FsifFile:
   def force(): Unit = channel.force(false)
 
   def close(): Unit = channel.close()
+
+/** The sizes of a store's FSIF files, kept in memory so `FsifBackend.estimateSize` (which runs on the store's
+ *  executor) never touches the disk. Statted once at construction, on the thread that opens the backend; afterwards
+ *  every size is maintained by the handles `open` returns, which are the only writers of these files while the
+ *  backend is open: a write raises it to the end of what was written, a truncate sets it. A mutation that throws may
+ *  have gone part way, so the handle's size is read back (a stat, on the failing I/O thread; rare). The counter is
+ *  shared by every handle of a name, so a checkpoint's second journal handle and the old journal's truncate update
+ *  it too. */
+private[fsif] final class SizeTrackedFiles(under: FsifFiles) extends FsifFiles:
+  private val sizes: Map[String, AtomicLong] =
+    FsifRecovery.AllFiles.map(n => n -> new AtomicLong(under.size(n))).toMap
+
+  def exists(name: String): Boolean = under.exists(name)
+
+  /** The tracked size of one of the store's own files, else a stat */
+  def size(name: String): Long = sizes.get(name) match
+    case Some(s) => s.get
+    case None => under.size(name)
+
+  def open(name: String): FsifFile =
+    val f = under.open(name)
+    sizes.get(name) match
+      case None => f
+      case Some(tracked) =>
+        def resync(): Unit =
+          try tracked.set(f.size)
+          catch case NonFatal(_) => ()
+        new FsifFile:
+          def size: Long = tracked.get
+          def read(position: Long, length: Int): Array[Byte] = f.read(position, length)
+          def write(position: Long, bytes: Array[Byte]): Unit =
+            try
+              f.write(position, bytes)
+              tracked.accumulateAndGet(position + bytes.length, (a, b) => math.max(a, b))
+              ()
+            catch
+              case t: Throwable =>
+                resync()
+                throw t
+          def truncate(size: Long): Unit =
+            try
+              f.truncate(size)
+              tracked.set(size)
+            catch
+              case t: Throwable =>
+                resync()
+                throw t
+          def force(): Unit = f.force()
+          def close(): Unit = f.close()

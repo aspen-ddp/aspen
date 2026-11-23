@@ -608,6 +608,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 poolIDA = poolIDA,
                 admissionTier = admissionTier,
                 onThisHost = id => router.get(id).isDefined,
+                deviceIo = ctx.devices.devices.get(storageDeviceId).map(_.io),
                 // Its backend's completion handler is set below, after the Store is built: recovered transactions read
                 // their objects once it is installed (awaitCrlLoad)
                 deferRecovery = true,
@@ -899,12 +900,21 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           else
             Future.successful(None)
         .transformWith: extractedTry =>
-          onExecutor(entry):
-            // Closed whatever the CRL step did, so the store's backend and CRL admissions are released; a failed
-            // step then fails the close
-            val saved = Try(extractedTry.get.foreach(trs =>
-              CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile)))
-            store.close().flatMap(_ => Future.fromTry(saved))(using ExecutionContext.parasitic)
+          // The save is a SaveFile job on the store's device lane, never on its executor (a hung device then stalls
+          // only its own stores); the close follows it on the executor, whatever the CRL step or the save did, so the
+          // store's backend and CRL admissions are released; a failed step then fails the close
+          val saveFile = store.backend.crlSaveFile
+          val savedFuture: Future[Unit] = extractedTry match
+            case Failure(err) => Future.failed(err)
+            case Success(None) => Future.unit
+            case Success(Some(trs)) =>
+              store.deviceIo match
+                case Some(io) => io.submit(JobKind.SaveFile, Some(storeId))(StoreDisk.saveState(storeId, saveFile, trs)).future
+                case None => Future.fromTry(Try(StoreDisk.saveState(storeId, saveFile, trs)))
+          savedFuture.transformWith { saved =>
+            onExecutor(entry):
+              store.close().flatMap(_ => Future.fromTry(saved))(using ExecutionContext.parasitic)
+          }(using ExecutionContext.parasitic)
           .flatMap: _ =>
             // The store is closed: its copy's close ends here, before the extraction's deletion, so an open
             // that installs during the deletion finds the copy Idle

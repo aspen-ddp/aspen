@@ -132,6 +132,52 @@ object StoreRouterSuite:
       completionHandler()
     def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit = ()
 
+  /** A DeviceIo whose management lane is held: submitted jobs wait unrun, their kinds in `held`, until `release`, which
+   *  runs them on the device's own lane in submission order. Everything else is the wrapped DeviceIo's. */
+  private class HoldableDeviceIo(under: DeviceIo) extends DeviceIo:
+    private val lock = new Object
+    private var holding = true
+    private var parked = Vector.empty[() => Unit]
+    private val kinds = new java.util.concurrent.LinkedBlockingQueue[JobKind]()
+
+    def path: os.Path = under.path
+    def label: String = under.label
+    def setDeviceId(id: StorageDeviceId): Unit = under.setDeviceId(id)
+    def dataEc: ExecutionContext = under.dataEc
+    def serialEc: ExecutionContext = under.serialEc
+    def observer: DeviceIoObserver = under.observer
+    def beginRead(): Unit = under.beginRead()
+    def endRead(): Unit = under.endRead()
+    def readsOverBound: Boolean = under.readsOverBound
+    def close(): Unit = under.close()
+
+    /** Blocks until a job has been submitted and held, and returns its kind */
+    def awaitHeld(): JobKind =
+      val k = kinds.poll(Bound, TimeUnit.SECONDS)
+      assert(k != null, "no job was submitted to the held device")
+      k
+
+    def release(): Unit =
+      val toRun = lock.synchronized:
+        holding = false
+        val r = parked
+        parked = Vector.empty
+        r
+      toRun.foreach(_())
+
+    def submit[T](kind: JobKind, store: Option[StoreId])(job: => T): JobHandle[T] =
+      val promise = Promise[T]()
+      def run(): Unit = promise.completeWith(under.submit(kind, store)(job).future)
+      lock.synchronized:
+        if holding then
+          parked :+= (() => run())
+          kinds.put(kind)
+        else
+          run()
+      new JobHandle[T]:
+        def future: Future[T] = promise.future
+        def cancel(): Boolean = false
+
   /** A DeviceControl on a StoreThreadPool with what loading, routing and closing a store use. Its posted events run
    *  the StoreLoader handlers on the control thread. Its router is ready (as after a Host's startup scan) unless
    *  `ready` is false. */
@@ -185,9 +231,9 @@ object StoreRouterSuite:
       Await.result(p.future, Duration(Bound, SECONDS))
 
     /** A loaded device, onto which `storeId` is loaded (its copy is learned at its LoadStore) */
-    def addDevice(storeId: StoreId): LocalStorageDeviceState = onControl:
+    def addDevice(storeId: StoreId, wrap: DeviceIo => DeviceIo = io => io): LocalStorageDeviceState = onControl:
       val dir = os.temp.dir()
-      val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, ctx.deviceIos.forPath(dir))
+      val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, wrap(ctx.deviceIos.forPath(dir)))
       ctx.copyRegistry.attach(sds)
       ctx.devices.devices += deviceId -> sds
       sds
@@ -413,6 +459,53 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
         val store = fx.onControl(fx.ctx.router.entry(s0)).get.store
         awaitTrue(!store.frontend.recoveryPending)
         store.holdsTransaction(txid) should be(true)
+
+  test("crlLoaded removes the save file on the device lane"):
+    val s0 = StoreId(poolId, 0)
+    val txid = TransactionId(new UUID(15, 31))
+    withRouter(emptyCrl): fx =>
+      var holdable: Option[HoldableDeviceIo] = None
+      fx.addDevice(s0, io => { val h = new HoldableDeviceIo(io); holdable = Some(h); h })
+      val io = holdable.get
+      val backend = bootstrappedBackend(s0)
+      CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(List(voteState(s0, txid))), backend.crlSaveFile)
+      val loaded = fx.load(backend)
+      // The store's executor submitted the removal and did no I/O itself: the file is there while the device is held
+      io.awaitHeld() should be(JobKind.SaveFile)
+      fx.awaitControl()
+      val executor = fx.ctx.router.entry(s0).get.executor
+      fx.awaitExecutor(executor)
+      os.exists(backend.crlSaveFile) should be(true)
+      loaded.isCompleted should be(false)
+      io.release()
+      await(loaded)
+      os.exists(backend.crlSaveFile) should be(false)
+      val store = fx.onControl(fx.ctx.router.entry(s0)).get.store
+      awaitTrue(!store.frontend.recoveryPending)
+      store.holdsTransaction(txid) should be(true)
+
+  test("a failed save file removal on a held device lane still unloads the store and keeps its CRL entries"):
+    val s0 = StoreId(poolId, 0)
+    val txid = TransactionId(new UUID(15, 32))
+    val crl = emptyCrl.asInstanceOf[GatedCrl]
+    withRouter(crl): fx =>
+      var holdable: Option[HoldableDeviceIo] = None
+      val sds = fx.addDevice(s0, io => { val h = new HoldableDeviceIo(io); holdable = Some(h); h })
+      val io = holdable.get
+      val backend = bootstrappedBackend(s0)
+      CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(List(voteState(s0, txid))), backend.crlSaveFile)
+      val loaded = fx.load(backend)
+      io.awaitHeld() should be(JobKind.SaveFile)
+      os.perms.set(backend.path, "r-x------")
+      try
+        io.release()
+        intercept[Exception](await(loaded))
+        awaitTrue(fx.onControl(fx.threading.threadOf(s0).isEmpty))
+        assertAbandoned(fx, s0, sds, backend)
+        os.exists(backend.crlSaveFile) should be(true)
+        fx.ctx.router.saveFileRemovalPending(backend.crlSaveFile) should be(true)
+        crl.getFullRecoveryState(s0).map(_.txd.transactionId) should be(List(txid))
+      finally os.perms.set(backend.path, "rwx------")
 
   test("unknown store gets TxUnknownStore from the calling thread"):
     val unknown = StoreId(poolId, 2)

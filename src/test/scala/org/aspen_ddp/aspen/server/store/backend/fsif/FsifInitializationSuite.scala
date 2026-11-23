@@ -219,6 +219,55 @@ class FsifInitializationSuite extends FileBasedTests:
     an[IllegalArgumentException] should be thrownBy FsifTuning(journalHardLimit = FsifRecovery.MaxLoadSize + 1)
     an[IllegalArgumentException] should be thrownBy FsifTuning(journalHardLimit = 0)
 
+  test("estimateSize matches the files after writes and compaction"):
+    val dir = tdir / "store"
+    close(FsifBackend.create(storeId, dir, layout, io, _ => ()))
+    val stats = new java.util.concurrent.atomic.AtomicInteger(0)
+    val nio = new NioFsifFiles(dir)
+    // Counts every size query, of a held handle or by name: estimateSize must answer from memory
+    val counting = new FsifFiles:
+      def open(name: String): FsifFile =
+        val f = nio.open(name)
+        new FsifFile:
+          def size: Long =
+            stats.incrementAndGet()
+            f.size
+          def read(position: Long, length: Int): Array[Byte] = f.read(position, length)
+          def write(position: Long, bytes: Array[Byte]): Unit = f.write(position, bytes)
+          def truncate(size: Long): Unit = f.truncate(size)
+          def force(): Unit = f.force()
+          def close(): Unit = f.close()
+      def exists(name: String): Boolean = nio.exists(name)
+      def size(name: String): Long =
+        stats.incrementAndGet()
+        nio.size(name)
+    val rec = new Recorder
+    val b = new FsifBackend(storeId, dir, layout, counting, io)
+    try
+      b.setCompletionHandler(rec)
+      def onDisk: Long =
+        (Seq(FsifRecovery.DataFile) ++ FsifRecovery.IndexFiles ++ FsifRecovery.JournalFiles)
+          .map(n => if os.exists(dir / n) then os.size(dir / n) else 0L).sum
+      def check(): Unit =
+        Await.result(b.quiesce(), Timeout)
+        val before = stats.get
+        b.estimateSize() shouldBe onDisk
+        stats.get shouldBe before
+      check()
+      for i <- 1 to 10 do
+        rec.commit(b, CommitState(ptr(i), md(1), ObjectType.Data, DataBuffer(bytes(300, i)), allocating = true))
+      check()
+      Await.result(b.checkpointNow(), Timeout) // switches journals and rewrites an index
+      check()
+      // Deleting the tail objects lets compaction truncate the data file
+      for i <- 6 to 10 do
+        rec.commit(b, CommitState(ptr(i), Metadata(md(2).revision, ObjectRefcount(2, 0), md(2).timestamp), ObjectType.Data,
+          DataBuffer()))
+      check()
+      Await.result(b.checkpointNow(), Timeout)
+      check()
+    finally close(b)
+
   test("estimateSize sizes the files it does not hold without opening them"):
     val dir = tdir / "store"
     close(FsifBackend.create(storeId, dir, layout, io, _ => ()))

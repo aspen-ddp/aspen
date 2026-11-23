@@ -413,7 +413,7 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
   (`server.FileStat`) is an I/O error, retried, not an absence.
 - **onFatal** posts `BackendFailed`. The routes are listed in section 4.2.
 - **Frozen close.** `ShutdownStore` logs and closes without waiting for space.
-- **`estimateSize`** is the sum of the data, journal and index file sizes.
+- **`estimateSize`** is the sum of the data, journal and index file sizes, kept in memory by `SizeTrackedFiles` (statted once at open, then updated by every write and truncate through its handles), so it does no I/O on the store's executor.
 
 ---
 

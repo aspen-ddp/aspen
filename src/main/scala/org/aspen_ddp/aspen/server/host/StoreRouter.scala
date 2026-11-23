@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionId, TransactionStatus}
-import org.aspen_ddp.aspen.server.{DurableFiles, Host}
+import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.crl.{CrlClosed, CrlFailed, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.repair.StoreNotHosted
 import org.aspen_ddp.aspen.server.store.{ReconcileResult, RepairSnapshot, Store}
@@ -16,7 +16,7 @@ import scribe.Logging
 import java.util.concurrent.ConcurrentHashMap
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.jdk.CollectionConverters.*
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Success, Try}
 import scala.util.control.NonFatal
 
 object StoreRouter:
@@ -263,33 +263,46 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
         ctx.post(Host.StoreFailStopped(store, err, StoreRebuilds.RecoveryFailed))
 
   /** The CRL holds the state loaded from `store`'s crl_save.log, or the file's earlier removal may not be durable
-   *  (saveFileRemovalPending). On its executor, if it is still the store installed: removes the save file durably,
-   *  forcing its directory even when the file is already absent (an earlier attempt may have unlinked it and failed
-   *  to force), and recovers its transactions. A save file brought back by a crash would be loaded again over newer
-   *  device-CRL state. A failed removal fails `p` and posts SaveFileRemovalFailed: the store has not recovered, so
-   *  has served nothing, and the device CRL holds exactly what the file held; StoreLoader unloads it keeping those
-   *  entries and retries its load. `p` is completed either way. A store closed meanwhile keeps its save file, which
-   *  its close rewrote, and recovers from it when next loaded. */
+   *  (saveFileRemovalPending). On its executor, if it is still the store installed: submits the removal of the save
+   *  file as a `SaveFile` job on the store's device lane (`StoreDisk.removeSaveFile`: durable, forcing its directory
+   *  even when the file is already absent, as an earlier attempt may have unlinked it and failed to force), so the
+   *  executor does no device I/O. The job's result returns to the executor, where, if the store is still the one
+   *  installed, a success recovers its transactions and a failure fails `p` and posts SaveFileRemovalFailed. A save
+   *  file brought back by a crash would be loaded again over newer device-CRL state. A failed removal means the store
+   *  has not recovered, so has served nothing, and the device CRL holds exactly what the file held; StoreLoader
+   *  unloads it keeping those entries and retries its load. The store stays unrecovered (its messages held) while the
+   *  job waits, and a hung device stalls only its own stores. `p` is completed either way. A store closed or replaced
+   *  meanwhile keeps its save file, which its close rewrote, and recovers from it when next loaded. */
   private[host] def crlLoaded(store: Store, saveFile: os.Path, p: Promise[Unit]): Unit =
     route(store.storeId, () => { p.success(()); () }): installed =>
       if installed eq store then
-        val removed =
+        def removeFile(): Unit =
           try
-            os.remove(saveFile, checkExists = false)
-            DurableFiles.syncDirectory(saveFile / os.up)
+            StoreDisk.removeSaveFile(saveFile)
             saveFileRemovals.remove(saveFile)
-            true
           catch
             case NonFatal(err) =>
               saveFileRemovals.add(saveFile)
+              throw err
+        def removed(result: Try[Unit]): Unit =
+          result match
+            case Success(_) =>
+              readAndRecover(installed)
+              p.success(())
+            case Failure(err) =>
               logger.error(s"Store ${store.storeId} failed to remove its loaded crl_save.log durably. Unloading " +
                            s"it and retrying its load at the device scans. $saveFile. Error: $err")
               ctx.post(Host.SaveFileRemovalFailed(store.storeId, store))
               p.failure(err)
-              false
-        if removed then
-          readAndRecover(installed)
-          p.success(())
+        store.deviceIo match
+          case None => removed(Try(removeFile()))
+          case Some(io) =>
+            val job = io.submit(JobKind.SaveFile, Some(store.storeId))(removeFile())
+            job.future.onComplete { result =>
+              // Back on the store's executor, where the store may have been closed or replaced meanwhile
+              route(store.storeId, () => { p.success(()); () }): nowInstalled =>
+                if nowInstalled eq store then removed(result) else p.success(())
+            }(using ExecutionContext.parasitic)
       else
         p.success(())
 

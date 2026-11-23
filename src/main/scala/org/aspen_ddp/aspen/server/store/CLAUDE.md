@@ -125,7 +125,7 @@
   later instance after a same-host reopen), which ends the guard (`inheritedGrowthRepaired`). A guarded object's deletion, once it persists (a refcount-zero commit's backend success,
   or `deleteObjectForRepair`), ends its guard instead, since no repair of it follows (`inheritedGrowthDeleted`); one
   persisted before the first round's scan answers is left out of what the scan lists. A failed scan keeps every
-  object locked and repeats the round. Nothing is persisted beyond the inherited-votes file: a reload repeats the round, the guarded objects' entries still there
+  object locked and repeats the round. The file's removal once nothing is inherited or guarded is a job on the store's device lane (`Frontend.deviceIo`), never done on the store's executor. Nothing is persisted beyond the inherited-votes file: a reload repeats the round, the guarded objects' entries still there
 - Start-time lead (`Frontend.MaxStartLead`, 2 s): every store mutes, the same way, a prepare for an unknown transaction
   whose client-chosen start timestamp leads the host's wall clock (`wallClockMillis`, not the JVM-wide HLC, which the
   host's own client ratchets) by more; the designated leader does not drive it (`Store`). The client's retransmission

@@ -483,7 +483,13 @@
   (`ThreadedDeviceIo` for StoreThreadPool and SingleThreadThreading, configured by `DeviceIo.Config`;
   `LockstepDeviceIo` under lockstep). `DeviceControl.deviceIos` (`DeviceIos`, control-owned) keeps one per path from
   first sight, so a reload reuses it (`forPath`, `get`, `forget` only with nothing in flight, `hostRoot`, `all`);
-  `Host.shutdown` closes them all without waiting. `LocalStorageDeviceState.io` is its device's. Control code does no
+  `Host.shutdown` closes them all without waiting. `Store.deviceIo` (set by `StoreLoader` from `sds.io`; None runs inline, tests only) is how code on a store's
+  executor reaches its device: store-thread code never touches the disk, it submits a job and applies the result back
+  on the executor after rechecking that the store is still the installed one (`crlLoaded`; the transfer-out close
+  saves `crl_save.log` as a `SaveFile` job through `StoreDisk.saveState` and only then closes the store on its
+  executor, so a failed or hung save still ends in the close; `Frontend.removeInheritedStateWhenDone` removes the
+  inherited-votes file as a job with nothing to apply; FSIF's `estimateSize` answers from sizes kept in memory,
+  `SizeTrackedFiles`). `LocalStorageDeviceState.io` is its device's. Control code does no
   device I/O itself (rule 2 of `HostThreading`): `DeviceIoUsageSuite` scans `server/host`, `rebuild` and `transfer`
   for the forbidden direct disk calls and requires each file's count to equal its `baseline` literal (files named
   `*Disk.scala` and the DeviceIo classes are exempt), so a task that moves calls behind a lane lowers its entries in
@@ -522,7 +528,10 @@
   (`RebuildingStore.writeEmptyCrlState`), so its first load drops what an earlier copy left; a late save by a
   fail-stopped earlier copy's close precedes that drop, since the new store cannot install until the close releases
   its executor slot (`HostThreading.AlreadyAssigned`). Once the CRL holds the file's state, `StoreRouter.crlLoaded`
-  removes the file durably and only then recovers. A failed removal (`SaveFileRemovalFailed`) unloads the store
+  removes the file durably, as a `SaveFile` job on the store's device lane (`StoreDisk.removeSaveFile`; the store's
+  executor does no device I/O, so a hung device stalls only its own stores), and only when the job's result returns to
+  the executor, if the store is still the one installed, recovers; the store's messages are held meanwhile
+  (`awaitRecovery`). A failed removal (`SaveFileRemovalFailed`) unloads the store
   keeping its device-CRL entries (after a successful unlink they are its whole state) and retries the load every
   device scan; the router records the file (`saveFileRemovalPending`), so the retry removes it again, forcing the
   directory even if it is gone, before recovering

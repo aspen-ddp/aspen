@@ -129,11 +129,6 @@ object RebuildingStore:
       Some(scala.util.Try(os.read(file).trim.toLong)
         .getOrElse(inheritedVotesAfter(System.currentTimeMillis(), horizon)))
 
-  /** No inherited vote is held any more. Not forced: a reload that still finds the file queries again */
-  def removeInheritedVotes(storePath: os.Path): Unit =
-    try os.remove(storePath / InheritedVotesFile)
-    catch case NonFatal(_) => ()
-
   /** How long the sweep waits on listed allocations before it records what is still unsettled for repair
    *  (sweepPending). Every listed transaction started before the query, at most MaxStartLead ahead of its stores'
    *  clocks, so by then its stores' own expiry resolution has had its chance. Liveness only: what is recorded is

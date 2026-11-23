@@ -35,6 +35,12 @@ object RebuildDisk extends Logging:
     os.remove(dir / RebuildState.stateFilename)
     os.remove(dir / RebuildState.tempFilename)
 
+  /** No inherited vote is held any more (Frontend.removeInheritedStateWhenDone). Not forced: a reload that still
+   *  finds the file queries again. Blocks on the disk: the Frontend runs it as a device-lane job. */
+  def removeInheritedVotes(storePath: os.Path): Unit =
+    try os.remove(storePath / RebuildingStore.InheritedVotesFile)
+    catch case NonFatal(_) => ()
+
   def loadRebuildState(file: os.Path): RebuildState =
     RebuildState.create(loadYamlFile(file))
 

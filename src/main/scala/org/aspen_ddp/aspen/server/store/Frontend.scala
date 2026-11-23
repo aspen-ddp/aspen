@@ -13,10 +13,10 @@ import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitState, Completion, Read}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{ExpiryTally, TransactionStatusCache, Tx}
-import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
+import org.aspen_ddp.aspen.server.rebuild.{RebuildDisk, RebuildingStore}
 import org.aspen_ddp.aspen.common.util.{LogRateLimit, Varint}
 import scribe.Logging
-import org.aspen_ddp.aspen.server.host.JoinCeiling
+import org.aspen_ddp.aspen.server.host.{DeviceIo, JobKind, JoinCeiling}
 import org.aspen_ddp.aspen.client.{ReadLocks, ObjectState as ClientObjectState}
 
 import scala.concurrent.duration.{Duration, FiniteDuration, SECONDS}
@@ -213,7 +213,12 @@ class Frontend(val storeId: StoreId,
                  * primary stores may still hold T, so its finalization may be unfinished, and past expiry no driver
                  * learns the outcome from frozen peers. The Store finalizes it unless a driver of its own holds the
                  * outcome (Store.finalizeHeldCommit) */
-               onKnownCommitHeld: Tx => Unit = _ => ()) extends Logging {
+               onKnownCommitHeld: Tx => Unit = _ => (),
+               /** The store's device's I/O lanes: the store's executor never touches the disk, so file work of the
+                 * Frontend (removeInheritedStateWhenDone) runs as a job on its management lane. None runs it inline:
+                 * tests with in-memory backends
+                 */
+               val deviceIo: Option[DeviceIo] = None) extends Logging {
 
   /** The limit every growing KeyValue update must fit, at vote, apply re-check and a repair install beside held
     * reservations: maxSliceSize lowered to the pool IDA's IDA.maxKVSliceSize, so the union of committed updates repair
@@ -474,7 +479,16 @@ class Frontend(val storeId: StoreId,
   /** Removes the inherited-votes file once neither an inherited vote nor a growth guard is held */
   private def removeInheritedStateWhenDone(): Unit =
     if inheritedVotes.exists(_.isEmpty) && inheritedGrowthLocks.isEmpty then
-      RebuildingStore.removeInheritedVotes(backend.path)
+      // A job on the device's management lane, never on the store's executor. Nothing to apply afterwards: the removal
+      // swallows its failures (a reload that still finds the file queries again), and it is idempotent, so a job a
+      // reload's new Frontend outlives only removes a file the reload will remove again
+      val path = backend.path
+      deviceIo match
+        case Some(io) =>
+          io.submit(JobKind.Other("RemoveInheritedVotes"), Some(storeId))(RebuildDisk.removeInheritedVotes(path))
+          ()
+        case None =>
+          RebuildDisk.removeInheritedVotes(path)
 
   /** The first round's scan answered (HeldVoteQuery.growthScan): every object with an entry against this store, the
     * reported transactions' objects now among them. The objects are guarded, then the inherited votes are set */

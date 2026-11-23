@@ -66,9 +66,11 @@ class ThreadedDeviceIoSuite extends AnyFunSuite with Matchers:
 
   test("a job blocked in the gate is running and cannot be cancelled; the job queued behind it can be"):
     val latch = new CountDownLatch(1)
-    withIo(() => latch.await()) : io =>
+    val entered = new CountDownLatch(1)
+    withIo(() => { entered.countDown(); latch.await() }) : io =>
       val ran = new AtomicBoolean(false)
       val a = io.submit(JobKind.Scan, None)(())
+      entered.await()
       val b = io.submit(JobKind.Scan, None)(ran.set(true))
       a.cancel() should be(false)
       b.cancel() should be(true)

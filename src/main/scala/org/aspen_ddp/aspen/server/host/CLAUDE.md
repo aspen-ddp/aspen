@@ -226,7 +226,11 @@
   purpose from `closingFor` (DeviceShutdown: Shutdown / Relinquish; `handleClose` with `extractCrl`: TransferOut; else
   FailStop), until `handleClose`/`closeUnloaded` end it (Idle, or AwaitingRetry when a retry was parked while it closed;
   a transfer-out close ends once the store is closed, before the extraction's deletion); `StoreCopies.retire` Retiring
-  (`isRetiring`, over loaded devices: a second retire of the store does nothing). Work is the only record of each
+  (`isRetiring`, over loaded devices: a second retire of the store does nothing); `Activity.DiskJob(kind, prior)` marks a copy busy
+  while a disk job for it runs on its device's lane (`HostCopies.diskJob`, a claim legal from Idle, Served and AwaitingRetry,
+  refused if the copy is already busy; `diskJobEnded`, a fact, restores `prior`). `CopyDecision.decide` returns Nil for a
+  DiskJob copy, `ForgetGoneCopy` and `EndQueuedRebuild` included, and the result's application checks the device again; a
+  DiskJob over Served still counts as served for silence, the move guards and `isOffline` (`Activity.underlying`). Work is the only record of each
   owner's work, set where it starts and ends: Create (`createNewStore`, until the copy is served, its open fails or the
   create is skipped; the flip that follows touches no copy and is kept apart, `pendingCreateFlips`), Rebuild
   (`server/rebuild/CLAUDE.md`: Queued, DiscardingLost, Running, Abandoned; the running rebuild's handle and settled

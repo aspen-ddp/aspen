@@ -678,7 +678,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                       s"$deviceId out of service before transferring the store onto it")
           ctx.rebuilds.takeOutOfService(local, storeId,
             s"is served from a copy of an earlier tenancy on device $deviceId, which the store is transferring onto")
-        else if record.exists(_.activity == Activity.Served) then
+        else if record.exists(_.activity.underlying == Activity.Served) then
           // Served by nothing installed here (a stand-in): left for whatever ends it
           endWork()
         else

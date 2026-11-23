@@ -119,6 +119,16 @@ class CopyDecisionSuite extends AnyFunSuite with Matchers:
     decide(in(active, copy(Phase.Live), facts = f.copy(openingOnHost = true))) should be(Nil)
     decide(in(active, copy(Phase.Live), facts = f.copy(rebuildHoldsOnHost = true))) should be(Nil)
 
+  test("a copy with a disk job in flight gets no action, whatever else holds"):
+    val entries: List[Option[StoreEntry]] = None :: StoreStatus.values.toList.map(s => entry(s))
+    val works: List[Option[Work]] = None :: Some(Work.Create) :: Some(Work.Rebuild(None, RebuildStage.Queued)) ::
+      Some(Work.Rebuild(Some(e1), RebuildStage.Running)) :: Nil
+    val facts = List(none, none.copy(dirPresent = Some(false)), none.copy(dirPresent = Some(true),
+      configPresent = Some(false)), none.copy(declaredMissing = true, configPresent = Some(true)),
+      none.copy(tracked = List(TrackedIn(otherDevice, deviceId))))
+    for e <- entries; p <- phases; u <- List(false, true); l <- List(false, true); w <- works; f <- facts do
+      decide(StoreInputs(deviceId, storeId, e, Some(CopyState(p, u, ActivityKind.DiskJob, l)), w, f)) should be(Nil)
+
   test("a copy awaiting its load retry is left to the retry"):
     val awaiting = copy(Phase.Live, ActivityKind.AwaitingRetry)
     decide(in(active, awaiting, facts = none.copy(configPresent = Some(true)))) should be(Nil)

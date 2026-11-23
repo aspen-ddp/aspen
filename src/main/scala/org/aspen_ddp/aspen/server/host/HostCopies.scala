@@ -599,6 +599,25 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   def isRetiring(storeId: StoreId): Boolean =
     allCopies.exists(_.copies.get(storeId).exists(_.activity == Activity.Retiring))
 
+  /** A disk job of `kind` for the copy of `storeId` on `sds` is about to be submitted to the device's lane: the copy
+   *  is DiskJob, busy, until diskJobEnded. A claim: refused (false) where the copy is already busy (a disk job in
+   *  flight, or any activity but Idle, Served or AwaitingRetry), has no record, or `sds` is not attached */
+  def diskJob(sds: LocalStorageDeviceState, storeId: StoreId, kind: JobKind): Boolean =
+    claim("disk job"):
+      val copies = copiesOf(sds).getOrElse(
+        throw IllegalStateException(s"Device ${sds.storageDeviceId} is not attached to the copy registry"))
+      val r = copies.copies.getOrElse(storeId, throw IllegalStateException(s"No copy record for $storeId"))
+      copies.setActivity(storeId, Activity.DiskJob(kind, r.activity))
+
+  /** The disk job of `storeId` on `sds` ended and its result is applied: the copy returns to the activity it was in.
+   *  A fact: a copy not in DiskJob (its record went with a detach, or another fact moved it) is left as it is */
+  def diskJobEnded(sds: LocalStorageDeviceState, storeId: StoreId): Unit =
+    fact("disk job ended"):
+      copiesOf(sds).foreach: copies =>
+        copies.copies.get(storeId).map(_.activity).foreach:
+          case Activity.DiskJob(_, prior) => activityFact("disk job ended", copies, storeId, prior)
+          case _ => ()
+
   /** Whether an entry says no transfer out of its store is outstanding (CopyDecision.noTransferOut) */
   def noTransferOut(entry: StorageDeviceState.StoreEntry): Boolean = CopyDecision.noTransferOut(entry)
 
@@ -626,7 +645,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
    *  Initializing (a create to come, a failed one's included), are Opening reasons */
   def silence(storeId: StoreId): Silence =
     // A store installed with no record (a test's stand-in, served from a device neither loaded nor seamed) is served
-    if allCopies.exists(_.copies.get(storeId).exists(_.activity == Activity.Served)) || ctx.router.get(storeId).isDefined
+    if allCopies.exists(_.copies.get(storeId).exists(_.activity.underlying == Activity.Served)) || ctx.router.get(storeId).isDefined
     then
       Silence.Served
     else
@@ -695,7 +714,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
 
   /** Whether `r` is neither served nor opening */
   private def isOffline(r: CopyRecord): Boolean =
-    !(r.activity == Activity.Served || r.activity.isInstanceOf[Activity.Opening])
+    !(r.activity.underlying == Activity.Served || r.activity.isInstanceOf[Activity.Opening])
 
   /** The stores of `local`'s copies that the reconcile's passes may act on: Idle or awaiting a load retry (neither
    *  served, opening, closing nor retiring), with no work on the device. I3: a transfer in, rebuild, create or transfer

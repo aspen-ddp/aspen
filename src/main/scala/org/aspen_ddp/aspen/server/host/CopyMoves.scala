@@ -69,7 +69,7 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
         val t = IllegalStateException(s"No record of a copy of $storeId on device ${sds.storageDeviceId} to move")
         logger.error(s"Copy move ($site): $t")
         MoveResult.NotMoved(t)
-      case Some(r) if r.activity.isInstanceOf[Activity.Opening] || r.activity == Activity.Served ||
+      case Some(r) if r.activity.isInstanceOf[Activity.Opening] || r.activity.underlying == Activity.Served ||
                       r.activity.isInstanceOf[Activity.Closing] =>
         val t = IllegalStateException(s"The copy of $storeId on device ${sds.storageDeviceId} is ${r.activity}: " +
                                       s"its directory is never moved while its store is installed or opening")

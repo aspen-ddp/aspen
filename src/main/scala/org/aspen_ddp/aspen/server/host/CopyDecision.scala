@@ -14,7 +14,7 @@ object CopyDecision:
 
   /** What a copy's Activity is, without its payload */
   enum ActivityKind:
-    case Idle, AwaitingRetry, Opening, Served, Closing, Retiring
+    case Idle, AwaitingRetry, Opening, Served, Closing, Retiring, DiskJob
 
   object ActivityKind:
     def of(a: Activity): ActivityKind = a match
@@ -24,6 +24,7 @@ object CopyDecision:
       case Activity.Served => Served
       case Activity.Closing(_) => Closing
       case Activity.Retiring => Retiring
+      case Activity.DiskJob(_, _) => DiskJob
 
   /** The copy of a store on the device, as the rules see it. `pendingLost`: its move to lost/ failed and is retried by
    *  each device check (CopyMoves.pendingLost) */
@@ -116,6 +117,11 @@ object CopyDecision:
         (c.activity == ActivityKind.Idle || c.activity == ActivityKind.AwaitingRetry)
     val open = in.copy.exists(c => c.activity == ActivityKind.Opening || c.activity == ActivityKind.Served)
     val phase = in.copy.map(_.phase)
+
+    // A copy with a disk job in flight is busy until the job's result is applied (HostCopies.diskJobEnded), which
+    // checks the device again: nothing fires for it, ForgetGoneCopy, TakeOutOfService and EndQueuedRebuild included
+    if in.copy.exists(_.activity == ActivityKind.DiskJob) then
+      return Nil
 
     val out = List.newBuilder[Action]
 

@@ -782,7 +782,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       case Some(r) if r.phase == Phase.Lost =>
         ctx.moves.holdLost(sds, storeId, held = false)
         MoveResult.Durable
-      case Some(r) if r.activity.isInstanceOf[Activity.Opening] || r.activity == Activity.Served ||
+      case Some(r) if r.activity.isInstanceOf[Activity.Opening] || r.activity.underlying == Activity.Served ||
                       r.activity.isInstanceOf[Activity.Closing] =>
         // Opened, opening or closing since this move was asked for (a failed unserved backend's close ending after
         // a new open began): never moved while installed or opening, and not held for a retry, which would refuse at

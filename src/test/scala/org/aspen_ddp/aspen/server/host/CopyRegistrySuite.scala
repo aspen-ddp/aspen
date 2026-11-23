@@ -45,7 +45,9 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
   private val activities: List[Activity] = List(Activity.Idle, Activity.AwaitingRetry(retry), Activity.Opening(1L),
     Activity.Served, Activity.Closing(ClosePurpose.TransferOut), Activity.Closing(ClosePurpose.Shutdown),
     Activity.Closing(ClosePurpose.Relinquish), Activity.Closing(ClosePurpose.FailStop),
-    Activity.Closing(ClosePurpose.Unserved), Activity.Retiring)
+    Activity.Closing(ClosePurpose.Unserved), Activity.Retiring,
+    Activity.DiskJob(JobKind.Move, Activity.Idle), Activity.DiskJob(JobKind.Move, Activity.Served),
+    Activity.DiskJob(JobKind.Move, Activity.AwaitingRetry(retry)), Activity.DiskJob(JobKind.Scan, Activity.Idle))
 
   private def akind(a: Activity): String = a match
     case Activity.Idle => "Idle"
@@ -54,6 +56,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
     case Activity.Served => "Served"
     case Activity.Closing(_) => "Closing"
     case Activity.Retiring => "Retiring"
+    case Activity.DiskJob(_, _) => "DiskJob"
 
   private def expectedActivity(phase: Phase, from: Activity, to: Activity): Boolean =
     val any = Set("Idle" -> "AwaitingRetry", "Idle" -> "Served", "AwaitingRetry" -> "AwaitingRetry",
@@ -61,7 +64,12 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
       "Opening" -> "AwaitingRetry", "Served" -> "Closing", "Served" -> "Served", "Closing" -> "Idle",
       "Retiring" -> "Idle")
     val pair = akind(from) -> akind(to)
-    any.contains(pair) ||
+    // A disk job holds an Idle, Served or AwaitingRetry copy and returns it to exactly that activity
+    val diskJob = (from, to) match
+      case (_, Activity.DiskJob(_, prior)) => prior == from && Set("Idle", "Served", "AwaitingRetry").contains(akind(from))
+      case (Activity.DiskJob(_, prior), _) => to == prior
+      case _ => false
+    diskJob || any.contains(pair) ||
       (pair == ("Idle" -> "Opening") && phase == Phase.Live) ||
       (pair == ("Idle" -> "Retiring") && phase == Phase.Lost) ||
       // An unserved backend's close holds its Live copy (StoreRebuilds.retireUnserved)
@@ -85,6 +93,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
       case Activity.Served => List(Activity.Served)
       case c @ Activity.Closing(_) => List(Activity.Served, c)
       case Activity.Retiring => List(Activity.Retiring)
+      case j @ Activity.DiskJob(_, prior) => (if prior == Activity.Idle then Nil else List(prior)) :+ j
     path.foreach(d.setActivity(storeId, _))
     d
 
@@ -264,6 +273,49 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
       sds.copies.register(storeId, from, CopyFixtures.copyIdOf(path), unsynced = true)
     ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(storeId)).map(_.phase) should be(Some(from))
     (ctx, sds, path)
+
+  test("a disk job returns the copy to its prior activity"):
+    val root = os.temp.dir(prefix = "aspen-disk-job", deleteOnExit = false)
+    try
+      val (ctx, sds, _) = attachedCopy(root, Phase.Live)
+      val registry = ctx.copyRegistry
+      def activity = sds.copies.copies(storeId).activity
+      registry.installed(sds.storageDeviceId, storeId, ctx.copyRegistry.pathOf(sds, storeId).get)
+      activity should be(Activity.Served)
+      registry.diskJob(sds, storeId, JobKind.Move) should be(true)
+      activity should be(Activity.DiskJob(JobKind.Move, Activity.Served))
+      registry.silence(storeId) should be(Silence.Served)
+      registry.diskJobEnded(sds, storeId)
+      activity should be(Activity.Served)
+      // From Idle, and a second ended job leaves the copy alone
+      sds.copies.setActivity(storeId, Activity.Closing(ClosePurpose.Shutdown))
+      sds.copies.setActivity(storeId, Activity.Idle)
+      registry.diskJob(sds, storeId, JobKind.Scan) should be(true)
+      activity should be(Activity.DiskJob(JobKind.Scan, Activity.Idle))
+      registry.diskJobEnded(sds, storeId)
+      registry.diskJobEnded(sds, storeId)
+      activity should be(Activity.Idle)
+      registry.takeRegistryErrors() should be(Vector())
+    finally os.remove.all(root)
+
+  test("a second disk job on a busy copy is refused"):
+    val root = os.temp.dir(prefix = "aspen-disk-job", deleteOnExit = false)
+    try
+      val (ctx, sds, _) = attachedCopy(root, Phase.Live)
+      val registry = ctx.copyRegistry
+      registry.diskJob(sds, storeId, JobKind.Scan) should be(true)
+      registry.takeRegistryErrors() should be(Vector())
+      registry.diskJob(sds, storeId, JobKind.Move) should be(false)
+      sds.copies.copies(storeId).activity should be(Activity.DiskJob(JobKind.Scan, Activity.Idle))
+      registry.takeRegistryErrors().size should be(1)
+      // An activity a disk job cannot hold is refused too, and an unknown store
+      registry.diskJobEnded(sds, storeId)
+      sds.copies.setActivity(storeId, Activity.Served)
+      sds.copies.setActivity(storeId, Activity.Closing(ClosePurpose.Shutdown))
+      registry.diskJob(sds, storeId, JobKind.Scan) should be(false)
+      registry.diskJob(sds, other, JobKind.Scan) should be(false)
+      registry.takeRegistryErrors().size should be(2)
+    finally os.remove.all(root)
 
   test("every (from, to) pair is legal exactly as the spec's table says"):
     val root = os.temp.dir(prefix = "aspen-copy-table", deleteOnExit = false)

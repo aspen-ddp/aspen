@@ -465,7 +465,7 @@ since. It answers `Unconfirmed` instead. The host acts only after the decision:
   `CopyMoves.move`), then `loadStoreById`. The committed flip gossips `StoreMoved` (`HostServices.gossipStoreOnline`),
   clearing the `StoreOffline` gossiped at the start. A failed move leaves the store unloaded and silent, its copy
   offline on its device (its Rebuilt record, as a restart's load would leave it), so the reconcile's Completed
-  Rebuilds pass (`DeviceReconciler.completeRebuilds`, for a store not rebuilding here), finding the entry Active and
+  Rebuilds pass (`CopyDecision`'s `BringRebuiltLive` case, for a store not rebuilding here), finding the entry Active and
   the copy in `rebuilt/`, retries the move and the load at each device check. A rename that landed but whose
   directory sync failed leaves the copy Live and unsynced (`MoveResult.Unsynced`), never loaded until the next device
   check forces both directories again and loads it (`CopyDecision.LoadResynced`). Its

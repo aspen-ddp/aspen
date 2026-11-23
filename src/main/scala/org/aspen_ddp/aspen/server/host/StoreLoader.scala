@@ -762,7 +762,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   def handleUnloadFailed(e: UnloadFailedStore): Unit =
     val UnloadFailedStore(storeId, store) = e
     router.entry(storeId).filter(_.store eq store).foreach: entry =>
-      // Its copy stays where it is, to load again: no fail-stop
+      // Its copy stays where it is, to load again: no fail-stop. Closed with ClosePurpose.Reload it is left Idle, and
+      // CopyDecision's Load case reloads it at each device check while it stays so (an Active entry, no work)
       ctx.copyRegistry.closingFor(storeId, ClosePurpose.Reload)
       router.remove(storeId)
       // Drops whatever part of the saved state did reach the CRL. The save file is not

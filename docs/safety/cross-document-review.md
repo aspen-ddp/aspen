@@ -202,7 +202,7 @@ The premises other subsystems take from this:
   CRL itself, whose failure unloads the device (`DeviceShutdown.crlFailed`). A store whose `config.yaml` cannot be read
   by `StoreLoader.tryLoadStore` (`awaitUnreadRetry`), or whose load finds its executor slot still held
   (`HostThreading.AlreadyAssigned`), is left offline and AwaitingRetry like a failed open, its `onServed`
-  kept for the load that serves it. A load's `onServed` (the `StoreMoved` gossip of `DeviceShutdown.reloadClosedStores`
+  kept for the load that serves it. A load's `onServed` (the `StoreMoved` gossip of the `Load` case of `CopyDecision`
   and `StoreTransfersOut.reinstateAbandonedOut`) runs only once its LoadStore has installed and recovered the store
   (`StoreLoader.awaitServed`); a LoadStore that leaves it offline with its data intact (no CRL room, no executor slot, a
   save file whose removal failed, a Store whose build throws) hands the callback to its copy's AwaitingRetry,
@@ -262,7 +262,7 @@ The premises other subsystems take from this:
   `phase-param.arrived` cannot be read, and refuses a path whose stat fails; `openDeviceCrl` throws before moving `crl/`;
   an unserved `backendFailed` treats the directory as present (moved to `lost/`).
   A phase a reconcile pass looks for counts only from the registry's record, which a device load builds only from a
-  listing that succeeded, so a failed listing leaves the device unloaded and no pass runs on it; `reloadClosedStores`
+  listing that succeeded, so a failed listing leaves the device unloaded and no decision runs on it; `CopyDecision.Load`
   loads a Live record's store, the load then holding it back with its own `FileStat` tests. `StoreTransfersOut.extractUnloaded` tests the directory and the save file with `FileStat`, failing
   the extraction on a failed stat.
 * A lost device CRL moves every store copy to `lost/` except those that held nothing in it (`DeviceDiscovery.holdsOwnState`):

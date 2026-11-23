@@ -1728,6 +1728,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- host.control.transfersOut.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
       saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
       heldAfterExtract = held(crl, storeId)
+      _ = transferOutWork(host, storeId, held = false)
       _ = factory.shutdownAll()
     yield
       heldAfterClose should be(Set(txid))
@@ -1765,6 +1766,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
       heldAfter = held(crl, storeId)
       retainedAfter = admission.retainedBytes(storeId)
+      _ = transferOutWork(host, storeId, held = false)
       _ = factory.shutdownAll()
     yield
       retainedBefore should be > 0L
@@ -1803,6 +1805,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.perms.set(locked, "rwx------")
       saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
       heldAfter = held(crl, storeId)
+      _ = transferOutWork(host, storeId, held = false)
       _ = factory.shutdownAll()
     yield
       outcome.exists(_.isFailure) should be(true)

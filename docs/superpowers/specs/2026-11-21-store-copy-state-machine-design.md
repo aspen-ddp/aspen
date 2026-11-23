@@ -5,8 +5,9 @@
 directories replacing the per-copy marker files) is done, 2026-11-22 (plan
 `docs/superpowers/plans/2026-11-22-store-copy-state-machine-stage2.md`, commits `e104a53d..59c39437` on branch
 `state_refactor`, plus test-only flake fixes `44e08ebe`, `34739243` and `ad7eedb1`); its decisions are in "Stage 2
-decisions" below, with an amendment pointer where each changes the text. Stage 3 is not started (`Todo.txt`). The
-stage 1 audit findings below are kept: stage 3 builds from them. The sections below describe the design as drafted;
+decisions" below, with an amendment pointer where each changes the text. Stage 3 (the reconcile as a decision function) is done, 2026-11-22 (plan
+`docs/superpowers/plans/2026-11-22-store-copy-state-machine-stage3.md`, commits `b46456b4..` on branch `state_refactor`);
+its decisions are in "Stage 3 decisions" below. The stage 1 audit findings below are kept as history. The sections below describe the design as drafted;
 the four marker files they name are history after stage 2.
 
 ## Intent
@@ -290,6 +291,9 @@ inventories those readers.
 def decide(entry: Option[StoreEntry], copies: List[CopyRecord], work: Option[Work], facts: HostFacts): List[Action]
 ```
 
+**Amended by stage 3 (D1):** `decide` takes one `StoreInputs` (the entry, the store's one copy per P2, its work and
+`StoreFacts`) and returns `List[Action]`; `HostFacts` is `StoreFacts`. See "Stage 3 decisions".
+
 `HostFacts` holds what the function cannot see in the device's own state: the store is served or opening on
 another device of this host, the pool's owner device is Active, the rebuild slot is free, and the retry holds.
 `Action` is a closed enum (`Load`, `Move(copy, phase)`, `Retire`, `Release`, `RequestRebuild`, `StartRebuild`,
@@ -369,7 +373,7 @@ Each stage leaves the full suite green and is reviewable on its own.
      the marker-reading phase function.
    - Update bootstrap (`cmdline`, `DefaultBackendOpener.createStore`) to create into `live/`, and update the
      transfer service to ship from `outbound/` and stage into `transferring-in/`.
-3. **Decision function.**
+3. **Decision function.** Done (2026-11-22). The decisions are in "Stage 3 decisions".
    - Extract `decide` and replace the passes.
    - Add an exhaustive test over every (entry status × up to two copies × each phase × activity × work)
      combination, asserting I1–I5, the store-copies release rule, and "no Action loads a non-Live copy".
@@ -845,3 +849,52 @@ Other marker readers outside the five sites. Stage 1 keeps them as single-marker
    refused forever (TO-only) or deleted (TI+TO). TO+RC is unchanged (retired).
 4. `reloadClosedStores` skips an RC-only copy (unreachable), and must offer the copy when its phase cannot be
    read.
+
+## Stage 3 decisions
+
+Decisions the stage 3 plan made where this spec left a choice open, with the rulings made during execution. Each is
+stated as what holds now. Where this block and the text above disagree, this block governs.
+
+### Decisions
+
+- **D1. Inputs are values, not the registry.** `CopyDecision.decide` takes one `StoreInputs` (entry, the store's copy,
+  work, `StoreFacts`). Its `CopyState` carries an `ActivityKind` (the `Activity` cases without payloads), so tests need
+  no `LoadRetry` or device state. `HostFacts` is `StoreFacts`.
+- **D2. Store-major order replaces pass-major order.** Each store's actions run before the next store's, and each
+  store's inputs are read fresh at its turn. Within a store the cases keep the old pass order. Rebuild slots are taken
+  in `(poolId.uuid, poolIndex)` order.
+- **D3. `decide` enforces I3.** It emits `Create`, `StartRebuild` or `StartTransferIn` only when the store has no work
+  left after this reconcile's own `EndQueuedRebuild`, or has work of the same kind. The other combinations back off
+  silently there instead of being refused and logged by the handler's claim.
+- **D4. `decide` ends a queued rebuild first.** Work `Rebuild(_, Queued)` under an entry that is not Rebuilding gives
+  `EndQueuedRebuild`, and the rest of `decide` sees no work.
+- **D5. Missing Stores is one case.** `DeclareMissing(first)`; the executor sets `local.declaredMissing` to exactly the
+  stores given it in this reconcile.
+- **D6. Outside `decide`:** the device-status branches (Failed, other host, shutting down), `CopyMoves.resync` and
+  `retryPendingLost`, `dropLeftoverCrlState`, the `rebuilding/` staging sweep, and `StoreCopies.release`'s listing of
+  `pending-delete/` (its per-copy rule is the pure `CopyDecision.release`).
+- **D7. One Live-copy rule, `Load`, replaces `closedForShutdown`, `heldForSync` and `reloadClosedStores`.** An Idle,
+  synced Live copy with no work, under an Active entry, not being sent, whose store is not served, opening or held by a
+  rebuild anywhere on the host, whose config is present and which is not declared missing, is loaded. A copy held
+  offline on purpose (pendingLost, work, AwaitingRetry, a device that stops serving) is never in that state. This
+  settles the Todo's question: `closedForShutdown` became a case of the Live-copy rule.
+
+The exhaustive test (`CopyDecisionSuite`) runs every entry status, copy phase, activity and work and asserts I1-I5, the
+store-copies release rule and "no Action loads a non-Live copy".
+
+### Rulings made during execution
+
+- **R1. `declaredMissing` is snapshotted before the loop.** `storeInputs` reads the snapshot; after the loop the executor
+  assigns the new set, then calls `missingIs` once.
+- **R2. `StoreRebuilds.hasRunningRebuild(storeId)`** exists for `StoreFacts.rebuildHandle`.
+- **R4. Every transfer-out close's end re-checks the source device,** whatever its outcome (StoreTransfersOut), since a
+  reconcile is a re-read, not a delta. `rebuildWaitsForClose` (a predicate) replaces `deferRebuildUntilClosed` and
+  `rebuildsAwaitingClose` is gone. Parked (pre-existing, unchanged): a rebuild of a store on another device of the host
+  that waits for a transfer-out close is prompted only by the periodic device check.
+- **R6. A Live copy whose config stat fails waits** until the stat answers (it is not offered); a Live copy with no
+  config is a fixture-only state, since creates and moves are atomic.
+- **R7. Test fixtures hold the work production holds.** A real load claims Opening at once, and production closes for
+  transfer out only under TransferOut work; fixtures that closed a copy for transfer out hold that work, and release
+  it at the end.
+- **R8. Reload copies are reloaded.** A copy closed with `ClosePurpose.Reload` (a failed CRL-state load, a failed
+  save-file removal) is left Idle, and `Load` reloads it at each device check while it stays so.

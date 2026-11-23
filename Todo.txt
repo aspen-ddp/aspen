@@ -33,16 +33,11 @@ X = cross-document-review (its section 5 lists contradictions between documents)
 Store copy state machine (docs/superpowers/specs/2026-11-21-store-copy-state-machine-design.md)
 ------------------------------------------------------------------------------------------------
 
-Stage 1 (the copy registry over today's markers, derived router silence, uniform marker durability) and stage 2
-(phase directories: the layout, CopyMoves, copy ids, no marker files; SCM-2) are done; the spec's "Stage 2 decisions"
-holds what stage 2 decided, and its open questions on Outbound and Parked are resolved (P8, P9). Every lockstep test
-host checks the registry against the disk at each drain (Host.Seams.verifyCopyRegistry).
-
-SCM-3. Stage 3, the reconcile as a decision function. [L]
-  Extract decide(entries, copies, work, HostFacts) and replace the reconcile passes with one match over its
-  Actions. Add the exhaustive test over every entry status x up to two copies x phase x activity x work, asserting
-  I1-I5, the store-copies release rule and "no Action loads a non-Live copy". Parked stays a phase (P9); decide
-  whether closedForShutdown becomes a case of reloadClosedStores's rule.
+Stage 1 (the copy registry over today's markers, derived router silence, uniform marker durability), stage 2
+(phase directories: the layout, CopyMoves, copy ids, no marker files; SCM-2) and stage 3 (the reconcile as a decision
+function, CopyDecision; SCM-3) are done; the spec's "Stage 2 decisions" and "Stage 3 decisions" hold what they decided,
+and its open questions on Outbound and Parked are resolved (P8, P9). Every lockstep test host checks the registry
+against the disk at each drain (Host.Seams.verifyCopyRegistry).
 
 
 PRIORITY 0: design rules

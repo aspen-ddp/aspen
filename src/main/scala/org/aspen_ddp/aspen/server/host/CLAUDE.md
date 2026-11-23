@@ -123,7 +123,8 @@
   `handleClose` caller) whatever its callback meets, so a throw there never wedges the device's unloads.
   A close that ends after its device's unload is a bug: logged at error, and its copy moved
   with `moveUnattached` all the same. `ClosePurpose.Reload` (a failed CRL load, `handleUnloadFailed`; a failed save-file
-  removal, `handleSaveFileRemovalFailed`) leaves the copy where it is, to load again. A move that fails is logged at
+  removal, `handleSaveFileRemovalFailed`) leaves the copy where it is, to load again: it is left Idle, and `Load` (a Live
+  copy rule of `CopyDecision`) reloads it at each device check while it stays so. A move that fails is logged at
   error and the copy held offline in `CopyMoves.pendingLost(local)` (not a copy Opening, Served or Closing again since
   the move was asked for, e.g. a failed unserved backend's close ending after a new open: logged at warn, left to its
   own open or close, never held) (in memory, per device, dropped at detach): never

@@ -119,8 +119,8 @@ class CopyDecisionSuite extends AnyFunSuite with Matchers:
     decide(in(active, copy(Phase.Live), facts = f.copy(rebuildHoldsOnHost = true))) should be(Nil)
 
   test("a copy awaiting its load retry is left to the retry"):
-    decide(in(active, copy(Phase.Live, ActivityKind.AwaitingRetry), facts = none.copy(configPresent = Some(true)))) should
-      be(Nil)
+    val awaiting = copy(Phase.Live, ActivityKind.AwaitingRetry)
+    decide(in(active, awaiting, facts = none.copy(configPresent = Some(true)))) should be(Nil)
 
   test("an Initializing entry is created; other work holds it"):
     val init = entry(StoreStatus.Initializing)

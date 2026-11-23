@@ -140,7 +140,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *
    *  An Operational device of this host has its leftover device-CRL entries dropped, then each of its stores decided
    *  in turn (reconcileStores: CopyDecision.decide over the store's inputs, read fresh at its turn, and its actions
-   *  carried out in order before the next store's inputs are read), the staging of rebuilds no longer listed swept, and its pending-delete copies released.
+   *  carried out in order before the next store's inputs are read), the staging of rebuilds no longer listed swept,
+   *  and its pending-delete copies released.
    */
   private def reconcileDeviceState(local: LocalStorageDeviceState,
                                    remote: StorageDeviceState): Unit =

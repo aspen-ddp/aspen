@@ -83,8 +83,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     def loop(n: Int): Future[Option[Try[Unit]]] = rebuild.complete.value match
       case Some(outcome) => Future.successful(Some(outcome.map(_ => ())))
       case None if n == 0 => Future.successful(None)
-      // Each yield pauses 1 ms: the staging store's open runs on its device's own threads, off this EC
-      case None => Future(Thread.sleep(1)).flatMap(_ => loop(n - 1))
+      case None => Future(()).flatMap(_ => loop(n - 1))
     loop(maxYields)
 
   atest("a full walk restores every object and moves the store into place"):

@@ -458,7 +458,7 @@ trait ControlFixture:
    *  Silent on exhaustion, like `yieldUntil`: the caller asserts the end state. */
   protected def completeRebuilds(host: Host,
                                  deviceId: StorageDeviceId,
-                                 maxRounds: Int = 5000): Future[Unit] =
+                                 maxRounds: Int = 500): Future[Unit] =
     given ExecutionContext = executionContext
     def anyRebuilding(): Future[Boolean] =
       client.getStorageDeviceState(deviceId).map: state =>
@@ -473,9 +473,9 @@ trait ControlFixture:
           case true =>
             host.control.reconciler.checkAll()
             for
-              // Yield so queued work -- the rebuild's own Future and its callbacks -- gets to run. 1 ms: a rebuild's
-              // staging store opens on its device's own threads
-              _ <- Future { Thread.sleep(1); host.testingOnlyHandleEvents() }
+              // Yield so queued work -- the rebuild's own Future and its callbacks -- gets to run. The host is lockstep:
+              // the staging store's open is a lane job that the drain runs
+              _ <- Future { host.testingOnlyHandleEvents() }
               _ <- waitForTransactionsToComplete()
               _ <- loop(rounds - 1)
             yield ()

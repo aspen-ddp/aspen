@@ -25,7 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS, SECONDS}
 import scala.concurrent.{Future, Promise}
 
-class StoreRepairerSuite extends IntegrationTestSuite:
+class StoreRepairerSuite extends IntegrationTestSuite with org.scalatest.ParallelTestExecution:
 
   private val storeId = StoreId(PoolId.BootstrapPoolId, 0.toByte)
 

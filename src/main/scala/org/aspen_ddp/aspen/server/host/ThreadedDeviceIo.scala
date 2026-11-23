@@ -65,7 +65,12 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
         finally laneJobs.decrementAndGet(): Unit
     catch case _: InterruptedException => ()
 
-  laneThread.start()
+  private val laneStarted = new java.util.concurrent.atomic.AtomicBoolean(false)
+
+  /** The lane thread starts with the first job, so a DeviceIo that never runs one (a host root nobody lists, the
+   *  unused lane of a LockstepDeviceIo) holds no thread. */
+  private def startLane(): Unit =
+    if laneStarted.compareAndSet(false, true) && !closed then laneThread.start()
 
   def submit[T](kind: JobKind, store: Option[StoreId])(job: => T): JobHandle[T] =
     val p = Promise[T]()
@@ -79,6 +84,7 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
     val skip: () => Unit = () => { p.tryFailure(DeviceIo.Cancelled); () }
     laneJobs.incrementAndGet()
     lane.add(new Entry(state, run, skip))
+    startLane()
     new JobHandle[T]:
       def future: Future[T] = p.future
       def cancel(): Boolean =

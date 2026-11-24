@@ -757,7 +757,8 @@
   retire refuses (false) a copy another disk job holds, and one whose job never returns (a hung device) leaves its
   future pending and the copy busy: never decided around (spec 7a). Three paths retire:
   - The Rebuilding case, for a Lost copy of a store rebuilt here (`StoreRebuilds.discardLostStore`). It holds a rebuild
-    slot from its start (`maxConcurrentRebuilds` counts its Rebuild work's DiscardingLost stage), and the slot passes
+    slot on its device from its start (`maxConcurrentRebuilds`, per destination device, counts its Rebuild work's
+    DiscardingLost stage, `HostCopies.discardsOn`), and the slot passes
     straight to the rebuild in the same callback (DiscardingLost -> Running), so one reconcile cannot retire every Lost
     store at once. Discards count only on loaded devices (`HostCopies.discards`), as does `isRetiring`: a device
     unloaded mid-retire (`crlFailed`, a relinquish) drops its discard work and frees the slot while the orphaned
@@ -847,7 +848,7 @@
   it and loads it (`CopyDecision.Load`). Tests fail the rename through `CopyMoves.rename` and the sync through
   `CopyMoves.syncDirectory`
 - A failed rebuild pass or a permanently failed flip never re-checks its own device at once, which would restart the
-  same store in a spin: it re-checks the other devices (the slot is host-wide) and schedules a backoff re-check of its
+  same store in a spin: it re-checks the other devices (as every completion does; slots are per destination device) and schedules a backoff re-check of its
   own (`StoreRebuilds.scheduleRebuildRetry`: `Host.RebuildRetryInitialDelay` 30 s, doubled per failure of the store in
   a row up to `RebuildRetryMaxDelay` 30 min, reset when a flip settles; rebuild-process 5.7). Until it runs,
   `startRebuild` skips the store for what failed (`HeldRebuild`: device, episode, `acceptLoss`), so a failing store

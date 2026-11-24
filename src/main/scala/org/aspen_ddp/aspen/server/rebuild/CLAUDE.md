@@ -116,7 +116,11 @@
   is any stage on one device. `startRebuild`'s host-wide "a rebuild of the store runs" also counts a running handle, so
   a rebuild still running for a device unloaded under it (crlFailed cancels nothing, and a cancel past the abort latch completes; its Work went with
   the device's records) blocks a second rebuild of the store until it releases its slot. Slots (`maxConcurrentRebuilds`)
-  count running rebuilds by handle and discards by work; a discard hands its slot to the rebuild with no gap
+  are per destination device (`StoreRebuilds.slotsTaken(deviceId)`): each device holds at most that many, counting the
+  rebuilds running onto it by handle and the discards on it by work. Every slot holder waits only on its own device's
+  lane (its staging jobs, its finish's listing, its flip's move, its discard's retire), so a hung device holds only its
+  own slots and a rebuild onto a healthy device always starts (spec 7a); within a device, queued rebuilds wait for a
+  slot there; a discard hands its slot to the rebuild with no gap
   (`startRebuild(handoff = true)`: DiscardingLost goes straight to Running, the discard's own slot not counted), and a
   rebuild that does not start leaves the work Queued. An outcome that ends the work ends it at the slot's release, after
   the outcome's steps (an Adopt's move to Live and load), so the store stays Rebuilding-silent throughout

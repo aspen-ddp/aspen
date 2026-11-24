@@ -229,9 +229,10 @@ class Host(val client: AspenClient,
                    val storeTransferService: StoreTransferService = StoreTransferService.Disabled,
                    val storeRebuildFactory: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
                    /** A rebuild reads a whole store's worth of data through the client, so an
-                    *  eight-store device must not start eight at once. Entries beyond this bound
-                    *  wait; every completion re-checks all loaded devices and starts whatever is
-                    *  queued. */
+                    *  eight-store device must not start eight at once. Per destination device: each
+                    *  device runs (or discards a lost copy for) at most this many rebuilds at once, so a
+                    *  hung device holds only its own slots. Entries beyond this bound wait; every
+                    *  completion re-checks all loaded devices and starts whatever is queued. */
                    val maxConcurrentRebuilds: Int = 2,
                    /** How often storage-devices/ is listed for newly present device directories.
                     *  Only the local directory scan runs this often. The network-reading

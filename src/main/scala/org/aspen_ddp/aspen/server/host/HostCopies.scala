@@ -602,6 +602,15 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
 
   /** How many (device, store) pairs hold discard work (RebuildStage.DiscardingLost), but `except`'s: each takes a
    *  rebuild slot, as a running rebuild does */
+  /** The discards (Rebuild work DiscardingLost) on the loaded device `deviceId`, but `except`'s: its rebuild slots
+   *  taken by discards (StoreRebuilds.slotsTaken) */
+  def discardsOn(deviceId: StorageDeviceId, except: Option[(StorageDeviceId, StoreId)] = None): Int =
+    attached.get(deviceId).toList.map: sds =>
+      sds.copies.work.count:
+        case (s, Work.Rebuild(_, RebuildStage.DiscardingLost)) => !except.contains((deviceId, s))
+        case _ => false
+    .sum
+
   def discards(except: Option[(StorageDeviceId, StoreId)] = None): Int =
     attached.toList.map: (id, sds) =>
       sds.copies.work.count:

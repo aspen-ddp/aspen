@@ -28,8 +28,8 @@ import scala.util.control.NonFatal
  *
  *  Rebuild and create work lives in the copy registry (Work.Rebuild, Work.Create, by device and store); what is kept
  *  here is what Work cannot hold: each running rebuild's handle (to cancel it) and the promise a shutdown waits on,
- *  a pending flip, request and retry backoff. The rebuild slots are host-wide, so a slot released by one device's
- *  rebuild can unblock another's. */
+ *  a pending flip, request and retry backoff. The rebuild slots are per destination device (slotsTaken), so a hung
+ *  device holds only its own and never blocks a rebuild onto another. */
 class StoreRebuilds(ctx: DeviceControl) extends Logging:
   import ctx.given
 
@@ -90,10 +90,13 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   /** The stores with a backoff re-check of their device scheduled */
   private[server] def rebuildRetriesScheduled: Set[StoreId] = scheduledRebuildRetries.keySet
 
-  /** The rebuild slots taken: each running rebuild (by its handle, so one whose device was unloaded meanwhile still
-   *  counts until its slot is released), and each discard but `except`'s */
-  private def slotsTaken(except: Option[(StorageDeviceId, StoreId)]): Int =
-    runningRebuilds.size + registry.discards(except)
+  /** The rebuild slots taken on destination device `deviceId`: each rebuild running onto it (by its handle, so one
+   *  whose device was unloaded meanwhile still counts until its slot is released), and each discard on it but
+   *  `except`'s. Slots are per device (maxConcurrentRebuilds each): every slot holder waits only on its own device's
+   *  lane (its staging jobs, its finish's listing, its flip's move, its discard's retire), so a hung device holds only
+   *  its own slots and never blocks a rebuild onto a healthy one (spec 7a) */
+  private def slotsTaken(deviceId: StorageDeviceId, except: Option[(StorageDeviceId, StoreId)]): Int =
+    runningRebuilds.valuesIterator.count(_.deviceId == deviceId) + registry.discardsOn(deviceId, except)
 
   /** Test-only (HostCopies.verifyAgainstDisk): the phase a copy placed by the running rebuild of `storeId` on device
    *  `deviceId` reads (Rebuilt, with its episode in phase-param.rebuilt), while its completion's handler has not yet
@@ -108,8 +111,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private[server] def finishPlacingOn(deviceId: StorageDeviceId): Map[StoreId, Phase] =
     runningRebuilds.keys.flatMap(s => finishPlacing(deviceId, s).map(s -> _)).toMap
 
-  /** The rebuild slots taken now (tests) */
-  private[server] def rebuildSlotsTaken: Int = slotsTaken(None)
+  /** The rebuild slots taken now on every device together (tests) */
+  private[server] def rebuildSlotsTaken: Int = runningRebuilds.size + registry.discards()
+
+  /** The rebuild slots taken now on device `deviceId` (tests) */
+  private[server] def rebuildSlotsTakenOn(deviceId: StorageDeviceId): Int = slotsTaken(deviceId, None)
 
   /** Cancels the rebuilds of the given stores of `deviceId` for its shutdown, returning, by store, the future of
    *  each one's slot release. A cancel during the walk, sweep, retries or finish's close fails the pass; a rebuild
@@ -254,9 +260,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  was failed. The slot is released only after the flip commits, so a concurrent check cannot
    *  restart the same store between the release and the commit.
    *
-   *  Every completion re-checks the host's other loaded devices, because
-   *  the rebuild slots are host-wide: a slot released by device A's rebuild could unblock a queued
-   *  rebuild on device B, and without a re-check of B it would wait for the periodic sweep (one
+   *  Every completion re-checks the host's other loaded devices. The slots are per destination device, so a slot
+   *  released by device A's rebuild unblocks only A's queued rebuilds; the re-check of the others is cheap and keeps a
+   *  rebuild queued on device B for any other reason from waiting for the periodic sweep (one
    *  hour) with data under-replicated. Every flip outcome but `NotOwned` (`Adopt`, `AdoptOffline`,
    *  `Discard`, `Superseded`, `Unconfirmed`) additionally re-checks this device, to start the next
    *  store queued behind the slot just freed; after `NotOwned` the device is another host's. A
@@ -319,7 +325,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     // Nor while the store's staging checkpoint drop runs (retireForeignCopy): its apply continues the start
     if !closing && !refused && !shipping && !runs && !scheduledRebuildRetries.get(storeId).contains(held) &&
        !stagingDrops.contains((deviceId, storeId)) &&
-       slotsTaken(Option.when(handoff)((deviceId, storeId))) < ctx.maxConcurrentRebuilds &&
+       slotsTaken(deviceId, Option.when(handoff)((deviceId, storeId))) < ctx.maxConcurrentRebuilds &&
        ! ctx.shutdown.isShuttingDown(local.storageDeviceId) &&
        retireForeignCopy(local, storeId, episode, acceptLoss, checkpointDropped, disk) &&
        discardLostStore(local, storeId, episode, held) then
@@ -356,7 +362,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
       /** Every loaded device except the one this rebuild ran on.
        *
-       *  For the failure path only. The freed slot is host-wide, so the other devices are still
+       *  For the failure path only. The other devices are still
        *  worth re-checking, but re-checking this one restarts the rebuild that just failed:
        *  `release()` has already put the store's work back to Queued, the tree entry still
        *  reads `Rebuilding`, and reconcileDeviceState's Rebuilding pass therefore starts it
@@ -591,7 +597,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           // from the re-check here, because a rebuild that fails in well under a millisecond --
           // an unreadable checkpoint, a pool that cannot be read -- would spin through tree reads
           // and WARN lines forever. It comes from scheduleRebuildRetry's backoff (rebuild-process 5.7). The
-          // other devices are re-checked because the slot just freed is host-wide and may be
+          // other devices are re-checked, as every completion re-checks them, and may be
           // what a queued rebuild elsewhere is waiting on.
           try
             logger.warn(s"Rebuild of store $storeId failed: $err")

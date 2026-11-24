@@ -444,8 +444,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         openEnded()
         // No backend opened, so the copy is closed: moved to lost/ now. A move that fails holds it offline for the
         // checks to retry; a crash before the move recovers the same files at the next start and lands here again.
-        // The move is a lane job; the device is checked once its result is applied (a device still being loaded is
-        // checked once it is registered)
+        // The move is a lane job; the device is checked once its result is applied, if it was the loaded one when
+        // the open ended and still is (a device unloaded meanwhile is checked by its next load, which reconciles it)
         ctx.rebuilds.moveToLostOnLane("BackendStateLost", sds, storeId): _ =>
           if registered && ctx.devices.isLoaded(sds) then
             ctx.reconciler.checkStorageDevice(sds.storageDeviceId)

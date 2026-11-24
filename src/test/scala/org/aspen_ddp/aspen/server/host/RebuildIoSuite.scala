@@ -34,13 +34,22 @@ class RebuildIoSuite extends IntegrationTestSuite with ControlFixture:
   private final case class Bench(host: Host, factory: HeldRebuildFactory, devA: os.Path, devB: os.Path)
 
   /** A host with devices A and B; `place` puts copies on them before their load */
-  private def rig(place: (os.Path, os.Path) => Unit = (_, _) => ()): Bench =
+  private def rig(place: (os.Path, os.Path) => Unit = (_, _) => (), slots: Int = 2,
+                  realOn: Option[StorageDeviceId] = None): Bench =
     val hostRoot = newHostDir()
     val devA = device(hostRoot, "dev0", deviceA)
     val devB = device(hostRoot, "dev1", deviceB)
     place(devA, devB)
     val factory = new HeldRebuildFactory
-    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 2)
+    // A rebuild onto `realOn` is a real RebuildingStore (its staging jobs on that device's lane); any other is held
+    val chosen = realOn.fold[StoreRebuildFactory](factory): real =>
+      new StoreRebuildFactory:
+        def createRebuild(client: AspenClient, storeId: StoreId, storageDeviceId: StorageDeviceId, devicePath: os.Path,
+                          backends: BackendOpener, io: DeviceIo, episode: Option[UUID],
+                          existingCopy: Option[(Phase, os.Path)]): StoreRebuild =
+          val f = if storageDeviceId == real then StoreRebuildFactory.Filesystem else factory
+          f.createRebuild(client, storeId, storageDeviceId, devicePath, backends, io, episode, existingCopy)
+    val host = newHost(hostRoot, storeRebuildFactory = chosen, maxConcurrentRebuilds = slots)
     host.testingOnlyHandleEvents()
     Bench(host, factory, devA, devB)
 
@@ -218,6 +227,107 @@ class RebuildIoSuite extends IntegrationTestSuite with ControlFixture:
       r.host.control.copyRegistry.device(deviceA) should be(None)
       recorded(r.host).loadStoreByIdRequests should not contain((deviceA, sA))
       labels(r.host, r.devA) should be(Nil)
+      noViolations(r.host)
+
+  // ---- Rebuild slots are per destination device ----
+
+  /** sA Rebuilding on A and sB on B in the tree, with one slot per device */
+  private def bothInTree(eA: UUID, eB: UUID)(using ExecutionContext): Future[Unit] =
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- net.createDevice(deviceB)
+      _ <- setDeviceState(deviceA)(_.setRebuilding(sA, eA))
+      _ <- setDeviceState(deviceB)(_.setRebuilding(sB, eB))
+      _ <- waitForTransactionsToComplete()
+    yield ()
+
+  /** With A's only slot held by a rebuild waiting on A's held lane, a rebuild onto B starts and completes */
+  private def bCompletesBesideHeldA(r: Bench, eB: UUID)(using ExecutionContext): Future[org.scalatest.Assertion] =
+    start(r.host, deviceB, sB, eB)
+    for
+      _ <- pump(r.host, "B's rebuild created", drain = false)(r.factory.created.exists(_.storeId == sB))
+      _ = rebuildOf(r, sB).placeAndComplete()
+      _ <- pump(r.host, "B's rebuild settled", drain = false)(outcome(r.host, deviceB, sB).nonEmpty && !running(r.host, sB))
+    yield
+      outcome(r.host, deviceB, sB) should be(Some(RebuildOutcome.Adopt))
+      recordOn(r.host, deviceB, sB).map(_.phase) should be(Some(Phase.Live))
+      recorded(r.host).loadStoreByIdRequests should contain((deviceB, sB))
+      // A still holds its own slot, waiting on its lane
+      running(r.host, sA) should be(true)
+      r.host.control.rebuilds.rebuildSlotsTakenOn(deviceA) should be(1)
+      r.host.control.rebuilds.rebuildSlotsTakenOn(deviceB) should be(0)
+      noViolations(r.host)
+
+  atest("a rebuild onto another device completes while a held finish listing holds a device's only slot"):
+    given ExecutionContext = executionContext
+    val r = rig(slots = 1)
+    val (eA, eB) = (UUID.randomUUID(), UUID.randomUUID())
+    for
+      _ <- bothInTree(eA, eB)
+      _ = start(r.host, deviceA, sA, eA)
+      _ <- pump(r.host, "A's rebuild created")(r.factory.created.nonEmpty)
+      _ = holdDevice(r.host, r.devA)
+      _ = rebuildOf(r, sA).placeAndComplete()
+      _ <- pump(r.host, "A's listing held", drain = false)(labels(r.host, r.devA).nonEmpty)
+      _ = labels(r.host, r.devA) should be(List("RebuildBookkeeping"))
+      done <- bCompletesBesideHeldA(r, eB)
+    yield done
+
+  atest("a rebuild onto another device completes while a held Adopt move holds a device's only slot"):
+    given ExecutionContext = executionContext
+    val r = rig(slots = 1)
+    val (eA, eB) = (UUID.randomUUID(), UUID.randomUUID())
+    for
+      _ <- bothInTree(eA, eB)
+      _ = start(r.host, deviceA, sA, eA)
+      _ <- pump(r.host, "A's rebuild created")(r.factory.created.nonEmpty)
+      _ = holdDevice(r.host, r.devA)
+      _ = rebuildOf(r, sA).placeAndComplete()
+      _ <- pump(r.host, "A's listing held", drain = false)(labels(r.host, r.devA).nonEmpty)
+      _ = stepOnce(r.host, r.devA, "RebuildBookkeeping")
+      _ <- pump(r.host, "A's move held", drain = false)(labels(r.host, r.devA).nonEmpty)
+      _ = labels(r.host, r.devA) should be(List("Move"))
+      done <- bCompletesBesideHeldA(r, eB)
+    yield done
+
+  atest("a rebuild onto another device completes while a held staging job holds a device's only slot"):
+    given ExecutionContext = executionContext
+    val r = rig(slots = 1, realOn = Some(deviceA))
+    val (eA, eB) = (UUID.randomUUID(), UUID.randomUUID())
+    holdDevice(r.host, r.devA)
+    for
+      _ <- bothInTree(eA, eB)
+      // A real rebuild: its first step, the checkpoint's load, is a Staging job on A's held lane
+      _ = start(r.host, deviceA, sA, eA)
+      _ <- pump(r.host, "A's staging job held", drain = false)(labels(r.host, r.devA).nonEmpty)
+      _ = labels(r.host, r.devA) should be(List("Staging"))
+      done <- bCompletesBesideHeldA(r, eB)
+    yield done
+
+  atest("on one device with one slot, a second rebuild waits for the first, then starts"):
+    given ExecutionContext = executionContext
+    val r = rig(slots = 1)
+    val sA2 = StoreId(sA.poolId, 2.toByte)
+    val (e1, e2) = (UUID.randomUUID(), UUID.randomUUID())
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.setRebuilding(sA, e1).setRebuilding(sA2, e2))
+      _ <- waitForTransactionsToComplete()
+      _ = start(r.host, deviceA, sA, e1)
+      _ = start(r.host, deviceA, sA2, e2)
+      _ <- pump(r.host, "the first rebuild created")(r.factory.created.nonEmpty)
+      firstOnly = r.factory.created.map(_.storeId).toList
+      secondWork = r.host.control.copyRegistry.rebuildWorkOn(deviceA, sA2).map(_.stage)
+      slots = r.host.control.rebuilds.rebuildSlotsTakenOn(deviceA)
+      _ = rebuildOf(r, sA).placeAndComplete()
+      // The first's completion re-checks the device, whose reconcile starts the second
+      _ <- pump(r.host, "the second rebuild created")(r.factory.created.exists(_.storeId == sA2))
+    yield
+      firstOnly should be(List(sA))
+      secondWork should be(Some(RebuildStage.Queued))
+      slots should be(1)
+      outcome(r.host, deviceA, sA) should be(Some(RebuildOutcome.Adopt))
+      r.host.control.rebuilds.rebuildSlotsTakenOn(deviceA) should be(1)
       noViolations(r.host)
 
   // ---- The staging checkpoint's drop ----

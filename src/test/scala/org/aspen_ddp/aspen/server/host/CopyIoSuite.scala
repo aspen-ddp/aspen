@@ -154,6 +154,21 @@ class CopyIoSuite extends IntegrationTestSuite with ControlFixture:
     recordOn(host, deviceA, s) should be(None)
     noViolations(host)
 
+  test("runCopyJobs runs a copy job early but applies its result only after the events queued before it"):
+    val (host, devA, _) = twoDevices(CopyFixtures.placeCopy(_, s, Phase.Lost): Unit, _ => ())
+    var order = List.empty[String]
+    host.control.post(Host.DeviceJobDone("an earlier event", () => order :+= "earlier"))
+    host.control.moves.moveOnLane("test", local(host, deviceA), s, Phase.Retired)(r => order :+= s"moved $r")
+    runCopyJobs(host)
+    // The lane job ran (the copy is in pending-delete), its result still queued behind the earlier event
+    CopyFixtures.retiredCopies(devA, s).size should be(1)
+    order should be(Nil)
+    recordOn(host, deviceA, s).map(_.activity) should be(Some(Activity.DiskJob(JobKind.Move, Activity.Idle)))
+    drain(host)
+    order should be(List("earlier", s"moved ${MoveResult.Durable}"))
+    recordOn(host, deviceA, s) should be(None)
+    noViolations(host)
+
   test("a move completing after its device's unload changes nothing"):
     val (host, devA, _) = twoDevices(CopyFixtures.placeCopy(_, s, Phase.Lost): Unit, _ => ())
     holdDevice(host, devA)
@@ -276,6 +291,37 @@ class CopyIoSuite extends IntegrationTestSuite with ControlFixture:
         CopyFixtures.retiredCopies(devA, s).size should be(1)
         heldJobs(host, devA) should be(Nil)
         noViolations(host)
+
+  for (variant, tree) <- List[(String, StorageDeviceState => StorageDeviceState)](
+        "declared Failed" -> (_.copy(status = StorageDeviceState.DeviceStatus.Failed)),
+        "owned by another host" -> (_.copy(hostId = org.aspen_ddp.aspen.common.metadata.HostId(UUID.randomUUID()))))
+  do
+    atest(s"a device $variant is stopped at once, not after the resync its held lane holds"):
+      given ExecutionContext = executionContext
+      val (host, devA, _) = twoDevices(CopyFixtures.placeCopy(_, s, Phase.Live): Unit, _ => ())
+      host.control.copyRegistry.copiesOf(local(host, deviceA)).get.setUnsynced(s, true)
+      holdDevice(host, devA)
+      recorded(host).armLookup(deviceA).success(tree(deviceState(deviceA)))
+      host.control.reconciler.checkStorageDevice(deviceA)
+      awaitLoudly(s"device A's check, $variant") {
+        drain(host)
+        host.control.reconciler.activeDeviceChecks.isEmpty
+      }.flatMap: _ =>
+        // The resync was asked for and waits on the held lane; the stop did not wait for it
+        heldJobs(host, devA) should be(List(JobKind.Move))
+        awaitLoudly(s"device A unloaded, $variant") {
+          drain(host)
+          !loadedDevices(host).contains(deviceA)
+        }.map: _ =>
+          loadedDevices(host).contains(deviceA) should be(false)
+          heldJobs(host, devA) should be(List(JobKind.Move))
+          if variant == "declared Failed" then
+            os.exists(devA / "failed") should be(true)
+          releaseDevice(host, devA)
+          drain(host)
+          heldJobs(host, devA) should be(Nil)
+          host.control.moves.resyncRunning(devA) should be(false)
+          noViolations(host)
 
   test("a resync whose force fails leaves the copy unsynced, and one completing after unload changes nothing"):
     val (host, devA, _) = twoDevices(CopyFixtures.placeCopy(_, s, Phase.Live): Unit, _ => ())

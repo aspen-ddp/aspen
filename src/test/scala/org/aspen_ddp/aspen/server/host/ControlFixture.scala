@@ -424,20 +424,14 @@ trait ControlFixture:
    *  was actually wrong far better than a timeout would -- but it means callers MUST assert the condition
    *  themselves or they get a false pass. */
   protected def yieldUntil(condition: => Boolean, maxYields: Int = 100): Future[Unit] =
-    // Copy moves, retires and deletes are lane jobs: each yield runs those of this suite's hosts, as the calls that
-    // queued them once ran them inline (runCopyJobs; a held path's stay held)
+    // Copy moves, retires and discards are lane jobs: each yield runs those of this suite's lockstep hosts, their
+    // results applied only from the head of the FIFO (runCopyJobs), so in the order a real drain applies them
     runAllCopyJobs()
     if condition || maxYields == 0 then
       Future.unit
     else
       Future(()).flatMap(_ => yieldUntil(condition, maxYields - 1))
 
-  /** runCopyJobs of every lockstep host this suite built with newHost */
-  protected def runAllCopyJobs(): Unit =
-    rigs.keySet.toArray(Array.empty[Host]).foreach: host =>
-      host.threading match
-        case _: LockstepThreading => runCopyJobs(host)
-        case _ => ()
 
   /** Yields and pumps the network's transactions until `condition` holds, failing with `what` once `timeout` of real
    *  time has passed without it: never a silent end. For waits on work that crosses real-time hops (the client's
@@ -576,6 +570,12 @@ trait ControlFixture:
           t.event.isInstanceOf[Host.CheckLoadedDevice])) ||
           (!keepInitializeTaskExecutor && t.event.isInstanceOf[Host.InitializeTaskExecutor])
       case _ => false
+    // The startup gate's StoresReady, posted once the startup paths are decided, is handled first, as the control
+    // thread handles it before anything posted after it (a test that never drains still sees later results in order)
+    threading.queuedItems.headOption.foreach:
+      case t: Host.EventTask if t.event.isInstanceOf[Host.StoresReady] =>
+        threading.removeQueued(_ eq t).foreach(_.run())
+      case _ => ()
     rigs.put(host, new Rig(recording, scheduler))
     host
 
@@ -763,23 +763,40 @@ trait ControlFixture:
       batch.foreach(_.run())
       batch = ls.removeQueued(isLoadRead)
 
-  /** Runs the queued copy jobs (StoreCopies, CopyMoves: `Move`, `Retire`, `Release`, `Delete`) and their results
-   *  (DeviceJobDone named "copy ..."), including what those queue of the same, ahead of and leaving queued everything
-   *  else, without the drain's disk check: what a retire, move or discard once did inline. A held path's jobs stay
-   *  held */
+  /** Runs the queued copy jobs (StoreCopies, CopyMoves: `Move`, `Retire`, `Release`, `Delete`) wherever they are
+   *  queued (running a lane job early is legal: its result is posted at the FIFO's tail), and applies their results
+   *  (DeviceJobDone named "copy ...") only from the head of the FIFO, so no result is applied ahead of an event queued
+   *  before it. Stops at the first other event at the head, left for a real drain. No disk check. A held path's jobs
+   *  stay held */
   protected def runCopyJobs(host: Host): Unit =
     val ls = lockstep(host)
     val kinds = Set[JobKind](JobKind.Move, JobKind.Retire, JobKind.Release, JobKind.Delete)
-    def isCopyJob(task: Runnable): Boolean = task match
+    def isCopyTask(task: Runnable): Boolean = task match
       case t: LockstepThreading.DeviceTask => kinds.contains(t.kind)
+      case _ => false
+    def isCopyResult(task: Runnable): Boolean = task match
       case t: Host.EventTask => t.event match
         case e: Host.DeviceJobDone => e.what.startsWith("copy ")
         case _ => false
       case _ => false
-    var batch = ls.removeQueued(isCopyJob)
-    while batch.nonEmpty do
-      batch.foreach(_.run())
-      batch = ls.removeQueued(isCopyJob)
+    var progress = true
+    while progress do
+      progress = false
+      val tasks = ls.removeQueued(isCopyTask)
+      tasks.foreach(_.run())
+      progress = tasks.nonEmpty
+      var head = ls.queuedItems.headOption
+      while head.exists(isCopyResult) do
+        ls.removeQueued(_ eq head.get).foreach(_.run())
+        progress = true
+        head = ls.queuedItems.headOption
+
+  /** runCopyJobs of every lockstep host this suite built with newHost */
+  protected def runAllCopyJobs(): Unit =
+    rigs.keySet.toArray(Array.empty[Host]).foreach: host =>
+      host.threading match
+        case _: LockstepThreading => runCopyJobs(host)
+        case _ => ()
 
   /** The kinds of the management jobs held on `path`, in submission order. */
   protected def heldJobs(host: Host, path: os.Path): List[JobKind] = lockstep(host).held(path)

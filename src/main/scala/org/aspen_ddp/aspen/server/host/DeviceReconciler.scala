@@ -147,19 +147,32 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   private def reconcileDeviceState(local: LocalStorageDeviceState,
                                    remote: StorageDeviceState)(ended: () => Unit): Unit =
     local.reconciledEntries = Some(remote.stores)
-    // Copies whose move was not durable (CopyMoves) are forced again first, a job on the device's lane, so the
-    // decisions see them synced: they run once its result is applied, the device's check held until then (a hung
-    // device's check waits with it, and its later checks are deferred behind it). Then copies whose move to lost/
-    // failed are moved (StoreRebuilds.moveToLost)
-    ctx.moves.resync(local):
+    val shuttingDown = remote.status == StorageDeviceState.DeviceStatus.ShuttingDown ||
+      remote.status == StorageDeviceState.DeviceStatus.Shutdown || ctx.shutdown.isShuttingDown(local.storageDeviceId)
+    if remote.isFailed || remote.hostId != ctx.hostId || shuttingDown then
+      // The device-level branches need no copy synced, so they never wait for the resync: a device whose lane hangs
+      // (a failing directory sync is what leaves a copy unsynced) is still retired, relinquished or shut down. The
+      // resync is still asked for, and copies whose move to lost/ failed are moved (StoreRebuilds.moveToLost)
       try
-        if ctx.devices.isLoaded(local) then
-          reconcileResynced(local, remote)
+        ctx.moves.resync(local)(())
+        ctx.rebuilds.retryPendingLost(local)
+        deviceLevel(local, remote)
       finally ended()
+    else
+      // Copies whose move was not durable (CopyMoves) are forced again first, a job on the device's lane, so the
+      // store decisions see them synced: they run once its result is applied, the device's check held until then (a
+      // hung device's check waits with it, and its later checks are deferred behind it). Then copies whose move to
+      // lost/ failed are moved (StoreRebuilds.moveToLost)
+      ctx.moves.resync(local):
+        try
+          if ctx.devices.isLoaded(local) then
+            ctx.rebuilds.retryPendingLost(local)
+            // The tree read before the resync may have changed meanwhile; the next check reads it again
+            operational(local, remote)
+        finally ended()
 
-  /** reconcileDeviceState's steps after its resync */
-  private def reconcileResynced(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
-    ctx.rebuilds.retryPendingLost(local)
+  /** reconcileDeviceState's device-level branches: a Failed device, one owned elsewhere, one shutting down */
+  private def deviceLevel(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     if remote.isFailed then
       // An operator has declared this device dead. Its directory can still mount -- a dead
       // controller rather than a dead platter -- and its zeroed host id must not be mistaken for
@@ -168,9 +181,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       ctx.shutdown.retireFailedDevice(local, remote)
     else if remote.hostId != ctx.hostId then
       ctx.shutdown.relinquishDevice(local, remote)
-    else if remote.status == StorageDeviceState.DeviceStatus.ShuttingDown ||
-            remote.status == StorageDeviceState.DeviceStatus.Shutdown ||
-            ctx.shutdown.isShuttingDown(local.storageDeviceId) then
+    else
       // None of the store decisions run: each would start work on a device about to be shelved.
       // A store transferred away meanwhile keeps its directory until the device is next
       // reconciled while Operational, here or on an adopting host.
@@ -180,6 +191,15 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // again once its own work has stopped, and that check runs the decisions. shutDownDevice
       // itself does nothing then, as the guard is held.
       ctx.shutdown.shutDownDevice(local, remote)
+
+  /** reconcileDeviceState's Operational branch, after its resync */
+  private def operational(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    if ctx.shutdown.isShuttingDown(local.storageDeviceId) then
+      // A shutdown began while the resync ran: its own sequence owns the device now
+      ctx.shutdown.shutDownDevice(local, remote)
+    else if ctx.shutdown.isStoppingServing(local.storageDeviceId) then
+      // A relinquish or Failed retirement began while the resync ran: nothing new starts on the device
+      ()
     else
       // Any entries a store transferred away left in the device CRL go
       dropLeftoverCrlState(local, remote)

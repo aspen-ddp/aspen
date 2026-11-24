@@ -15,9 +15,11 @@
   `unsyncedPaths` until its attach). An unsynced copy is never loaded (`tryLoadStore`), shipped (`startOut`
   refuses), retired (`StoreCopies.retire` answers false) or received over (`startIn` waits). Each device check
   first forces every unsynced copy again (`CopyMoves.resync`, at the top of `reconcileDeviceState`: one `Move` job on
-  the device's lane, `CopyDisk.resync`, each copy DiskJob(Move) meanwhile, one outstanding per device; the check's
-  decisions run in its continuation once the result is applied, so they see the copies synced, and the check stays
-  active until then: a hung device's check waits, its later checks deferred behind it). A copy moved
+  the device's lane, `CopyDisk.resync`, each copy DiskJob(Move) meanwhile, one outstanding per device). An
+  Operational device's store decisions run in its continuation once the result is applied, so they see the copies
+  synced, and the check stays active until then: a hung device's check waits, its later checks deferred behind it.
+  The device-level branches (Failed retire, relinquish, shutdown) need no copy synced: they are decided at once and
+  only ask for the resync, so a hung lane never keeps an operator's Failed or a new owner waiting. A copy moved
   Live unsynced is loaded, once synced, by the reconcile's Live-copy load rule (`CopyDecision.Load`, with its online
   gossip; see the reconcile below): the case that moved it will not see it again, and a check that finds the entry not
   Active or work holding the copy only defers it
@@ -358,7 +360,7 @@
   (`storeInputs`: the entry, the copy's record, its work and the `CopyDecision.StoreFacts`, each field naming its
   source), runs the pure `CopyDecision.decide` and carries out its actions in order (`run`, one case per
   `CopyDecision.Action`, onto the handlers) before the next store's inputs are read. (The steps after the resync run in
-  its continuation, `reconcileResynced`.) The former passes are decide's
+  its continuation, `operational`.) The former passes are decide's
   cases, in this order, each with its rationale there: EndQueuedRebuild (queued Rebuild work of a store no longer
   Rebuilding ends first, so the rest see its copy free; `StoreRebuilds.endQueuedRebuild`), Deleted Stores
   (TakeOutOfService for a served copy with no entry, `retireUnlistedServed`; ForgetGoneCopy; Retire), Missing Stores
@@ -391,9 +393,11 @@
   a served copy with `servedHere` (the recording shutdown close ends it); the recording `tryLoadStore` opens
   nothing, so its copy stays Idle and `Load` offers it again at the next check, unless the test sets
   `RecordingSeams.offersClaimOpening` (each offer then claims the copy Opening, as a real open does); copy jobs
-  (`Move`, `Retire`, `Release`, `Delete` and their "copy ..." results) run with `ControlFixture.runCopyJobs` (every
-  `yieldUntil` runs them for the suite's lockstep hosts, as their callers once ran them inline; `settled(host, f)`
-  drains until a retire's future completes; `CopyIoSuite` holds each);
+  (`Move`, `Retire`, `Release`, `Delete`) run with `ControlFixture.runCopyJobs`, which runs the lane jobs wherever
+  they are queued but applies their "copy ..." results only from the FIFO's head, never ahead of an event queued
+  before them (every `yieldUntil` calls it for the suite's lockstep hosts; `newHost` handles the startup gate's
+  `StoresReady` at the head so later results are not stuck behind it; `settled(host, f)` drains until a retire's
+  future completes; `CopyIoSuite` holds each);
   `ControlFixture.awaitLoudly` waits on work that crosses real-time hops and fails, naming what it waited for, when
   its time runs out. `LocalDevices.isLoaded(sds)`
   says whether a device state is still the loaded one. `CopyDecisionSuite` checks decide's invariants over every

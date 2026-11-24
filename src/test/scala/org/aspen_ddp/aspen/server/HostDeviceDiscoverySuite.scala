@@ -1983,6 +1983,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
         _ = host.control.loader.tryLoadStore(local, earlier)
         markedOffline = offlineCopies(host, local).contains(movingStore)
         routerOfflineAfterScan = host.control.router.isOffline(movingStore)
+        // Whatever the offer queued on the lane runs, in FIFO order, before the copy's later jobs' results
+        _ = runLoadReads(host)
 
         _ <- client.transferStore(movingStore, net.secondDeviceId)
         _ <- waitForTransactionsToComplete()

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.server.host.{AdoptionClass, CopyFixtures, CopyLayout, DeviceStateDisk, JobKind, Phase}
+import org.aspen_ddp.aspen.server.host.{AdoptionClass, CopyFixtures, CopyLayout, DeviceStateDisk, JobKind, LockstepThreading, Phase}
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService, StoreLoader}
 import org.aspen_ddp.aspen.client.Transaction
@@ -147,30 +147,35 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
   private def setUpMetadata(owner: HostId,
                             status: DeviceStatus,
                             count: Int,
-                            registerOldHost: Boolean)
+                            registerOldHost: Boolean,
+                            device: StorageDeviceId = deviceA,
+                            createOldHost: Option[Boolean] = None)
                            (entries: List[StoreId] => Map[StoreId, StoreEntry]): Future[List[StoreId]] =
     given ExecutionContext = executionContext
     for
       _ <-
-        if registerOldHost then
+        if createOldHost.getOrElse(registerOldHost) then
           client.createHost("old-host", "10.0.0.9", 5750, 5751, 5752, owner).map(_ => ())
         else
           Future.unit
-      _ <- net.createDevice(deviceA)
+      _ <- net.createDevice(device)
       // One at a time: pool creations write the same set and device objects, and would collide.
-      stores <- runSequentially((0 until count).toList)(i => newPool(s"adopt-pool-$i")).map(_.toList)
-      _ <- runSequentially(stores)(s => setPoolEntry(s, owner, deviceA))
-      _ <- setDeviceState(deviceA)(_.copy(hostId = owner, status = status, stores = entries(stores)))
-      _ <- if registerOldHost then addToHost(owner, deviceA) else Future.unit
+      stores <- runSequentially((0 until count).toList)(i => newPool(s"adopt-pool-${device.uuid}-$i")).map(_.toList)
+      _ <- runSequentially(stores)(s => setPoolEntry(s, owner, device))
+      _ <- setDeviceState(device)(_.copy(hostId = owner, status = status, stores = entries(stores)))
+      _ <- if registerOldHost then addToHost(owner, device) else Future.unit
       _ <- waitForTransactionsToComplete()
     yield stores
 
   /** The device directory as carried to the Host's root: `owning-host` and
    *  `shutdown.state` naming `markerHost` (owning-host `owningHost`). */
   private def writeCarriedDevice(markerHost: HostId,
-                                 owningHost: HostId): (os.Path, os.Path) =
-    val hostRoot = newHostDir()
-    val deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = Some(owningHost))
+                                 owningHost: HostId,
+                                 into: Option[os.Path] = None,
+                                 name: String = "dev0",
+                                 device: StorageDeviceId = deviceA): (os.Path, os.Path) =
+    val hostRoot = into.getOrElse(newHostDir())
+    val deviceDir = writeDevice(hostRoot, name, device, owner = Some(owningHost))
     // The CRL its stores' state lives in, which every carried device that holds stores has
     os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
     DeviceMarkers.writeShutdownState(deviceDir, markerHost)
@@ -180,6 +185,178 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
 
   // Device I/O isolation (Task 15): the ownership decision's recheck of the directory is one job on the device's lane,
   // the path pending meanwhile, so no scan resolves it again; it reads the disk as it is when it runs
+  // ---- Two devices: each adoption step held on A while B's adoption completes (device I/O isolation, Task 15) ----
+
+  /** Drains `host` (every event, in FIFO order: a held device's jobs stay held) and the network's transactions, until
+   *  `condition` holds or `rounds` run out (silent: callers assert) */
+  private def drainUntil(host: Host, condition: => Boolean, rounds: Int = 60): Future[Unit] =
+    given ExecutionContext = executionContext
+    host.testingOnlyHandleEvents()
+    if condition || rounds == 0 then Future.unit
+    else
+      for
+        _ <- waitForTransactionsToComplete()
+        _ <- yieldUntil(condition, 5)
+        _ <- drainUntil(host, condition, rounds - 1)
+      yield ()
+
+  /** drainUntil, waiting in real time between rounds for the client's retry backoff (a transaction that collided
+   *  with the other device's adoption retries), until `condition` or 20 s; callers assert the end state */
+  private def drainPolling(host: Host, condition: => Boolean): Future[Unit] =
+    val deadline = System.nanoTime() + 20_000_000_000L
+    given ExecutionContext = executionContext
+    def loop(): Future[Unit] =
+      drainUntil(host, condition, rounds = 2).flatMap: _ =>
+        if condition || System.nanoTime() > deadline then Future.unit
+        else
+          val p = scala.concurrent.Promise[Unit]()
+          client.backgroundTaskManager.schedule(scala.concurrent.duration.Duration(10, "ms"))(p.success(()))
+          p.future.flatMap(_ => loop())
+    loop()
+
+  /** Two devices of the old host, Shutdown, carried to one adopting host's root: A (dev0) holding an Offline store
+   *  and a CrlLost one (an outbound/ copy with no save file, which the adoption moves to lost/), B (dev1) an Offline
+   *  store. Both lanes are held from the host's construction. Returns the host, both directories and A's CrlLost
+   *  store */
+  private def twoCarried(): Future[(Host, os.Path, os.Path, StoreId)] =
+    given ExecutionContext = executionContext
+    for
+      aStores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 2, registerOldHost = true): ss =>
+                   Map(ss(0) -> offline, ss(1) -> offline)
+      bStores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 1, registerOldHost = true, device = deviceB,
+                               createOldHost = Some(false))(ss => Map(ss(0) -> offline))
+      (hostRoot, devA) = writeCarriedDevice(oldHostId, oldHostId)
+      (_, devB) = writeCarriedDevice(oldHostId, oldHostId, into = Some(hostRoot), name = "dev1", device = deviceB)
+      _ = writeClosedStore(devA, aStores(0))
+      _ = CopyFixtures.placeCopy(devA, aStores(1), Phase.Outbound(""))
+      _ = writeClosedStore(devB, bStores(0))
+      host = newHost(hostRoot, threadingOf = ec =>
+               val t = new LockstepThreading(ec)
+               t.hold(devA)
+               t.hold(devB)
+               t)
+    yield (host, devA, devB, aStores(1))
+
+  /** Lets A's held jobs run one at a time until the `nth` job of `kind` is the first held, the others draining */
+  private def advanceHeld(host: Host, dev: os.Path, kind: JobKind, nth: Int, rounds: Int = 80): Future[Unit] =
+    given ExecutionContext = executionContext
+    var passed = 0
+    def loop(left: Int): Future[Unit] =
+      host.testingOnlyHandleEvents()
+      val held = heldJobs(host, dev)
+      if (held.headOption.contains(kind) && passed == nth - 1) || left == 0 then
+        Future.unit
+      else
+        if held.nonEmpty then
+          passHeldJob(host, dev).foreach(k => if k == kind then passed += 1)
+        drainUntil(host, false, rounds = 1).flatMap(_ => loop(left - 1))
+    loop(rounds)
+
+  for (step, kind, nth) <- List(("its ownership listing", JobKind.DeviceOwnership, 1),
+                                ("its ownership recheck", JobKind.DeviceOwnership, 2),
+                                ("its adoption look", JobKind.Adoption, 1),
+                                ("its transaction's unclean classes", JobKind.Adoption, 2),
+                                ("its transaction's CrlLost classes", JobKind.Adoption, 3),
+                                ("its transaction's moves to lost/", JobKind.Adoption, 4),
+                                ("its bringIntoService", JobKind.Adoption, 5))
+  do
+    atest(s"an adoption held at $step on one device waits while another device's adoption completes"):
+      given ExecutionContext = executionContext
+      for
+        (host, devA, devB, lostOnA) <- twoCarried()
+        _ = scanNow(host)
+        // A to the step, B still held at its first job; then B's whole adoption runs while A waits there
+        _ <- advanceHeld(host, devA, kind, nth)
+        heldAt = heldJobs(host, devA).headOption
+        _ = releaseDevice(host, devB)
+        _ <- drainPolling(host, loadedDevices(host).contains(deviceB) &&
+                                host.control.reconciler.activeDeviceChecks.isEmpty)
+        bState <- state(deviceB)
+        aWhile <- state(deviceA)
+        aOwnerWhile = DeviceMarkers.readOwningHost(devA)
+        aLoadedWhile = loadedDevices(host).contains(deviceA)
+        _ = releaseDevice(host, devA)
+        _ <- drainPolling(host, loadedDevices(host).contains(deviceA) &&
+                                host.control.reconciler.activeDeviceChecks.isEmpty)
+        aState <- state(deviceA)
+      yield
+        heldAt should be(Some(kind))
+        // B, the same work on another device, completed: adopted, its owner rewritten, loaded
+        bState.hostId should be(HostId.BootstrapHostId)
+        DeviceMarkers.readOwningHost(devB) should be(Some(HostId.BootstrapHostId))
+        os.exists(devB / DeviceMarkers.ShutdownStateFile) should be(false)
+        // A waited at the held step: not loaded, its owner not rewritten; committed only once the transaction's last
+        // disk step had run (bringIntoService follows the commit)
+        aLoadedWhile should be(false)
+        aOwnerWhile should be(Some(oldHostId))
+        aWhile.hostId should be(if nth == 5 && kind == JobKind.Adoption then HostId.BootstrapHostId else oldHostId)
+        // Released, A completes the same way, its CrlLost store moved to lost/ and adopted Rebuilding
+        aState.hostId should be(HostId.BootstrapHostId)
+        aState.stores(lostOnA).status should be(StoreStatus.Rebuilding)
+        CopyFixtures.phaseOf(devA, lostOnA) should be(Some(Phase.Lost))
+        DeviceMarkers.readOwningHost(devA) should be(Some(HostId.BootstrapHostId))
+        os.exists(devA / DeviceMarkers.ShutdownStateFile) should be(false)
+        loadedDevices(host).contains(deviceA) should be(true)
+
+  /** Runs `job` (a queued lane task of `host`) with the interleaving of a path leaving the listing while it runs:
+   *  `devA` moved away, a listing run (its result queued), `devA` moved back, then `job` run, so the listing's result
+   *  (which forgets the path's DeviceIo, idle by then) is applied before the job's */
+  private def leaveListingWhile(host: Host, devA: os.Path)(isJob: Runnable => Boolean): Unit =
+    val ls = host.threading.asInstanceOf[LockstepThreading]
+    val away = devA / os.up / os.up / "away"
+    os.move(devA, away)
+    // A scan's listing, run now (devA absent from it), its result queued behind
+    host.control.reconciler.scan()
+    ls.removeQueued:
+      case t: LockstepThreading.DeviceTask => t.kind == JobKind.DeviceListing
+      case _ => false
+    .foreach(_.run())
+    os.move(away, devA)
+    // The job, run on the restored directory: its result is queued after the listing's
+    ls.removeQueued(isJob).foreach(_.run())
+
+  for (step, nth) <- List(("its adoption look", 1), ("its bringIntoService", 5))
+  do
+    atest(s"an adoption job ($step) completing after its path left the listing changes nothing"):
+      given ExecutionContext = executionContext
+      for
+        // B stays held throughout: no other adoption's transaction collides with A's
+        (host, devA, _, _) <- twoCarried()
+        _ = scanNow(host)
+        _ <- advanceHeld(host, devA, JobKind.Adoption, nth)
+        heldAt = heldJobs(host, devA)
+        adoptsBefore = recorded(host).adoptCalls.toList
+        // The held job goes to the FIFO; it runs only inside the interleaving
+        _ = releaseDevice(host, devA)
+        _ = leaveListingWhile(host, devA):
+              case t: LockstepThreading.DeviceTask => t.kind == JobKind.Adoption
+              case _ => false
+        // The listing's result, then the job's, in FIFO order
+        _ = host.testingOnlyHandleEvents()
+        forgotten = host.control.deviceIos.get(devA).isEmpty
+        pendingAfter = host.control.discovery.pendingMarkerResolutions
+        reportedAfter = host.control.discovery.reportedDeviceDirs.contains(devA)
+        loadedAfter = loadedDevices(host).contains(deviceA)
+        adoptsAfter = recorded(host).adoptCalls.toList
+        // The directory is back: a later scan decides afresh from what its disk says
+        _ = scanNow(host)
+        _ <- drainPolling(host, loadedDevices(host).contains(deviceA) &&
+                                host.control.reconciler.activeDeviceChecks.isEmpty)
+        aState <- state(deviceA)
+      yield
+        heldAt should be(List(JobKind.Adoption))
+        // The job's DeviceIo was forgotten as the path left the listing: its result is taken as Cancelled
+        // (laneJob), no warning, nothing adopted or loaded, the path no longer pending
+        forgotten should be(true)
+        reportedAfter should be(false)
+        pendingAfter should not contain devA
+        loadedAfter should be(false)
+        adoptsAfter should be(adoptsBefore)
+        // The look's: no transaction began. bringIntoService's: its disk steps ran, so the later scan finds the
+        // device owned here and loads it as its own; the look's later scan adopts it
+        aState.hostId should be(HostId.BootstrapHostId)
+        loadedDevices(host).contains(deviceA) should be(true)
+
   atest("an ownership recheck waits on a held device, then adopts it"):
     given ExecutionContext = executionContext
     for

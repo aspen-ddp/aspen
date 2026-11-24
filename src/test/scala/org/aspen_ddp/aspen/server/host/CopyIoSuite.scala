@@ -333,6 +333,28 @@ class CopyIoSuite extends IntegrationTestSuite with ControlFixture:
           host.control.moves.resyncRunning(devA) should be(false)
           noViolations(host)
 
+  // Two devices both declared Failed: A's failed marker waits on its held lane while B's is written; neither stop
+  // waits for its marker
+  atest("a Failed device's marker write waits on a held device while another's is written"):
+    given ExecutionContext = executionContext
+    val (host, devA, devB) = twoDevices(CopyFixtures.placeCopy(_, s, Phase.Live): Unit,
+                                        CopyFixtures.placeCopy(_, s2, Phase.Live): Unit)
+    holdDevice(host, devA)
+    for id <- List(deviceA, deviceB) do
+      recorded(host).armLookup(id).success(deviceState(id).copy(status = StorageDeviceState.DeviceStatus.Failed))
+      host.control.reconciler.checkStorageDevice(id)
+    awaitLoudly("both devices unloaded") {
+      drain(host)
+      !loadedDevices(host).contains(deviceA) && !loadedDevices(host).contains(deviceB)
+    }.map: _ =>
+      heldJobs(host, devA) should be(List(JobKind.Markers))
+      os.exists(devA / "failed") should be(false)
+      os.exists(devB / "failed") should be(true)
+      releaseDevice(host, devA)
+      drain(host)
+      os.exists(devA / "failed") should be(true)
+      noViolations(host)
+
   test("a resync whose force fails leaves the copy unsynced, and one completing after unload changes nothing"):
     val (host, devA, _) = twoDevices(CopyFixtures.placeCopy(_, s, Phase.Live): Unit, _ => ())
     val sds = local(host, deviceA)

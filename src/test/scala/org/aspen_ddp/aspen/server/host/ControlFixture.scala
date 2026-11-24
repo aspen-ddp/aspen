@@ -701,6 +701,9 @@ trait ControlFixture:
 
   protected def releaseDevice(host: Host, path: os.Path): Unit = lockstep(host).release(path)
 
+  /** Lets the first of `path`'s held jobs run (LockstepThreading.passOne), the path staying held: its kind */
+  protected def passHeldJob(host: Host, path: os.Path): Option[JobKind] = lockstep(host).passOne(path)
+
   /** Runs the queued tasks in order, stopping before the first queued LoadStore (left queued) or when none are
    *  queued: a backend open is a lane job now, so a test that wants the opened store's LoadStore queued but not yet
    *  handled runs the open, then BackendOpened, and stops. */

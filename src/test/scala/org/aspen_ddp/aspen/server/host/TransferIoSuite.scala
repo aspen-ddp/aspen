@@ -36,6 +36,20 @@ class TransferIoSuite extends IntegrationTestSuite with ControlFixture:
         _ <- pumpUntil(condition, rounds - 1)
       yield ()
 
+  /** pumpUntil, waiting in real time between rounds for the client's retry backoff (two pool updates of one pool
+   *  collide, and one retries), until `condition` or 20 s; callers assert the end state */
+  private def pumpPolling(condition: => Boolean): Future[Unit] =
+    val deadline = System.nanoTime() + 20_000_000_000L
+    given ExecutionContext = executionContext
+    def loop(): Future[Unit] =
+      pumpUntil(condition, rounds = 2).flatMap: _ =>
+        if condition || System.nanoTime() > deadline then Future.unit
+        else
+          val p = scala.concurrent.Promise[Unit]()
+          client.backgroundTaskManager.schedule(scala.concurrent.duration.Duration(10, "ms"))(p.success(()))
+          p.future.flatMap(_ => loop())
+    loop()
+
   private def drain(host: Host): Unit = host.testingOnlyHandleEvents()
 
   private def transfers(host: Host): StoreTransfers = host.control.transfers
@@ -74,13 +88,13 @@ class TransferIoSuite extends IntegrationTestSuite with ControlFixture:
       _ = holdDevice(host, dev0)
       _ = service.finishTransferIn(first)
       _ = service.finishTransferIn(second)
-      _ <- pumpUntil(recorded(host).transferOutcomes.contains(second) &&
+      _ <- pumpPolling(recorded(host).transferOutcomes.contains(second) &&
                      CopyFixtures.phaseOf(dev1, second).contains(Phase.Live))
       heldWhile = heldJobs(host, dev0)
       promotingWhile = transfers(host).promotingStores
       placedWhile = CopyFixtures.copyPath(dev0, first)
       _ = releaseDevice(host, dev0)
-      _ <- pumpUntil(recorded(host).transferOutcomes.contains(first) &&
+      _ <- pumpPolling(recorded(host).transferOutcomes.contains(first) &&
                      CopyFixtures.phaseOf(dev0, first).contains(Phase.Live))
     yield
       // The promotion's job waits on the held lane: nothing placed, the store still promoting, no pool update
@@ -115,6 +129,40 @@ class TransferIoSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).transferOutcomes.contains(first) should be(false)
       host.control.copyRegistry.device(net.secondDeviceId) should be(None)
       transfers(host).receiving.contains(first) should be(false)
+
+  atest("an arrived copy's move to Live (T9) waits on a held device and others proceed"):
+    given ExecutionContext = executionContext
+    for
+      (host, dev0, dev1, service) <- receivingTwo()
+      // Both promoted, their pool updates held, so the moves to Live come after the hold
+      gate = recorded(host).holdTransferOutcomes()
+      _ = service.finishTransferIn(first)
+      _ = service.finishTransferIn(second)
+      _ <- pumpUntil(CopyFixtures.phaseOf(dev0, first).exists(_.isInstanceOf[Phase.Arrived]) &&
+                     CopyFixtures.phaseOf(dev1, second).exists(_.isInstanceOf[Phase.Arrived]) &&
+                     transfers(host).promotingStores.isEmpty)
+      _ = holdDevice(host, dev0)
+      _ = gate.success(())
+      _ <- pumpPolling(recorded(host).transferOutcomes.contains(first) &&
+                       CopyFixtures.phaseOf(dev1, second).contains(Phase.Live) &&
+                       heldJobs(host, dev0).contains(JobKind.Move))
+      heldWhile = heldJobs(host, dev0)
+      phaseWhile = CopyFixtures.phaseOf(dev0, first)
+      arrivalWhile = CopyFixtures.copyPath(dev0, first).map(p => os.exists(p / StoreLoader.ArrivedAtFile))
+      activityWhile = host.control.copyRegistry.device(net.secondDeviceId).flatMap(_.copies.get(first)).map(_.activity)
+      _ = releaseDevice(host, dev0)
+      _ <- pumpPolling(CopyFixtures.phaseOf(dev0, first).contains(Phase.Live))
+    yield
+      heldWhile should contain(JobKind.Move)
+      // Still Arrived, its arrival not yet written (the write is the move's own job), the copy busy
+      phaseWhile.exists(_.isInstanceOf[Phase.Arrived]) should be(true)
+      arrivalWhile should be(Some(false))
+      activityWhile should be(Some(Activity.DiskJob(JobKind.Move, Activity.Idle)))
+      CopyFixtures.phaseOf(dev1, second) should be(Some(Phase.Live))
+      CopyFixtures.copyPath(dev1, second).map(p => os.exists(p / StoreLoader.ArrivedAtFile)) should be(Some(true))
+      // Released: the arrival written, then Live
+      CopyFixtures.phaseOf(dev0, first) should be(Some(Phase.Live))
+      CopyFixtures.copyPath(dev0, first).map(p => os.exists(p / StoreLoader.ArrivedAtFile)) should be(Some(true))
 
   // ---- Staging removal ----
 

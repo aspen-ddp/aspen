@@ -303,6 +303,49 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       st.status should be(DeviceStatus.Shutdown)
       DeviceMarkers.readShutdownState(deviceDir) should be(Some(HostId.BootstrapHostId))
 
+  atest("a shutdown's shutdown.state write waits on a held device while another device's shutdown completes"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val devA = writeDevice(hostRoot, "dev0", deviceA)
+    val devB = writeDevice(hostRoot, "dev1", deviceB)
+    val host = newHost(hostRoot, transferService = new StagedTransferService)
+    CopyFixtures.placeCopy(devA, s0, configured = false)
+    CopyFixtures.placeCopy(devB, s1, configured = false)
+    servedHere(host, loadedDevices(host)(deviceA), s0)
+    servedHere(host, loadedDevices(host)(deviceB), s1)
+    for
+      _ <- net.createDevice(deviceA)
+      _ <- setDeviceState(deviceA)(_.copy(stores = Map(s0 -> active)))
+      _ <- net.createDevice(deviceB)
+      _ <- setDeviceState(deviceB)(_.copy(stores = Map(s1 -> active)))
+      _ <- addToBootstrapHost(deviceA)
+      _ <- addToBootstrapHost(deviceB)
+      _ <- client.shutdownStorageDevice(deviceA)
+      _ <- client.shutdownStorageDevice(deviceB)
+      _ <- waitForTransactionsToComplete()
+      _ = holdDevice(host, devA)
+      _ = checkAllNow(host)
+      _ <- pumpUntil(heldJobs(host, devA).contains(JobKind.Markers) && !loadedDevices(host).contains(deviceB))
+      heldWhile = heldJobs(host, devA)
+      aWhile <- state(deviceA)
+      bState <- state(deviceB)
+      markerAWhile = os.exists(devA / DeviceMarkers.ShutdownStateFile)
+      loadedAWhile = loadedDevices(host).contains(deviceA)
+      _ = releaseDevice(host, devA)
+      _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
+      aState <- state(deviceA)
+    yield
+      heldWhile should be(List(JobKind.Markers))
+      // B's shutdown wrote its marker and committed while A's write waited
+      bState.status should be(DeviceStatus.Shutdown)
+      DeviceMarkers.readShutdownState(devB) should be(Some(HostId.BootstrapHostId))
+      loadedDevices(host).contains(deviceB) should be(false)
+      aWhile.status should be(DeviceStatus.ShuttingDown)
+      markerAWhile should be(false)
+      loadedAWhile should be(true)
+      aState.status should be(DeviceStatus.Shutdown)
+      DeviceMarkers.readShutdownState(devA) should be(Some(HostId.BootstrapHostId))
+
   atest("a shutdown.state write completing after its device's unload commits nothing"):
     given ExecutionContext = executionContext
     for

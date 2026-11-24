@@ -63,6 +63,17 @@ class LockstepThreading(ec: ExecutionContext) extends HostThreading:
       l
     latch.foreach(_.countDown())
 
+  /** Testing hook: puts the first of `path`'s held management jobs on the FIFO and keeps the path held, so a test lets
+   *  a held device's sequence go one step at a time. Its kind, None when none is held */
+  def passOne(path: os.Path): Option[JobKind] =
+    holdLock.synchronized:
+      heldTasks.getOrElse(path, Vector()) match
+        case first +: rest =>
+          queue.put(first)
+          if rest.isEmpty then heldTasks -= path else heldTasks += path -> rest
+          Some(first.kind)
+        case _ => None
+
   /** Testing hook: whether `path` is held (`hold`) */
   def isHeld(path: os.Path): Boolean = holdLock.synchronized(holds.contains(path))
 

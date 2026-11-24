@@ -6,6 +6,10 @@
   out older ones
 - Write-back: WRITE completes from memory; durable at FLUSH/FUA. Block objects are the largest multiple of the
   logical block size <= the allocator's `maxObjectSize`
+- A block's clean (`CleanBlock`) and dirty (`SegmentSnapshot`) pieces are kept sorted and non-overlapping, and are
+  never coalesced: random 4 KiB writes or fetches leave a block as ~1000 pieces. Per-request and per-committed-write
+  work (`VirtualDisk.gaps`, `covers`, `assemble`) must look only at the pieces in range (binary search), never pass
+  over or sort all of them: that cost 60-70 us per cache-hit read and most of the server's CPU under random writes
 - The block map's `LruTierCache(anyRoot = true)` relies on it being the single writer; `BlockMap.refresh` clears it
   (`client/tkvl/CLAUDE.md`)
 - `vdisk-server` drives the kernel's TCMU interface directly through FFM (`vdisk.tcmu`: netlink, configfs, the

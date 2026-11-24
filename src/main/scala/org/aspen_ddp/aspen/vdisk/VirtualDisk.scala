@@ -754,7 +754,7 @@ final class VirtualDisk private (val client: AspenClient,
           val st = block(b)
           val overlay = st.dirty.snapshot
           if covers(overlay.pieces, from, to) then
-            Left(Future.successful(assemble(seg, Nil, overlay)))
+            Left(Future.successful(assemble(seg, Vector.empty, Nil, overlay)))
           else
             val p = Promise[Array[Byte]]()
             pendingReads += p
@@ -799,16 +799,15 @@ final class VirtualDisk private (val client: AspenClient,
     val (pointer, revision, length, clean, generation) =
       synchronized((st.pointer, st.revision, st.length, cleanPieces(b), st.generation))
     pointer match
-      case None => Future.successful(assemble(seg, Nil, overlay))
+      case None => Future.successful(assemble(seg, Vector.empty, Nil, overlay))
       case Some(ptr) =>
-        val held = clean ++ overlay.pieces
         // Bytes beyond the object's length are zeros. When the length is unknown a read past it comes back short
-        def needed(end: Int): List[(Int, Int)] = gaps(from, end, held).flatMap: (a, e) =>
+        def needed(end: Int): List[(Int, Int)] = gaps(from, end, clean, overlay.pieces).flatMap: (a, e) =>
           length match
             case Some(len) => if a < len then Some((a, math.min(e, len))) else None
             case None => Some((a, e))
         if needed(to).isEmpty then
-          Future.successful(assemble(seg, clean, overlay))
+          Future.successful(assemble(seg, clean, Nil, overlay))
         else
           // Readahead joins a fetch the request needs anyway, so a read served from the caches costs no I/O
           val ranges = needed(fetchEnd)
@@ -845,7 +844,7 @@ final class VirtualDisk private (val client: AspenClient,
             outcome match
               case Left(err) => Future.failed(StopRetrying(err))
               case Right(true) => Future.failed(StaleFetch)
-              case Right(false) => Future.successful(assemble(seg, clean ++ fetched, overlay))
+              case Right(false) => Future.successful(assemble(seg, clean, fetched, overlay))
 
 /** Whether a disk is served. Once it is not, it never is again: a new owner has to acquire the disk */
 enum DiskState:
@@ -891,29 +890,71 @@ object VirtualDisk:
     yield
       new VirtualDisk(client, info, fenceRevision, BlockMap(tree), allocator, config)
 
-  /** Sub-ranges of [from, to) that no piece covers */
-  private def gaps(from: Int, to: Int, pieces: Seq[(Int, Array[Byte])]): List[(Int, Int)] =
+  /** Sub-ranges of [from, to) that no piece covers. `pieces` are sorted by offset and do not overlap, as a
+    * CleanBlock's and a SegmentSnapshot's are. Only the pieces overlapping the range are looked at, the first found by
+    * binary search: a block held as many small pieces (random writes, 4 KiB fetches) is read once per request and
+    * checked once per committed write, so a pass over all its pieces made those cost O(pieces) each
+    */
+  private[vdisk] def gaps(from: Int, to: Int, pieces: IndexedSeq[(Int, Array[Byte])]): List[(Int, Int)] =
     val result = ListBuffer[(Int, Int)]()
     var pos = from
-    pieces.map((o, b) => (o, o + b.length)).sortBy(_._1).foreach: (s, e) =>
-      if e > pos && s < to then
+    var i = firstEndingAfter(pieces, from)
+    var more = true
+    while more && i < pieces.length do
+      val (s, bytes) = pieces(i)
+      if s >= to then
+        more = false
+      else
         if s > pos then
           result += ((pos, s))
-        pos = math.max(pos, e)
+        pos = math.max(pos, s + bytes.length)
+        i += 1
     if pos < to then
       result += ((pos, to))
     result.toList
 
-  private[vdisk] def covers(pieces: Seq[(Int, Array[Byte])], from: Int, to: Int): Boolean = gaps(from, to, pieces).isEmpty
+  /** The index of the first of the sorted, non-overlapping `pieces` that ends after `pos`, else their count. Their
+    * ends rise with their offsets, so a binary search finds it
+    */
+  private def firstEndingAfter(pieces: IndexedSeq[(Int, Array[Byte])], pos: Int): Int =
+    var lo = 0
+    var hi = pieces.length
+    while lo < hi do
+      val mid = (lo + hi) >>> 1
+      val (o, bytes) = pieces(mid)
+      if o + bytes.length <= pos then lo = mid + 1 else hi = mid
+    lo
 
-  /** The segment's bytes: zeros, then `base` (non-overlapping committed content), then the overlay on top */
-  private def assemble(seg: BlockSegment, base: Seq[(Int, Array[Byte])], overlay: SegmentSnapshot): Array[Byte] =
+  /** Sub-ranges of [from, to) that neither `a` nor `b` covers. Each is sorted and non-overlapping (see `gaps`); they
+    * may overlap each other
+    */
+  private[vdisk] def gaps(from: Int, to: Int, a: IndexedSeq[(Int, Array[Byte])],
+                          b: IndexedSeq[(Int, Array[Byte])]): List[(Int, Int)] =
+    gaps(from, to, a).flatMap((s, e) => gaps(s, e, b))
+
+  private[vdisk] def covers(pieces: IndexedSeq[(Int, Array[Byte])], from: Int, to: Int): Boolean = gaps(from, to, pieces).isEmpty
+
+  /** The segment's bytes: zeros, then the committed content, then the overlay on top. The committed content is
+    * `clean` (sorted and non-overlapping, see `gaps`; only the pieces under the segment are looked at) and `fetched`,
+    * which overlaps neither it nor itself
+    */
+  private[vdisk] def assemble(seg: BlockSegment,
+                              clean: IndexedSeq[(Int, Array[Byte])],
+                              fetched: Seq[(Int, Array[Byte])],
+                              overlay: SegmentSnapshot): Array[Byte] =
     val from = seg.offsetInBlock
+    val to = from + seg.length
     val buf = new Array[Byte](seg.length)
-    base.foreach: (o, bytes) =>
+    def copy(o: Int, bytes: Array[Byte]): Unit =
       val s = math.max(o, from)
-      val e = math.min(o + bytes.length, from + seg.length)
+      val e = math.min(o + bytes.length, to)
       if s < e then
         System.arraycopy(bytes, s - o, buf, s - from, e - s)
+    var i = firstEndingAfter(clean, from)
+    while i < clean.length && clean(i)._1 < to do
+      val (o, bytes) = clean(i)
+      copy(o, bytes)
+      i += 1
+    fetched.foreach(copy)
     overlay.overlay(buf, from)
     buf

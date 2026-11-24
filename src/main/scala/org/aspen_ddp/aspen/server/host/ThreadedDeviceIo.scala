@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.host
 
-import java.util.concurrent.{ExecutorService, Executors, LinkedBlockingQueue, ThreadFactory}
+import java.util.concurrent.{LinkedBlockingQueue, ThreadFactory, ThreadPoolExecutor, TimeUnit}
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -26,9 +26,12 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
     val counter = new AtomicInteger(0)
     (r: Runnable) =>
       val idx = if single then -1 else counter.getAndIncrement()
-      val t = new Thread(r, threadName(role, idx))
+      val named = new Array[Named](1)
+      // A pool thread that times out leaves the set, so it holds only live threads
+      val t = new Thread(() => try r.run() finally threads.remove(named(0)): Unit, threadName(role, idx))
       t.setDaemon(true)
-      threads.add(new Named(role, idx, t))
+      named(0) = new Named(role, idx, t)
+      threads.add(named(0))
       t
 
   def label: String = currentLabel
@@ -116,8 +119,12 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
           true
         else false
 
-  private def pool(role: String, n: Int): (ExecutorService, ExecutionContext) =
-    val exec = Executors.newFixedThreadPool(n, factory(role, false))
+  /** A pool of up to `n` threads, each timing out after `cfg.poolKeepAliveMillis` idle: a device with no backend
+   *  task holds no pool thread, and the pool never rejects a task until `close` */
+  private def pool(role: String, n: Int): (ThreadPoolExecutor, ExecutionContext) =
+    val exec = new ThreadPoolExecutor(n, n, cfg.poolKeepAliveMillis, TimeUnit.MILLISECONDS,
+      new LinkedBlockingQueue[Runnable](), factory(role, false))
+    exec.allowCoreThreadTimeOut(true)
     val ec = new ExecutionContext:
       def execute(r: Runnable): Unit =
         poolTasks.incrementAndGet()
@@ -157,15 +164,24 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
 
   def idle: Boolean = laneJobs.get() == 0 && poolIdle
 
+  /** Pool threads alive, data and serial: 0 once both pools have been idle past their keep-alive */
+  private[host] def poolThreads: Int = dataExec.getPoolSize + serialExec.getPoolSize
+
   /** No data or serial task queued or running */
   private[host] def poolIdle: Boolean = poolTasks.get() == 0
 
-  /** Stops the lane and both pools without waiting. Every lane job not yet started fails with `DeviceIo.Cancelled`,
-   *  and every later submit at once. A running job is interrupted (a hung syscall is not: its thread stays, confined
-   *  to this device); a data or serial task not yet started is dropped, which only the owner of a device no longer in
-   *  use (DeviceIos.forget closes only an idle one) or a host shutting down ever does */
-  def close(): Unit =
+  /** Stops the lane without waiting: every lane job not yet started fails with `DeviceIo.Cancelled` now, even behind
+   *  a running job hung in a syscall, and every later submit at once. The running job is interrupted (a hung syscall
+   *  is not: its thread stays, confined to this device). The pools are untouched */
+  def closeLane(): Unit =
     closed = true
-    if laneStarted.get() then laneThread.interrupt() else cancelQueued()
+    if laneStarted.get() then laneThread.interrupt()
+    // Here, not only in the lane thread's finally, which a hung job never reaches. Each entry is polled by one party
+    cancelQueued()
+
+  /** Host shutdown: `closeLane`, then both pools stopped without waiting, a running task interrupted and one not yet
+   *  started dropped */
+  def close(): Unit =
+    closeLane()
     dataExec.shutdownNow()
     serialExec.shutdownNow()

@@ -79,9 +79,9 @@ It has:
   marker reads/writes, `CopyLayout.list`, copy moves/retire/release/delete (`os.remove.all`), staging sweeps,
   `crl_save.log` reads and writes, device CRL open and recovery (including the lost-CRL path), CRL creation, statfs,
   RocksDB opens and creates, FSIF opens and creates (replacing `FsifOpenEc` for this device).
-- **Data pool**: N threads (default max(4, CPUs/2), configurable, see section 8). Runs backend data I/O: FSIF's `io` executor
-  (reads, writes, journal, checkpoint, compaction moves, forces), RocksDB foreground ops (`BufferedConsistentRocksDB`
-  puts/deletes/gets/iteration), rebuild staging writes and flushes.
+- **Data pool**: N threads (default max(4, CPUs/2), configurable, see section 8). Runs backend data I/O: FSIF's `io`
+  executor (reads, writes, journal, checkpoint, compaction moves, forces), RocksDB foreground ops
+  (`BufferedConsistentRocksDB` puts/deletes/gets/iteration), rebuild staging writes and flushes.
 - **FSIF serial pool**: 1 thread (default), the base for the device's FSIF stores' `SerialExecutor`s, replacing
   `sharedSerial`. Kept per device rather than shared because serial work still makes inline I/O calls (compaction's
   truncate) and FSIF `close()` closes channels there, and `FileChannel.close` waits for threads blocked in I/O on that
@@ -208,11 +208,14 @@ Management jobs are bounded by coalescing (section 2) and by the copy busy marks
 ### 7. Lifecycle and identity
 
 - A `DeviceIo` follows the **path** under `<host-root>/storage-devices`, not the device id (my call): the id is known
-  only after reading `config.yaml`, which can itself hang. It is created at first sight of the path and closed when
-  the path is gone from the host's listing and its jobs have drained. A path that reappears while its `DeviceIo` is
-  still alive reuses it, so a still-hung mount stays confined to its existing threads instead of gaining new ones.
-  A hung `DeviceIo` is never drained: it stays, with its stuck threads, until the process exits. Thread names carry
-  the path basename, plus the id once the device's config has been read.
+  only after reading `config.yaml`, which can itself hang. It is created at first sight of the path and closed when the
+  path is gone from the host's listing and its jobs have drained. That close stops only its management lane: a backend
+  still open on its data and serial pools (a rebuild's staging store waiting on peers, a close outliving the listing)
+  keeps running on them, so no backend task is rejected and no Future is left incomplete. Pool threads time out once
+  idle, so an unused `DeviceIo` holds none; only `Host.shutdown` stops the pools. A path that reappears while its
+  `DeviceIo` is still alive reuses it, so a still-hung mount stays confined to its existing threads instead of gaining
+  new ones. A hung `DeviceIo` is never drained: it stays, with its stuck threads, until the process exits. Thread names
+  carry the path basename, plus the id once the device's config has been read.
 - Identity conflicts (two paths with one device id, an id that changes under a path) are handled by discovery as
   today; this project does not change them.
 - Jobs queued behind a hung job on the management lane stay queued. Control state for that device stays busy for as
@@ -237,15 +240,15 @@ only guarantees that such a move onto a healthy device is not blocked by the hun
 
 ### 8. Thread budget and performance
 
-Per device: 1 management thread, N data threads (default max(4, CPUs/2), chosen by measurement), 1 FSIF serial
-thread, the existing CRL threads, plus 2 RocksDB background slots per RocksDB store. Today FSIF has max(4, CPUs) io threads shared by all devices, so one busy
-NVMe device could use more than 4. The defaults must be measured against the benchmarks in
-`docs/host-threading-measurement.md` (single and multiple devices, randrw and seqwrite) before and after; G5 is the
-acceptance bar. N is a host option (e.g. `--device-io-threads`), and the builder may pick a different default (e.g.
-scaled to CPUs) if measurement favors it. Process: measure the baseline on `main` before the backend changes land,
-repeat after, with the same runs the measurement doc uses (several runs each, so noise is visible). Report both sets
-of numbers. A regression outside run-to-run spread that a default change cannot fix stops the work and goes back to
-the user; it does not get absorbed by changing the design silently.
+Per device: 1 management thread, N data threads (default max(4, CPUs/2), chosen by measurement), 1 FSIF serial thread,
+the existing CRL threads, plus 2 RocksDB background slots per RocksDB store. Today FSIF has max(4, CPUs) io threads
+shared by all devices, so one busy NVMe device could use more than 4. The defaults must be measured against the
+benchmarks in `docs/host-threading-measurement.md` (single and multiple devices, randrw and seqwrite) before and after;
+G5 is the acceptance bar. N is a host option (e.g. `--device-io-threads`), and the builder may pick a different default
+(e.g. scaled to CPUs) if measurement favors it. Process: measure the baseline on `main` before the backend changes land,
+repeat after, with the same runs the measurement doc uses (several runs each, so noise is visible). Report both sets of
+numbers. A regression outside run-to-run spread that a default change cannot fix stops the work and goes back to the
+user; it does not get absorbed by changing the design silently.
 
 ### 9. Testing
 

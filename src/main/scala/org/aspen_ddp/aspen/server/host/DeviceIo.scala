@@ -54,6 +54,12 @@ trait DeviceIo:
    *  (DeviceIos.forget). A snapshot: true only while nothing submits to this DeviceIo, which holds for a path with no
    *  device loaded and no control step outstanding on it */
   def idle: Boolean
+  /** Closes the management lane only (DeviceIos.forget): every lane job queued fails with `Cancelled`, and every later
+   *  submit at once. The data and serial pools keep running whatever is still executed on them (a rebuild's staging
+   *  backend, an FSIF serial executor, a late close that outlives its device's listing), on this device's threads,
+   *  which time out once idle; so no backend task is ever rejected and no Future chained on one left incomplete */
+  def closeLane(): Unit
+  /** Host shutdown (DeviceIos.closeAll): `closeLane`, and both pools stopped without waiting */
   def close(): Unit
 
 object DeviceIo:
@@ -64,7 +70,10 @@ object DeviceIo:
    *  or beat it (docs/host-threading-measurement.md, "Device I/O isolation"). */
   def defaultDataThreads: Int = math.max(4, Runtime.getRuntime.availableProcessors / 2)
 
-  final case class Config(dataThreads: Int = defaultDataThreads, serialThreads: Int = 1, readBound: Int = 4096)
+  /** `poolKeepAliveMillis`: how long an idle data or serial thread lives before it exits (a device with no backend
+   *  work holds no pool thread) */
+  final case class Config(dataThreads: Int = defaultDataThreads, serialThreads: Int = 1, readBound: Int = 4096,
+                          poolKeepAliveMillis: Long = 30000)
 
 /** Thread-safe record of the jobs a device is running. */
 final class DeviceIoObserver:

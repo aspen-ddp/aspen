@@ -152,6 +152,7 @@ object StoreRouterSuite:
     def readsOverBound: Boolean = under.readsOverBound
     def idle: Boolean = under.idle
     def close(): Unit = under.close()
+    def closeLane(): Unit = under.closeLane()
 
     /** Blocks until a job has been submitted and held, and returns its kind */
     def awaitHeld(): JobKind =

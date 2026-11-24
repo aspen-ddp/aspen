@@ -61,6 +61,10 @@ final class LockstepDeviceIo(val path: os.Path, threading: LockstepThreading, cf
           true
         else false
 
+  def closeLane(): Unit =
+    closed = true
+    threaded.closeLane()
+
   def close(): Unit =
     closed = true
     threaded.close()

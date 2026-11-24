@@ -100,8 +100,10 @@
   shut down as an unload does) and changes nothing else. Each device a discovery
   loads is checked at once (`Trigger.check`: ScanDevices, CheckAllDevices, a nudge); a nudge naming a device not loaded
   also checks it at once. A path gone from the listing, with no device loaded from it and nothing outstanding, has its
-  DeviceIo closed by `DeviceIos.forget`, which closes only an idle one (`DeviceIo.idle`: no management job queued or
-  running, no data or serial task queued or running); a busy one stays and is asked again at the next listing. The
+  DeviceIo dropped by `DeviceIos.forget`, which closes only an idle one's lane (`DeviceIo.idle`: no management job
+  queued or running, no data or serial task queued or running; `closeLane`); a busy one stays and is asked again at
+  the next listing. Its pools stay usable, so a backend still open on them (a rebuild's staging store waiting on
+  peers, a close outliving the listing) keeps running on that device's threads, never rejected. The
   Host constructor's scan (`startupScan`, before `threading.start()`) posts the same jobs and blocks on no device.
   Each device it loads is checked by a `Host.CheckLoadedDevice` posted as its load applies (there is no initial
   CheckAllDevices), so a hung path never delays another device's check. The startup gate posts `StoresReady` once,
@@ -661,13 +663,15 @@
   executor (`StoreRouter.onStore`) and gets results back through a Future whose callbacks name the control context
 - Device I/O isolation (`DeviceIo`, `DeviceIos`; spec `docs/superpowers/specs/2026-11-23-device-io-isolation-design.md`):
   each device directory has a `DeviceIo`: a serial management lane (`submit(kind, store)`, one thread, cancellable
-  while queued), a data pool (`--device-io-threads`, default `DeviceIo.defaultDataThreads` = max(4, CPUs/2)) and a serial pool (`dataEc`, `serialEc`) and an observer of what it runs, all on daemon
-  threads of that device, so a hung device stalls only its own work. `HostThreading.newDeviceIo(path)` builds it
+  while queued), a data pool (`--device-io-threads`, default `DeviceIo.defaultDataThreads` = max(4, CPUs/2)) and a serial pool (`dataEc`, `serialEc`; their threads made on demand and timing out
+  after `DeviceIo.Config.poolKeepAliveMillis` idle, 30 s, so an idle device holds none, and only `close` stops them)
+  and an observer of what it runs, all on daemon threads of that device, so a hung device stalls only its own work. `HostThreading.newDeviceIo(path)` builds it
   (`ThreadedDeviceIo` for StoreThreadPool and SingleThreadThreading, configured by `DeviceIo.Config`;
   `LockstepDeviceIo` under lockstep). `DeviceControl.deviceIos` (`DeviceIos`, control-owned) keeps one per path from
   first sight, so a reload reuses it (`forPath`, `get`, `forget` only when `DeviceIo.idle`, `hostRoot`, `all`);
-  `Host.shutdown` closes them all without waiting. A closed DeviceIo (`forget`, `Host.shutdown`) runs nothing more: every
-  job queued on it, and every later `submit` at once, fails with `DeviceIo.Cancelled`, which every apply treats as
+  `Host.shutdown` closes them all without waiting (`close`: lane and pools). A closed lane (`forget`'s `closeLane`,
+  `Host.shutdown`) runs nothing more: every job queued on it, even behind a job hung in a syscall, and every later
+  `submit` at once, fails with `DeviceIo.Cancelled`, which every apply treats as
   "nothing happened" (so a caller holding a forgotten `sds.io` never waits forever); a job that ran always completes
   its future, whatever it threw (fatal throwables and a throwing gate included), its observer entry ended first.
   `Store.deviceIo` (always set by `StoreLoader`: `sds.io`, or the host root's lane for the test seam's unloaded-device

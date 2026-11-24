@@ -20,16 +20,19 @@ final class DeviceIos(threading: HostThreading, rootDir: os.Path):
 
   def get(path: os.Path): Option[DeviceIo] = Option(ios.get(path))
 
-  /** Closes and drops the path's DeviceIo if it is idle (`DeviceIo.idle`: no management job queued or running, no
-   *  data or serial task queued or running), so closing drops nothing; a busy one is kept, and its caller (discovery,
-   *  for a path gone from its listing) asks again later. Returns whether the path now has no DeviceIo. */
+  /** Drops the path's DeviceIo and closes its lane (`DeviceIo.closeLane`) if it is idle (`DeviceIo.idle`: no
+   *  management job queued or running, no data or serial task queued or running), so closing cancels nothing; a busy
+   *  one is kept, and its caller (discovery, for a path gone from its listing) asks again later. Its pools stay
+   *  usable: a backend still open on them (a rebuild's staging store waiting on peers, a close that outlives the
+   *  listing) goes on running on this device's threads, which time out once idle. Returns whether the path now has
+   *  no DeviceIo. */
   def forget(path: os.Path): Boolean =
     val io = ios.get(path)
     if io == null then
       true
     else if io.idle then
       ios.remove(path)
-      io.close()
+      io.closeLane()
       true
     else
       false

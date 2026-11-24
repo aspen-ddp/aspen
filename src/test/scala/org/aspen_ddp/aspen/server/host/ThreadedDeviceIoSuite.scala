@@ -167,3 +167,58 @@ class ThreadedDeviceIoSuite extends AnyFunSuite with Matchers:
     queued.future.value.map(_.failed.get) should be(Some(DeviceIo.Cancelled))
     ran.get should be(false)
     io.idle should be(true)
+
+  test("close fails the jobs queued behind a lane job hung past its interrupt"):
+    val entered = new CountDownLatch(1)
+    val unhang = new CountDownLatch(1)
+    val io = new ThreadedDeviceIo(os.Path("/tmp/devX"), cfg)
+    // A hung syscall: the interrupt does not end it
+    val hung = io.submit(JobKind.Scan, None):
+      entered.countDown()
+      var done = false
+      while !done do
+        try
+          unhang.await()
+          done = true
+        catch case _: InterruptedException => ()
+    entered.await()
+    val queued = (0 until 5).map(_ => io.submit(JobKind.Scan, None)(()))
+    io.close()
+    try
+      queued.foreach: h =>
+        intercept[Throwable](Await.result(h.future, wait)) should be theSameInstanceAs DeviceIo.Cancelled
+      hung.future.isCompleted should be(false)
+    finally unhang.countDown()
+    Await.result(hung.future, wait)
+
+  test("a forgotten DeviceIo still runs the data and serial tasks of a backend that outlives it"):
+    val threading = new SingleThreadThreading(cfg)
+    val ios = new DeviceIos(threading, os.Path("/tmp/hostX"))
+    val io = ios.forPath(os.Path("/tmp/devX"))
+    // As an FSIF backend's serial executor: alive, idle between tasks, when its path's DeviceIo is forgotten
+    val serial = new org.aspen_ddp.aspen.server.store.backend.fsif.SerialExecutor(io.serialEc)
+    Await.result(Future(1)(using serial), wait) should be(1)
+    // The task's pool count ends just after its Future completes
+    val deadline = System.nanoTime() + wait.toNanos
+    while !io.idle && System.nanoTime() < deadline do Thread.sleep(1)
+    io.idle should be(true)
+    ios.forget(io.path) should be(true)
+    ios.get(io.path) should be(None)
+    // The lane is closed: a late job fails Cancelled, at once
+    io.submit(JobKind.Scan, None)(()).future.value.map(_.failed.get) should be(Some(DeviceIo.Cancelled))
+    try
+      Await.result(Future(2)(using serial), wait) should be(2)
+      Await.result(Future(3)(using io.dataEc), wait) should be(3)
+      Await.result(Future(4)(using serial), wait) should be(4)
+    finally io.close()
+
+  test("idle pool threads time out, and the pool starts new ones for later tasks"):
+    val io = new ThreadedDeviceIo(os.Path("/tmp/devX"), cfg.copy(poolKeepAliveMillis = 20))
+    try
+      Await.result(Future(1)(using io.dataEc), wait)
+      Await.result(Future(1)(using io.serialEc), wait)
+      val deadline = System.nanoTime() + wait.toNanos
+      while io.poolThreads > 0 && System.nanoTime() < deadline do Thread.sleep(5)
+      io.poolThreads should be(0)
+      Await.result(Future(2)(using io.dataEc), wait) should be(2)
+    finally io.close()

@@ -1009,6 +1009,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           ctx.rebuilds.failStopClosed(store.storageDeviceId, store.storeId, store.backend.path)
         else if ctx.devices.devices.contains(store.storageDeviceId) then
           ctx.reconciler.checkStorageDevice(store.storageDeviceId)
+      catch case NonFatal(t) =>
+        // A bug: logged here rather than left to the context's reportFailure, and the close still ends below
+        logger.error(s"Close of store ${store.storeId} failed in its end: $t")
       finally ctx.rebuilds.closeDone(store.storageDeviceId, tracked)
 
   /** The first step of a close, on the executor of `entry`, whose store the router no longer holds. Every task

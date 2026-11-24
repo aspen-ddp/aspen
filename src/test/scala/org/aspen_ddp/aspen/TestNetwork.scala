@@ -962,9 +962,11 @@ class TestNetwork(executionContext: ExecutionContext,
   def printTransactionStatus(): Unit = {
     if hasTransactions then
       val test = client.getSystemAttribute("unittest.name")
-      println(s"*********** Transaction Status. Hung Test: $test ***********")
-      allHosts.foreach(_.logTransactionStatus(s => println(s)))
-      println("******************************************")
+      // Through the logger, so test output stays clean unless a test turns logging on
+      val log = scribe.Logger("TestNetwork")
+      log.warn(s"*********** Transaction Status. Hung Test: $test ***********")
+      allHosts.foreach(_.logTransactionStatus(s => log.warn(s)))
+      log.warn("******************************************")
   }
 
   def waitForTransactionsToComplete(): Future[Unit] = {

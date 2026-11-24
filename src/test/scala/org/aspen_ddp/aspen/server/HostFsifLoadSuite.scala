@@ -190,7 +190,6 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
                          gossipStoreOnline = Some(seams.gossipStoreOnline), loadStore = Some(loadStore))))
     built = host
     runDiscovery(host)
-    host
     fsifSeams.put(host, seams)
     host
 

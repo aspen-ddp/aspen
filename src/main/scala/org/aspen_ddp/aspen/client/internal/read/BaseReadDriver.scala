@@ -285,7 +285,7 @@ object BaseReadDriver:
           if !promise.isCompleted then
             ec.execute(() => if !promise.isCompleted then sendReadRequests())
           if count * ResendEvery.toMillis == HungAfter.toMillis then
-            objectReader.debugLogStatus(s"*** HUNG READ in test $test", println)
+            objectReader.debugLogStatus(s"*** HUNG READ in test $test", s => logger.warn(s))
 
       val checkerThread = new Thread(myRunnable, "waitForReadCompleteThread")
 

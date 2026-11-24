@@ -20,7 +20,11 @@ enum JobKind:
   /** Device discovery's own jobs (DeviceDiscovery), used by nothing else: the listing of storage-devices/ on the host
    *  root's lane, a path's probe, and a load's sweep and P2. A load's device CRL open (DeviceCrlDisk.open) is
    *  `CrlOpen`, used by discovery only */
-  case DeviceListing, DeviceProbe, LoadSweep, LoadDuplicates
+  case DeviceListing, DeviceProbe, LoadSweep, LoadDuplicates,
+    /** Ownership resolution's reads (DeviceStateDisk.storesIn, ownershipUnchanged) */
+    DeviceOwnership,
+    /** Adoption's reads and moves, and bringIntoService's steps (DeviceStateDisk) */
+    Adoption
   case Other(name: String)
 
   def label: String = this match

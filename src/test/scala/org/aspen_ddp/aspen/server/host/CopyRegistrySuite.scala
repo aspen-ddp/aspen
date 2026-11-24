@@ -250,7 +250,9 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
       metadata = null, scheduler = null, backends = null, devices = new LocalDevices(), client = null,
       hostId = HostId.BootstrapHostId, aspenSystemId = new UUID(0, 0), rootDir = os.root, net = null,
       backgroundTasks = BackgroundTaskManager.NoBackgroundTaskManager,
-      threading = new LockstepThreading(ExecutionContext.parasitic), post = _ => (), crlFactory = null,
+      threading = new LockstepThreading(ExecutionContext.parasitic),
+      // A lane job's result (CopyMoves.moveOnLane) is applied as it is posted
+      post = { case e: org.aspen_ddp.aspen.server.Host.DeviceJobDone => e.apply(); case _ => () }, crlFactory = null,
       unloadedDeviceCrl = None, txStatusCache = null, wrapCompletionHandler = identity, objectCacheFactory = null,
       finalizerFactory = null, txDriverFactory = null, heartbeatPeriod = Duration(5, SECONDS),
       deviceScanPeriod = Duration(10, SECONDS), storeRebuildFactory = null, maxConcurrentRebuilds = 2,
@@ -353,7 +355,12 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
         // parameter, and records the fact, legal or not; within one directory it is no move (NotMoved) and changes
         // nothing
         val (moveCtx, moveSds, at) = attachedCopy(root, from)
-        val result = moveCtx.moves.move("table", moveSds, storeId, to)
+        // As a loaded device's: moveOnLane applies only for the loaded device, its job run by a drain
+        moveCtx.devices.devices += moveSds.storageDeviceId -> moveSds
+        var moveResult = Option.empty[MoveResult]
+        moveCtx.moves.moveOnLane("table", moveSds, storeId, to)(r => moveResult = Some(r))
+        moveCtx.threading.asInstanceOf[LockstepThreading].drain()
+        val result = moveResult.get
         val target = CopyLayout.path(moveSds.devicePath, storeId, CopyFixtures.copyIdOf(at), to)
         if CopyLayout.dirOf(from) == CopyLayout.dirOf(to) then
           result shouldBe a[MoveResult.NotMoved]

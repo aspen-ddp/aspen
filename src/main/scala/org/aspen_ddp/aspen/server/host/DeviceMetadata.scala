@@ -39,9 +39,9 @@ trait DeviceMetadata:
   def adoptDevice(storageDeviceId: StorageDeviceId,
                   previousHostId: HostId,
                   devicePath: os.Path,
-                  uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
-                  crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],
-                  moveToLost: StoreId => Unit): Future[AdoptOutcome]
+                  uncleanStores: (os.Path, StorageDeviceState) => Future[List[StoreId]],
+                  crlLostStores: (os.Path, StorageDeviceState) => Future[List[StoreId]],
+                  moveToLost: List[StoreId] => Future[Unit]): Future[AdoptOutcome]
 
   def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState]
 
@@ -496,7 +496,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
    *  adopter racing this one makes one of them lose and re-read. Returns Changed, writing nothing,
    *  when the re-read finds the device Failed or no longer owned by `previousHostId`, and
    *  Unclean, writing nothing, when an Offline or Active entry of the re-read state has no directory
-   *  under `devicePath` (DeviceDiscovery.adoptionClass): the state validated is the state committed,
+   *  under `devicePath` (DeviceStateDisk.adoptionClass): the state validated is the state committed,
    *  so an entry changed since the caller's lookup is checked too. Adopted carries the state
    *  written, which the post-commit steps act on. The
    *  previous host's HostState is skipped if that host has no entry in the hosts tree: it was
@@ -517,9 +517,9 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
   def adoptDevice(storageDeviceId: StorageDeviceId,
                   previousHostId: HostId,
                   devicePath: os.Path,
-                  uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
-                  crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],
-                  moveToLost: StoreId => Unit): Future[AdoptOutcome] =
+                  uncleanStores: (os.Path, StorageDeviceState) => Future[List[StoreId]],
+                  crlLostStores: (os.Path, StorageDeviceState) => Future[List[StoreId]],
+                  moveToLost: List[StoreId] => Future[Unit]): Future[AdoptOutcome] =
     import StorageDeviceState.DeviceStatus
 
     case class PoolUpdate(pointer: KeyValueObjectPointer, kvos: KeyValueObjectState, config: StoragePoolState)
@@ -551,7 +551,8 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
         devPtr <- client.getStorageDevicePointer(storageDeviceId)
         devKvos <- client.read(devPtr)
         state = StorageDeviceState(devKvos)
-        unclean = uncleanStores(devicePath, state)
+        // Disk reads, each a job on the device's lane (DeviceDiscovery), applied on the control thread
+        unclean <- uncleanStores(devicePath, state)
         adopted <-
           if retry.mayHaveCommitted && !state.isFailed && state.hostId == hostId && previousHostId != hostId then
             tx.result.foreach: _ =>
@@ -584,6 +585,15 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
                        val cfg = pools.find(_.config.poolId == storeId.poolId).get.config
                        BootstrapConfig.prepRadicleUpdate(client, storeId, cfg, hostId)
                      case None => Future.unit
+              // Stores whose CRL state is gone are rebuilt rather than refused. The copy is moved
+              // to lost/ before the commit, which is correct whatever its outcome: the state is lost
+              // either way, and lost/ is what keeps the copy from ever being loaded. The moves are one job on the
+              // device's lane; a move that fails fails this attempt
+              crlLost <- crlLostStores(devicePath, state)
+              _ = crlLost.foreach: storeId =>
+                    logger.warn(s"Store $storeId on storage device $storageDeviceId has lost its CRL state. " +
+                                s"Adopting it as Rebuilding")
+              _ <- moveToLost(crlLost)
             yield
               val changedPools = repointed.map(_.poolId).toSet
               pools.filter(pu => changedPools.contains(pu.config.poolId)).foreach: pu =>
@@ -591,14 +601,6 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
                   List(KeyRevision(StoragePoolState.ConfigKey, pu.kvos.contents(StoragePoolState.ConfigKey).revision)),
                   List(Insert(StoragePoolState.ConfigKey, pu.config.encode())))
 
-              // Stores whose CRL state is gone are rebuilt rather than refused. The copy is moved
-              // to lost/ before the commit, which is correct whatever its outcome: the state is lost
-              // either way, and lost/ is what keeps the copy from ever being loaded.
-              val crlLost = crlLostStores(devicePath, state)
-              crlLost.foreach: storeId =>
-                logger.warn(s"Store $storeId on storage device $storageDeviceId has lost its CRL state. " +
-                            s"Adopting it as Rebuilding")
-                moveToLost(storeId)
               val reactivated = state.withOfflineStoresActive.copy(hostId = hostId, status = DeviceStatus.Operational)
               val newState = crlLost.foldLeft(reactivated): (st, storeId) =>
                 st.setRebuilding(storeId, UUID.randomUUID())

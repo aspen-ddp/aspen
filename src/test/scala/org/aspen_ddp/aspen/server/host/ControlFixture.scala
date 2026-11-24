@@ -239,9 +239,9 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
     override def adoptDevice(storageDeviceId: StorageDeviceId,
                              previousHostId: HostId,
                              devicePath: os.Path,
-                             uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
-                             crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],
-                             moveToLost: StoreId => Unit): Future[AdoptOutcome] =
+                             uncleanStores: (os.Path, StorageDeviceState) => Future[List[StoreId]],
+                             crlLostStores: (os.Path, StorageDeviceState) => Future[List[StoreId]],
+                             moveToLost: List[StoreId] => Future[Unit]): Future[AdoptOutcome] =
       synchronized:
         adoptCalls += ((storageDeviceId, previousHostId))
       base.adoptDevice(storageDeviceId, previousHostId, devicePath, uncleanStores, crlLostStores, moveToLost)
@@ -394,6 +394,12 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
  *
  *  A component is driven directly (`host.control.reconciler.checkAll()`) rather than through a queued event, so a
  *  test need not drain unrelated queued work, and read through the accessors on `host.control`. */
+object ControlFixture:
+  /** The `what` prefixes of the lane job results runCopyJobs applies from the FIFO's head (Host.DeviceJobDone): copy
+   *  jobs, rebuild bookkeeping, transfers' jobs (StoreTransfers, StoreTransfersOut), marker writes (DeviceShutdown)
+   *  and ownership and adoption jobs (DeviceDiscovery) */
+  val laneResultPrefixes: List[String] = List("copy ", "rebuild ", "transfer ", "marker ", "adoption ")
+
 trait ControlFixture:
   this: IntegrationTestSuite =>
 
@@ -741,7 +747,7 @@ trait ControlFixture:
     // Discovery's own job kinds and results only (JobKind.DeviceListing etc., DeviceJobDone.discovery): other
     // subsystems' jobs and results keep their place on the FIFO
     val kinds = Set[JobKind](JobKind.DeviceListing, JobKind.DeviceProbe, JobKind.LoadSweep, JobKind.CrlOpen,
-      JobKind.LoadDuplicates)
+      JobKind.LoadDuplicates, JobKind.DeviceOwnership, JobKind.Adoption)
     def isDiscovery(task: Runnable): Boolean = task match
       case t: LockstepThreading.DeviceTask => kinds.contains(t.kind)
       case t: Host.EventTask => t.event match
@@ -789,7 +795,7 @@ trait ControlFixture:
     def isCopyResult(task: Runnable): Boolean = task match
       case t: Host.EventTask => t.event match
         case e: Host.DeviceJobDone =>
-          e.what.startsWith("copy ") || e.what.startsWith("rebuild ") || e.what == DeviceReconciler.ReconcileInputsJob
+          ControlFixture.laneResultPrefixes.exists(e.what.startsWith) || e.what == DeviceReconciler.ReconcileInputsJob
         case _ => false
       case _ => false
     var progress = true

@@ -3,17 +3,15 @@ package org.aspen_ddp.aspen.server.host
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
-import org.aspen_ddp.aspen.server.{DeviceMarkers, FileStat, Host, StorageDeviceConfig, StorageDeviceManager,
-  StoreConfig}
+import org.aspen_ddp.aspen.server.{Host, StorageDeviceConfig, StorageDeviceManager}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlConfigInvalid, CrlSizingMismatch}
-import org.aspen_ddp.aspen.server.store.backend.Backend
 import scribe.Logging
 
-import scala.concurrent.Future
+import scala.concurrent.{Future, Promise}
 import scala.util.{Failure, Success, Try}
 
-/** How one store an adoption serves (an Offline or Active entry) was left, as adoptionClass reads it from its
- *  directory. */
+/** How one store an adoption serves (an Offline or Active entry) was left, as DeviceStateDisk.adoptionClass reads it
+ *  from its directory. */
 private[aspen] enum AdoptionClass:
   /** Its state is on the device (the device CRL, or a network transfer's save file): adopted Active. */
   case Clean
@@ -297,20 +295,53 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  awaiting their device, so the router drops their messages instead of answering UnknownStore.
    */
   private def resolveOwnership(storageDevicePath: os.Path,
+                               b: Busy,
                                sdCfg: StorageDeviceConfig,
                                previousHost: HostId,
                                fromShutdownMarker: Boolean): Unit =
-    if ! pendingResolutions.contains(storageDevicePath) then
-      val stores = storesIn(storageDevicePath)
-      ctx.copyRegistry.awaitDevice(storageDevicePath, stores)
-      pendingResolutions += storageDevicePath -> stores
-      // A throw before the Future exists would register no callback, and the path would stay
-      // pending -- and the device unresolved -- for the life of the process.
-      val lookup =
-        try ctx.metadata.lookupStorageDeviceState(sdCfg.storageDeviceId)
-        catch case t: Throwable => Future.failed(t)
-      lookup.onComplete: result =>
-        ctx.post(Host.DeviceOwnershipResolved(storageDevicePath, sdCfg, previousHost, fromShutdownMarker, result))
+    if pendingResolutions.contains(storageDevicePath) then
+      end(storageDevicePath, b)
+    else
+      // The stores in the directory are listed by one DeviceOwnership job on its lane (DeviceStateDisk.storesIn), `b`
+      // holding the path meanwhile; a listing that fails leaves the device to the next scan (submitFor warns)
+      submitFor(storageDevicePath, b, JobKind.DeviceOwnership, "device ownership listing")(
+        DeviceStateDisk.storesIn(storageDevicePath))(_ => ()): stores =>
+        if pendingResolutions.contains(storageDevicePath) then
+          end(storageDevicePath, b)
+        else
+          ctx.copyRegistry.awaitDevice(storageDevicePath, stores)
+          pendingResolutions += storageDevicePath -> stores
+          end(storageDevicePath, b)
+          // A throw before the Future exists would register no callback, and the path would stay
+          // pending -- and the device unresolved -- for the life of the process.
+          val lookup =
+            try ctx.metadata.lookupStorageDeviceState(sdCfg.storageDeviceId)
+            catch case t: Throwable => Future.failed(t)
+          lookup.onComplete: result =>
+            ctx.post(Host.DeviceOwnershipResolved(storageDevicePath, sdCfg, previousHost, fromShutdownMarker, result))
+
+  /** Runs `job` as one `kind` job on the lane of the device directory `path` (its DeviceIo, created on first sight),
+   *  its result given to `apply` as a posted discovery event (DeviceControl.onControl). A submission that throws is
+   *  given to `apply` as the failure */
+  private def laneJob[T](path: os.Path, kind: JobKind, what: String)(job: => T)(apply: Try[T] => Unit): Unit =
+    val io = ctx.deviceIos.forPath(path)
+    val handle =
+      try Right(io.submit(kind, None)(job))
+      catch case t: Throwable => Left(t)
+    handle match
+      case Left(t) => apply(Failure(t))
+      case Right(h) =>
+        ctx.onControl(what, h, discovery = true): result =>
+          // A DeviceIo forgotten meanwhile (the path left the listing) answers as a cancelled job: nothing happened
+          apply(if ctx.deviceIos.get(path).exists(_ eq io) then result else Failure(DeviceIo.Cancelled))
+
+  /** laneJob as a Future of `apply`'s value, completed on the control thread once the result is applied (a throw of
+   *  `apply`, or the job's failure, fails it): the adoption transaction's disk callbacks */
+  private def laneFuture[T, R](path: os.Path, kind: JobKind, what: String)(job: => T)(apply: T => R): Future[R] =
+    val p = Promise[R]()
+    laneJob(path, kind, what)(job): result =>
+      p.complete(result.map(apply))
+    p.future
 
   /** Acts on the StorageDeviceState looked up for a device this host does not load on its own. The previous host is
    *  the one named by `shutdown.state` when the device carries it, otherwise by `owning-host`:
@@ -335,24 +366,37 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  decides again from a fresh read: a restart or a finished shutdown is picked up that way.
    */
   def handleOwnershipResolved(e: Host.DeviceOwnershipResolved): Unit =
-    val Host.DeviceOwnershipResolved(path, sdCfg, previousHost, fromShutdownMarker, result) = e
-    import StorageDeviceState.DeviceStatus
+    val Host.DeviceOwnershipResolved(path, sdCfg, previousHost, fromShutdownMarker, _) = e
     // The marks are cleared once the outcome has been acted on, so a store the outcome loads is
     // already marked loading by then; an adoption started here takes them over instead.
     val marked = pendingResolutions.getOrElse(path, Set())
-    pendingResolutions -= path
+    val deviceId = sdCfg.storageDeviceId
+    // The disk was read before the lookup went out. If it has been pulled, or the file naming the previous host has
+    // changed, since then, this result describes a directory that is no longer there to act on; the next scan starts
+    // over from what the disk says now. The recheck is one DeviceOwnership job on the path's lane
+    // (DeviceStateDisk.ownershipUnchanged); the path stays pending until it is applied, so no scan resolves it again
+    // meanwhile. A stat that fails (FileStat), or a cancelled job, leaves it to the next scan
+    laneJob(path, JobKind.DeviceOwnership, "adoption ownership recheck")(
+      DeviceStateDisk.ownershipUnchanged(path, previousHost, fromShutdownMarker)): unchanged =>
+      pendingResolutions -= path
+      try
+        unchanged match
+          case Failure(t) =>
+            if t != DeviceIo.Cancelled then
+              warnOnce(path, s"Failed to resolve the ownership of storage device $deviceId at $path. " +
+                             s"Will retry on the next scan. Error: $t")
+          case Success(false) => ()
+          case Success(true) => ownershipResolved(e, marked)
+      finally
+        releaseMarks(path, marked)
+
+  /** handleOwnershipResolved's table, once the recheck found the directory unchanged */
+  private def ownershipResolved(e: Host.DeviceOwnershipResolved, marked: Set[StoreId]): Unit =
+    val Host.DeviceOwnershipResolved(path, sdCfg, previousHost, fromShutdownMarker, result) = e
+    import StorageDeviceState.DeviceStatus
     val deviceId = sdCfg.storageDeviceId
     try
-      // The disk was read before the lookup went out. If it has been pulled, or the file naming
-      // the previous host has changed, since then, this result describes a directory that is no
-      // longer there to act on; the next scan starts over from what the disk says now.
-      // A stat that fails throws (FileStat): the next scan starts over.
-      val unchanged = FileStat.isDir(path) && (
-        if fromShutdownMarker then DeviceMarkers.readShutdownState(path).contains(previousHost)
-        else
-          !FileStat.exists(path / DeviceMarkers.ShutdownStateFile) &&
-            DeviceMarkers.readOwningHost(path).contains(previousHost))
-      if ! unchanged || loadedDirs.contains(path) then
+      if loadedDirs.contains(path) then
         ()
       else if devices.get(deviceId).exists(_.devicePath != path) then
         warnOnce(path, s"Storage device $deviceId is already loaded from " +
@@ -372,8 +416,10 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                              s"host ${state.hostId}. $why")
 
             if state.isFailed then
-              try DeviceMarkers.writeFailed(path)
-              catch case t: Throwable => logger.warn(s"Failed to write the failed marker of $path: $t")
+              // One Markers job, its outcome only logged: the device is not loaded either way
+              laneJob(path, JobKind.DeviceOwnership, "adoption failed marker")(DeviceStateDisk.writeFailed(path)):
+                _.failed.foreach: t =>
+                  if t != DeviceIo.Cancelled then logger.warn(s"Failed to write the failed marker of $path: $t")
               refuse("It has been declared failed. Not loading it")
             else if previousHost == ctx.hostId then
               state.status match
@@ -387,7 +433,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                   loadResolved(path, sdCfg)
                 case DeviceStatus.Operational if ownedHere =>
                   logger.info(s"Storage device $deviceId at $path has been restarted. Loading it")
-                  bringIntoService(path, sdCfg, state, rewriteOwner = false)
+                  bringIntoService(path, sdCfg, state, rewriteOwner = false, marked)
                 case _ =>
                   refuse("Not loading it")
             else if state.hostId == previousHost then
@@ -397,64 +443,18 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
               // reconcile carries it on.
               logger.info(s"Storage device $deviceId at $path was adopted by this host but not " +
                           s"yet loaded. Finishing the adoption")
-              bringIntoService(path, sdCfg, state, rewriteOwner = true)
+              bringIntoService(path, sdCfg, state, rewriteOwner = true, marked)
             else
               refuse("Not loading or adopting it")
     catch
       case t: Throwable =>
         warnOnce(path, s"Failed to resolve the ownership of storage device $deviceId at $path. " +
                        s"Will retry on the next scan. Error: $t")
-    finally
-      releaseMarks(path, marked)
-
-  /** The stores with a configured copy on the device directory `path` outside pending-delete/, by their copies'
-   *  names (CopyLayout.list). A listing or a config stat that fails throws (FileStat): a store it cannot see is never
-   *  taken for none, so the caller leaves the device to the next scan */
-  private def storesIn(path: os.Path): Set[StoreId] =
-    CopyLayout.list(path).copies.filter(f =>
-      f.phase != Phase.Retired && FileStat.isFile(f.path / StoreConfig.configFilename)).map(_.storeId).toSet
 
   /** Clears the awaiting-device marks of `stores`, unless an adoption of `path` has taken them over */
   private def releaseMarks(path: os.Path, stores: Set[StoreId]): Unit =
     if ! pendingResolutions.contains(path) then
       ctx.copyRegistry.deviceDecided(path)
-
-  /** How the store whose entry is Offline or Active, with `copy` its copy on the device, can be put back into service
-   *  by an adoption: a lookup on the copy's phase alone (spec "Adoption"). The host that served it is not here, so its
-   *  state must be on the device: in the device CRL, or, for a network transfer in flight, in the store's own
-   *  crl_save.log.
-   *
-   *  - No copy in any phase: the store's close or creation did not finish (or its directory was lost), and
-   *    adopting it would drop whatever it held: Unclean, and the device is refused.
-   *  - In lost/: CrlLost. Its host moved it there because its state cannot be trusted (a backend that failed while
-   *    closing, a lost CRL).
-   *  - In arrived/: Clean. A transfer in that landed during the shutdown (PoolRepointedOffline);
-   *    it was never opened on this device, so it has no CRL state to carry.
-   *  - In outbound/: a network transfer out had taken its state out of the device CRL into
-   *    crl_save.log. Clean with a valid save file. Without one the state is gone -- a disk pulled
-   *    before the file reached the platter, or later damage -- and the host that wrote it no longer
-   *    holds it either: refusing the device would not bring it back, so it is CrlLost and adopted as
-   *    Rebuilding. The save file is parsed, not just found: loadValidStoreState rejects a file cut
-   *    short, and one whose header names another store. One it cannot read (CrashRecoveryLog.isUnreadable)
-   *    throws, failing the adoption for the next scan to retry, rather than be taken for lost.
-   *  - In rebuilt/ or parked/: Clean. A finished rebuild awaiting its flip, or one whose flip wrote its entry Offline
-   *    (keepRebuiltStoreOffline): it has never served, and its empty save file is its whole state.
-   *  - In live/: Clean. The shutdown closed it, or a crash or a pulled drive stopped it,
-   *    with its state in the device CRL, which the adopting host opens before loading it.
-   *
-   *  A save file that cannot be read throws, failing the adoption for the next scan to retry.
-   */
-  private def adoptionClass(storeId: StoreId, copy: Option[CopyLayout.Found]): AdoptionClass =
-    copy.map(_.phase) match
-      case None => AdoptionClass.Unclean
-      case Some(Phase.Live | Phase.Arrived(_) | Phase.Rebuilt(_) | Phase.Parked) => AdoptionClass.Clean
-      case Some(Phase.Outbound(_)) =>
-        CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(copy.get.path), storeId) match
-          case Right(_) => AdoptionClass.Clean
-          case Left(_) => AdoptionClass.CrlLost
-      case Some(Phase.Lost) => AdoptionClass.CrlLost
-      // Not listed: servedStoresIn leaves pending-delete/ out
-      case Some(Phase.Retired) => AdoptionClass.Unclean
 
   /** Validates a device last owned by `previousHostId`, shut down or not, and adopts it if its CRL
    *  is on it and every store it serves has its directory. On success the post-commit steps run
@@ -477,21 +477,44 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                              marked: Set[StoreId]): Unit =
     val deviceId = sdCfg.storageDeviceId
     // Checked here as well as inside adoptDevice, against the looked-up state, so a device that
-    // is plainly not ready costs no transaction. The check that counts is adoptDevice's own.
-    val unclean = uncleanStores(path, state)
+    // is plainly not ready costs no transaction. The check that counts is adoptDevice's own. Its reads are one
+    // Adoption job on the device's lane (DeviceStateDisk.adoptionLook); the path stays pending meanwhile
+    pendingResolutions += path -> marked
+    laneJob(path, JobKind.Adoption, "adoption look")(DeviceStateDisk.adoptionLook(path, state)): look =>
+      look match
+        case Success(l) if !l.crlPresent || l.unclean.nonEmpty =>
+          pendingResolutions -= path
+          releaseMarks(path, marked)
+          if !l.crlPresent then
+            warnOnce(path, s"Storage device $deviceId at $path, last owned by host $previousHostId, holds stores but " +
+                           s"its CRL is not on it (${CrashRecoveryLog.deviceCrlDir(path)}). Not adopting it. Return " +
+                           s"it to that host")
+          else
+            warnUnclean(path, deviceId, previousHostId, l.unclean)
+        case Success(_) =>
+          adopt(path, sdCfg, state, previousHostId, marked)
+        case Failure(t) =>
+          pendingResolutions -= path
+          releaseMarks(path, marked)
+          if t != DeviceIo.Cancelled then
+            warnOnce(path, s"Failed to resolve the ownership of storage device $deviceId at $path. " +
+                           s"Will retry on the next scan. Error: $t")
 
-    if storesIn(path).nonEmpty && !FileStat.isDir(CrashRecoveryLog.deviceCrlDir(path)) then
-      warnOnce(path, s"Storage device $deviceId at $path, last owned by host $previousHostId, holds stores but its " +
-                     s"CRL is not on it (${CrashRecoveryLog.deviceCrlDir(path)}). Not adopting it. Return it to " +
-                     s"that host")
-    else if unclean.nonEmpty then
-      warnUnclean(path, deviceId, previousHostId, unclean)
-    else
+  /** tryAdoptDevice's transaction (DeviceMetadata.adoptDevice), its disk callbacks each one Adoption job on the
+   *  device's lane, applied on the control thread (laneFuture), so the transaction's order of disk steps and metadata
+   *  rewrite is as it was: the CrlLost moves made before the commit */
+  private def adopt(path: os.Path,
+                    sdCfg: StorageDeviceConfig,
+                    state: StorageDeviceState,
+                    previousHostId: HostId,
+                    marked: Set[StoreId]): Unit =
+    val deviceId = sdCfg.storageDeviceId
+    locally:
       logger.info(s"Adopting storage device $deviceId at $path, ${state.status} and owned by host $previousHostId")
       def handleAdoption(result: Try[AdoptOutcome]): Unit =
         result match
           case Success(AdoptOutcome.Adopted(committed)) =>
-            try bringIntoService(path, sdCfg, committed, rewriteOwner = true)
+            try bringIntoService(path, sdCfg, committed, rewriteOwner = true, marked)
             catch case t: Throwable =>
               // The adoption is committed, so the next scan reaching this directory takes the
               // "Operational, owned here" row and runs these steps again.
@@ -506,10 +529,10 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             warnOnce(path, s"Failed to adopt storage device $deviceId at $path. Will retry on the " +
                            s"next scan. Error: $t")
 
-      pendingResolutions += path -> marked
       val fadopt =
-        try ctx.metadata.adoptDevice(deviceId, previousHostId, path, uncleanStores,
-                                     (p, s) => servedStoresIn(p, s, AdoptionClass.CrlLost),
+        try ctx.metadata.adoptDevice(deviceId, previousHostId, path,
+                                     (p, s) => servedStoresOnLane(p, s, AdoptionClass.Unclean),
+                                     (p, s) => servedStoresOnLane(p, s, AdoptionClass.CrlLost),
                                      moveToLostUnattached(path))
         catch case t: Throwable => Future.failed(t)
       fadopt.onComplete: result =>
@@ -517,34 +540,27 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         try handleAdoption(result)
         finally releaseMarks(path, marked)
 
-  /** The entries of `state` an adoption serves -- Offline ones, and the Active ones of a device not
-   *  shut down -- in adoption class `cls`, by their directories under `path`. */
-  def servedStoresIn(path: os.Path,
-                     state: StorageDeviceState,
-                     cls: AdoptionClass): List[StoreId] =
-    // A failed listing throws, failing the adoption for the next scan
-    val copies = CopyLayout.list(path).copies.filter(_.phase != Phase.Retired)
-    state.stores.collect {
-      case (storeId, entry) if (entry.status == StorageDeviceState.StoreStatus.Offline ||
-                                entry.status == StorageDeviceState.StoreStatus.Active) &&
-                               adoptionClass(storeId, copies.find(_.storeId == storeId)) == cls =>
-        storeId
-    }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+  /** The entries of `state` an adoption serves -- Offline ones, and the Active ones of a device not shut down -- in
+   *  adoption class `cls`, by their directories under `path` (DeviceStateDisk.servedStoresIn), read by one Adoption
+   *  job on the device's lane. A failed listing or read fails it, failing the adoption for the next scan */
+  private def servedStoresOnLane(path: os.Path, state: StorageDeviceState, cls: AdoptionClass): Future[List[StoreId]] =
+    laneFuture(path, JobKind.Adoption, "adoption classes")(DeviceStateDisk.servedStoresIn(path, state, cls))(identity)
 
-  /** T10 for an adoption's CrlLost store on the device at `path`, not attached yet: its copy moved to lost/ unless it
-   *  is there. A move that fails throws, failing the adoption's transaction for the next scan to retry; one not
-   *  forced is held for the device's attach (CopyMoves.moveUnattached) */
-  private def moveToLostUnattached(path: os.Path)(storeId: StoreId): Unit =
-    CopyLayout.list(path).copies.find(f => f.storeId == storeId && f.phase != Phase.Retired) match
-      case Some(found) if found.phase != Phase.Lost =>
-        ctx.moves.moveUnattached("adoption CrlLost", found.path, storeId, found.copyId, Phase.Lost)._1 match
-          case MoveResult.NotMoved(t) => throw t
-          case _ => ()
-      case _ => ()
-
-  /** The Offline and Active entries of `state` whose directories under `path` are missing. */
-  def uncleanStores(path: os.Path, state: StorageDeviceState): List[StoreId] =
-    servedStoresIn(path, state, AdoptionClass.Unclean)
+  /** T10 for an adoption's CrlLost stores on the device at `path`, not attached yet: each copy moved to lost/ unless it
+   *  is there, in one Adoption job (DeviceStateDisk.moveToLost). A move that fails fails the Future, and with it the
+   *  adoption's transaction for the next scan to retry; one not forced is held for the device's attach
+   *  (CopyMoves.unattachedMoved) */
+  private def moveToLostUnattached(path: os.Path)(stores: List[StoreId]): Future[Unit] =
+    if stores.isEmpty then
+      Future.unit
+    else
+      val sync = ctx.moves.syncDirectory
+      val rename = ctx.moves.rename
+      laneFuture(path, JobKind.Adoption, "adoption moves to lost")(
+        DeviceStateDisk.moveToLost(path, stores, sync, rename)): moved =>
+        moved.foreach(ctx.moves.unattachedMoved)
+        moved.map(_.result).collectFirst { case MoveResult.NotMoved(t) => throw t }
+        ()
 
   private def warnUnclean(path: os.Path,
                           deviceId: StorageDeviceId,
@@ -553,12 +569,6 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     warnOnce(path, s"Storage device $deviceId at $path, last owned by host $previousHostId, has no directory for " +
                    s"stores ${unclean.mkString(", ")}. Not adopting it. It may have been " +
                    s"removed too early: return it to that host to finish the shutdown")
-
-  /** Whether a copy in the phase directory of `phase` may go Live once its device is in service: outbound/ (T7),
-   *  rebuilt/ (T3) and parked/ (T5) */
-  private def mayGoLive(phase: Phase): Boolean = phase match
-    case Phase.Outbound(_) | Phase.Rebuilt(_) | Phase.Parked => true
-    case _ => false
 
   /** The local half of a restart or adoption, once `state` -- Operational and owned by this host
    *  -- has committed. Each step is idempotent, so a crash between any two of them is finished by
@@ -590,36 +600,37 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   private def bringIntoService(path: os.Path,
                                sdCfg: StorageDeviceConfig,
                                state: StorageDeviceState,
-                               rewriteOwner: Boolean): Unit =
-    // A failed listing throws, leaving the device to the next scan
-    val listing = CopyLayout.list(path).copies
-    if rewriteOwner then
-      // Each store arrives from another host, whose clock may lead this one's: its load floor must cover that. Before
-      // the owner is rewritten, so that a crash between the two finds the adoption still to finish. Each live/ copy of
-      // a store the device lists, and each in outbound/ or parked/, which step 2 may reinstate, and in rebuilt/, which
-      // goes Live at the Completed Rebuilds pass. A directory stat that fails throws (FileStat), leaving the owner
-      // unwritten and the adoption to the next scan
-      listing.filter(f => state.stores.contains(f.storeId) && (f.phase == Phase.Live || mayGoLive(f.phase)))
-        .map(_.path).filter(FileStat.isDir(_)).foreach(LoadDisk.writeArrivedAt)
-      DeviceMarkers.writeOwningHost(path, ctx.hostId)
-
+                               rewriteOwner: Boolean,
+                               marked: Set[StoreId]): Unit =
     val active = state.stores.collect {
       case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Active => storeId -> entry
     }
-    val offline = listing.filter(f => f.phase.isInstanceOf[Phase.Outbound] || f.phase == Phase.Parked)
-    active.foreach: (storeId, entry) =>
-      if ctx.copyRegistry.mayReinstateOut(entry, storeId) then
-        // T7, T5. A move that fails keeps the store offline where it is, until a later check of its device (logged by
-        // the move); one not forced leaves the copy unsynced, which its attach takes and the device's check forces
-        // and loads
-        offline.filter(_.storeId == storeId).foreach: found =>
-          ctx.moves.moveUnattached(s"adoption brings ${found.phase} into service", found.path, storeId, found.copyId,
-            Phase.Live): Unit
-
-    announceOnLoad += path -> active.keySet
-    DeviceMarkers.removeShutdownState(path)
-
-    probe(path, DeviceDiscovery.Trigger(scan = false, check = true), explicit = true): Unit
+    // Decided here, from control state: the stores whose outbound/ or parked/ copy may go Live (T7, T5)
+    val reinstate = active.collect { case (storeId, entry) if ctx.copyRegistry.mayReinstateOut(entry, storeId) =>
+      storeId }.toSet
+    val sync = ctx.moves.syncDirectory
+    val rename = ctx.moves.rename
+    // Steps 1-3 are one Adoption job on the device's lane (DeviceStateDisk.bringIntoService), the path pending (its
+    // stores still awaiting their device) until it is applied
+    pendingResolutions += path -> marked
+    laneJob(path, JobKind.Adoption, "adoption brings into service")(
+      DeviceStateDisk.bringIntoService(path, state.stores.keySet, rewriteOwner, ctx.hostId, reinstate, sync, rename)):
+      result =>
+        pendingResolutions -= path
+        try
+          result match
+            case Success(moved) =>
+              // A move that failed keeps its store offline where it is, until a later check of its device; one not
+              // forced leaves the copy unsynced, which its attach takes and the device's check forces and loads
+              moved.foreach(ctx.moves.unattachedMoved)
+              announceOnLoad += path -> active.keySet
+              probe(path, DeviceDiscovery.Trigger(scan = false, check = true), explicit = true): Unit
+            case Failure(t) =>
+              if t != DeviceIo.Cancelled then
+                warnOnce(path, s"Failed to bring storage device ${sdCfg.storageDeviceId} at $path into service. " +
+                               s"Will retry on the next scan. Error: $t")
+        finally
+          releaseMarks(path, marked)
 
   /** Probes the device directory `path` (DiscoveryDisk.probe, one job on its DeviceIo) and decides on the result
    *  (`decide`), unless a discovery job is outstanding for it: then a scan skips it, and an `explicit` request asks for
@@ -683,8 +694,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         try
           markers.shutdownState.get match
             case Some(markerHost) =>
-              done()
-              resolveOwnership(storageDevicePath, sdCfg, markerHost, fromShutdownMarker = true)
+              resolveOwnership(storageDevicePath, b, sdCfg, markerHost, fromShutdownMarker = true)
             case None =>
               markers.owningHost.get match
                 case Some(owner) if owner == ctx.hostId =>
@@ -693,12 +703,11 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                   else
                     loadOwnedDevice(storageDevicePath, b, sdCfg, trigger)
                 case Some(owner) =>
-                  done()
-                  resolveOwnership(storageDevicePath, sdCfg, owner, fromShutdownMarker = false)
+                  resolveOwnership(storageDevicePath, b, sdCfg, owner, fromShutdownMarker = false)
                 case None =>
                   done()
                   warnOnce(storageDevicePath, s"Storage device ${sdCfg.storageDeviceId} at $storageDevicePath " +
-                                              s"has no ${DeviceMarkers.OwningHostFile} file. Not loading or " +
+                                              s"has no ${DeviceStateDisk.OwningHostFile} file. Not loading or " +
                                               s"claiming it")
         catch
           case t: Throwable =>

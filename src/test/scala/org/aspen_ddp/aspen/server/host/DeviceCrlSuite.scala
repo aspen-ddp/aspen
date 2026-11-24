@@ -161,9 +161,9 @@ private class HookedMetadata(base: DeviceMetadata, beforeComplete: () => Future[
                              gossipStoreOnline: StoreId => Unit): Future[RebuildOutcome] =
     base.markRebuiltStoreActive(storageDeviceId, storeId, episode, gossipStoreOnline)
   def adoptDevice(storageDeviceId: StorageDeviceId, previousHostId: HostId, devicePath: os.Path,
-                  uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
-                  crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],
-                  moveToLost: StoreId => Unit): Future[AdoptOutcome] =
+                  uncleanStores: (os.Path, StorageDeviceState) => Future[List[StoreId]],
+                  crlLostStores: (os.Path, StorageDeviceState) => Future[List[StoreId]],
+                  moveToLost: List[StoreId] => Future[Unit]): Future[AdoptOutcome] =
     base.adoptDevice(storageDeviceId, previousHostId, devicePath, uncleanStores, crlLostStores, moveToLost)
   def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
     base.lookupStorageDeviceState(storageDeviceId)
@@ -1732,7 +1732,10 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
       _ <- closed
       heldAfterClose = held(crl, storeId)
       saveFileAfterClose = os.exists(Backend.crlSaveFile(storeDir))
-      _ <- host.control.transfersOut.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
+      // Its reads and its save are lane jobs, run by the pump
+      extracting = host.control.transfersOut.closeForTransferOut(storeId, host.control.devices.devices(deviceA))
+      _ <- pumpUntil(host, extracting.isCompleted)
+      _ <- extracting
       saved = CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storeDir), storeId)
       heldAfterExtract = held(crl, storeId)
       _ = transferOutWork(host, storeId, held = false)

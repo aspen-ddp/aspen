@@ -187,11 +187,15 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       remote.status == StorageDeviceState.DeviceStatus.Shutdown || ctx.shutdown.isShuttingDown(local.storageDeviceId)
     if remote.isFailed || remote.hostId != ctx.hostId || shuttingDown then
       // The device-level branches need no copy synced, so they never wait for the resync: a device whose lane hangs
-      // (a failing directory sync is what leaves a copy unsynced) is still retired, relinquished or shut down. The
-      // resync is still asked for, and copies whose move to lost/ failed are moved (StoreRebuilds.moveToLostOnLane)
+      // (a failing directory sync is what leaves a copy unsynced) is still retired, relinquished or shut down. On a
+      // device shutting down the resync is still asked for, and copies whose move to lost/ failed are moved
+      // (StoreRebuilds.moveToLostOnLane)
       try
-        ctx.moves.resync(local)(())
-        ctx.rebuilds.retryPendingLost(local, None)
+        // Not on a device being relinquished or retired (owned elsewhere, or Failed): its ownership has moved or it
+        // is dead, and nothing more is written to it
+        if !remote.isFailed && remote.hostId == ctx.hostId then
+          ctx.moves.resync(local)(())
+          ctx.rebuilds.retryPendingLost(local, None)
         deviceLevel(local, remote)
       finally ended()
     else
@@ -405,8 +409,10 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       case BringArrivedLive =>
         logger.warn(s"Store $storeId on device $deviceId is Active but its copy is still in arrived/. " +
                     s"Completing the transfer and loading the store")
-        if ctx.transfers.bringArrivedLive(local, storeId) == MoveResult.Durable then
-          ctx.copyRegistry.pathOf(local, storeId).foreach(ctx.tryLoadStore(local, _, None))
+        // A lane job: the load follows a durable move, on a device still the loaded one (moveOnLane's recheck)
+        ctx.transfers.bringArrivedLive(local, storeId): moved =>
+          if moved == MoveResult.Durable && ctx.devices.isLoaded(local) then
+            ctx.copyRegistry.pathOf(local, storeId).foreach(ctx.tryLoadStore(local, _, None))
       case BringRebuiltLive =>
         logger.warn(s"Store $storeId on device $deviceId is Active but its copy is still in rebuilt/. " +
                     s"Completing the rebuild and loading the store")

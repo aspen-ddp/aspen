@@ -7,10 +7,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.runSequentially
 import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.ShutdownOutcome
-import org.aspen_ddp.aspen.server.{DeviceMarkers, FileStat}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
-import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
-import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
 
 import java.util.concurrent.Executors
@@ -87,7 +84,8 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
           for
             _ <- awaitShutdownWork(deviceId, stopping)
             _ <- closeStoresForShutdown(local)
-            _ = DeviceMarkers.writeShutdownState(local.devicePath, ctx.hostId)
+            _ <- writeMarker(local, "shutdown.state write", requireLoaded = true)(
+                   DeviceStateDisk.writeShutdownState(local.devicePath, ctx.hostId))
             outcome <- ctx.metadata.completeDeviceShutdown(deviceId)
             _ <-
               if outcome == ShutdownOutcome.Completed then closeThenUnload(local)
@@ -115,12 +113,11 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
           // which loads each store this shutdown closed and that is Active again
           // (CopyDecision.Load).
           logger.info(s"Shutdown of storage device $deviceId was cancelled by a restart")
-          try DeviceMarkers.removeShutdownState(local.devicePath)
-          catch case t: Throwable =>
-            // Harmless while this process runs: the device stays loaded. A restart of this host
-            // would find the file and treat the device as shut down until it is resolved.
-            logger.error(s"Failed to remove ${DeviceMarkers.ShutdownStateFile} from " +
-                         s"${local.devicePath}: $t")
+          // One Markers job; its failure is only logged. Harmless while this process runs: the device stays loaded. A
+          // restart of this host would find the file and treat the device as shut down until it is resolved
+          writeMarker(local, "shutdown.state removal")(DeviceStateDisk.removeShutdownState(local.devicePath))
+            .failed.foreach: t =>
+              logger.error(s"Failed to remove ${DeviceStateDisk.ShutdownStateFile} from ${local.devicePath}: $t")
           release()
           ctx.reconciler.checkStorageDevice(deviceId)
 
@@ -170,7 +167,8 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
 
     cancelledIns.foreach: (storeId, transferUUID) =>
       logger.info(s"Cancelling the transfer in of store $storeId for the shutdown of device ${local.storageDeviceId}")
-      ctx.storeTransferService.cancelTransferIn(storeId, transferUUID)
+      // Its removal is a job on the device's lane; the attempt's failure removes its staging (StoreTransfers)
+      ctx.storeTransferService.cancelTransferIn(storeId, transferUUID): Unit
 
     stopping
 
@@ -243,12 +241,30 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  unloads a device. Nothing else on it is written or deleted: a healthy disk failed by mistake keeps its data. */
   def retireFailedDevice(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     if ! relinquishingDevices.contains(local.storageDeviceId) then
-      try DeviceMarkers.writeFailed(local.devicePath)
-      catch case t: Throwable =>
-        // Unloaded for the life of this process either way; a restart loads it and retires it again
+      // One Markers job on the device's lane, queued ahead of everything the unload's closes submit there. The unload
+      // does not wait for it, so a hung lane never keeps an operator's Failed serving: unloaded for the life of this
+      // process either way, and a restart before the marker is durable loads the device and retires it again
+      writeMarker(local, "failed marker write")(DeviceStateDisk.writeFailed(local.devicePath)).failed.foreach: t =>
         logger.error(s"Failed to write the failed marker of storage device ${local.storageDeviceId} at " +
                      s"${local.devicePath}: $t")
       stopServing(local, remote, "has been declared failed. Unloading it", "declared failed")
+
+  /** Writes one of the device's markers (DeviceStateDisk: durable once the job ends) as one `Markers` job on `local`'s
+   *  lane: a Future completed on the control thread once its result is applied, failed by the job's failure or a
+   *  cancel, and, when `requireLoaded`, by a device no longer the loaded one (a shutdown's step then goes no further:
+   *  the device was taken out of service meanwhile). A marker's durability order is the caller's: what must follow
+   *  the write waits for this Future */
+  private def writeMarker(local: LocalStorageDeviceState, what: String, requireLoaded: Boolean = false)
+                         (job: => Unit): Future[Unit] =
+    val p = Promise[Unit]()
+    try
+      ctx.onControl(s"marker $what", local.io.submit(JobKind.Markers, None)(job)): result =>
+        if requireLoaded && !ctx.devices.isLoaded(local) then
+          p.failure(IllegalStateException(s"Device ${local.storageDeviceId} was unloaded while its $what ran"))
+        else
+          p.complete(result)
+    catch case t: Throwable => p.tryFailure(t)
+    p.future
 
   /** relinquishDevice's sequence, logging that the device `what` */
   private def stopServing(local: LocalStorageDeviceState, remote: StorageDeviceState, what: String,

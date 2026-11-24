@@ -456,6 +456,8 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
         _ <- waitForTransactionsToComplete()
         _ = sends.endTransferOut(shipped)
         _ = host.control.transfersOut.reinstateAbandonedOut(local, shipped)
+        // The move to Live is a lane job
+        _ <- pumpUntil(host, phases(host, source).get(shipped).contains(Phase.Live))
       yield
         started should be(Success(()))
         outbound should be(a[Phase.Outbound])
@@ -672,8 +674,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
                        s.work.exists(_.isInstanceOf[Work.TransferOut])) should be(true)
       // The work starts before the close and ends after the move to outbound/
       runs(seen.map(_.work.map(_.toString.takeWhile(_ != '(')))) should be(List(Some("TransferOut"), None))
+      // The move to outbound/ is a lane job, its copy DiskJob(Move) while it runs
       runs(seen.map(_.activity)) should be(List(Some(Activity.Served), Some(Activity.Closing(ClosePurpose.TransferOut)),
-        Some(Activity.Idle)))
+        Some(Activity.Idle), Some(Activity.DiskJob(JobKind.Move, Activity.Idle)), Some(Activity.Idle)))
       after.map(r => (r.phase, r.activity)).get._1 should be(a[Phase.Outbound])
       after.map(_.activity) should be(Some(Activity.Idle))
       work should be(None)

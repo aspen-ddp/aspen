@@ -143,7 +143,7 @@ class CopyIoSuite extends IntegrationTestSuite with ControlFixture:
     resultA should be(None)
     recordOn(host, deviceA, s).map(_.activity) should be(Some(Activity.DiskJob(JobKind.Move, Activity.Idle)))
     // A synchronous move of a busy copy is refused, never made under the job
-    host.control.moves.move("test", local(host, deviceA), s, Phase.Retired) shouldBe a[MoveResult.NotMoved]
+    CopyFixtures.moveNow(host, "test", local(host, deviceA), s, Phase.Retired) shouldBe a[MoveResult.NotMoved]
     CopyFixtures.phaseOf(devA, s) should be(Some(Phase.Lost))
     resultB should be(Some(MoveResult.Durable))
     CopyFixtures.retiredCopies(devB, s2).size should be(1)
@@ -300,7 +300,9 @@ class CopyIoSuite extends IntegrationTestSuite with ControlFixture:
         "declared Failed" -> (_.copy(status = StorageDeviceState.DeviceStatus.Failed)),
         "owned by another host" -> (_.copy(hostId = org.aspen_ddp.aspen.common.metadata.HostId(UUID.randomUUID()))))
   do
-    atest(s"a device $variant is stopped at once, not after the resync its held lane holds"):
+    // Task 15: such a device's ownership has moved, or it is dead: no resync is queued on it, so nothing is forced on a
+    // device another host now owns. A Failed device's only job is its failed marker, which the stop does not wait for
+    atest(s"a device $variant is stopped at once, with no resync queued on its held lane"):
       given ExecutionContext = executionContext
       val (host, devA, _) = twoDevices(CopyFixtures.placeCopy(_, s, Phase.Live): Unit, _ => ())
       host.control.copyRegistry.copiesOf(local(host, deviceA)).get.setUnsynced(s, true)
@@ -311,18 +313,22 @@ class CopyIoSuite extends IntegrationTestSuite with ControlFixture:
         drain(host)
         host.control.reconciler.activeDeviceChecks.isEmpty
       }.flatMap: _ =>
-        // The resync was asked for and waits on the held lane; the stop did not wait for it
-        heldJobs(host, devA) should be(List(JobKind.Move))
+        // No resync was asked for; a Failed device's marker write waits on the held lane, and the stop did not wait
+        // for it
+        val queued = if variant == "declared Failed" then List(JobKind.Markers) else Nil
+        heldJobs(host, devA) should be(queued)
+        host.control.moves.resyncRunning(devA) should be(false)
         awaitLoudly(s"device A unloaded, $variant") {
           drain(host)
           !loadedDevices(host).contains(deviceA)
         }.map: _ =>
           loadedDevices(host).contains(deviceA) should be(false)
-          heldJobs(host, devA) should be(List(JobKind.Move))
-          if variant == "declared Failed" then
-            os.exists(devA / "failed") should be(true)
+          heldJobs(host, devA) should be(queued)
+          os.exists(devA / "failed") should be(false)
           releaseDevice(host, devA)
           drain(host)
+          if variant == "declared Failed" then
+            os.exists(devA / "failed") should be(true)
           heldJobs(host, devA) should be(Nil)
           host.control.moves.resyncRunning(devA) should be(false)
           noViolations(host)

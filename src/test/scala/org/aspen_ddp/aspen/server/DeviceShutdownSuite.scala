@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.server.host.{CopyFixtures, Phase}
+import org.aspen_ddp.aspen.server.host.{CopyFixtures, JobKind, Phase}
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, RebuildStage, StagedSendService, StagedTransferService, TransferInStage, Work}
@@ -274,6 +274,53 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       recorded(host).shutdownCloses.toList.sortBy(_.poolIndex) should be(List(s0, s1))
       recorded(host).shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
       st.status should be(DeviceStatus.Shutdown)
+
+  // Device I/O isolation (Task 15): shutdown.state is one Markers job on the device's lane, durable before Shutdown
+  // commits
+  atest("a shutdown's shutdown.state write waits on a held device, and Shutdown commits only once it is written"):
+    given ExecutionContext = executionContext
+    for
+      (host, deviceDir) <- setUp(Map(s0 -> active), loaded = Set(s0))
+      _ <- addToBootstrapHost(deviceA)
+      _ <- client.shutdownStorageDevice(deviceA)
+      _ <- waitForTransactionsToComplete()
+      _ = holdDevice(host, deviceDir)
+      _ = checkAllNow(host)
+      _ <- pumpUntil(heldJobs(host, deviceDir).contains(JobKind.Markers))
+      _ <- pumpUntil(false, rounds = 2)
+      heldWhile = heldJobs(host, deviceDir)
+      whileHeld <- state(deviceA)
+      markerWhile = os.exists(deviceDir / DeviceMarkers.ShutdownStateFile)
+      loadedWhile = loadedDevices(host).contains(deviceA)
+      _ = releaseDevice(host, deviceDir)
+      _ <- pumpUntil(!loadedDevices(host).contains(deviceA))
+      st <- state(deviceA)
+    yield
+      heldWhile should be(List(JobKind.Markers))
+      whileHeld.status should be(DeviceStatus.ShuttingDown)
+      markerWhile should be(false)
+      loadedWhile should be(true)
+      st.status should be(DeviceStatus.Shutdown)
+      DeviceMarkers.readShutdownState(deviceDir) should be(Some(HostId.BootstrapHostId))
+
+  atest("a shutdown.state write completing after its device's unload commits nothing"):
+    given ExecutionContext = executionContext
+    for
+      (host, deviceDir) <- setUp(Map(s0 -> active), loaded = Set(s0))
+      _ <- addToBootstrapHost(deviceA)
+      _ <- client.shutdownStorageDevice(deviceA)
+      _ <- waitForTransactionsToComplete()
+      _ = holdDevice(host, deviceDir)
+      _ = checkAllNow(host)
+      _ <- pumpUntil(heldJobs(host, deviceDir).contains(JobKind.Markers))
+      _ = host.control.shutdown.unloadDevice(deviceA)
+      _ = releaseDevice(host, deviceDir)
+      _ <- pumpUntil(!host.control.shutdown.isShuttingDown(deviceA))
+      st <- state(deviceA)
+    yield
+      host.control.shutdown.isShuttingDown(deviceA) should be(false)
+      recorded(host).shutdownOutcomes should be(empty)
+      st.status should be(DeviceStatus.ShuttingDown)
 
   atest("restart during shutdown cancels it"):
     given ExecutionContext = executionContext

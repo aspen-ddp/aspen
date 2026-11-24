@@ -17,6 +17,10 @@ import scala.util.control.NonFatal
  *  the control thread (CopyMoves' synchronous `move`, `place` and `moveUnattached`; `delete` from
  *  StoreTransfers.startIn; DiscoveryDisk's sweep). They touch no control state; the caller applies what they report. */
 object CopyDisk extends Logging:
+  /** The directory sync and copy rename every move uses unless a test replaces them (CopyMoves' seams) */
+  val DefaultSyncDirectory: os.Path => Unit = DurableFiles.syncDirectory
+  val DefaultRename: (os.Path, os.Path) => Unit = DurableFiles.atomicRename
+
   /** The steps of a move from `from` to `target`, into phase `to`: the target's directory made if absent, `to`'s own
    *  parameter file placed durably (the source phase's file is never touched, so a failed move leaves the source
    *  reading what it read), then the rename forced, through `syncDirectory` and `rename` (CopyMoves' seams). A move onto

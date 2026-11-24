@@ -85,9 +85,9 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
                                         gossipStoreOnline: StoreId => Unit) =
       base.markRebuiltStoreActive(storageDeviceId, storeId, episode, gossipStoreOnline)
     override def adoptDevice(storageDeviceId: StorageDeviceId, previousHostId: HostId, devicePath: os.Path,
-                             uncleanStores: (os.Path, StorageDeviceState) => List[StoreId],
-                             crlLostStores: (os.Path, StorageDeviceState) => List[StoreId],
-                             moveToLost: StoreId => Unit) =
+                             uncleanStores: (os.Path, StorageDeviceState) => Future[List[StoreId]],
+                             crlLostStores: (os.Path, StorageDeviceState) => Future[List[StoreId]],
+                             moveToLost: List[StoreId] => Future[Unit]) =
       base.adoptDevice(storageDeviceId, previousHostId, devicePath, uncleanStores, crlLostStores, moveToLost)
     override def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
       heldLookups.get(storageDeviceId) match

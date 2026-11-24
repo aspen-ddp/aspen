@@ -46,7 +46,7 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
       renames ::= (a, b)
       CopyLayout.param(Phase.Retired).foreach(p => CopyLayout.readParam(a, Phase.Retired) should be(p))
       rename(a, b)
-    host.control.moves.move("test", local, s, Phase.Retired) should be(MoveResult.Durable)
+    CopyFixtures.moveNow(host, "test", local, s, Phase.Retired) should be(MoveResult.Durable)
     host.testingOnlyHandleEvents()
     renames.map(_._1) should be(List(from))
     CopyFixtures.retiredCopies(dev, s) should be(renames.map(_._2))
@@ -68,7 +68,7 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     host.control.moves.rename = (x, y) =>
       seen ::= (x, y, CopyLayout.readParam(x, Phase.Outbound("")))
       rename(x, y)
-    host.control.moves.move("test", local, s, Phase.Outbound("t-7")) should be(MoveResult.Durable)
+    CopyFixtures.moveNow(host, "test", local, s, Phase.Outbound("t-7")) should be(MoveResult.Durable)
     host.testingOnlyHandleEvents()
     val newPath = CopyFixtures.copyPath(dev, s).get
     seen should be(List((flat, newPath, "t-7")))
@@ -88,7 +88,7 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
         failures -= 1
         throw injected()
       DurableFiles.syncDirectory(d)
-    host.control.moves.move("test", local, s, Phase.Retired) shouldBe a[MoveResult.Unsynced]
+    CopyFixtures.moveNow(host, "test", local, s, Phase.Retired) shouldBe a[MoveResult.Unsynced]
     host.testingOnlyHandleEvents()
     record(host, s).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Retired, true)))
     CopyFixtures.retiredCopies(dev, s).size should be(1)
@@ -114,7 +114,8 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(tdir / "outbound")
     os.write(copy / CopyLayout.paramFile(Phase.Rebuilt("")).get, "episode-e")
     host.control.moves.rename = (_, _) => throw injected()
-    host.control.moves.relocate(copy, tdir / "outbound" / "copy", Phase.Outbound("transfer-t")) shouldBe a[MoveResult.NotMoved]
+    CopyDisk.relocate(copy, tdir / "outbound" / "copy", Phase.Outbound("transfer-t"),
+      host.control.moves.syncDirectory, host.control.moves.rename) shouldBe a[MoveResult.NotMoved]
     host.testingOnlyHandleEvents()
     os.isDir(copy) should be(true)
     CopyLayout.readParam(copy, Phase.Rebuilt("")) should be("episode-e")
@@ -127,7 +128,7 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     val (host, local, dev) = withDevice()
     val before = record(host, s)
     host.control.moves.rename = (_, _) => throw injected()
-    host.control.moves.move("test", local, s, Phase.Retired) shouldBe a[MoveResult.NotMoved]
+    CopyFixtures.moveNow(host, "test", local, s, Phase.Retired) shouldBe a[MoveResult.NotMoved]
     host.testingOnlyHandleEvents()
     CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Lost))
     CopyFixtures.retiredCopies(dev, s) should be(Nil)

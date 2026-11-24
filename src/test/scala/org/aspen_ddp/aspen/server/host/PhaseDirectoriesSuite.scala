@@ -11,6 +11,7 @@ import org.aspen_ddp.aspen.server.{TestDeviceIo, DurableFiles, Host, StorageDevi
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.{RebuildOutcome, TransferOutcome}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
+import org.aspen_ddp.aspen.server.transfer.TransferLane
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendStateLost, DefaultBackendOpener, StoreCreation}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
@@ -635,13 +636,13 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
     def record = copies.copies(s)
     for activity <- List(Activity.Opening(1), Activity.Served, Activity.Closing(ClosePurpose.FailStop)) do
       copies.applyActivity(s, activity)
-      host.control.moves.move("test", sds, s, Phase.Lost) shouldBe a[MoveResult.NotMoved]
+      CopyFixtures.moveNow(host, "test", sds, s, Phase.Lost) shouldBe a[MoveResult.NotMoved]
       record.phase should be(Phase.Live)
       CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Live))
       copies.applyActivity(s, Activity.Idle)
     // Unsynced by an earlier change a crash could undo: a durable move forces only the directories naming the copy
     copies.setUnsynced(s, true)
-    host.control.moves.move("test", sds, s, Phase.Lost) should be(MoveResult.Durable)
+    CopyFixtures.moveNow(host, "test", sds, s, Phase.Lost) should be(MoveResult.Durable)
     record.phase should be(Phase.Lost)
     record.unsynced should be(true)
     CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Lost))
@@ -1136,9 +1137,10 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
    *  `moving`: its retired copies, and whether each holds its lost-crl-state.log */
   private class SnapshotTransfers(dev: => os.Path) extends StagedTransferService:
     @volatile var atBegin: Vector[List[(os.Path, Boolean)]] = Vector()
-    override def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path): Future[Unit] =
+    override def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path,
+                                 lane: TransferLane): Future[Unit] =
       atBegin :+= CopyFixtures.retiredCopies(dev, moving).map(p => p -> os.exists(p / RebuildingStore.LostCrlStateFile))
-      super.beginTransferIn(storeId, transferUUID, destinationDirectory)
+      super.beginTransferIn(storeId, transferUUID, destinationDirectory, lane)
 
   atest("a received copy is staged under its attempt and promoted into arrived with its transfer id"):
     given ExecutionContext = executionContext

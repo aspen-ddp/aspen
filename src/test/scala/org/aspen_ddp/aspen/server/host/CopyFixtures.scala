@@ -11,6 +11,15 @@ import java.util.UUID
  *  never build a copy's path by hand: each later stage of the layout changes only these bodies. */
 object CopyFixtures:
 
+  /** Moves the copy of `storeId` on `sds` to `to` as `host`'s own moves do (CopyMoves.moveOnLane, one lane job), and
+   *  returns the result: a refusal at once, otherwise once a drain of `host` has applied the job's result */
+  def moveNow(host: org.aspen_ddp.aspen.server.Host, site: String, sds: LocalStorageDeviceState, storeId: StoreId,
+              to: Phase): MoveResult =
+    var result = Option.empty[MoveResult]
+    host.control.moves.moveOnLane(site, sds, storeId, to)(r => result = Some(r))
+    if result.isEmpty then host.testingOnlyHandleEvents()
+    result.getOrElse(throw IllegalStateException(s"The move of $storeId to $to did not complete in a drain"))
+
   /** Places a configured copy of `storeId` in `phase` on the device at `deviceDir`, under a fresh copy id, returning
    *  its path. Writes the store config (as ControlFixture.writeStoreConfig), unless not `configured` (a copy holding
    *  nothing: a test's stand-in for a landed rebuild, or a copy that lost its config), and the phase's parameter

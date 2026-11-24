@@ -55,6 +55,11 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     managers += m
     m
 
+  /** Runs each removal inline on the calling thread, as these tests always saw it; one lock per `dir` */
+  private def inlineLane(dir: os.Path): TransferLane = new TransferLane:
+    def device: os.Path = dir
+    def run(job: => Unit): Future[Unit] = Future.fromTry(Try(job))
+
   private def tempDir(): os.Path =
     val d = os.temp.dir(prefix = "store-transfer-manager-suite")
     tempDirs += d
@@ -110,7 +115,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
 
     rejectedSending(clientContext(creds), m.boundPort, sid, u) should be(true)
     Thread.sleep(500)
@@ -228,7 +233,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
     val s = connect(m)
     send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailerFor(sid))
     s.close()
@@ -262,7 +267,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
     val s = connect(m)
     send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailer(sid, archive))
     s.close()
@@ -276,7 +281,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val sid = newStoreId()
     val u = UUID.randomUUID()
     os.write(dest / sid.directoryName / "stale", "old", createFolders = true)
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
     val s = connect(m)
     send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailer(sid, archive))
     s.close()
@@ -289,7 +294,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
     val s = connect(m)
     send(s, StoreTransferManager.encodeHeader(sid, u), archive)
     s.close()
@@ -301,7 +306,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
     val s = connect(m)
     send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailer(newStoreId(), archive))
     s.close()
@@ -334,7 +339,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
     val s = connect(m)
     // A cut in the middle of the 3 MiB entry makes `jar --extract` exit 1. The trailer matches the
     // cut archive, so only the extractor can reject it.
@@ -353,7 +358,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
 
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
     val s = connect(m)
     send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailer(sid, archive))
     s.close()
@@ -365,7 +370,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val sid = newStoreId()
     val u1 = UUID.randomUUID()
     val u2 = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u2, dest)
+    val f = m.beginTransferIn(sid, u2, dest, inlineLane(dest))
     val stale = connect(m)
     send(stale, StoreTransferManager.encodeHeader(sid, u1))
     isClosedByPeer(stale) should be(true)
@@ -381,7 +386,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
     val half = archive.length / 2
     val first = connect(m)
     send(first, StoreTransferManager.encodeHeader(sid, u), archive.take(half))
@@ -402,7 +407,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
     val s = connect(m)
     send(s, StoreTransferManager.encodeHeader(sid, u), archive.take(1024))
     await(f, 5.seconds).isFailure should be(true)
@@ -413,9 +418,9 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val m = newManager()
     val dest = tempDir()
     val sid = newStoreId()
-    val f1 = m.beginTransferIn(sid, UUID.randomUUID(), dest)
+    val f1 = m.beginTransferIn(sid, UUID.randomUUID(), dest, inlineLane(dest))
     val u2 = UUID.randomUUID()
-    val f2 = m.beginTransferIn(sid, u2, dest)
+    val f2 = m.beginTransferIn(sid, u2, dest, inlineLane(dest))
     await(f1).isFailure should be(true)
 
     val s = connect(m)
@@ -430,7 +435,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
     m.cancelTransferIn(sid, UUID.randomUUID())
     f.isCompleted should be(false)
 
@@ -444,7 +449,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
     m.cancelTransferIn(sid, u)
     await(f).isFailure should be(true)
 
@@ -457,7 +462,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = m.beginTransferIn(sid, u, dest)
+    val f = m.beginTransferIn(sid, u, dest, inlineLane(dest))
     val s = connect(m)
     send(s, StoreTransferManager.encodeHeader(sid, u), archive.take(archive.length / 2))
     eventually { os.exists(dest / sid.directoryName) should be(true) }
@@ -467,6 +472,69 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     isClosedByPeer(s) should be(true)
     eventually { os.exists(dest / sid.directoryName) should be(false) }
 
+  /** A lane whose jobs wait until the test runs them, as a device's management lane behind a hung job. Thread-safe */
+  private class HeldLane(val device: os.Path) extends TransferLane:
+    private val jobs = ArrayBuffer[(() => Unit, scala.concurrent.Promise[Unit])]()
+    def run(job: => Unit): Future[Unit] = synchronized:
+      val p = scala.concurrent.Promise[Unit]()
+      jobs += ((() => job, p))
+      p.future
+    def queued: Int = synchronized(jobs.size)
+    /** Runs the queued jobs on the calling thread; `cancel` fails them unrun instead, as a cancel before start does */
+    def runAll(cancel: Boolean = false): Unit =
+      val taken = synchronized:
+        val t = jobs.toList
+        jobs.clear()
+        t
+      taken.foreach: (job, p) =>
+        if cancel then p.failure(new Exception("cancelled before it started"))
+        else p.complete(Try(job()))
+
+  // Device I/O isolation (Task 15): the caller of cancelTransferIn (the host's control thread) never removes anything
+  // or takes a directory lock; the removal is one job on the attempt's lane, which a held lane holds
+  test("cancelTransferIn queues its removal on the attempt's lane and removes nothing on the caller's thread"):
+    val m = newManager()
+    val dest = tempDir()
+    val sid = newStoreId()
+    val u = UUID.randomUUID()
+    val lane = new HeldLane(dest)
+    val f = m.beginTransferIn(sid, u, dest, lane)
+    val s = connect(m)
+    send(s, StoreTransferManager.encodeHeader(sid, u), archive.take(archive.length / 2))
+    eventually { os.exists(dest / sid.directoryName) should be(true) }
+
+    val removal = m.cancelTransferIn(sid, u)
+    // The attempt fails at once; its directory stays until the lane runs the removal
+    await(f).isFailure should be(true)
+    isClosedByPeer(s) should be(true)
+    removal.isCompleted should be(false)
+    eventually { lane.queued should be(1) }
+    os.exists(dest / sid.directoryName) should be(true)
+    // A second cancel of the settled attempt queues nothing
+    m.cancelTransferIn(sid, u).isCompleted should be(true)
+    lane.queued should be(1)
+    lane.runAll()
+    await(removal).isSuccess should be(true)
+    os.exists(dest / sid.directoryName) should be(false)
+
+  test("a removal cancelled before it starts removes nothing"):
+    val m = newManager()
+    val dest = tempDir()
+    val sid = newStoreId()
+    val u = UUID.randomUUID()
+    val lane = new HeldLane(dest)
+    m.beginTransferIn(sid, u, dest, lane)
+    val s = connect(m)
+    send(s, StoreTransferManager.encodeHeader(sid, u), archive.take(archive.length / 2))
+    eventually { os.exists(dest / sid.directoryName) should be(true) }
+    val removal = m.cancelTransferIn(sid, u)
+    isClosedByPeer(s) should be(true)
+    eventually { lane.queued should be(1) }
+    // Cancelled unrun, as a cancel before start leaves it: the directory stays (the device's next load sweeps it)
+    lane.runAll(cancel = true)
+    await(removal).isFailure should be(true)
+    os.exists(dest / sid.directoryName) should be(true)
+
   test("round trip between two managers"):
     val a = newManager()
     val b = newManager()
@@ -475,7 +543,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val dest = tempDir()
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = b.beginTransferIn(sid, u, dest)
+    val f = b.beginTransferIn(sid, u, dest, inlineLane(dest))
     a.beginTransferOut(sid, u, src, "127.0.0.1", b.boundPort, HLCTimestamp.now)
     await(f).isSuccess should be(true)
     assertExtracted(dest / sid.directoryName)
@@ -497,7 +565,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
       org.aspen_ddp.aspen.server.host.Phase.Outbound("")).get
     os.write(copy / paramFile, u.toString)
     val dest = tempDir()
-    val f = b.beginTransferIn(sid, u, dest)
+    val f = b.beginTransferIn(sid, u, dest, inlineLane(dest))
     a.beginTransferOut(sid, u, copy, "127.0.0.1", b.boundPort, HLCTimestamp.now)
     await(f).isSuccess should be(true)
     assertExtracted(dest / sid.directoryName)
@@ -547,7 +615,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val sid = newStoreId()
     val u = UUID.randomUUID()
     val dest = tempDir()
-    val f = b.beginTransferIn(sid, u, dest)
+    val f = b.beginTransferIn(sid, u, dest, inlineLane(dest))
     a.beginTransferOut(sid, u, bigTree(), "127.0.0.1", b.boundPort, HLCTimestamp.now)
     // The receiver is extracting: cancelled before it connected, the receiver would hear nothing and fail only by
     // timing out
@@ -571,7 +639,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val sid = newStoreId()
     val u1 = UUID.randomUUID()
     val ts1 = HLCTimestamp.now
-    val f = b.beginTransferIn(sid, u1, tempDir())
+    val f = b.beginTransferIn(sid, u1, tempDir(), inlineLane(os.root))
     a.beginTransferOut(sid, u1, src, "127.0.0.1", b.boundPort, ts1)
     await(f).isSuccess should be(true)
     eventually { a.isTransferringOut(sid) should be(false) }
@@ -604,7 +672,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val missing = tempDir() / "does-not-exist"
     val sid = newStoreId()
     val u = UUID.randomUUID()
-    val f = b.beginTransferIn(sid, u, tempDir())
+    val f = b.beginTransferIn(sid, u, tempDir(), inlineLane(os.root))
     a.beginTransferOut(sid, u, missing, "127.0.0.1", b.boundPort, HLCTimestamp.now)
     await(f).isFailure should be(true)
     eventually { a.isTransferringOut(sid) should be(false) }
@@ -632,7 +700,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     a.beginTransferOut(sid, u, src, "127.0.0.1", freePort(), ts1)
     eventually { a.isTransferringOut(sid) should be(false) }
 
-    val f = b.beginTransferIn(sid, u, dest)
+    val f = b.beginTransferIn(sid, u, dest, inlineLane(dest))
     a.beginTransferOut(sid, u, src, "127.0.0.1", b.boundPort, ts1)
     await(f).isSuccess should be(true)
     assertExtracted(dest / sid.directoryName)
@@ -666,7 +734,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val sid = newStoreId()
     val u = UUID.randomUUID()
     val dest = tempDir()
-    val f = b.beginTransferIn(sid, u, dest)
+    val f = b.beginTransferIn(sid, u, dest, inlineLane(dest))
     a.beginTransferOut(sid, u, src, "127.0.0.1", b.boundPort, HLCTimestamp.now)
     await(f).isFailure should be(true)
     os.exists(dest / sid.directoryName) should be(false)

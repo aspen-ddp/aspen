@@ -5,12 +5,10 @@ import org.aspen_ddp.aspen.common.metadata.{HostState, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.{StartStoreTransfer, StoreOffline}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
-import org.aspen_ddp.aspen.server.FileStat
-import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import scribe.Logging
 import java.util.UUID
-import scala.concurrent.Future
+import scala.concurrent.{Future, Promise}
 import scala.util.{Failure, Success, Try}
 
 /** Runs only on the control thread. See HostThreading.scala.
@@ -69,8 +67,9 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
    *  retained for them when the extraction began. An unusable save file fails the close before anything is read: its
    *  state is lost, and writing the CRL's entries over it would hide that. So does a stat of the directory or the
    *  file that fails (FileStat): it says nothing of whether the file is there, and taken for an absence it would
-   *  write the CRL's entries over a valid file. Runs on the control thread, as the move beside it does;
-   *  nothing blocks on the CRL.
+   *  write the CRL's entries over a valid file. The directory and save file reads are one `SaveFile` job on the
+   *  device's lane (TransferDisk.inspectSaveFile), and the save of the entries another (TransferDisk.saveExtracted);
+   *  each apply fails the extraction for a device no longer loaded. Nothing blocks on the CRL or the disk.
    *
    *  The store must stay closed throughout: one loaded meanwhile would recover the entries read, which the deletion
    *  would take from under it, and might save others the file would lack (or, from a save file, remove the file). The
@@ -85,37 +84,38 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
     // A stat that fails says nothing (FileStat): taken for an absence, the CRL's entries would be written over a save
     // file, or nothing extracted from a directory that ships
     // A store with no record has no copy on the device: nothing to extract
-    Try(ctx.copyRegistry.pathOf(sds, storeId).exists(FileStat.isDir(_))) match
-      case Failure(err) => Future.failed(err)
-      case Success(false) => Future.unit
-      case Success(true) => extractFromDirectory(storeId, sds)
+    ctx.copyRegistry.pathOf(sds, storeId) match
+      case None => Future.unit
+      case Some(path) =>
+        val saveFile = Backend.crlSaveFile(path)
+        // Read before anything is, so the release below covers only the entries the extraction takes
+        val charge = sds.admission.retainedCharge(storeId)
+        def released(): Future[Unit] =
+          charge.foreach(sds.admission.releaseRetained(storeId, _))
+          Future.unit
+        onLane(sds, storeId, "transfer out extraction read")(TransferDisk.inspectSaveFile(path, storeId)).flatMap:
+          case TransferDisk.SaveFileState.NoCopy => Future.unit
+          // A file that cannot be read (CrashRecoveryLog.isUnreadable) fails the close as an invalid one does
+          case TransferDisk.SaveFileState.Failed(err) => Future.failed(err)
+          case TransferDisk.SaveFileState.Valid => sds.crl.dropStore(storeId).flatMap(_ => released())
+          case TransferDisk.SaveFileState.Absent =>
+            sds.crl.readStoreState(storeId).flatMap: state =>
+              if state.isEmpty then
+                Future.unit
+              else
+                // A failed save leaves them in the device CRL, for a retried request to extract again
+                onLane(sds, storeId, "transfer out extraction save")(
+                  TransferDisk.saveExtracted(storeId, state, saveFile)).flatMap: _ =>
+                  sds.crl.deleteTransactions(storeId, state.entryIds).flatMap(_ => released())
 
-  private def extractFromDirectory(storeId: StoreId, sds: LocalStorageDeviceState): Future[Unit] =
-    val saveFile = Backend.crlSaveFile(ctx.copyRegistry.pathOf(sds, storeId).getOrElse(
-      throw IllegalStateException(s"No copy record of store $storeId on device ${sds.storageDeviceId}")))
-    // Read before anything is, so the release below covers only the entries the extraction takes
-    val charge = sds.admission.retainedCharge(storeId)
-    def released(): Future[Unit] =
-      charge.foreach(sds.admission.releaseRetained(storeId, _))
-      Future.unit
-    Try(FileStat.exists(saveFile)) match
-      case Failure(err) => Future.failed(err)
-      case Success(true) =>
-        // A file that cannot be read (CrashRecoveryLog.isUnreadable) fails the close as an invalid one does
-        val valid =
-          try CrashRecoveryLog.loadValidStoreState(saveFile, storeId)
-          catch case t: Throwable => Left(t)
-        valid match
-          case Left(err) => Future.failed(err)
-          case Right(_) => sds.crl.dropStore(storeId).flatMap(_ => released())
-      case Success(false) =>
-        sds.crl.readStoreState(storeId).flatMap: state =>
-          if state.isEmpty then
-            Future.unit
-          else
-            // A failed save leaves them in the device CRL, for a retried request to extract again
-            CrashRecoveryLog.saveStoreState(storeId, state, saveFile)
-            sds.crl.deleteTransactions(storeId, state.entryIds).flatMap(_ => released())
+  /** `job` as one `SaveFile` job on `sds`'s lane, its result applied on the control thread: a Future of its value,
+   *  failed by its failure, a cancel, or a device no longer the loaded one */
+  private def onLane[T](sds: LocalStorageDeviceState, storeId: StoreId, what: String)(job: => T): Future[T] =
+    val p = Promise[T]()
+    ctx.onControl(what, sds.io.submit(JobKind.SaveFile, Some(storeId))(job)): result =>
+      if ctx.devices.isLoaded(sds) then p.complete(result)
+      else p.failure(IllegalStateException(s"Device ${sds.storageDeviceId} was unloaded while $what ran"))
+    p.future
 
   /** Returns the request's handling, which fails when the request is refused. Only tests look at
    *  it (they call this directly); the control thread drops it, as a refusal is answered by
@@ -244,14 +244,22 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
           catch case t: Throwable => Future.failed(t)
 
         fclosed.onComplete: result =>
-          try closedForTransfer(m, devEntry, sourceDs, toHostState, wasLoaded, result)
-          finally
-            endWork(m.storeId, sourceDs, TransferOutStage.Closing)
-            // Whatever the close's outcome (moved into outbound/, failed, aborted), the source device is checked again:
-            // the work held the (device, store) (I3), so a decision the reconcile left to it (a rebuild waiting for
-            // the close) is taken now rather than at the periodic check. Checks coalesce
-            if ctx.devices.isLoaded(sourceDs) then
-              ctx.reconciler.checkStorageDevice(sourceDs.storageDeviceId)
+          // The work ends once the request's last step is done: the close's outcome acted on, and the move to
+          // outbound/, a lane job, applied
+          var ended = false
+          def done(): Unit =
+            if !ended then
+              ended = true
+              endWork(m.storeId, sourceDs, TransferOutStage.Closing)
+              // Whatever the close's outcome (moved into outbound/, failed, aborted), the source device is checked
+              // again: the work held the (device, store) (I3), so a decision the reconcile left to it (a rebuild
+              // waiting for the close) is taken now rather than at the periodic check. Checks coalesce
+              if ctx.devices.isLoaded(sourceDs) then
+                ctx.reconciler.checkStorageDevice(sourceDs.storageDeviceId)
+          try closedForTransfer(m, devEntry, sourceDs, toHostState, wasLoaded, result)(done)
+          catch case t: Throwable =>
+            done()
+            throw t
 
   /** The phase of the record of `storeId`'s copy on `sds`, None without one */
   private def sourcePhase(sds: LocalStorageDeviceState, storeId: StoreId): Option[Phase] =
@@ -269,43 +277,49 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
   /** Whether a copy in `phase` must move to be Outbound(tid) */
   private def needsMove(phase: Phase, tid: String): Boolean = phase != Phase.Outbound(tid)
 
-  /** T6: moves the closed copy of `storeId` on `sds` into outbound/ with transfer id `tid`, returning the copy's path
-   *  there once the move is durable. One already Outbound for `tid` stays where it is. One Outbound for another
-   *  transfer (aborted, then a new one started before the Abandoned Transfers Out pass reinstated it) goes back to
-   *  Live first (T7), its state still in its crl_save.log. None, logged, when a move fails or is not forced: nothing
-   *  ships, and the receiver's retransmit retries (an unsynced copy once a device check has forced it) */
-  private def moveToOutbound(sds: LocalStorageDeviceState, storeId: StoreId, tid: String): Option[os.Path] =
-    def moveTo(to: Phase): Boolean =
-      ctx.moves.move("transfer out", sds, storeId, to) match
-        case MoveResult.Durable => true
-        case MoveResult.Unsynced(_) | MoveResult.NotMoved(_) => false
-    val moved = sourcePhase(sds, storeId) match
-      case Some(Phase.Outbound(t)) if t == tid => true
+  /** T6: moves the closed copy of `storeId` on `sds` into outbound/ with transfer id `tid`, giving `andThen` the copy's
+   *  path there once the move is durable. Each move is a `Move` job on the device's lane (CopyMoves.moveOnLane), applied
+   *  on the control thread. One already Outbound for `tid` stays where it is. One Outbound for another transfer
+   *  (aborted, then a new one started before the Abandoned Transfers Out pass reinstated it) goes back to Live first
+   *  (T7), its state still in its crl_save.log. None, logged, when a move fails or is not forced: nothing ships, and
+   *  the receiver's retransmit retries (an unsynced copy once a device check has forced it) */
+  private def moveToOutbound(sds: LocalStorageDeviceState, storeId: StoreId, tid: String)
+                            (andThen: Option[os.Path] => Unit): Unit =
+    def moveTo(to: Phase)(next: Boolean => Unit): Unit =
+      ctx.moves.moveOnLane("transfer out", sds, storeId, to): moved =>
+        next(moved == MoveResult.Durable)
+    def outbound(moved: Boolean): Unit =
+      andThen(if moved then ctx.copyRegistry.pathOf(sds, storeId) else None)
+    sourcePhase(sds, storeId) match
+      case Some(Phase.Outbound(t)) if t == tid => outbound(true)
       case Some(phase) if ctx.storeTransferService.isTransferringOut(storeId) =>
         // startOut refused this; a send registered since (none starts but here) would have its directory moved
         logger.warn(s"Not shipping store $storeId: a send of it is registered, and its copy ($phase) must move")
-        false
-      case Some(Phase.Outbound(_)) => moveTo(Phase.Live) && moveTo(Phase.Outbound(tid))
-      case Some(phase) if isSource(phase) => moveTo(Phase.Outbound(tid))
+        outbound(false)
+      case Some(Phase.Outbound(_)) =>
+        moveTo(Phase.Live): live =>
+          if live then moveTo(Phase.Outbound(tid))(outbound) else outbound(false)
+      case Some(phase) if isSource(phase) => moveTo(Phase.Outbound(tid))(outbound)
       case other =>
         logger.warn(s"Not shipping store $storeId: its copy on device ${sds.storageDeviceId} is now $other")
-        false
-    if moved then ctx.copyRegistry.pathOf(sds, storeId) else None
+        outbound(false)
 
   /** The rest of startOut once the store's close for its transfer out has completed, in that completion's control
-   *  task: either the closed copy is moved to outbound/ (T6) and the send begun from there, or the request is
-   *  refused */
+   *  task: either the closed copy is moved to outbound/ (T6, a lane job) and the send begun from there in the move's
+   *  apply, or the request is refused. `done` runs once its last step has run, whatever the outcome */
   private def closedForTransfer(m: StartStoreTransfer, devEntry: StorageDeviceState.StoreEntry,
                                 sourceDs: LocalStorageDeviceState, toHostState: HostState, wasLoaded: Boolean,
-                                result: Try[Unit]): Unit =
+                                result: Try[Unit])(done: () => Unit): Unit =
     result.failed.foreach:
       case e: StoreFailedOnClose =>
         logger.error(s"Not starting the transfer out of store ${m.storeId}, transfer ${m.transferUUID}: " +
                      s"its backend failed while closing. Returning it to the rebuild path")
-        returnLostTransferToRebuild(m.storeId, sourceDs)
+        try returnLostTransferToRebuild(m.storeId, sourceDs)
+        finally done()
       case t =>
         logger.warn(s"Not starting the transfer out of store ${m.storeId}, transfer ${m.transferUUID}: " +
                     s"its close failed. Error: $t")
+        done()
 
     result.foreach: _ =>
       // Checked again now the close is done: a shutdown that began during it has already
@@ -318,32 +332,44 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
          !ctx.devices.isLoaded(sourceDs) then
         logger.info(s"Not starting the transfer out of store ${m.storeId}: source device " +
                     s"${sourceDs.storageDeviceId} began shutting down while the store closed")
+        done()
       // No open of the copy can have started since its close: its TransferOut work refused them (R12). An open of
       // another device's copy of the store on this host reads that device's CRL, never this extraction's
       else if isLost(sourceDs, m.storeId) then
         // Moved to lost/ while it closed (a BackendFailed for it), or its move there awaits its retry: as above, never
         // shipped.
         logger.error(s"Not starting the transfer out of store ${m.storeId}: it became Lost while it closed")
-        returnLostTransferToRebuild(m.storeId, sourceDs)
-      else try
+        try returnLostTransferToRebuild(m.storeId, sourceDs)
+        finally done()
+      else
         // Moved before archiving, after the extraction made crl_save.log durable: outbound/ keeps this copy offline
         // across restarts until the transfer is resolved one way or the other, and the shipped copy carries its
-        // phase-param.outbound, inert at the destination. A move that fails or is not forced ships nothing
-        val outbound = moveToOutbound(sourceDs, m.storeId, tidOf(devEntry))
-        outbound.foreach: outboundPath =>
-          ctx.storeTransferService.beginTransferOut(m.storeId, m.transferUUID, outboundPath,
-            toHostState.address, toHostState.storeTransferPort, m.timestamp)
-        ctx.publishView()
-        // The transfer may have been aborted after the reads above, and the abort's nudge handled before the copy
-        // was in outbound/. No check would then ever see it beside the Active entry, leaving the store dark for a
-        // full checkStorageDevicePeriod while the tree counts it online. An unsynced move is forced by it too
-        ctx.reconciler.scheduleDeviceRecheck(sourceDs.storageDeviceId)
-        if wasLoaded then
-          ctx.services.gossipRetransmitter.broadcast(StoreOffline(m.storeId, HLCTimestamp.now))
-      catch
-        case t: Throwable =>
-          logger.warn(s"Failed to start transfer out of store ${m.storeId}, transfer " +
-                      s"${m.transferUUID}. Error: $t")
+        // phase-param.outbound, inert at the destination. A move that fails or is not forced ships nothing. The
+        // TransferOut work keeps every open off the copy until the move is applied (R12)
+        def shipped(outbound: Option[os.Path]): Unit =
+          try
+            // A device unloaded while the move ran is not ours to send from (moveOnLane's recheck answers None)
+            outbound.filter(_ => ctx.devices.isLoaded(sourceDs)).foreach: outboundPath =>
+              ctx.storeTransferService.beginTransferOut(m.storeId, m.transferUUID, outboundPath,
+                toHostState.address, toHostState.storeTransferPort, m.timestamp)
+            ctx.publishView()
+            // The transfer may have been aborted after the reads above, and the abort's nudge handled before the copy
+            // was in outbound/. No check would then ever see it beside the Active entry, leaving the store dark for a
+            // full checkStorageDevicePeriod while the tree counts it online. An unsynced move is forced by it too
+            ctx.reconciler.scheduleDeviceRecheck(sourceDs.storageDeviceId)
+            if wasLoaded then
+              ctx.services.gossipRetransmitter.broadcast(StoreOffline(m.storeId, HLCTimestamp.now))
+          catch
+            case t: Throwable =>
+              logger.warn(s"Failed to start transfer out of store ${m.storeId}, transfer " +
+                          s"${m.transferUUID}. Error: $t")
+          finally done()
+        try moveToOutbound(sourceDs, m.storeId, tidOf(devEntry))(shipped)
+        catch
+          case t: Throwable =>
+            logger.warn(s"Failed to start transfer out of store ${m.storeId}, transfer " +
+                        s"${m.transferUUID}. Error: $t")
+            done()
 
   /** Whether the copy of `storeId` on `sds` is Lost (in lost/), or held for a move there that failed
    *  (CopyMoves.pendingLost): such a copy is never shipped */
@@ -399,9 +425,10 @@ class StoreTransfersOut(ctx: DeviceControl) extends Logging:
 
     // T7. A failed move leaves the store offline in outbound/, for a later check. Loading it before its move is
     // durable could be undone by the next restart, so this pass would have logged a repair that did not hold. A move
-    // not forced leaves it unsynced, which the next check of the device forces and loads (DeviceReconciler)
-    ctx.moves.move("reinstate abandoned transfer out", local, storeId, Phase.Live) match
-      case MoveResult.Durable =>
+    // not forced leaves it unsynced, which the next check of the device forces and loads (DeviceReconciler). The move
+    // is a lane job; the load follows it on a device still the loaded one (moveOnLane's recheck)
+    ctx.moves.moveOnLane("reinstate abandoned transfer out", local, storeId, Phase.Live):
+      case MoveResult.Durable if ctx.devices.isLoaded(local) =>
         ctx.copyRegistry.pathOf(local, storeId).foreach(path =>
           ctx.tryLoadStore(local, path, Some(() => ctx.gossipStoreOnline(storeId))))
-      case MoveResult.Unsynced(_) | MoveResult.NotMoved(_) => ()
+      case _ => ()

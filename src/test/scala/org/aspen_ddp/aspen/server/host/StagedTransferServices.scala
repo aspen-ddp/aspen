@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
 import org.aspen_ddp.aspen.server.store.backend.Backend
-import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
+import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService, TransferLane}
 
 import java.util.UUID
 import scala.collection.mutable
@@ -20,6 +20,7 @@ import scala.concurrent.{Future, Promise}
  */
 class StagedTransferService extends StoreTransferService:
   private val calls = mutable.ArrayBuffer[(StoreId, UUID, os.Path, Promise[Unit])]()
+  private val lanes = mutable.Map[UUID, TransferLane]()
   private val cancels = mutable.ArrayBuffer[(StoreId, UUID)]()
 
   /** Every cancelTransferIn call, in order. */
@@ -59,17 +60,25 @@ class StagedTransferService extends StoreTransferService:
   def failTransferIn(storeId: StoreId): Unit =
     latest(storeId).foreach(_._4.failure(new Exception(s"Simulated failure of transfer in of $storeId")))
 
-  def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path): Future[Unit] =
+  def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path,
+                      lane: TransferLane): Future[Unit] =
     synchronized:
       val p = Promise[Unit]()
       calls += ((storeId, transferUUID, destinationDirectory, p))
+      lanes(transferUUID) = lane
       p.future
 
-  def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Unit =
-    val p = synchronized:
+  /** As the real service's: the attempt's future fails at once, and its (here empty) removal is one job on the
+   *  attempt's lane, whose Future this returns. An attempt already settled is left alone */
+  def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Future[Unit] =
+    val (p, lane) = synchronized:
       cancels += ((storeId, transferUUID))
-      calls.find(c => c._1 == storeId && c._2 == transferUUID).map(_._4)
-    p.foreach(_.tryFailure(new Exception(s"Cancelled transfer in of $storeId")))
+      (calls.find(c => c._1 == storeId && c._2 == transferUUID).map(_._4).filter(!_.isCompleted),
+       lanes.get(transferUUID))
+    p match
+      case Some(promise) if promise.tryFailure(new Exception(s"Cancelled transfer in of $storeId")) =>
+        lane.fold(Future.unit)(_.run(()))
+      case _ => Future.unit
 
   def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
                        destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit =
@@ -114,10 +123,11 @@ class StagedSendService extends StoreTransferService:
   def endTransferOut(storeId: StoreId): Unit = synchronized:
     sending -= storeId
 
-  def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path): Future[Unit] =
+  def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path,
+                      lane: TransferLane): Future[Unit] =
     throw new UnsupportedOperationException("StagedSendService does not receive stores")
 
-  def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Unit = ()
+  def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Future[Unit] = Future.unit
 
   def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
                        destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit = synchronized:

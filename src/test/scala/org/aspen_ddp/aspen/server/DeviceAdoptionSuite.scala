@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.server.host.{AdoptionClass, CopyFixtures, CopyLayout, Phase}
+import org.aspen_ddp.aspen.server.host.{AdoptionClass, CopyFixtures, CopyLayout, DeviceStateDisk, JobKind, Phase}
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService, StoreLoader}
 import org.aspen_ddp.aspen.client.Transaction
@@ -42,6 +42,13 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
         _ <- waitForTransactionsToComplete()
         _ <- pumpUntil(condition, rounds - 1)
       yield ()
+
+  /** pumpUntil with discovery's jobs and results run each round (runDiscovery) */
+  private def pumpWithDiscovery(host: Host, condition: => Boolean, rounds: Int = 30): Future[Unit] =
+    given ExecutionContext = executionContext
+    runDiscovery(host)
+    if condition || rounds == 0 then Future.unit
+    else pumpUntil(condition, 1).flatMap(_ => pumpWithDiscovery(host, condition, rounds - 1))
 
   /** Waits for the shutdown-marker lookups issued by the last scan, handles their results, then
    *  waits for whatever those started (an adoption, the device check of a loaded device). */
@@ -170,6 +177,64 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
     (hostRoot, deviceDir)
 
   private val oldHostId = HostId(UUID.fromString("0a0a0a0a-0000-0000-0000-000000000001"))
+
+  // Device I/O isolation (Task 15): the ownership decision's recheck of the directory is one job on the device's lane,
+  // the path pending meanwhile, so no scan resolves it again; it reads the disk as it is when it runs
+  atest("an ownership recheck waits on a held device, then adopts it"):
+    given ExecutionContext = executionContext
+    for
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 1, registerOldHost = true)(ss => Map(ss(0) -> offline))
+      List(s0) = stores: @unchecked
+      (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
+      _ = writeClosedStore(deviceDir, s0)
+      host = newHost(hostRoot)
+      _ <- pumpUntil(queuedMarkerEvents(host) > 0)
+      _ = holdDevice(host, deviceDir)
+      _ = handleMarkerEvents(host)
+      _ <- pumpUntil(false, rounds = 2)
+      heldWhile = heldJobs(host, deviceDir)
+      pendingWhile = host.control.discovery.pendingMarkerResolutions
+      adoptsWhile = recorded(host).adoptCalls.toList
+      _ = scanNow(host)
+      heldAfterScan = heldJobs(host, deviceDir)
+      _ = releaseDevice(host, deviceDir)
+      // The scan's probe results are discovery's: run with the pumps
+      _ <- pumpWithDiscovery(host, loadedDevices(host).contains(deviceA) &&
+                                   host.control.reconciler.activeDeviceChecks.isEmpty)
+      st <- state(deviceA)
+    yield
+      heldWhile should be(List(JobKind.DeviceOwnership))
+      pendingWhile should be(Set(deviceDir))
+      adoptsWhile should be(Nil)
+      // A scan meanwhile starts no second resolution (its probe of the path waits behind the recheck)
+      heldAfterScan.count(_ == JobKind.DeviceOwnership) should be(1)
+      recorded(host).adoptCalls.toList should be(List((deviceA, oldHostId)))
+      st.hostId should be(HostId.BootstrapHostId)
+      loadedDevices(host).contains(deviceA) should be(true)
+
+  atest("an ownership recheck reads the directory as it is when its held job runs"):
+    given ExecutionContext = executionContext
+    for
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 1, registerOldHost = true)(ss => Map(ss(0) -> offline))
+      List(s0) = stores: @unchecked
+      (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
+      _ = writeClosedStore(deviceDir, s0)
+      host = newHost(hostRoot)
+      _ <- pumpUntil(queuedMarkerEvents(host) > 0)
+      _ = holdDevice(host, deviceDir)
+      _ = handleMarkerEvents(host)
+      // The marker the lookup was made for changes while the recheck waits
+      _ = DeviceMarkers.writeShutdownState(deviceDir, HostId(UUID.randomUUID()))
+      _ = releaseDevice(host, deviceDir)
+      _ <- pumpUntil(host.control.discovery.pendingMarkerResolutions.isEmpty)
+      _ = runDiscovery(host)
+      _ <- pumpUntil(false, rounds = 2)
+      st <- state(deviceA)
+    yield
+      // Nothing adopted: the next scan decides afresh from what the disk says
+      recorded(host).adoptCalls.toList should be(Nil)
+      st.hostId should be(oldHostId)
+      loadedDevices(host).contains(deviceA) should be(false)
 
   atest("a properly shut down device from another host is adopted"):
     given ExecutionContext = executionContext
@@ -327,8 +392,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       _ = os.remove(Backend.crlSaveFile(d1))
       before <- state(deviceA)
       host = newHost(hostRoot, storeRebuildFactory = rebuilds, adjustSeams = _.copy(copyRename = Some(rename)))
-      clean = host.control.discovery.servedStoresIn(deviceDir, before, AdoptionClass.Clean)
-      crlLost = host.control.discovery.servedStoresIn(deviceDir, before, AdoptionClass.CrlLost)
+      clean = DeviceStateDisk.servedStoresIn(deviceDir, before, AdoptionClass.Clean)
+      crlLost = DeviceStateDisk.servedStoresIn(deviceDir, before, AdoptionClass.CrlLost)
       _ <- resolve(host)
       _ <- pumpUntil(rebuilds.created.nonEmpty)
       st <- state(deviceA)
@@ -955,6 +1020,6 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
     val state = deviceState(deviceA, expected.keys.zipWithIndex.map((s, i) =>
       s -> StoreEntry(if i % 2 == 0 then StoreStatus.Active else StoreStatus.Offline, None)).toMap)
     Future.successful:
-      AdoptionClass.values.toList.map(cls => cls -> host.control.discovery.servedStoresIn(deviceDir, state, cls).toSet)
+      AdoptionClass.values.toList.map(cls => cls -> DeviceStateDisk.servedStoresIn(deviceDir, state, cls).toSet)
         .toMap should be(AdoptionClass.values.toList.map(cls =>
           cls -> expected.collect { case (s, c) if c == cls => s }.toSet).toMap)

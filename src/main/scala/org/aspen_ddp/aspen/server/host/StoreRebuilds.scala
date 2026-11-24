@@ -418,7 +418,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           // A rename into rebuilt/ that landed unforced: the copy is recorded unsynced, its directories held for the
           // resync. Read only after the completion, which publishes it
           val unforced = sr.placedUnforced
-          unforced.foreach(ctx.moves.placedUnforced)
+          unforced.foreach(e => ctx.moves.placedUnforced(e.source, e.target))
           ctx.copyRegistry.rebuilt("rebuild finish", local, storeId,
             Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)), copyId, unsynced = unforced.isDefined)
           // Another copy of the store on the device, back while the rebuild ran (a mount or restore finishing late,

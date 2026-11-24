@@ -1,7 +1,6 @@
 package org.aspen_ddp.aspen.server.transfer
 
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.common.network.implementations.quic.TlsCredentials
 import org.aspen_ddp.aspen.common.network.tls.TLSContext
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -13,9 +12,10 @@ import java.net.{InetSocketAddress, Socket, SocketException}
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import java.util.zip.CRC32
-import java.util.concurrent.{Executors, ScheduledExecutorService, TimeUnit}
+import java.util.concurrent.{ConcurrentHashMap, Executors, ScheduledExecutorService, TimeUnit}
 import javax.net.ssl.{SSLServerSocket, SSLSocket}
 import scala.concurrent.{Future, Promise}
+import scala.util.control.NonFatal
 import scala.concurrent.duration.*
 
 object StoreTransferManager:
@@ -52,9 +52,11 @@ object StoreTransferManager:
     (storeId, new UUID(bb.getLong, bb.getLong))
 
   /** One pending transfer-in. Mutable fields are guarded by the owning manager's lock. `done` is set
-   *  by whichever party (connection thread, re-registration, close) settles the transfer first. */
+   *  by whichever party (connection thread, re-registration, close) settles the transfer first. `lane` runs every
+   *  removal of its directory (TransferLane). */
   private class Registration(val transferUUID: UUID,
                              val destinationDirectory: os.Path,
+                             val lane: TransferLane,
                              val promise: Promise[Unit]):
     var activeSocket: Option[SSLSocket] = None
     var extractor: Option[os.SubProcess] = None
@@ -75,6 +77,14 @@ object StoreTransferManager:
  *  length and the archive's CRC32. The trailer is written only after the sender's archiver exits
  *  successfully, so a stream that ends without it, or whose final 29 bytes do not match the
  *  StoreId and the archive bytes actually received, is incomplete or corrupt.
+ *
+ *  Device I/O: no caller's thread touches a disk or waits for one. A transfer in's directory work runs on its
+ *  connection thread (the set-up of the directory it extracts into) or as a job on the attempt's TransferLane, its
+ *  device's management lane (every removal: a cancel's, a supersession's, a failed receive's); each takes only its
+ *  device's directory lock (one per device root, TransferLane.device), so a hung device stalls only its own
+ *  transfers. `cancelTransferIn` and `beginTransferIn`'s supersession, which the host's control thread calls, take
+ *  no lock and return at once, the removal queued (cancelTransferIn returns its Future). A send reads its source
+ *  directory on its own thread. Disk work is in StoreTransferDisk.
  */
 class StoreTransferManager(port: Int,
                            tls: TlsCredentials,
@@ -94,12 +104,18 @@ class StoreTransferManager(port: Int,
 
   private var registrations: Map[StoreId, Registration] = Map()
 
-  /** Serializes creation and removal of store directories. Guards `directoryOwners`, which maps each
-   *  store directory to the registration that last created it. A registration removes a directory
-   *  only while it is still the owner, so a settled attempt can never delete the directory a newer
-   *  attempt has set up at the same path. Never acquired while holding the manager lock. */
-  private val directoryLock = new Object
-  private var directoryOwners: Map[os.Path, Registration] = Map()
+  /** One lock per device root (TransferLane.device), serializing the creation and removal of store directories on that
+   *  device: a receive's set-up on its connection thread, and each removal, which runs as a job on the device's own
+   *  lane. So only threads working on one device ever wait for its disk; the caller of cancelTransferIn or
+   *  beginTransferIn (the host's control thread) never takes one. Never acquired while holding the manager lock.
+   *  `directoryOwners` maps each store directory to the registration that last created it. A registration removes a
+   *  directory only while it is still the owner (an atomic conditional remove, under the device's lock), so a settled
+   *  attempt can never delete the directory a newer attempt has set up at the same path. A removal cancelled before
+   *  its job starts leaves the owner recorded: nothing has been removed */
+  private val directoryLocks = new ConcurrentHashMap[os.Path, Object]()
+  private val directoryOwners = new ConcurrentHashMap[os.Path, Registration]()
+
+  private def lockFor(reg: Registration): Object = directoryLocks.computeIfAbsent(reg.lane.device, _ => new Object)
 
   /** The current transfer-out attempt per store */
   private var active: Map[StoreId, Outbound] = Map()
@@ -132,24 +148,25 @@ class StoreTransferManager(port: Int,
       live.foreach((_, reg) => reg.done = true)
       registrations = Map()
       (live, active.values.toList)
-    regs.foreach((storeId, reg) => abort(storeId, reg, "transfer manager closed"))
+    regs.foreach((storeId, reg) => abort(storeId, reg, "transfer manager closed"): Unit)
     outs.foreach(abortOutbound(_, "transfer manager closed"))
 
-  def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path): Future[Unit] =
-    val reg = new Registration(transferUUID, destinationDirectory, Promise())
+  def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path,
+                      lane: TransferLane): Future[Unit] =
+    val reg = new Registration(transferUUID, destinationDirectory, lane, Promise())
     val previous = synchronized:
       val prev = registrations.get(storeId).filter(!_.done)
       prev.foreach(_.done = true)
       registrations += storeId -> reg
       prev
-    previous.foreach(p => abort(storeId, p, s"superseded by transfer $transferUUID"))
+    previous.foreach(p => abort(storeId, p, s"superseded by transfer $transferUUID"): Unit)
     logger.info(s"Awaiting transfer in of store $storeId, transfer $transferUUID")
     reg.promise.future
 
-  def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Unit =
+  def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Future[Unit] =
     val reg = synchronized:
       registrations.get(storeId).filter(r => r.transferUUID == transferUUID && !r.done)
-    reg.foreach(fail(storeId, _, "cancelled"))
+    reg.fold(Future.unit)(fail(storeId, _, "cancelled"))
 
   /** Starts sending `sourceDirectory` unless a request with the same or a newer timestamp has already
    *  been seen for this store. A newer request aborts the active attempt for the store. */
@@ -207,7 +224,7 @@ class StoreTransferManager(port: Int,
       write(encodeHeader(storeId, out.transferUUID), HeaderSize)
 
       // os.spawn leaks a throwing shutdown hook if the process cannot start, so check the cwd first
-      if !FileStat.isDir(sourceDirectory) then
+      if !StoreTransferDisk.isDirectory(sourceDirectory) then
         throw new Exception(s"source directory $sourceDirectory does not exist")
       val tmp = os.temp.dir(prefix = "store-transfer-out")
       archiverTmp = Some(tmp)
@@ -261,7 +278,7 @@ class StoreTransferManager(port: Int,
           lastTimestamp -= storeId
       try raw.close() catch case _: Throwable => ()
       archiverTmp.foreach: tmp =>
-        try os.remove.all(tmp) catch case _: Throwable => ()
+        try StoreTransferDisk.removeAll(tmp) catch case _: Throwable => ()
 
   /** Records the attempt's socket so it can be aborted. False if the attempt was already aborted. */
   private def attach(out: Outbound, sock: Socket): Boolean = synchronized:
@@ -352,17 +369,17 @@ class StoreTransferManager(port: Int,
         try
           receive(storeId, reg, sock, in)
         catch
-          case t: Throwable => fail(storeId, reg, t.toString)
+          case t: Throwable => fail(storeId, reg, t.toString): Unit
 
   private def storeDirectory(storeId: StoreId, reg: Registration): os.Path =
     reg.destinationDirectory / storeId.directoryName
 
   private def receive(storeId: StoreId, reg: Registration, sock: SSLSocket, in: InputStream): Unit =
     val storeDir = storeDirectory(storeId, reg)
-    val (extractor, aborted) = directoryLock.synchronized:
-      os.remove.all(storeDir)
-      os.makeDir.all(storeDir)
-      directoryOwners += storeDir -> reg
+    // On this connection thread, under the device's lock: only this device's threads ever take it
+    val (extractor, aborted) = lockFor(reg).synchronized:
+      StoreTransferDisk.prepareDirectory(storeDir)
+      directoryOwners.put(storeDir, reg)
       val p = os.spawn(cmd = ("jar", "--extract"), cwd = storeDir, stderr = os.Pipe)
       val aborted = synchronized:
         if !reg.done then
@@ -372,7 +389,7 @@ class StoreTransferManager(port: Int,
     if aborted then
       // Aborted between matching and spawning; abort() could not see this extractor or directory
       extractor.destroy()
-      removeOwnedDirectory(storeId, reg)
+      removeOwnedDirectory(storeId, reg): Unit
     else
       logger.info(s"Receiving store $storeId, transfer ${reg.transferUUID}, from ${sock.getRemoteSocketAddress}")
 
@@ -397,18 +414,17 @@ class StoreTransferManager(port: Int,
             held = TrailerSize
 
       if held != TrailerSize || !buf.take(TrailerSize).sameElements(encodeTrailer(storeId, length, crc.getValue)) then
-        fail(storeId, reg, "stream ended without a valid trailer")
+        fail(storeId, reg, "stream ended without a valid trailer"): Unit
       else
         extractor.stdin.close()
         extractor.waitFor()
         val exitCode = extractor.exitCode()
         if exitCode != 0 then
-          fail(storeId, reg, s"extractor exited with code $exitCode: ${extractor.stderr.text().trim}")
+          fail(storeId, reg, s"extractor exited with code $exitCode: ${extractor.stderr.text().trim}"): Unit
         else
           if claim(storeId, reg) then
-            directoryLock.synchronized:
-              if directoryOwners.get(storeDir).exists(_ eq reg) then
-                directoryOwners -= storeDir
+            // The directory is the caller's now: no removal of this attempt's may take it
+            directoryOwners.remove(storeDir, reg)
             closeQuietly(sock)
             logger.info(s"Received store $storeId, transfer ${reg.transferUUID}")
             reg.promise.success(())
@@ -423,30 +439,40 @@ class StoreTransferManager(port: Int,
         registrations -= storeId
       true
 
-  private def fail(storeId: StoreId, reg: Registration, cause: String): Unit =
+  /** Settles and aborts `reg` unless it is already settled; the Future is its directory's removal (abort) */
+  private def fail(storeId: StoreId, reg: Registration, cause: String): Future[Unit] =
     if claim(storeId, reg) then
       abort(storeId, reg, cause)
+    else
+      Future.unit
 
-  /** Removes the store directory `reg` created, unless a newer attempt has since recreated it */
-  private def removeOwnedDirectory(storeId: StoreId, reg: Registration): Unit =
+  /** Removes the store directory `reg` created, unless a newer attempt has since recreated it: one job on `reg`'s
+   *  lane, taking the device's lock there, never on the calling thread. A job cancelled before it starts removes
+   *  nothing and leaves the owner recorded */
+  private def removeOwnedDirectory(storeId: StoreId, reg: Registration): Future[Unit] =
     val storeDir = storeDirectory(storeId, reg)
-    directoryLock.synchronized:
-      if directoryOwners.get(storeDir).exists(_ eq reg) then
-        directoryOwners -= storeDir
-        try
-          os.remove.all(storeDir)
-        catch
-          case t: Throwable => logger.error(s"Failed to remove partial store directory for $storeId: $t")
+    try
+      reg.lane.run:
+        lockFor(reg).synchronized:
+          if directoryOwners.remove(storeDir, reg) then
+            try
+              StoreTransferDisk.removeAll(storeDir)
+            catch
+              case t: Throwable => logger.error(s"Failed to remove partial store directory for $storeId: $t")
+    catch case NonFatal(t) =>
+      logger.error(s"Failed to queue the removal of the partial store directory for $storeId: $t")
+      Future.failed(t)
 
-  /** Tears down a settled registration: closes its connection, destroys its extractor, removes the
-   *  partially extracted directory and fails its future. */
-  private def abort(storeId: StoreId, reg: Registration, cause: String): Unit =
+  /** Tears down a settled registration: closes its connection, destroys its extractor, fails its future and queues
+   *  the removal of the partially extracted directory on its lane, returning that removal */
+  private def abort(storeId: StoreId, reg: Registration, cause: String): Future[Unit] =
     val (sock, extractor) = synchronized((reg.activeSocket, reg.extractor))
     sock.foreach(closeQuietly)
     extractor.foreach: p =>
       if p.isAlive() then
         p.destroy()
-    removeOwnedDirectory(storeId, reg)
+    val removal = removeOwnedDirectory(storeId, reg)
     val msg = s"Transfer in of store $storeId, transfer ${reg.transferUUID}, failed: $cause"
     logger.warn(msg)
     reg.promise.tryFailure(new Exception(msg))
+    removal

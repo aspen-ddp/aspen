@@ -63,6 +63,9 @@ class LockstepThreading(ec: ExecutionContext) extends HostThreading:
       l
     latch.foreach(_.countDown())
 
+  /** Testing hook: whether `path` is held (`hold`) */
+  def isHeld(path: os.Path): Boolean = holdLock.synchronized(holds.contains(path))
+
   /** Testing hook: the kinds of `path`'s held management jobs, in submission order. */
   def held(path: os.Path): List[JobKind] =
     holdLock.synchronized(heldTasks.getOrElse(path, Vector()).map(_.kind).toList)

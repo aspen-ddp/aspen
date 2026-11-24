@@ -50,7 +50,7 @@ object DiscoveryDisk extends Logging:
 
   /** The scratch areas of a device being loaded, which nothing can be using yet: the transfer staging directory (a
    *  copy that had finished arriving was already moved to its final path), `creating/` (a complete store was already
-   *  renamed out of it, StoreCreation), `deleting/` (an interrupted delete, StoreCopies.delete) and `crl.creating` (an
+   *  renamed out of it, StoreCreation), `deleting/` (an interrupted delete, CopyDisk.delete) and `crl.creating` (an
    *  unfinished replacement of a lost CRL, which holds no entry). A removal that fails is logged and left */
   def sweepAtLoad(devicePath: os.Path): Unit =
     def remove(dir: os.Path, what: String): Unit =
@@ -58,7 +58,7 @@ object DiscoveryDisk extends Logging:
       catch case t: Throwable => logger.warn(s"Failed to remove $what $dir: $t")
     remove(devicePath / StoreTransfer.StagingDirectory, "stale transfer staging directory")
     remove(devicePath / StoreCreation.CreatingDirectory, "stale store-creation directory")
-    StoreCopies.sweepDeleting(devicePath)
+    CopyDisk.sweepDeleting(devicePath)
     remove(CrashRecoveryLog.replacementCrlDir(devicePath), "the unfinished replacement CRL directory")
 
   /** retireDuplicates' outcome: the listing after its moves, or the error that stopped them, and every move whose

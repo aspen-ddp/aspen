@@ -25,7 +25,7 @@ enum Activity:
   case Retiring
   /** A disk job of `kind` for the copy runs on its device's lane (DeviceIo). The copy is busy until its result is
    *  applied: no reconcile action fires for it (CopyDecision.decide), and `prior`, the activity it was in (Idle,
-   *  Served or AwaitingRetry), comes back when the job ends (HostCopies.diskJobEnded) */
+   *  Served, AwaitingRetry or Retiring), comes back when the job ends (HostCopies.diskJobEnded) */
   case DiskJob(kind: JobKind, prior: Activity)
 
   /** The activity the copy is in apart from any disk job in flight */
@@ -94,8 +94,10 @@ object Transitions:
     case (Activity.Idle | Activity.AwaitingRetry(_) | Activity.Opening(_), Activity.Closing(ClosePurpose.Unserved)) =>
       phase == Phase.Live
     case (Activity.Closing(_), Activity.Idle) => true
-    // A disk job holds an Idle, Served or awaiting-retry copy, and gives it back as it was
-    case (Activity.Idle | Activity.Served | Activity.AwaitingRetry(_), Activity.DiskJob(_, prior)) => prior == from
+    // A disk job holds an Idle, Served, awaiting-retry or retiring copy (a retire's own disk steps), and gives it back
+    // as it was
+    case (Activity.Idle | Activity.Served | Activity.AwaitingRetry(_) | Activity.Retiring,
+          Activity.DiskJob(_, prior)) => prior == from
     case (Activity.DiskJob(_, prior), _) => to == prior
     case (Activity.Retiring, Activity.Idle) => true
     case _ => false

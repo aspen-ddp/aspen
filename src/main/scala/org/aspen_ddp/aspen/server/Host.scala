@@ -556,10 +556,11 @@ class Host(val client: AspenClient,
       t.drain()
       if seams.verifyCopyRegistry then
         val registry = deviceControl.copyRegistry
+        val diskCheck = testingOnlyVerifyCopyRegistry()
         // A copy a load learned of fails too: a test that places a copy after its device's load registers it
         // (testingOnlyRescan), so any other learn is a site that placed a copy without recording it
         val problems = registry.takeRegistryErrors().toList ++ registry.takeSilenceErrors() ++
-          registry.verifyAgainstDisk() ++ registry.takeLearned().map(l => s"(learned) $l")
+          diskCheck ++ registry.takeLearned().map(l => s"(learned) $l")
         if problems.nonEmpty then
           throw new IllegalStateException(s"Copy registry of host $hostId after a drain:\n  " +
                                           problems.mkString("\n  "))
@@ -570,6 +571,22 @@ class Host(val client: AspenClient,
           throw new IllegalStateException(s"Copy registry of host $hostId after a drain, its updates threw:\n  " +
                                           problems.mkString("\n  "))
     case _ => ()
+
+  /** Test-only, lockstep: the copy registry's disk check (HostCopies.verifyAgainstDisk), each loaded device's run as a
+   *  job on its lane, and the jobs drained. A held device is not checked (its lane runs nothing). The mismatches;
+   *  empty when consistent, and for any other threading */
+  private[aspen] def testingOnlyVerifyCopyRegistry(): List[String] = threading match
+    case t: LockstepThreading =>
+      // Anything posted since the last drain runs first, so the check's records are what the drained host holds
+      t.drain()
+      val checks = deviceControl.copyRegistry.verifyAgainstDisk(t.isHeld)
+      t.drain()
+      checks.flatMap: f =>
+        f.value match
+          case Some(scala.util.Success(found)) => found
+          case Some(scala.util.Failure(e)) => List(s"the disk check failed: $e")
+          case None => Nil
+    case _ => Nil
 
   /** Test-only, on the control thread (lockstep: the test thread): registers in the copy registry the store
    *  directories a test placed by hand on loaded device `deviceId` after its load, as the device's load registers the

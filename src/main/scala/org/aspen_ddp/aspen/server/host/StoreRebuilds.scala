@@ -104,6 +104,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     runningRebuilds.get(storeId).filter(r => r.deviceId == deviceId && !r.finishRecorded)
       .map(r => Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(r.episode)))
 
+  /** Test-only: finishPlacing of every store of device `deviceId` it is defined for */
+  private[server] def finishPlacingOn(deviceId: StorageDeviceId): Map[StoreId, Phase] =
+    runningRebuilds.keys.flatMap(s => finishPlacing(deviceId, s).map(s -> _)).toMap
+
   /** The rebuild slots taken now (tests) */
   private[server] def rebuildSlotsTaken: Int = slotsTaken(None)
 
@@ -416,9 +420,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               logger.error(s"Rebuild of store $storeId on device ${local.storageDeviceId}: ${found.map(_.path)
                 .mkString(", ")} came back while it ran. Discarding the rebuilt copy, so that copy is retired with " +
                 "its CRL state and the store rebuilt again")
-              ctx.devices.discardStoreDirectory(storeId, local.storageDeviceId,
-                "Another copy of the store came back while it was rebuilt")
-                .foreach(sds => ctx.copyRegistry.removed("rebuild finish beside a returned copy", sds, storeId))
+              ctx.copies.discard(storeId, local.storageDeviceId,
+                "Another copy of the store came back while it was rebuilt"):
+                sds => ctx.copyRegistry.removed("rebuild finish beside a returned copy", sds, storeId)
           if !others.toOption.exists(_.isEmpty) then
             try
               others.failed.foreach: t =>
@@ -468,9 +472,9 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               case Success(RebuildOutcome.Discard) =>
                 try
                   workEnds = true
-                  ctx.devices.discardStoreDirectory(storeId, local.storageDeviceId,
-                    "The tree does not say this device owns a rebuilt store")
-                    .foreach(sds => ctx.copyRegistry.removed("RebuildOutcome.Discard", sds, storeId))
+                  ctx.copies.discard(storeId, local.storageDeviceId,
+                    "The tree does not say this device owns a rebuilt store"):
+                    sds => ctx.copyRegistry.removed("RebuildOutcome.Discard", sds, storeId)
                 finally
                   finishSettled(recheckAll())
 
@@ -778,10 +782,38 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  ending after a new open began) is not moved, held or retried: logged at warn, NotMoved, left to its own open or
    *  close (CopyMoves.move would refuse it) */
   def moveToLost(site: String, sds: LocalStorageDeviceState, storeId: StoreId): MoveResult =
+    lostMoveDecided(site, sds, storeId).getOrElse:
+      val held = registry.copiesOf(sds).flatMap(_.copies.get(storeId)).isDefined
+      val result = ctx.moves.move(site, sds, storeId, Phase.Lost)
+      lostMoveDone(site, sds, storeId, held, result)
+      result
+
+  /** moveToLost as a lane job (CopyMoves.moveOnLane), its result given to `andThen` on the control thread. The same
+   *  decisions and holds; a device unloaded meanwhile holds nothing (its holds went with its detach) */
+  def moveToLostOnLane(site: String, sds: LocalStorageDeviceState, storeId: StoreId)
+                      (andThen: MoveResult => Unit): Unit =
+    lostMoveDecided(site, sds, storeId) match
+      case Some(result) => andThen(result)
+      case None =>
+        val held = registry.copiesOf(sds).flatMap(_.copies.get(storeId)).isDefined
+        ctx.moves.moveOnLane(site, sds, storeId, Phase.Lost): result =>
+          if ctx.devices.isLoaded(sds) then
+            lostMoveDone(site, sds, storeId, held, result)
+          andThen(result)
+
+  /** moveToLost's outcome where no move is made: a copy already Lost (Durable), or one opened, opening or closing
+   *  since (NotMoved, its hold released). A copy busy with a disk job is held (pendingLost) and NotMoved: the move
+   *  waits for the job's end, retried at the next device check, never made under it. None: the move is to be made */
+  private def lostMoveDecided(site: String, sds: LocalStorageDeviceState, storeId: StoreId): Option[MoveResult] =
     registry.copiesOf(sds).flatMap(_.copies.get(storeId)) match
       case Some(r) if r.phase == Phase.Lost =>
         ctx.moves.holdLost(sds, storeId, held = false)
-        MoveResult.Durable
+        Some(MoveResult.Durable)
+      case Some(r) if r.activity.isInstanceOf[Activity.DiskJob] =>
+        logger.info(s"Not moving the copy of store $storeId on device ${sds.storageDeviceId} to lost/ yet ($site): " +
+                    s"it is ${r.activity}. Held offline, and the move retried at the device's next check")
+        ctx.moves.holdLost(sds, storeId, held = true)
+        Some(MoveResult.NotMoved(IllegalStateException(s"the copy of $storeId is ${r.activity}")))
       case Some(r) if r.activity.isInstanceOf[Activity.Opening] || r.activity.underlying == Activity.Served ||
                       r.activity.isInstanceOf[Activity.Closing] =>
         // Opened, opening or closing since this move was asked for (a failed unserved backend's close ending after
@@ -791,17 +823,19 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         ctx.moves.holdLost(sds, storeId, held = false)
         logger.warn(s"Not moving the copy of store $storeId on device ${sds.storageDeviceId} to lost/ ($site): it " +
                     s"is ${r.activity} now. Left to its own open or close")
-        MoveResult.NotMoved(IllegalStateException(s"the copy of $storeId is ${r.activity}"))
-      case record =>
-        // No record: no copy to move, NotMoved
-        val result = ctx.moves.move(site, sds, storeId, Phase.Lost)
-        result match
-          case MoveResult.NotMoved(t) if record.isDefined =>
-            logger.error(s"Failed to move the copy of store $storeId on device ${sds.storageDeviceId} to lost/ " +
-                         s"($site). It is held offline, and the move retried at each check of its device. Error: $t")
-            ctx.moves.holdLost(sds, storeId, held = true)
-          case _ => ()
-        result
+        Some(MoveResult.NotMoved(IllegalStateException(s"the copy of $storeId is ${r.activity}")))
+      case _ => None
+
+  /** A move to lost/ that failed holds its copy offline, for the retry at each device check. No record: no copy to
+   *  move, NotMoved, nothing held */
+  private def lostMoveDone(site: String, sds: LocalStorageDeviceState, storeId: StoreId, recorded: Boolean,
+                           result: MoveResult): Unit =
+    result match
+      case MoveResult.NotMoved(t) if recorded =>
+        logger.error(s"Failed to move the copy of store $storeId on device ${sds.storageDeviceId} to lost/ " +
+                     s"($site). It is held offline, and the move retried at each check of its device. Error: $t")
+        ctx.moves.holdLost(sds, storeId, held = true)
+      case _ => ()
 
   /** Retries the move to lost/ of every copy of `local` whose move failed (CopyMoves.pendingLost): each device check
    *  does, before its passes */

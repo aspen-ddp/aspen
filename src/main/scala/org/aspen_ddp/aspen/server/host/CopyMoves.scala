@@ -64,33 +64,97 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
    *  store's directory): refused, NotMoved, and logged at error as the caller's bug. A copy already unsynced stays
    *  unsynced after the move, whose syncs force only the directories naming it, until a resync forces it whole */
   def move(site: String, sds: LocalStorageDeviceState, storeId: StoreId, to: Phase): MoveResult =
+    movable(site, sds, storeId) match
+      case Left(refused) => refused
+      case Right(r) =>
+        val from = CopyLayout.path(sds.devicePath, storeId, r.copyId, r.phase)
+        val target = CopyLayout.path(sds.devicePath, storeId, r.copyId, to)
+        val result = relocateCopy(site, from, target, to)
+        recordMove(site, sds, storeId, r.copyId, from, target, to, result)
+        result
+
+  /** The record of the copy of `storeId` on `sds` a move may move, or the refusal (NotMoved, logged): no record, or a
+   *  copy opening, served or closing (no move of an installed store's directory), or busy with a disk job (another
+   *  job holds its disk: the move waits for a later attempt, never runs under it) */
+  private def movable(site: String, sds: LocalStorageDeviceState, storeId: StoreId): Either[MoveResult, CopyRecord] =
     ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(storeId)) match
       case None =>
         val t = IllegalStateException(s"No record of a copy of $storeId on device ${sds.storageDeviceId} to move")
         logger.error(s"Copy move ($site): $t")
-        MoveResult.NotMoved(t)
+        Left(MoveResult.NotMoved(t))
+      case Some(r) if r.activity.isInstanceOf[Activity.DiskJob] =>
+        val t = IllegalStateException(s"The copy of $storeId on device ${sds.storageDeviceId} is ${r.activity}: " +
+                                      "a disk job for it is running")
+        logger.info(s"Not moving the copy ($site) yet: $t")
+        Left(MoveResult.NotMoved(t))
       case Some(r) if r.activity.isInstanceOf[Activity.Opening] || r.activity.underlying == Activity.Served ||
                       r.activity.isInstanceOf[Activity.Closing] =>
         val t = IllegalStateException(s"The copy of $storeId on device ${sds.storageDeviceId} is ${r.activity}: " +
                                       s"its directory is never moved while its store is installed or opening")
         logger.error(s"Copy move ($site), a bug: $t")
-        MoveResult.NotMoved(t)
-      case Some(r) =>
-        val copyId = r.copyId
-        val from = CopyLayout.path(sds.devicePath, storeId, copyId, r.phase)
-        val target = CopyLayout.path(sds.devicePath, storeId, copyId, to)
-        // An earlier unsynced change's directories still to force go with the copy to its new path
-        val earlier = unforced.get(from)
-        val result = relocateCopy(site, from, target, to)
-        result match
-          case MoveResult.NotMoved(_) => ()
-          case _ =>
-            earlier.foreach: dirs =>
-              unforced -= from
-              unforced += target -> (dirs ++ unforced.getOrElse(target, Nil)).distinct
-            ctx.copyRegistry.moved(site, sds, storeId, to, copyId,
-              unsynced = result.isInstanceOf[MoveResult.Unsynced])
-        result
+        Left(MoveResult.NotMoved(t))
+      case Some(r) => Right(r)
+
+  /** Records a move of the copy `copyId` of `storeId` on `sds` from `from` to `target` that reached `result`: an
+   *  earlier unsynced change's directories still to force go with the copy to its new path, and the registry takes
+   *  the phase (HostCopies.moved). An Unsynced result's own directories were held by `relocate` */
+  private def recordMove(site: String, sds: LocalStorageDeviceState, storeId: StoreId, copyId: UUID, from: os.Path,
+                         target: os.Path, to: Phase, result: MoveResult): Unit =
+    result match
+      case MoveResult.NotMoved(_) => ()
+      case _ =>
+        unforced.get(from).foreach: dirs =>
+          unforced -= from
+          unforced += target -> (dirs ++ unforced.getOrElse(target, Nil)).distinct
+        ctx.copyRegistry.moved(site, sds, storeId, to, copyId, unsynced = result.isInstanceOf[MoveResult.Unsynced])
+
+  /** `move` run as one `Move` job on the device's lane (CopyDisk.relocate), its result given to `andThen` on the
+   *  control thread. The copy is claimed DiskJob(Move) before the job is submitted (HostCopies.diskJob; refused as
+   *  `move` refuses, or where the claim is refused: NotMoved at once) and its mark cleared in the apply whatever the
+   *  outcome. The apply rechecks that the device is still the loaded one and the copy's record the one moved (same copy
+   *  id and phase): then it records the move as `move` does. Otherwise, or for a cancelled job, it records nothing
+   *  and gives `andThen` NotMoved; a rename that landed unforced on a device unloaded meanwhile is held for its next
+   *  attach (HostCopies.unsynced), as moveUnattached holds one. A job that never returns (a hung device) leaves the
+   *  copy busy and `andThen` waiting */
+  def moveOnLane(site: String, sds: LocalStorageDeviceState, storeId: StoreId, to: Phase)
+                (andThen: MoveResult => Unit): Unit =
+    movable(site, sds, storeId) match
+      case Left(refused) => andThen(refused)
+      case Right(r) =>
+        if !ctx.copyRegistry.diskJob(sds, storeId, JobKind.Move) then
+          andThen(MoveResult.NotMoved(IllegalStateException(s"The copy of $storeId could not be claimed for a move")))
+        else
+          val from = CopyLayout.path(sds.devicePath, storeId, r.copyId, r.phase)
+          val target = CopyLayout.path(sds.devicePath, storeId, r.copyId, to)
+          val sync = syncDirectory
+          val renameCopy = rename
+          val job = sds.io.submit(JobKind.Move, Some(storeId))(CopyDisk.relocate(from, target, to, sync, renameCopy))
+          ctx.onControl(s"copy move ($site)", job): done =>
+            val result = done match
+              case scala.util.Success(m) => m
+              case scala.util.Failure(t) => MoveResult.NotMoved(t)
+            val current = ctx.devices.isLoaded(sds) &&
+              ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(storeId)).exists: now =>
+                now.copyId == r.copyId && now.phase == r.phase && now.activity.isInstanceOf[Activity.DiskJob]
+            if done != scala.util.Failure(DeviceIo.Cancelled) then
+              logMove(site, from, target, result)
+            if current then
+              result match
+                case MoveResult.Unsynced(_) => heldUnforced(from, target)
+                case _ => ()
+              // Recorded under the mark (a retry beneath it retargeted, HostCopies.moved), then the mark cleared
+              recordMove(site, sds, storeId, r.copyId, from, target, to, result)
+              ctx.copyRegistry.diskJobEnded(sds, storeId)
+              andThen(result)
+            else
+              ctx.copyRegistry.diskJobEnded(sds, storeId)
+              result match
+                case MoveResult.Unsynced(_) if !ctx.devices.isLoaded(sds) =>
+                  heldUnforced(from, target)
+                  ctx.copyRegistry.unsynced(site, target)
+                case _ => ()
+              andThen(MoveResult.NotMoved(IllegalStateException(
+                s"The move of $storeId ($site) ended after its device was unloaded or its copy changed")))
 
   /** Places the copy staged at `from`, in a scratch area (a transfer's staging, T8), into `to` on the attached `sds`
    *  under a fresh copy id (P4), as one move: `to`'s parameter file written durably, then the rename forced. Recorded
@@ -134,23 +198,59 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
       unforced -= path
       ctx.copyRegistry.synced(path)
 
-  /** Forces again each unsynced copy's source and target directories, and the copy's own (the device check). Returns
-   *  the stores synced now */
-  def resync(local: LocalStorageDeviceState): List[StoreId] =
-    ctx.copyRegistry.unsyncedCopies(local).filter: storeId =>
-      ctx.copyRegistry.pathOf(local, storeId).exists: path =>
-        try
-          (unforced.getOrElse(path, Nil) :+ path).foreach(syncDirectory)
-          unforced -= path
-          ctx.copyRegistry.synced(path)
-          true
-        catch case NonFatal(t) =>
-          logger.warn(s"Failed to force $path again. Its copy stays unsynced and unloaded. Error: $t")
-          false
+  // The devices with a resync job outstanding (resync), by path: at most one each
+  private var resyncing: Set[os.Path] = Set()
+
+  /** Whether a resync of the device at `devicePath` is outstanding */
+  private[server] def resyncRunning(devicePath: os.Path): Boolean = resyncing.contains(devicePath)
+
+  /** Forces again each unsynced copy's source and target directories, and the copy's own (the device check), in one
+   *  `Move` job on the device's lane (CopyDisk.resync). Each copy is claimed DiskJob(Move) for the job (one already
+   *  busy is left for a later check); a device with a resync outstanding starts none (coalesced). The apply clears
+   *  the marks and, for a device still the loaded one, takes each copy whose record is still at the forced path as
+   *  synced; a copy whose force failed stays unsynced (logged). `andThen` runs on the control thread once the job's
+   *  result is applied, or at once when no job is submitted (nothing to force, or a resync already outstanding):
+   *  the device check's decisions run there, so they see the copies synced (DeviceReconciler). A hung device's resync
+   *  never applies, and its check waits with it */
+  def resync(local: LocalStorageDeviceState)(andThen: => Unit): Unit =
+    if resyncing.contains(local.devicePath) then
+      andThen
+    else
+      val registry = ctx.copyRegistry
+      val claimed = registry.unsyncedCopies(local).flatMap: storeId =>
+        registry.pathOf(local, storeId).filter(_ => registry.diskJob(local, storeId, JobKind.Move))
+          .map(path => (storeId, path, unforced.getOrElse(path, Nil) :+ path))
+      if claimed.isEmpty then
+        andThen
+      else
+        resyncing += local.devicePath
+        val sync = syncDirectory
+        val dirs = claimed.map((_, path, ds) => path -> ds)
+        ctx.onControl("copy resync", local.io.submit(JobKind.Move, None)(CopyDisk.resync(dirs, sync))): done =>
+          resyncing -= local.devicePath
+          claimed.foreach((storeId, _, _) => registry.diskJobEnded(local, storeId))
+          if ctx.devices.isLoaded(local) then
+            val outcomes = done.getOrElse(Nil).toMap
+            done.failed.foreach: t =>
+              if t != DeviceIo.Cancelled then
+                logger.warn(s"Failed to force the unsynced copies of device ${local.storageDeviceId} again: $t")
+            claimed.foreach: (storeId, path, _) =>
+              outcomes.get(path) match
+                case Some(None) if registry.pathOf(local, storeId).contains(path) =>
+                  unforced -= path
+                  registry.synced(path)
+                case Some(Some(t)) =>
+                  logger.warn(s"Failed to force $path again. Its copy stays unsynced and unloaded. Error: $t")
+                case _ => ()
+          andThen
 
   /** `relocate` of the copy at `from` to `target`, in `to`, logged */
   private def relocateCopy(site: String, from: os.Path, target: os.Path, to: Phase): MoveResult =
     val result = relocate(from, target, to)
+    logMove(site, from, target, result)
+    result
+
+  private def logMove(site: String, from: os.Path, target: os.Path, result: MoveResult): Unit =
     result match
       case MoveResult.Durable => logger.info(s"Moved the copy at $from to $target ($site)")
       case MoveResult.Unsynced(t) =>
@@ -158,7 +258,6 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
                      s"unsynced until a later check of its device forces it. Error: $t")
       case MoveResult.NotMoved(t) =>
         logger.error(s"Failed to move the copy at $from to $target ($site). It stays where it is. Error: $t")
-    result
 
   /** CopyDisk.relocate through this host's seams, an Unsynced result's directories held for the resync */
   private[host] def relocate(from: os.Path, target: os.Path, to: Phase): MoveResult =

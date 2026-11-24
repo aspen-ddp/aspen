@@ -611,7 +611,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
     val active = Map(s -> org.aspen_ddp.aspen.common.metadata.StorageDeviceState.StoreEntry(
       org.aspen_ddp.aspen.common.metadata.StorageDeviceState.StoreStatus.Active, None))
     for
-      retiredWhileHeld <- host.control.copies.retire(sds, s)
+      retiredWhileHeld <- settled(host, host.control.copies.retire(sds, s))
       _ <- check(host, active)
     yield
       heldPhase should be(Some(Phase.Live))
@@ -646,7 +646,8 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
     record.unsynced should be(true)
     CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Lost))
     // The device check's resync forces the copy itself, and clears it
-    host.control.moves.resync(sds) should be(List(s))
+    host.control.moves.resync(sds)(())
+    host.testingOnlyHandleEvents()
     record.unsynced should be(false)
     host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
@@ -758,7 +759,11 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       // A retransmit while it is unsynced ships nothing either
       second <- askAndSettle(host)
       shippedAfterSecond = sends.sources
-      resynced = host.control.moves.resync(local)
+      _ = host.control.moves.resync(local)(())
+      resyncSubmitted = host.control.moves.resyncRunning(dev)
+      // The resync's job and its apply
+      _ = host.testingOnlyHandleEvents()
+      unsyncedAfterResync = recordOf(host, local, shipped).map(_.unsynced)
       third <- askAndSettle(host)
     yield
       first should be(Success(()))
@@ -769,7 +774,8 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       unsyncedAfterFirst should be(Some((Phase.Outbound(tid), true)))
       second shouldBe a[Failure[?]]
       shippedAfterSecond should be(Vector())
-      resynced should be(List(shipped))
+      resyncSubmitted should be(true)
+      unsyncedAfterResync should be(Some(false))
       third should be(Success(()))
       sends.sources.map(_._1) should be(Vector(shipped))
       sends.sources.head._2 should be(CopyFixtures.copyPath(dev, shipped).get)

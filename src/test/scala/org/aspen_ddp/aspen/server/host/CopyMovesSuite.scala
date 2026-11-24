@@ -92,11 +92,15 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     host.testingOnlyHandleEvents()
     record(host, s).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Retired, true)))
     CopyFixtures.retiredCopies(dev, s).size should be(1)
-    host.control.moves.resync(local) should be(List(s))
+    // One resync job on the device's lane, the copy busy with it until it is applied
+    host.control.moves.resync(local)(())
+    host.control.moves.resyncRunning(dev) should be(true)
+    record(host, s).map(_.activity) should be(Some(Activity.DiskJob(JobKind.Move, Activity.Idle)))
     host.testingOnlyHandleEvents()
     // Synced, the retired copy leaves the registry as a durable move's does
     record(host, s) should be(None)
-    host.control.moves.resync(local) should be(Nil)
+    host.control.moves.resync(local)(())
+    host.control.moves.resyncRunning(dev) should be(false)
 
   // Review finding (fix round 1): a move writes only its target phase's parameter file, so a failed rename (or a crash
   // before it) leaves the source reading its own parameter. No param-carrying phase is converted yet: driven through

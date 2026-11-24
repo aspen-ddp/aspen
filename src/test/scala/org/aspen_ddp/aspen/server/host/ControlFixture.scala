@@ -424,10 +424,20 @@ trait ControlFixture:
    *  was actually wrong far better than a timeout would -- but it means callers MUST assert the condition
    *  themselves or they get a false pass. */
   protected def yieldUntil(condition: => Boolean, maxYields: Int = 100): Future[Unit] =
+    // Copy moves, retires and deletes are lane jobs: each yield runs those of this suite's hosts, as the calls that
+    // queued them once ran them inline (runCopyJobs; a held path's stay held)
+    runAllCopyJobs()
     if condition || maxYields == 0 then
       Future.unit
     else
       Future(()).flatMap(_ => yieldUntil(condition, maxYields - 1))
+
+  /** runCopyJobs of every lockstep host this suite built with newHost */
+  protected def runAllCopyJobs(): Unit =
+    rigs.keySet.toArray(Array.empty[Host]).foreach: host =>
+      host.threading match
+        case _: LockstepThreading => runCopyJobs(host)
+        case _ => ()
 
   /** Yields and pumps the network's transactions until `condition` holds, failing with `what` once `timeout` of real
    *  time has passed without it: never a silent end. For waits on work that crosses real-time hops (the client's
@@ -753,8 +763,37 @@ trait ControlFixture:
       batch.foreach(_.run())
       batch = ls.removeQueued(isLoadRead)
 
+  /** Runs the queued copy jobs (StoreCopies, CopyMoves: `Move`, `Retire`, `Release`, `Delete`) and their results
+   *  (DeviceJobDone named "copy ..."), including what those queue of the same, ahead of and leaving queued everything
+   *  else, without the drain's disk check: what a retire, move or discard once did inline. A held path's jobs stay
+   *  held */
+  protected def runCopyJobs(host: Host): Unit =
+    val ls = lockstep(host)
+    val kinds = Set[JobKind](JobKind.Move, JobKind.Retire, JobKind.Release, JobKind.Delete)
+    def isCopyJob(task: Runnable): Boolean = task match
+      case t: LockstepThreading.DeviceTask => kinds.contains(t.kind)
+      case t: Host.EventTask => t.event match
+        case e: Host.DeviceJobDone => e.what.startsWith("copy ")
+        case _ => false
+      case _ => false
+    var batch = ls.removeQueued(isCopyJob)
+    while batch.nonEmpty do
+      batch.foreach(_.run())
+      batch = ls.removeQueued(isCopyJob)
+
   /** The kinds of the management jobs held on `path`, in submission order. */
   protected def heldJobs(host: Host, path: os.Path): List[JobKind] = lockstep(host).held(path)
+
+  /** `f`, once drains of `host` have completed it: work whose steps are lane jobs (a retire, a move) completes only
+   *  as the drains run them. Drains and yields until `f` completes or 10 s pass (then `f` as it is, still pending) */
+  protected def settled[T](host: Host, f: Future[T]): Future[T] =
+    given ExecutionContext = executionContext
+    val deadline = System.nanoTime() + 10_000_000_000L
+    def loop(): Future[T] =
+      host.testingOnlyHandleEvents()
+      if f.isCompleted || System.nanoTime() > deadline then f
+      else Future(()).flatMap(_ => loop())
+    loop()
 
   private def lockstep(host: Host): LockstepThreading = host.threading match
     case t: LockstepThreading => t

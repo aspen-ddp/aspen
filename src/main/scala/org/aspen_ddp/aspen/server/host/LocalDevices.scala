@@ -2,7 +2,6 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.FileStat
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission}
 import scribe.Logging
 
@@ -60,37 +59,3 @@ class LocalDevices extends Logging:
   /** Whether `sds` is still the loaded state of its device (not unloaded, nor replaced by a later load) */
   def isLoaded(sds: LocalStorageDeviceState): Boolean =
     devices.get(sds.storageDeviceId).exists(_ eq sds)
-
-  /** Deletes a copy that never was its store's owner copy and holds nothing its source lacks, so it needs no retiring
-   *  (StoreCopies): the copy a transfer delivered onto a device that turned out to be tombstoned
-   *  (TransferOutcome.SourceRestored: the pool still names the source, which still holds the data), or one a rebuild
-   *  built from its peers on a device the tree does not say owns it (RebuildOutcome.Discard). Its place in arrived/
-   *  or rebuilt/ keeps tryLoadStore from loading it, but nothing else would ever reclaim it, since
-   *  reconcileDeviceState ignores a failed device outright. Were it loaded, and the source happened to live on this
-   *  same host, the load would replace the source's entry in `stores`, which is keyed by StoreId alone.
-   *
-   *  Nothing is unloaded because nothing was loaded: the load is downstream of the decision. Returns the device whose
-   *  copy was deleted, for the copy registry.
-   */
-  def discardStoreDirectory(storeId: StoreId,
-                            deviceId: StorageDeviceId,
-                            reason: String): Option[LocalStorageDeviceState] =
-    devices.get(deviceId) match
-      case None =>
-        // The operation completed on a device this process never loaded, or one a shutdown has
-        // since unloaded. Log rather than assume.
-        logger.warn(s"Cannot discard the copy of store $storeId on unloaded device $deviceId")
-        None
-
-      case Some(sds) =>
-        // No record: no copy of the store on the device. A stat that fails is no absence (FileStat): the delete is
-        // attempted, and fails rather than report it gone
-        sds.copies.pathOf(storeId) match
-          case Some(storePath) if !FileStat.existence(storePath).contains(false) =>
-            logger.warn(s"Discarding the copy of store $storeId on device $deviceId. " +
-                        s"$reason: $storePath")
-            // Rename-first: a failure leaves the copy whole where it is, so a restart never loads it.
-            // The store is not loaded, so nothing serves it now
-            if StoreCopies.delete(sds.devicePath, storePath, reason) then Some(sds) else None
-          case _ =>
-            None

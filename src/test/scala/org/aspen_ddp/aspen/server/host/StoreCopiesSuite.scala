@@ -14,11 +14,11 @@ class StoreCopiesSuite extends FileBasedTests:
     os.symlink(device / "copy", locked / "copy")
     os.perms.set(locked, "rw-------")
     val deleted =
-      try StoreCopies.delete(device, device / "copy", "a test")
+      try CopyDisk.delete(device, device / "copy", "a test")
       finally os.perms.set(locked, "rwx------")
     deleted should be(false)
     os.exists(locked / "copy" / "marker") should be(true)
 
   test("a copy known absent is gone"):
     os.makeDir.all(tdir / "device")
-    StoreCopies.delete(tdir / "device", tdir / "device" / "copy", "a test") should be(true)
+    CopyDisk.delete(tdir / "device", tdir / "device" / "copy", "a test") should be(true)

@@ -145,11 +145,20 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  and its pending-delete copies released.
    */
   private def reconcileDeviceState(local: LocalStorageDeviceState,
-                                   remote: StorageDeviceState): Unit =
+                                   remote: StorageDeviceState)(ended: () => Unit): Unit =
     local.reconciledEntries = Some(remote.stores)
-    // Copies whose move was not durable (CopyMoves) are forced again first, so the decisions
-    // see them synced, and copies whose move to lost/ failed are moved (StoreRebuilds.moveToLost)
-    ctx.moves.resync(local)
+    // Copies whose move was not durable (CopyMoves) are forced again first, a job on the device's lane, so the
+    // decisions see them synced: they run once its result is applied, the device's check held until then (a hung
+    // device's check waits with it, and its later checks are deferred behind it). Then copies whose move to lost/
+    // failed are moved (StoreRebuilds.moveToLost)
+    ctx.moves.resync(local):
+      try
+        if ctx.devices.isLoaded(local) then
+          reconcileResynced(local, remote)
+      finally ended()
+
+  /** reconcileDeviceState's steps after its resync */
+  private def reconcileResynced(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     ctx.rebuilds.retryPendingLost(local)
     if remote.isFailed then
       // An operator has declared this device dead. Its directory can still mount -- a dead
@@ -473,12 +482,21 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     lookup match
       case Success(pendingState) =>
         pendingState.onComplete: result =>
+          // The reconcile may end later than this callback (its resync job): it ends the check then, once
+          var ended = false
+          def endOnce(): Unit =
+            if !ended then
+              ended = true
+              endDeviceCheck()
+          var handedOff = false
           try
             result match
               case Success(remote) =>
                 // Load state re-read here, not at dispatch. See startDeviceCheck's scaladoc.
                 ctx.devices.devices.get(storageDeviceId) match
-                  case Some(local) => reconcileDeviceState(local, remote)
+                  case Some(local) =>
+                    reconcileDeviceState(local, remote)(() => endOnce())
+                    handedOff = true
                   case None =>
                     // A device not loaded right now: one that has not appeared on disk in this
                     // process, one the load decision rejected, or one a shutdown unloaded.
@@ -506,7 +524,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
                   else "never-loaded storage device"
                 logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
                             s"be registered in the storage-devices tree. Error: $err")
-          finally endDeviceCheck()
+          finally
+            if !handedOff then endOnce()
 
       // A distinct message from the Failure(err) branch above, which explains itself with a
       // missing tree registration. True of a failed read; not necessarily true of a throw, which

@@ -88,7 +88,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       sid(3) -> Phase.Arrived("t-in"),
       sid(4) -> Phase.Rebuilt("ep")))
     host.control.copyRegistry.device(deviceA).get.copies.values.map(_.activity).toSet should be(Set(Activity.Idle))
-    host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
+    host.testingOnlyVerifyCopyRegistry() should be(Nil)
 
   // A copy in live/ that cannot be read is Live by its location, and its load's
   // config read waits (StoreLoader.awaitUnreadRetry)
@@ -103,7 +103,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       host.testingOnlyHandleEvents()
       phases(host, deviceA) should be(Map(sid(0) -> Phase.Live))
       host.control.router.silentStores should contain(sid(0))
-      host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
+      host.testingOnlyVerifyCopyRegistry() should be(Nil)
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
     finally os.perms.set(dir, "rwx------")
 
@@ -159,8 +159,8 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       val copies = restarted.control.copyRegistry.device(source).get
       copies.copies.values.map(_.activity).toSet should be(Set(Activity.Idle))
       copies.work should be(Map())
-      host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
-      restarted.control.copyRegistry.verifyAgainstDisk() should be(Nil)
+      host.testingOnlyVerifyCopyRegistry() should be(Nil)
+      restarted.testingOnlyVerifyCopyRegistry() should be(Nil)
 
   // ---- Fix round 1: attach is total (I1), learning and refreshing at load (I3), untracked records (risk 2), and one
   //      wiring test per transition class (I4) ----
@@ -178,6 +178,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     else
       if drain then
         host.testingOnlyHandleEvents()
+      else
+        // A retire's or discard's lane jobs, which the rebuild waits on, run without the drain's disk check
+        runCopyJobs(host)
       for
         _ <- yieldUntil(condition, 20)
         _ <- waitForTransactionsToComplete()
@@ -192,7 +195,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
   /** The registry agrees with the disk, no update threw, and no load had to learn a copy */
   private def consistent(host: Host): org.scalatest.Assertion =
     host.testingOnlyHandleEvents()
-    host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
+    host.testingOnlyVerifyCopyRegistry() should be(Nil)
     host.control.copyRegistry.takeRegistryErrors() should be(Vector())
     host.control.copyRegistry.learned should be(Vector())
 
@@ -266,12 +269,12 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       org.aspen_ddp.aspen.server.StoreConfig(sid(0), org.aspen_ddp.aspen.server.StoreConfig.RocksDB(None), None,
         org.aspen_ddp.aspen.common.ida.Replication(3, 2)),
       dir, dev / org.aspen_ddp.aspen.server.store.backend.StoreCreation.CreatingDirectory)
-    host.control.copyRegistry.verifyAgainstDisk().size should be(1)
+    host.testingOnlyVerifyCopyRegistry().size should be(1)
     host.control.loader.tryLoadStore(local, dir)
     runLoadReads(host) // its config read, on the device's lane
     phases(host, deviceA) should be(Map(sid(0) -> Phase.Live))
     host.control.copyRegistry.takeLearned().size should be(1)
-    host.control.copyRegistry.verifyAgainstDisk() should be(Nil)
+    host.testingOnlyVerifyCopyRegistry() should be(Nil)
     host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 
   atest("a store served from an unloaded device has an untracked record, Idle once the router removes it"):
@@ -289,7 +292,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       // Kept, as a closed copy's record is kept on a loaded device: the store stays silent, as the router's mark says
       current.map(r => (r.phase, r.activity)) should be(Some((Phase.Live, Activity.Idle)))
       smgr.control.copyRegistry.silence(storeId) should be(Silence.Silent(Set(SilenceReason.CopyHere)))
-      smgr.control.copyRegistry.verifyAgainstDisk() should be(Nil)
+      smgr.testingOnlyVerifyCopyRegistry() should be(Nil)
 
   atest("a create registers its copy Live"):
     given ExecutionContext = executionContext
@@ -357,6 +360,8 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     host.control.rebuilds.startRebuild(local, sid(7), Some(UUID.randomUUID()), acceptLoss = false)
     for
       _ <- awaitRebuild(host, source, sid(7))
+      // The discard is a lane job its flip's outcome queues
+      _ = runCopyJobs(host)
     yield
       recorded(host).rebuildOutcomes((source, sid(7))) should be(RebuildOutcome.Discard)
       phases(host, source) should be(Map())
@@ -402,7 +407,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     consistent(host)
     val lost = phases(host, deviceA)
     for
-      retired <- host.control.copies.retire(local, sid(1))
+      retired <- settled(host, host.control.copies.retire(local, sid(1)))
     yield
       lost should be(Map(sid(0) -> Phase.Lost, sid(1) -> Phase.Live))
       retired should be(true)
@@ -1030,7 +1035,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val local = loadedDevices(host)(deviceA)
     val before = host.control.router.answersUnknown(sid(1))
     for
-      retired <- host.control.copies.retire(local, sid(1))
+      retired <- settled(host, host.control.copies.retire(local, sid(1)))
     yield
       before should be(false)
       retired should be(true)
@@ -1217,7 +1222,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     host.testingOnlyHandleEvents()
     val local = loadedDevices(host)(deviceA)
     val episode = UUID.randomUUID()
-    def mismatches(): List[String] = host.control.copyRegistry.verifyAgainstDisk()
+    def mismatches(): List[String] = host.testingOnlyVerifyCopyRegistry()
     for
       _ <- net.createDevice(deviceA)
       _ <- setDeviceState(deviceA)(_.setRebuilding(sid(0), episode))

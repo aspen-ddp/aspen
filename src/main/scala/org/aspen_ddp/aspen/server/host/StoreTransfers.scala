@@ -192,9 +192,9 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
 
   private def discardArrivedTransferIn(storeId: StoreId,
                                        toDeviceId: StorageDeviceId): Unit =
-    ctx.devices.discardStoreDirectory(storeId, toDeviceId,
-      "The pool does not name this device, so this copy belongs to nobody")
-      .foreach(sds => ctx.copyRegistry.removed("discardArrivedTransferIn", sds, storeId))
+    ctx.copies.discard(storeId, toDeviceId,
+      "The pool does not name this device, so this copy belongs to nobody"):
+      sds => ctx.copyRegistry.removed("discardArrivedTransferIn", sds, storeId)
 
   /** Restarts a failed transfer in after TransferInRetryDelay rather than at once. A deterministic
    *  failure (the sender's archiver exiting non-zero, a full disk here) would otherwise loop hot,
@@ -433,7 +433,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         // data. One whose save file is no longer valid would be repointed onto, and the source's intact copy then
         // released, as promotion refuses for a staged copy. Until the pool update commits the source still holds the
         // state, so either is deleted (T13) and the transfer started over. A save file that cannot be read
-        // (CrashRecoveryLog.isUnreadable), or a delete that could not stat the copy (StoreCopies.delete answers not
+        // (CrashRecoveryLog.isUnreadable), or a delete that could not stat the copy (CopyDisk.delete answers not
         // gone), says nothing of the copy: it is neither resumed nor deleted, and the next check reads it again.
         // A copy in any other phase is an earlier tenancy's, retired before the receive (retireEarlierTenancy).
         val next: Next = record match
@@ -467,7 +467,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                   case Right(Some(why)) =>
                     logger.warn(s"Deleting the arrived copy of store $storeId on device $toDeviceid: $why")
                     // Rename-first (T13): a failure leaves the copy whole in arrived/. The source still owns the store
-                    if StoreCopies.delete(devicePath, path, s"an unusable arrived copy of store $storeId") then
+                    if CopyDisk.delete(devicePath, path, s"an unusable arrived copy of store $storeId") then
                       ctx.copyRegistry.removed("startIn unusable arrived copy", toDevice, storeId)
                       Next.Receive
                     else

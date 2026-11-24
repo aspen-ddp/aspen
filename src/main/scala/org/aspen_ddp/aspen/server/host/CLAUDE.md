@@ -14,7 +14,10 @@
   `HostCopies.unsynced`; a copy of a device not attached yet, an adoption's or a lost CRL's moves, is held in
   `unsyncedPaths` until its attach). An unsynced copy is never loaded (`tryLoadStore`), shipped (`startOut`
   refuses), retired (`StoreCopies.retire` answers false) or received over (`startIn` waits). Each device check
-  first forces every unsynced copy again (`CopyMoves.resync`, at the top of `reconcileDeviceState`). A copy moved
+  first forces every unsynced copy again (`CopyMoves.resync`, at the top of `reconcileDeviceState`: one `Move` job on
+  the device's lane, `CopyDisk.resync`, each copy DiskJob(Move) meanwhile, one outstanding per device; the check's
+  decisions run in its continuation once the result is applied, so they see the copies synced, and the check stays
+  active until then: a hung device's check waits, its later checks deferred behind it). A copy moved
   Live unsynced is loaded, once synced, by the reconcile's Live-copy load rule (`CopyDecision.Load`, with its online
   gossip; see the reconcile below): the case that moved it will not see it again, and a check that finds the entry not
   Active or work holding the copy only defers it
@@ -41,8 +44,16 @@
   target's copy id before the create; a rebuild's finish into `rebuilt/`; a transfer's promotion into `arrived/`; P4)
   and keeps it across moves. Every phase change is one `CopyMoves.move` (`DeviceControl.moves`; `moveUnattached` for a
   device being loaded): the target phase's parameter file written durably, then `DurableFiles.move` through the `rename`
-  and `syncDirectory` seams, recorded as a fact (`HostCopies.moved`; a load retry the copy awaited is retargeted to its
-  new path for a move into Live and dropped for any other phase). `DurableFiles.move` throws
+  and `syncDirectory` seams (`CopyDisk.relocate`), recorded as a fact (`HostCopies.moved`; a load retry the copy
+  awaited is retargeted to its new path for a move into Live and dropped for any other phase, also beneath a DiskJob
+  mark, so the job's end restores it at the new path). `CopyMoves.moveOnLane` is the same move as one `Move` job on the
+  device's lane: the copy claimed DiskJob(Move) first, the result recorded under the mark and the mark cleared in the
+  apply, after a recheck that the device is still loaded and the record the one moved (same copy id and phase);
+  otherwise, or for a cancelled job, nothing is recorded and the caller gets NotMoved, and an unforced rename on a
+  device unloaded meanwhile is held for its attach (`HostCopies.unsynced`). Retire uses it (and
+  `StoreRebuilds.moveToLostOnLane`); the synchronous `move`, `place` and `moveUnattached` still run on the control
+  thread for the rebuild, transfer and adoption callers (Tasks 14, 15 of the device I/O isolation plan).
+  `DurableFiles.move` throws
   `DurableFiles.MoveNotForced` for a rename that landed but was not forced: `MoveResult.Unsynced`, the record takes the
   phase with `unsynced` (above) and `resync` forces both directories again; any other failure is `NotMoved`, nothing
   changed. A durable move to Retired unregisters the record (P3); an unsynced one stays recorded, Retired, out of
@@ -50,7 +61,9 @@
   directory (a transfer's promotion) is one `CopyMoves.place`, the same steps under a fresh copy id, recorded as a fact
   (`HostCopies.placed`, unsynced for a rename not forced). Tests place, find and read copies only through `CopyFixtures`
   (`placeCopy`, `markCopy`, `copyPath`, `phaseOf`, `retiredCopies`). `CopyMoves.move` refuses (NotMoved, logged at error
-  as a bug) a record that is Opening, Served or Closing, and a copy unsynced before a move stays unsynced after it (its
+  as a bug) a record that is Opening, Served or Closing, refuses (logged at info) one busy with a disk job (DiskJob:
+  another job holds its disk, so the move waits for a later attempt; `moveOnLane`'s own job holds the mark itself and
+  records through it), and a copy unsynced before a move stays unsynced after it (its
   earlier directories still to force move with it), until the resync. A move whose target is the copy's own path is
   NotMoved (no move changes only a parameter). A failed read of an `arrived/`, `outbound/` or `rebuilt/` copy's
   parameter file, or a phase directory that cannot be listed, fails `CopyLayout.list`: the device stays unloaded,
@@ -131,7 +144,7 @@
   (`StoreRebuilds.bringRebuiltLive`, T3: a NotMoved copy stays Rebuilt for the Completed Rebuilds case, which selects
   offline Rebuilt records of Active entries; an Unsynced one is Live, for `Load` once synced), `AdoptOffline`
   Rebuilt -> Parked in one move (`keepRebuiltStoreOffline`, T4; `moveUnattached` at its `rebuilt/` path when the device
-  is already unloaded), `Discard` deletes it rename-first (`discardStoreDirectory`, `StoreCopies.delete`, T13),
+  is already unloaded), `Discard` deletes it rename-first (`StoreCopies.discard`, `CopyDisk.delete`, T13),
   `Superseded`/`Unconfirmed`/`NotOwned` leave it Rebuilt. A Parked copy goes Live (T5) as an abandoned Outbound one
   does, and is a T6 source (Parked -> Outbound(tid), a real move). `retireForeignCopy` keys off the record's phase (no
   record, no copy). A lost device CRL leaves Rebuilt copies alone (`holdsOwnState`, by location) and treats Parked ones
@@ -165,7 +178,9 @@
   removal, `handleSaveFileRemovalFailed`) leaves the copy where it is, to load again: neither leaves it Idle for `Load`.
   Each records a load retry, so the copy ends AwaitingRetry and is reloaded by `retryFailedLoads` under the retry's
   backoff (a failed CRL load's doubles from the retry its open took, `UnloadFailedStore.previous`), never at each
-  device check. A move that fails is logged at error and the copy held offline in `CopyMoves.pendingLost(local)` (not a copy Opening, Served or Closing again since
+  device check. A copy busy with a disk job (DiskJob) is not moved but held pendingLost, so the retry moves it once
+  the job has ended. A move that fails is logged at error and the copy held offline in
+  `CopyMoves.pendingLost(local)` (not a copy Opening, Served or Closing again since
   the move was asked for, e.g. a failed unserved backend's close ending after a new open: logged at warn, left to its
   own open or close, never held) (in memory, per device, dropped at detach): never
   loaded (`tryLoadStore`), shipped (`startOut`, `closedForTransfer`: treated as Lost), retired (`StoreCopies.retire`
@@ -202,7 +217,7 @@
   Unsynced one leaves it Live, for `Load` once synced. `PoolRepointedOffline` leaves it Arrived. `startIn` decides
   from the record: none, receive; Retired or unsynced, wait; `Arrived(tid)` of this transfer with a valid save file,
   resume the pool update; Arrived of another transfer, or with an unusable save file, deleted rename-first (T13,
-  `StoreCopies.delete`, the record removed) and received; any other phase, Live included, the earlier tenancy's,
+  `CopyDisk.delete`, the record removed) and received; any other phase, Live included, the earlier tenancy's,
   retired (`retireEarlierTenancy`, below; the "store path already exists" refusal is gone). The reconcile's tree
   snapshot may predate this transfer's own pool update, after which `recordTransferIn` has moved the transfer's copy
   Live, so `retireEarlierTenancy` claims its work (RetiringEarlierTenancy) and acts only once a fresh read of the
@@ -264,9 +279,11 @@
   purpose from `closingFor` (DeviceShutdown: Shutdown / Relinquish; `handleClose` with `extractCrl`: TransferOut; else
   FailStop), until `handleClose`/`closeUnloaded` end it (Idle, or AwaitingRetry when a retry was parked while it closed;
   a transfer-out close ends once the store is closed, before the extraction's deletion); `StoreCopies.retire` Retiring
-  (`isRetiring`, over loaded devices: a second retire of the store does nothing); `Activity.DiskJob(kind, prior)` marks a copy busy
-  while a disk job for it runs on its device's lane (`HostCopies.diskJob`, a claim legal from Idle, Served and AwaitingRetry,
-  refused if the copy is already busy; `diskJobEnded`, a fact, restores `prior`). `CopyDecision.decide` returns Nil for a
+  (`isRetiring`, over loaded devices, by `Activity.underlying`: a second retire of the store does nothing);
+  `Activity.DiskJob(kind, prior)` marks a copy busy while a disk job for it runs on its device's lane
+  (`HostCopies.diskJob`, a claim legal from Idle, Served, AwaitingRetry and Retiring, the last for a retire's own
+  steps, refused if the copy is already busy; `diskJobEnded`, a fact, restores `prior`; `awaitingRetry` parks a retry
+  for a copy whose underlying activity is Closing or Retiring). `CopyDecision.decide` returns Nil for a
   DiskJob copy, `ForgetGoneCopy` and `EndQueuedRebuild` included, and the result's application checks the device again; a
   DiskJob over Served still counts as served for silence, the move guards and `isOffline` (`Activity.underlying`). Work is the only record of each
   owner's work, set where it starts and ends: Create (`createNewStore`, until the copy is served, its open fails or the
@@ -313,7 +330,9 @@
   fails on any violation the registry recorded, a fact's or a refused claim's (R21, R22); production logs them at
   error, applies the fact, and backs off the claim. With `verifyCopyRegistry` (every lockstep test host:
   TestNetwork, every ControlFixture host, `ControlFixture.compared` seams, FsifIntegrationSuite)
-  each drain also throws on any `verifyAgainstDisk` mismatch (phase, unrecorded config'd directory, record without
+  each drain also throws on any `verifyAgainstDisk` mismatch (each loaded device's check one job on its lane,
+  `CopyDisk.verify`, against its records taken at submission; `Host.testingOnlyVerifyCopyRegistry` submits them after
+  the drain and drains again; a held device is not checked) (phase, unrecorded config'd directory, record without
   directory) and on any copy a load, retry, LoadStore or `readAtLoad` learned since the last drain
   (`HostCopies.takeLearned`): a learn is a site that placed a copy without recording it. The disk check skips only:
   stats that fail; a create's record before its copy is placed
@@ -338,7 +357,8 @@
   any device), in `(poolId.uuid, poolIndex)` order (D2, store-major): for each in turn it reads its inputs fresh
   (`storeInputs`: the entry, the copy's record, its work and the `CopyDecision.StoreFacts`, each field naming its
   source), runs the pure `CopyDecision.decide` and carries out its actions in order (`run`, one case per
-  `CopyDecision.Action`, onto the handlers) before the next store's inputs are read. The former passes are decide's
+  `CopyDecision.Action`, onto the handlers) before the next store's inputs are read. (The steps after the resync run in
+  its continuation, `reconcileResynced`.) The former passes are decide's
   cases, in this order, each with its rationale there: EndQueuedRebuild (queued Rebuild work of a store no longer
   Rebuilding ends first, so the rest see its copy free; `StoreRebuilds.endQueuedRebuild`), Deleted Stores
   (TakeOutOfService for a served copy with no entry, `retireUnlistedServed`; ForgetGoneCopy; Retire), Missing Stores
@@ -370,7 +390,10 @@
   `DeviceShutdown.storesToClose`). Tests place copies after a device's load with `ControlFixture.placedCopies`, and fake
   a served copy with `servedHere` (the recording shutdown close ends it); the recording `tryLoadStore` opens
   nothing, so its copy stays Idle and `Load` offers it again at the next check, unless the test sets
-  `RecordingSeams.offersClaimOpening` (each offer then claims the copy Opening, as a real open does);
+  `RecordingSeams.offersClaimOpening` (each offer then claims the copy Opening, as a real open does); copy jobs
+  (`Move`, `Retire`, `Release`, `Delete` and their "copy ..." results) run with `ControlFixture.runCopyJobs` (every
+  `yieldUntil` runs them for the suite's lockstep hosts, as their callers once ran them inline; `settled(host, f)`
+  drains until a retire's future completes; `CopyIoSuite` holds each);
   `ControlFixture.awaitLoudly` waits on work that crosses real-time hops and fails, naming what it waited for, when
   its time runs out. `LocalDevices.isLoaded(sds)`
   says whether a device state is still the loaded one. `CopyDecisionSuite` checks decide's invariants over every
@@ -501,7 +524,7 @@
   checks (all in `LoadDisk` jobs) hold a load whose stat fails back through `awaitUnreadRetry` (a rebuilt store loaded without its gates would be
   a full acceptor of its old incarnation's transactions); the Missing Stores case, `dropLeftoverCrlState` and the
   Deleted Stores case skip such a store; `StoreCopies.retire` fails rather than report a clear path, and
-  `StoreCopies.delete` reports gone only a copy known absent; `DeviceCrlDisk.open` fails (device left for
+  `CopyDisk.delete` reports gone only a copy known absent; `DeviceCrlDisk.open` fails (device left for
   the next scan; a child whose config cannot be stat'd counts as a store directory) and so does `holdsOwnState`.
   `tryLoadDevice` leaves a device whose directory, config or `failed` marker cannot be stat'd for the next scan, and
   `DeviceMarkers`' host-id reads and `storesIn` throw too. `LoadDisk.readArrivedAt` counts a failed stat as an
@@ -681,7 +704,14 @@
   4. the copy is moved from `lost/` to `<device>/pending-delete/<copy>` under its copy name (`CopyMoves.move` to
      Retired; T11).
 
-  A crash at any later step leaves the copy in `lost/`, so the next retire redoes what remains. Three paths retire:
+  A crash at any later step leaves the copy in `lost/`, so the next retire redoes what remains. No step touches the
+  disk on the control thread (device I/O isolation, Task 12; disk work in `CopyDisk`): the copy's stat is a `Retire`
+  job (DiskJob(Retire) meanwhile), step 1 a `Move` job (`StoreRebuilds.moveToLostOnLane`), step 2 a `Retire` job
+  (`CopyDisk.retire`, given the store's device-CRL entries read first; the copy DiskJob(Retire) over Retiring), step 3
+  the CRL's own `dropStore`, and step 4 a `Move` job (`moveOnLane`, the copy Retiring until it ends). Each apply
+  rechecks that the device is still loaded and the copy still at its path; a mismatch ends the retire with false. A
+  retire refuses (false) a copy another disk job holds, and one whose job never returns (a hung device) leaves its
+  future pending and the copy busy: never decided around (spec 7a). Three paths retire:
   - The Rebuilding case, for a Lost copy of a store rebuilt here (`StoreRebuilds.discardLostStore`). It holds a rebuild
     slot from its start (`maxConcurrentRebuilds` counts its Rebuild work's DiscardingLost stage), and the slot passes
     straight to the rebuild in the same callback (DiscardingLost -> Running), so one reconcile cannot retire every Lost
@@ -720,16 +750,23 @@
     then moved to `lost/`, offline), so the check that follows retires it.
 
   The reconcile **releases** (`StoreCopies.release`) a `pending-delete/` copy once its store is Active on its owner
-  device: on this device by its own entry, elsewhere by the pool's entry and that device's state. This is the only
+  device: on this device by its own entry, elsewhere by the pool's entry and that device's state. The sweep of
+  `deleting/` and the listing are one `Release` job on the device's lane (`CopyDisk.pendingDeletes`, at most one per
+  device outstanding, `releasesRunning`), and each delete one `Delete` job (one per copy, `deletesRunning`), each
+  applied only while the device is still loaded. A release of a copy on a hung device waits on that device's lane,
+  never inferred done, while the store's owner copy elsewhere comes Active and serves (single-owner rule). This is
+  the only
   release condition. A rebuild that cannot finish, a failed read, or a name that identifies no store keeps the copy.
   An accepted rebuild loss is no exception: the operator's acceptance is the release, and `accept-rebuild-loss` says
   so. The store comes from the copy's name, never from parsing anything inside it.
 
-  Every delete of a copy is **rename-first** (`StoreCopies.delete`). The copy is renamed into `<device>/deleting/`,
+  Every delete of a copy is **rename-first** (`CopyDisk.delete`). The copy is renamed into `<device>/deleting/`,
   durably, then removed, and whatever is left there is removed at device load and at each reconcile. So an interrupted
   delete never leaves part of a copy in a phase directory, loadable, or a partial copy in `pending-delete/`. A copy that
   never was the owner's and holds nothing its source lacks is deleted directly (still rename-first):
-  `LocalDevices.discardStoreDirectory` and a stale or unusable arrived copy in `StoreTransfers.startIn`. Scratch areas
+  `StoreCopies.discard` (one `Delete` job, `CopyDisk.discard`, the copy DiskJob(Delete) meanwhile; its callback runs
+  only for a deleted copy on a device still loaded, its record still at the path) and a stale or unusable arrived copy
+  in `StoreTransfers.startIn` (`CopyDisk.delete`, still on the control thread: Task 15). Scratch areas
   are never loaded, so they are deleted in place: `creating/`, transfer staging (`transferring-in/`, every attempt's
   directory) and `deleting/` are swept whole at device load (`DeviceDiscovery.loadOwnedDevice`); `rebuilding/<id>` holds
   a resumable checkpoint and is deleted only by `StoreRebuilds.sweepUnlistedStaging` or a first pass's `createStaging`.

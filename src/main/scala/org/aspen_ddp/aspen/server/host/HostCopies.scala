@@ -223,10 +223,11 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   /** Test-only (Host.testingOnlyRescan): registers each copy on `sds` whose store has no record, with its phase,
    *  as `attach` registers the directories a device load finds: copies a test placed by hand after the load. Records
    *  already there are left as they are, and so is a copy a rebuild's finish placed whose completion's handler has
-   *  not yet run (finishInFlight): the handler records it. Returns the stores registered */
+   *  not yet run (finishInFlight): the handler records it. Returns the stores registered. A test seam only: it lists
+   *  the device inline, on the test's own (lockstep control) thread, and no production path calls it */
   def rescan(sds: LocalStorageDeviceState): List[StoreId] =
     copiesOf(sds).toList.flatMap: copies =>
-      CopyLayout.list(sds.devicePath).copies.collect:
+      CopyDisk.list(sds.devicePath).copies.collect:
         case f if f.phase != Phase.Retired && !copies.copies.contains(f.storeId) &&
                   !finishInFlight(sds.storageDeviceId, sds.devicePath, f.storeId) =>
           copies.register(f.storeId, f.phase, f.copyId)
@@ -376,7 +377,7 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
             learnedCopy(s"device ${retry.sds.storageDeviceId}: $storeId learned awaiting a retry, Live")
             copies.register(storeId, Phase.Live, copyId)
             copies.setActivity(storeId, Activity.AwaitingRetry(retry))
-          case Some(r) => r.activity match
+          case Some(r) => r.activity.underlying match
             case Activity.Closing(_) | Activity.Retiring => parkedRetries += (copies.deviceId, storeId) -> retry
             case _ => copies.setActivity(storeId, Activity.AwaitingRetry(retry))
 
@@ -617,11 +618,12 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
 
   /** Whether a copy of `storeId` is being retired on any device of the host (its Retiring activity) */
   def isRetiring(storeId: StoreId): Boolean =
-    allCopies.exists(_.copies.get(storeId).exists(_.activity == Activity.Retiring))
+    allCopies.exists(_.copies.get(storeId).exists(_.activity.underlying == Activity.Retiring))
 
   /** A disk job of `kind` for the copy of `storeId` on `sds` is about to be submitted to the device's lane: the copy
    *  is DiskJob, busy, until diskJobEnded. A claim: refused (false) where the copy is already busy (a disk job in
-   *  flight, or any activity but Idle, Served or AwaitingRetry), has no record, or `sds` is not attached */
+   *  flight, or any activity but Idle, Served, AwaitingRetry or Retiring, the last for a retire's own disk steps),
+   *  has no record, or `sds` is not attached */
   def diskJob(sds: LocalStorageDeviceState, storeId: StoreId, kind: JobKind): Boolean =
     claim("disk job"):
       val copies = copiesOf(sds).getOrElse(
@@ -795,18 +797,23 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
       copiesOf(sds).foreach: copies =>
         ctx.moves.holdLost(sds, storeId, held = false)
         copies.applyMove(storeId, to, copyId, unsynced).foreach(violation(site, _))
-        // A load retry the copy awaited names the path it left: retargeted to its new path for a move into Live (T7),
-        // where it may still load; dropped for any other phase, which never loads (its onServed unrun: the copy is
-        // being shipped, parked or retired)
+        // A load retry the copy awaited names the path it left: retargeted to its new path for a move into Live
+        // (T7), where it may still load; dropped for any other phase, which never loads (its onServed unrun: the
+        // copy is being shipped, parked or retired). A copy busy with a disk job (its own move's) has the retry
+        // beneath the mark retargeted or dropped the same way, so the job's end restores it at the copy's new path
+        def retargeted(r: LoadRetry): Activity =
+          if to == Phase.Live then
+            Activity.AwaitingRetry(r.copy(storePath = CopyLayout.path(sds.devicePath, storeId, copyId, to)))
+          else
+            logger.info(s"Dropping the load retry of store $storeId on device ${sds.storageDeviceId}: its copy " +
+                        s"moved to $to ($site)")
+            Activity.Idle
         copies.copies.get(storeId).map(_.activity).foreach:
           case Activity.AwaitingRetry(r) =>
-            if to == Phase.Live then
-              activityFact(site, copies, storeId,
-                Activity.AwaitingRetry(r.copy(storePath = CopyLayout.path(sds.devicePath, storeId, copyId, to))))
-            else
-              logger.info(s"Dropping the load retry of store $storeId on device ${sds.storageDeviceId}: its copy " +
-                          s"moved to $to ($site)")
-              activityFact(site, copies, storeId, Activity.Idle)
+            activityFact(site, copies, storeId, retargeted(r))
+          case Activity.DiskJob(kind, Activity.AwaitingRetry(r)) =>
+            // Not a move of the activity: the mark stays, only what it restores changes
+            copies.applyActivity(storeId, Activity.DiskJob(kind, retargeted(r))): Unit
           case _ => ()
         if to == Phase.Retired && !copies.copies.get(storeId).exists(_.unsynced) then
           removed(site, sds, storeId)
@@ -894,42 +901,30 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   /** Test-only. For every loaded device, where its records and its disk disagree:
    *   - a copy with a config has no record at its path (its phase and copy id), Retired copies aside;
    *   - a record has no directory at its path, but one whose create is still placing it (Work.Create).
-   *  Stats and reads that fail are skipped: they say nothing. A store path holding the copy a running rebuild's
-   *  finish placed, its directory reading that rebuild's Rebuilt phase while its completion's handler has not yet run
-   *  (finishInFlight), is skipped: finish places the copy off the control thread, ahead of the handler. A device a test
-   *  pulled from under the host (skipDiskCheck), and a copy path a test moves by hand while the host runs
-   *  (skipDiskCheckAt), are skipped. Empty when consistent. */
-  def verifyAgainstDisk(): List[String] =
+   *  Each device's check reads its disk in one job on its device's lane (CopyDisk.verify), against its records as they
+   *  are now; the returned futures complete with each device's mismatches once the lanes run them (lockstep: the
+   *  next drain, Host.testingOnlyHandleEvents). A device `skip` names by path (a held one) is not checked. Stats and
+   *  reads that fail are skipped: they say nothing. A store path holding the copy a running rebuild's finish placed,
+   *  its directory reading that rebuild's Rebuilt phase while its completion's handler has not yet run
+   *  (finishInFlight), is skipped: finish places the copy off the control thread, ahead of the handler. A device a
+   *  test pulled from under the host (skipDiskCheck), and a copy path a test moves by hand while the host runs
+   *  (skipDiskCheckAt), are skipped. All empty when consistent. */
+  def verifyAgainstDisk(skip: os.Path => Boolean = _ => false): List[scala.concurrent.Future[List[String]]] =
     ctx.devices.devices.toList.sortBy(_._1.uuid).flatMap: (id, sds) =>
       if !attached.get(id).exists(_ eq sds) then
-        List(s"device $id is loaded but not attached to the copy registry")
-      else if diskCheckSkipped.contains(id) then
-        // A test pulled the device from under its running host (skipDiskCheck)
+        List(scala.concurrent.Future.successful(List(s"device $id is loaded but not attached to the copy registry")))
+      else if diskCheckSkipped.contains(id) || skip(sds.devicePath) then
+        // A test pulled the device from under its running host (skipDiskCheck), or holds its lane
         Nil
       else
-        val placing = (storeId: StoreId) => finishInFlight(id, sds.devicePath, storeId)
-        val records = sds.copies.copies.filterNot((storeId, _) => placing(storeId))
-        // Retired copies are not recorded (P3), but one whose move is not forced yet
-        val onDisk =
-          try CopyLayout.list(sds.devicePath).copies.filter(f =>
-            f.phase != Phase.Retired && !placing(f.storeId) &&
-              FileStat.existence(f.path / StoreConfig.configFilename).contains(true))
-          catch case NonFatal(t) => Nil
-        // A create's record is registered at its open, before its create places the copy (off the control thread
-        // for FSIF): its directory may not be there yet
-        val dirMissing = records.values.toList.sortBy(_.storeId.directoryName).flatMap: r =>
-          val path = recordPath(sds.devicePath, r)
-          if sds.copies.work.get(r.storeId).contains(Work.Create) || diskCheckSkippedPaths.contains(path) then
-            Nil
-          else if Try(FileStat.isDir(path)).toOption.contains(false) then
-            List(s"device $id: record of ${r.storeId} (${r.phase}) has no directory at $path")
-          else
-            Nil
-        val unrecorded = onDisk
-          .filterNot(f => diskCheckSkippedPaths.contains(f.path) ||
-                          records.get(f.storeId).exists(r => recordPath(sds.devicePath, r) == f.path))
-          .map(f => s"device $id: directory ${f.path} (${f.phase}) has no record")
-        dirMissing ++ unrecorded
+        val records = sds.copies.copies.values.toList.map: r =>
+          CopyDisk.Recorded(r.storeId, r.phase, recordPath(sds.devicePath, r),
+            creating = sds.copies.work.get(r.storeId).contains(Work.Create))
+        val placing = ctx.rebuilds.finishPlacingOn(id)
+        val skipped = diskCheckSkippedPaths
+        val devicePath = sds.devicePath
+        List(sds.io.submit(JobKind.Other("VerifyCopies"), None)(
+          CopyDisk.verify(id, devicePath, records, placing, skipped)).future)
 
 /** Why a store the router does not serve is silent (HostCopies.silence) */
 enum SilenceReason:

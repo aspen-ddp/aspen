@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.common.util.runSequentially
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, ServiceEntry, TaskExecutor}
 import org.aspen_ddp.aspen.compute.impl.{SimpleDurableServiceExecutor, SimpleTaskExecutor}
 import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, SystemTaskRunner}
-import org.aspen_ddp.aspen.server.GossipRetransmitter
+import org.aspen_ddp.aspen.server.{GossipRetransmitter, Host}
 import org.aspen_ddp.aspen.server.usage.{StorageDeviceUsageManager, StoragePoolUsageManager}
 import scribe.Logging
 
@@ -51,6 +51,11 @@ class HostServices(ctx: DeviceControl) extends Logging:
   // Runs on the background task thread: the retransmitter is thread-safe and touches no control state.
   private val gossipRetransmitTask = ctx.backgroundTasks.schedulePeriodic(GossipRetransmitter.Period):
     gossipRetransmitter.retransmit()
+
+  // Runs on the background task thread: it only posts the judge's pass to the control thread, and needs no task
+  // executor. One posted after the control thread's shutdown is dropped there
+  private val deviceHealthTask = ctx.backgroundTasks.schedulePeriodic(DeviceHealthJudge.Period):
+    ctx.post(Host.CheckDeviceHealth())
 
   def initializeTaskExecutor(): Unit =
     val hostPointerFuture = ctx.client.getHostPointer(ctx.hostId)
@@ -237,4 +242,5 @@ class HostServices(ctx: DeviceControl) extends Logging:
     serviceExecutorPromise.future.foreach(_.shutdown())(using ctx.ec)
     systemTaskRunnerPromise.future.foreach(_.shutdown())(using ctx.ec)
     gossipRetransmitTask.cancel()
+    deviceHealthTask.cancel()
     usageUpdateTask.foreach(_.cancel())

@@ -41,6 +41,16 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
    *  DeviceReconciler.pollUsage); None until its first measurement is applied. Set on the control thread only */
   var usage: Option[(Long, Long)] = None
 
+  /** The device's current health (DeviceHealthJudge), Initial at load. Written on the control thread only;
+   *  @volatile because the health publish reads it on the client context */
+  @volatile var health: DeviceHealth = DeviceHealth.Initial
+  /** The health last written to the device's record, None until known (the health publish). Control thread only */
+  var publishedHealth: Option[DeviceHealth] = None
+  /** A health publish is in flight. Control thread only */
+  var healthPublishing: Boolean = false
+  /** The judge has logged the probe's current error, until a later attempt succeeds. Control thread only */
+  var probeErrorLogged: Boolean = false
+
 /** Runs only on the control thread. See HostThreading.scala.
  *
  *  The storage devices loaded on this host. Whoever changes `devices` calls DeviceControl.publishView afterwards.

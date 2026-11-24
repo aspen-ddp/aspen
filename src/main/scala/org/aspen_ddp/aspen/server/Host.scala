@@ -134,6 +134,9 @@ object Host:
     extends Event
   /** The check of a device the startup scan loaded, posted as its load is applied (DeviceDiscovery.startupScan) */
   private[server] case class CheckLoadedDevice(deviceId: StorageDeviceId) extends Event
+  /** One pass of the device health judge (DeviceHealthJudge.check), posted every DeviceHealthJudge.Period by
+   *  HostServices */
+  private[server] case class CheckDeviceHealth() extends Event
 
   /** What Host posts to its threading's control events: one event, handled by handleEvent. Carries the event so the
    *  test hooks can find queued events, and names it in the log line written when its handler throws. */
@@ -658,6 +661,8 @@ class Host(val client: AspenClient,
       case e: DeviceJobDone => e.apply()
 
       case CheckLoadedDevice(id) => reconciler.checkStorageDevice(id)
+
+      case CheckDeviceHealth() => deviceControl.health.check()
 
       case StoresReady() =>
         deviceControl.router.markReady()

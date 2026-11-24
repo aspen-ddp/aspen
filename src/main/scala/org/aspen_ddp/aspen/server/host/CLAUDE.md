@@ -711,6 +711,15 @@
   a reload inherits it on the same thread. Attempts are recorded in the observer as kind `HealthProbe` but are no lane
   job or pool task, so they never keep `DeviceIo.idle` false. The file is at the device root, so no copy listing sees it.
   Test seams: `ThreadedDeviceIo`/`LockstepDeviceIo` take `clock` (observer and probe) and `probeWrite`
+- Health judge (`DeviceHealthJudge`, `DeviceControl.health`, spec 5.2-5.3, 5.5): `HostServices` posts
+  `Host.CheckDeviceHealth` every `DeviceHealthJudge.Period` (30 s; from construction, no task executor needed;
+  cancelled by `HostServices.shutdown`), whose `check` judges each loaded device on the control thread from non-blocking
+  reads only: Hung while `probe.hung`, else Healthy (a probe error or an old non-probe operation never trips it). A
+  transition sets `LocalStorageDeviceState.health` (`DeviceHealth`: status, HLC `since`, `evidence`, capped at
+  `MaxEvidence` 1024; `@volatile`, the publish reads it off control), logs WARN (to Hung, with the evidence) or INFO
+  (back, with the hung duration), then calls each `onTransition` hook (project 3's), a throwing hook logged at error.
+  A probe error is logged once while it persists (`probeErrorLogged`). A fresh device state starts `DeviceHealth.Initial`,
+  so a reload inheriting a stuck probe is Hung at its first pass. Tests: `DeviceHealthJudgeSuite`
 - Callbacks name the control context. Work run elsewhere (backend opens, client transactions on the host's `ec`) names
   its context; timers and other non-Future callbacks post to `controlEvents` before touching control state
 - Tests use `LockstepThreading`: everything posted waits on one FIFO drained by `testingOnlyHandleEvents`, stores run

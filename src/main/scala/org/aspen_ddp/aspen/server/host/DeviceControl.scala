@@ -110,6 +110,7 @@ final class DeviceControl(val metadata: DeviceMetadata,
   lazy val services: HostServices = new HostServices(this)
   lazy val copyRegistry: HostCopies = new HostCopies(this)
   lazy val moves: CopyMoves = new CopyMoves(this)
+  lazy val health: DeviceHealthJudge = new DeviceHealthJudge(this)
 
   /** Delivers the outcome of `job` (a management-lane job) to `apply` as a posted control event, Host.DeviceJobDone,
    *  never inline in whichever thread completes it. `apply` must recheck that the device, path or copy the job was

@@ -109,6 +109,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   private var startupPaths: Option[Set[os.Path]] = None
   private var startupDecided: () => Unit = () => ()
 
+  /** bringIntoService's step 3 (DeviceStateDisk.bringIntoService); a test seam */
+  private[server] var removeShutdownState: os.Path => Unit = DeviceStateDisk.removeShutdownState
+
   /** Keeps the scan from loading the device at `path` again (see disownedDirs). */
   private[host] def disown(path: os.Path): Unit =
     disownedDirs += path
@@ -614,17 +617,25 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     // stores still awaiting their device) until it is applied
     pendingResolutions += path -> marked
     laneJob(path, JobKind.Adoption, "adoption brings into service")(
-      DeviceStateDisk.bringIntoService(path, state.stores.keySet, rewriteOwner, ctx.hostId, reinstate, sync, rename)):
+      DeviceStateDisk.bringIntoService(path, state.stores.keySet, rewriteOwner, ctx.hostId, reinstate, sync, rename,
+        removeShutdownState)):
       result =>
         pendingResolutions -= path
         try
           result match
-            case Success(moved) =>
+            case Success(DeviceStateDisk.BroughtIn(moved, markerFailure)) =>
               // A move that failed keeps its store offline where it is, until a later check of its device; one not
-              // forced leaves the copy unsynced, which its attach takes and the device's check forces and loads
+              // forced leaves the copy unsynced, which its attach takes and the device's check forces and loads.
+              // Held whether or not step 3 removed shutdown.state: a later bringIntoService finds the copy in live/
+              // and makes no move to report
               moved.foreach(ctx.moves.unattachedMoved)
-              announceOnLoad += path -> active.keySet
-              probe(path, DeviceDiscovery.Trigger(scan = false, check = true), explicit = true): Unit
+              markerFailure match
+                case None =>
+                  announceOnLoad += path -> active.keySet
+                  probe(path, DeviceDiscovery.Trigger(scan = false, check = true), explicit = true): Unit
+                case Some(t) =>
+                  warnOnce(path, s"Failed to bring storage device ${sdCfg.storageDeviceId} at $path into service. " +
+                                 s"Will retry on the next scan. Error: $t")
             case Failure(t) =>
               if t != DeviceIo.Cancelled then
                 warnOnce(path, s"Failed to bring storage device ${sdCfg.storageDeviceId} at $path into service. " +

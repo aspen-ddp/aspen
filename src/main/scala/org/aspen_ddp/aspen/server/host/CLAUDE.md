@@ -65,7 +65,8 @@
   result's hold for the attach. The transfer callers use it too (`StoreTransfers.bringArrivedLive`,
   `StoreTransfersOut.moveToOutbound` and `reinstateAbandonedOut`); an adoption's moves are made inside its own jobs
   (`DeviceStateDisk.moveToLost`, `bringIntoService`), their results logged and an unforced one held for the attach by
-  `CopyMoves.unattachedMoved`. Tests move a copy with `CopyFixtures.moveNow` (moveOnLane, then a drain).
+  `CopyMoves.unattachedMoved` (`bringIntoService` returns its moves with step 3's failure, `BroughtIn`, so a failed
+  `shutdown.state` removal still holds them). Tests move a copy with `CopyFixtures.moveNow` (moveOnLane, then a drain).
   `DurableFiles.move` throws
   `DurableFiles.MoveNotForced` for a rename that landed but was not forced: `MoveResult.Unsynced`, the record takes the
   phase with `unsynced` (above) and `resync` forces both directories again; any other failure is `NotMoved`, nothing

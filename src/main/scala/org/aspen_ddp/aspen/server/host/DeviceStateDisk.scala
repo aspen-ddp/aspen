@@ -133,11 +133,13 @@ object DeviceStateDisk extends Logging:
    *  2. each outbound/ or parked/ copy of a store in `reinstate` moved to Live (T7, T5; CopyDisk.relocate through
    *     CopyMoves' seams): a failed move keeps that store offline where it is, and is only reported;
    *  3. `shutdown.state` removed.
-   *  Throws a failed listing, stat, arrival or owner write (nothing after it is done) or a failed marker removal, and
-   *  returns the moves step 2 made */
+   *  Throws a failed listing, stat, arrival or owner write (nothing after it is done). Returns the moves step 2 made
+   *  with step 3's failure, if any: a failed marker removal still returns the moves, so an unsynced one is held for
+   *  the device's attach (CopyMoves.unattachedMoved) whatever step 3 did */
   def bringIntoService(path: os.Path, stores: Set[StoreId], rewriteOwner: Boolean, hostId: HostId,
                        reinstate: Set[StoreId], syncDirectory: os.Path => Unit,
-                       rename: (os.Path, os.Path) => Unit): List[Moved] =
+                       rename: (os.Path, os.Path) => Unit,
+                       removeShutdownState: os.Path => Unit = DeviceMarkers.removeShutdownState): BroughtIn =
     val listing = CopyLayoutDisk.list(path).copies
     if rewriteOwner then
       listing.filter(f => stores.contains(f.storeId) && (f.phase == Phase.Live || mayGoLive(f.phase)))
@@ -150,8 +152,15 @@ object DeviceStateDisk extends Logging:
         try CopyDisk.relocate(found.path, target, Phase.Live, syncDirectory, rename)
         catch case NonFatal(t) => MoveResult.NotMoved(t)
       Moved(s"adoption brings ${found.phase} into service", found.path, target, result)
-    DeviceMarkers.removeShutdownState(path)
-    moved
+    val markerFailure =
+      try
+        removeShutdownState(path)
+        None
+      catch case NonFatal(t) => Some(t)
+    BroughtIn(moved, markerFailure)
+
+  /** bringIntoService's result: the moves step 2 made, and step 3's failure to remove `shutdown.state` */
+  final case class BroughtIn(moved: List[Moved], markerFailure: Option[Throwable])
 
   /** Whether a copy in the phase directory of `phase` may go Live once its device is in service: outbound/ (T7),
    *  rebuilt/ (T3) and parked/ (T5) */

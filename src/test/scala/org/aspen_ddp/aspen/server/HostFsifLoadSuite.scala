@@ -822,6 +822,34 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         host.control.copyRegistry.silence(storeId) should be(Silence.Served)
         host.control.router.silentStores should not contain storeId
 
+  atest("a restart's reinstating move left unsynced is held for the attach even when shutdown.state's removal fails"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    DeviceMarkers.writeShutdownState(deviceDir, HostId.BootstrapHostId)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+      // Left in outbound/ by an abandoned transfer out: bringIntoService reinstates it (T7)
+      CopyFixtures.markCopy(deviceDir, storeId, Phase.Outbound(""))
+      val live = CopyFixtures.livePathOf(deviceDir, storeId)
+      val lookup = Promise[StorageDeviceState]()
+      val host = newSeamHost(hostRoot, _.heldLookups = Map(deviceA -> lookup))
+      host.testingOnlyHandleEvents()
+      // The rename into live/ lands, its sync fails (Unsynced); then step 3's marker removal fails
+      host.control.moves.syncDirectory = d =>
+        if d == live / os.up then throw new IOException("injected sync")
+        DurableFiles.syncDirectory(d)
+      host.control.discovery.removeShutdownState = _ => throw new IOException("injected marker removal")
+      lookup.success(deviceState(deviceA,
+        Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+      handleUntil(host)(host.control.discovery.pendingMarkerResolutions.isEmpty).map: _ =>
+        host.control.discovery.pendingMarkerResolutions should be(empty)
+        CopyFixtures.phaseOf(deviceDir, storeId) should be(Some(Phase.Live))
+        os.exists(deviceDir / DeviceMarkers.ShutdownStateFile) should be(true)
+        // Held for the device's attach: never loaded until a device check forces both directories
+        host.control.copyRegistry.isUnsyncedAt(live) should be(true)
+        host.getStoreIds should not contain storeId
+
 
   /** An FSIF store left offline in outbound/, whose device check then finds its entry Active with no transfer
    *  outstanding (an abandoned transfer out) and reinstates it. FSIF opens are queued, not run: returns once the

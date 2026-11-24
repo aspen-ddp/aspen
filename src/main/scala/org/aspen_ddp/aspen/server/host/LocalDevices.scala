@@ -50,6 +50,8 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
   var healthPublishing: Boolean = false
   /** The judge has logged the probe's current error, until a later attempt succeeds. Control thread only */
   var probeErrorLogged: Boolean = false
+  /** The judge has logged a failed health publish, until a publish succeeds. Control thread only */
+  var healthPublishFailureLogged: Boolean = false
 
 /** Runs only on the control thread. See HostThreading.scala.
  *

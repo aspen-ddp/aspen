@@ -14,7 +14,7 @@ import scala.concurrent.{ExecutionContext, Future}
 import scala.jdk.CollectionConverters.*
 
 /** A LockstepThreading whose DeviceIos stamp their observer and probe with `clock` and probe with `write` */
-private final class ProbeSeamThreading(ec: ExecutionContext, clock: AtomicLong, write: os.Path => Unit)
+private[host] final class ProbeSeamThreading(ec: ExecutionContext, clock: AtomicLong, write: os.Path => Unit)
   extends LockstepThreading(ec):
   override def newDeviceIo(path: os.Path): DeviceIo =
     new LockstepDeviceIo(path, this, DeviceIo.Config(), () => clock.get, write)
@@ -32,6 +32,9 @@ class DeviceHealthJudgeSuite extends IntegrationTestSuite with ControlFixture:
     val host: Host = newHost(newHostDir(), threadingOf = ec => new ProbeSeamThreading(ec, clock, write))
     val dev: os.Path = host.control.rootDir / os.up / "judged-device"
     os.makeDir.all(dev)
+    // The injected device has no record: a publisher that finds every record already holding the health
+    host.control.healthPublisher = (_, current) =>
+      Future.successful(DeviceHealthPublisher.Outcome.Unchanged(current()))
     var sds: LocalStorageDeviceState = inject()
     val transitions = new ConcurrentLinkedQueue[(LocalStorageDeviceState, DeviceHealth)]()
     host.control.health.onTransition((s, h) => transitions.add(s -> h))
@@ -51,10 +54,12 @@ class DeviceHealthJudgeSuite extends IntegrationTestSuite with ControlFixture:
 
     def advance(d: FiniteDuration): Unit = clock.addAndGet(d.toNanos)
 
-  /** Lines the judge logs at info or above while `f` runs */
+  /** Lines the judge logs at info or above about the device while `f` runs (suites log through it in parallel) */
   private def judgeLog(f: => Unit): List[(scribe.Level, String)] =
     val lines = new ConcurrentLinkedQueue[(scribe.Level, String)]()
-    val handler = scribe.handler.LogHandler(scribe.Level.Info)(r => lines.add(r.level -> r.logOutput.plainText))
+    val handler = scribe.handler.LogHandler(scribe.Level.Info): r =>
+      val text = r.logOutput.plainText
+      if text.contains(deviceId.toString) then lines.add(r.level -> text)
     LogCapture.during(classOf[DeviceHealthJudge].getName, handler)(f)
     lines.asScala.toList
 

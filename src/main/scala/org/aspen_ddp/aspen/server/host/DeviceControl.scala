@@ -111,6 +111,8 @@ final class DeviceControl(val metadata: DeviceMetadata,
   lazy val copyRegistry: HostCopies = new HostCopies(this)
   lazy val moves: CopyMoves = new CopyMoves(this)
   lazy val health: DeviceHealthJudge = new DeviceHealthJudge(this)
+  /** Writes each device's health into its StorageDeviceState record for the judge (a seam: tests set a fake) */
+  private[server] var healthPublisher: DeviceHealthPublisher = new ClientDeviceHealthPublisher(client, hostId)
 
   /** Delivers the outcome of `job` (a management-lane job) to `apply` as a posted control event, Host.DeviceJobDone,
    *  never inline in whichever thread completes it. `apply` must recheck that the device, path or copy the job was

@@ -719,7 +719,17 @@
   `MaxEvidence` 1024; `@volatile`, the publish reads it off control), logs WARN (to Hung, with the evidence) or INFO
   (back, with the hung duration), then calls each `onTransition` hook (project 3's), a throwing hook logged at error.
   A probe error is logged once while it persists (`probeErrorLogged`). A fresh device state starts `DeviceHealth.Initial`,
-  so a reload inheriting a stuck probe is Hung at its first pass. Tests: `DeviceHealthJudgeSuite`
+  so a reload inheriting a stuck probe is Hung at its first pass. Then each pass publishes (spec 5.3): while
+  `health` differs from `publishedHealth` and no publish is in flight (`healthPublishing`), it calls
+  `DeviceControl.healthPublisher` (`ClientDeviceHealthPublisher`, a `DeviceHealthPublisher`; a seam for tests), which
+  runs on the client context, never on the device: one `transactUntilSuccessfulWithRecovery(unlessCollision)` that
+  reads the record and the current `health` in its body, and writes it with `state.copy` under a `KeyRevision` on
+  `StateKey`, as `updateDeviceUsage` does (`Written`); nothing for a record already holding it (`Unchanged`: same
+  status and, unless `since` is Zero, the same `since`; so a Healthy record at load gets no write, and a stale Hung one
+  is written Healthy with `since` now) or one Failed or naming another host (`Skipped`). The outcome is applied on
+  control through `onControlFuture`, only while the device state is still loaded; a failure leaves `publishedHealth`
+  for the next pass, WARN once per failure streak (`healthPublishFailureLogged`). Tests: `DeviceHealthJudgeSuite`,
+  `DeviceHealthPublishSuite`
 - Callbacks name the control context. Work run elsewhere (backend opens, client transactions on the host's `ec`) names
   its context; timers and other non-Future callbacks post to `controlEvents` before touching control state
 - Tests use `LockstepThreading`: everything posted waits on one FIFO drained by `testingOnlyHandleEvents`, stores run

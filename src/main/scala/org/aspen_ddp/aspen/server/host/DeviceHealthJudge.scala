@@ -4,7 +4,9 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceState
 import scribe.Logging
 
+import scala.concurrent.Future
 import scala.concurrent.duration.*
+import scala.util.{Failure, Success}
 import scala.util.control.NonFatal
 
 /** A loaded device's health (device hang detection, spec section 5.3): its status, the time of its last transition
@@ -24,7 +26,10 @@ object DeviceHealth:
  *
  *  A transition sets `LocalStorageDeviceState.health`, logs once (WARN to Hung with the evidence, INFO back to
  *  Healthy with how long the device was hung) and calls every `onTransition` hook (project 3's), on this thread. A
- *  pass with no change logs nothing. A probe error is logged once while it persists. */
+ *  pass with no change logs nothing. A probe error is logged once while it persists.
+ *
+ *  After judging a device, the pass publishes its health into the device's record (`publish`) until the record
+ *  matches, through `DeviceControl.healthPublisher` on the client context: never on the device. */
 final class DeviceHealthJudge(ctx: DeviceControl) extends Logging:
   private var hooks: List[(LocalStorageDeviceState, DeviceHealth) => Unit] = Nil
 
@@ -32,7 +37,9 @@ final class DeviceHealthJudge(ctx: DeviceControl) extends Logging:
   def onTransition(f: (LocalStorageDeviceState, DeviceHealth) => Unit): Unit = hooks = hooks :+ f
 
   /** One pass over the loaded devices */
-  def check(): Unit = ctx.devices.devices.valuesIterator.foreach(judge)
+  def check(): Unit = ctx.devices.devices.valuesIterator.foreach: sds =>
+    judge(sds)
+    publish(sds)
 
   private def judge(sds: LocalStorageDeviceState): Unit =
     val probe = sds.io.probe
@@ -56,6 +63,33 @@ final class DeviceHealthJudge(ctx: DeviceControl) extends Logging:
         try hook(sds, sds.health)
         catch case NonFatal(t) =>
           logger.error(s"A health transition hook failed for storage device ${sds.storageDeviceId}: $t")
+
+  /** Starts a publish of the device's health while it differs from the one last published and none is in flight
+   *  (spec section 5.3). The publisher reads `health` when its transaction body runs, on the client context, so a
+   *  transition meanwhile is written by this publish or, failing that, by the next pass's. The outcome is applied
+   *  here, on the control thread, only while `sds` is still the loaded state; a failure leaves `publishedHealth` for
+   *  the next pass to retry, logged once per streak of failures */
+  private def publish(sds: LocalStorageDeviceState): Unit =
+    if !sds.healthPublishing && !sds.publishedHealth.contains(sds.health) then
+      sds.healthPublishing = true
+      val f =
+        try ctx.healthPublisher.publish(sds.storageDeviceId, () => sds.health)
+        catch case NonFatal(t) => Future.failed(t)
+      ctx.onControlFuture(s"health publish ${sds.storageDeviceId}", f): result =>
+        if ctx.devices.isLoaded(sds) then
+          sds.healthPublishing = false
+          result match
+            case Success(outcome) =>
+              sds.healthPublishFailureLogged = false
+              sds.publishedHealth = outcome match
+                case DeviceHealthPublisher.Outcome.Written(h) => Some(h)
+                case DeviceHealthPublisher.Outcome.Unchanged(h) => Some(h)
+                case DeviceHealthPublisher.Outcome.Skipped => Some(sds.health)
+            case Failure(err) =>
+              if !sds.healthPublishFailureLogged then
+                sds.healthPublishFailureLogged = true
+                logger.warn(s"Publishing the health of storage device ${sds.storageDeviceId} failed, retrying at " +
+                  s"each health check: $err")
 
   /** Logs the probe's last error once while it persists: until a later attempt succeeds */
   private def noteProbeError(sds: LocalStorageDeviceState, probe: HealthProbe): Unit =

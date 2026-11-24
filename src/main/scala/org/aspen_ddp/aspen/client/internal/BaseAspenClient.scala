@@ -701,7 +701,11 @@ abstract class BaseAspenClient(
 
   // ---- Misc plumbing ----
 
-  override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
+  /** Terminal: its timers stop, a timer not yet due never fires (BackgroundTaskManager.shutdown), and its retry loops
+   *  start no further attempt (RetryStrategy.shutdown), so no work of a shut-down client reaches its executor */
+  override def shutdown(): Unit =
+    retryStrategy.shutdown()
+    backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
 
   private val allocationQueries = new java.util.concurrent.ConcurrentHashMap[UUID, CurrentAllocationsQuery]()
 

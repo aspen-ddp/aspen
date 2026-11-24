@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.common.util
 
-import java.util.concurrent.{Executors, ScheduledFuture, ThreadLocalRandom, TimeUnit}
+import java.util.concurrent.{ScheduledFuture, ThreadLocalRandom, TimeUnit}
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS}
@@ -17,12 +17,17 @@ import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS}
 class BackgroundTaskManager(protected val executionContext: ExecutionContext) {
   import BackgroundTaskManager.*
 
-  private  val sched = Executors.newScheduledThreadPool(1, DaemonThreads.factory("aspen-bgtask"))
+  private  val sched = new java.util.concurrent.ScheduledThreadPoolExecutor(1, DaemonThreads.factory("aspen-bgtask"))
   private  val rand = new java.util.Random
 
   given ExecutionContext = executionContext
 
+  /** Stops the timers: a task already scheduled but not yet due never runs (a shut-down owner runs no more scheduled
+   *  work: a client torn down with its executor would otherwise have a missed-update mark fire into it), later
+   *  schedules are dropped (ShutdownTask), and a task already running may finish within `gracefulShutdownDelay` */
   def shutdown(gracefulShutdownDelay: Duration): Boolean = {
+    sched.setExecuteExistingDelayedTasksAfterShutdownPolicy(false)
+    sched.setContinueExistingPeriodicTasksAfterShutdownPolicy(false)
     sched.shutdown()
     sched.awaitTermination(gracefulShutdownDelay.toMillis, TimeUnit.MILLISECONDS)
     sched.isTerminated

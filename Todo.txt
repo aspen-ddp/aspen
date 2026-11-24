@@ -52,7 +52,11 @@ Hung devices: isolate, detect, handle (from Backlog "Isolate every device's I/O,
       other devices' stores keep serving, the host keeps heartbeating, and device management for the other devices
       continues.
 
-  2. Detection
+  2. Detection: DONE 2026-11-24 (spec docs/superpowers/specs/2026-11-24-device-hang-detection-design.md,
+     48548083..HEAD; the module guides, server/host/CLAUDE.md "Device health" and common/metadata/CLAUDE.md, describe
+     the result). The notes below are the brief it started from.
+    - Narrowed to hangs: spec docs/superpowers/specs/2026-11-24-device-hang-detection-design.md; slowness is Backlog
+      'Slow-device detection'
     - Built by project 1 for this: `DeviceIo.observer` (`DeviceIoObserver`, `host/DeviceIo.scala`) is the in-flight
       table every device operation passes through: `started(kind, store, bytes)` / `finished(token, ok)`, with
       `inFlight` (per kind: count and the oldest start in nanoTime) and `completed` (per kind counters). Kinds are

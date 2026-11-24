@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.internal.BaseAspenClient
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId}
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, Read, ReadResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Insert, Key, ObjectId, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -37,15 +37,16 @@ private final class HungGate:
     l.foreach(_.countDown())
   def await(): Unit = latch.foreach(_.await())
 
-/** A fixed StoreThreadPool whose DeviceIo of `hungPath` runs `gate` before every task (ThreadedDeviceIo's
- *  fault-injection seam), with `hungConfig`; every other device's is as production's */
-private final class GatedThreading(hungPath: os.Path, gate: HungGate, hungConfig: DeviceIo.Config)
-  extends StoreThreadPool(maxThreads = 3):
+/** A fixed StoreThreadPool whose DeviceIo of `hungPath` runs `gate` before every task and probe attempt
+ *  (ThreadedDeviceIo's fault-injection seam), with `hungConfig`; every other device's is as production's, with
+ *  `otherConfig` */
+private final class GatedThreading(hungPath: os.Path, gate: HungGate, hungConfig: DeviceIo.Config,
+                                   otherConfig: DeviceIo.Config) extends StoreThreadPool(maxThreads = 3):
   val ios = new ConcurrentHashMap[os.Path, ThreadedDeviceIo]()
   override def newDeviceIo(path: os.Path): DeviceIo =
     val io =
       if path == hungPath then new ThreadedDeviceIo(path, hungConfig, () => gate.await())
-      else new ThreadedDeviceIo(path, DeviceIo.Config())
+      else new ThreadedDeviceIo(path, otherConfig)
     ios.put(path, io)
     io
 
@@ -148,8 +149,8 @@ class ThreadedHungDeviceSuite extends IntegrationTestSuite with ControlFixture:
                                idB: StorageDeviceId, setA: StorageDeviceSetId, setB: StorageDeviceSetId):
     def ioA: ThreadedDeviceIo = threading.ios.get(devA)
 
-  /** The host with devices A and B (A gated, shut first when `hungFromStart`), started */
-  private def rig(hungFromStart: Boolean): Future[HungRig] =
+  /** The host with devices A and B (A gated, shut first when `hungFromStart`), both probing with `probe`, started */
+  private def rig(hungFromStart: Boolean, probe: HealthProbe.Config = HealthProbe.Config()): Future[HungRig] =
     gate = new HungGate
     if hungFromStart then gate.shut()
     for
@@ -162,7 +163,8 @@ class ThreadedHungDeviceSuite extends IntegrationTestSuite with ControlFixture:
       val hostRoot = newHostDir()
       val devA = writeDevice(hostRoot, "dev0", idA, owner = Some(hungHostId))
       val devB = writeDevice(hostRoot, "dev1", idB, owner = Some(hungHostId))
-      val threading = new GatedThreading(devA, gate, DeviceIo.Config(readBound = ReadBound))
+      val threading = new GatedThreading(devA, gate, DeviceIo.Config(readBound = ReadBound, probe = probe),
+        DeviceIo.Config(probe = probe))
       // Never shut down: a continuation of the host's last work may still be submitted to it after the test (a
       // rejection would print). Its daemon threads end once idle for a second
       val pool = new java.util.concurrent.ThreadPoolExecutor(3, 3, 1, TimeUnit.SECONDS,
@@ -337,3 +339,60 @@ class ThreadedHungDeviceSuite extends IntegrationTestSuite with ControlFixture:
       blocked should be(Nil)
       aWhile should be(None)
       devicePathB should be(Some(r.devB))
+
+  /** On the host's control thread: one judge pass (as `Host.CheckDeviceHealth` runs it), then the health of each
+   *  device in `ids`, None for one not loaded */
+  private def judgePass(ids: StorageDeviceId*): Future[List[Option[DeviceHealth]]] =
+    val h = host
+    val p = Promise[List[Option[DeviceHealth]]]()
+    h.threading.controlEvents.execute: () =>
+      p.complete(scala.util.Try:
+        h.control.health.check()
+        ids.toList.map(id => h.control.devices.devices.get(id).map(_.health)))
+    p.future
+
+  atest("a hung device is judged Hung, the other stays Healthy, and it recovers"):
+    // Device hang detection, spec section 6: both devices probe every 50 ms and are Hung past 500 ms. The judge is
+    // driven by passes on the control thread, not its 30 s timer; each pass also publishes. B is sampled at every
+    // pass, from before A's gate shuts until A's record shows Healthy again
+    val Hung = StorageDeviceState.HealthStatus.Hung
+    val Healthy = StorageDeviceState.HealthStatus.Healthy
+    val fast = HealthProbe.Config(interval = 50.millis, hangThreshold = 500.millis)
+    var bSeen = List.empty[DeviceHealth]
+    def judgeUntil(what: String, r: HungRig, timeout: FiniteDuration = 5.seconds)(
+        done: DeviceHealth => Future[Boolean]): Future[DeviceHealth] =
+      val deadline = System.nanoTime() + timeout.toNanos
+      def loop(): Future[DeviceHealth] =
+        judgePass(r.idA, r.idB).flatMap:
+          case List(Some(a), Some(b)) =>
+            bSeen = b :: bSeen
+            done(a).flatMap: ok =>
+              if ok then Future.successful(a)
+              else if System.nanoTime() > deadline then
+                Future.failed(new IllegalStateException(s"Timed out after $timeout: $what (A $a)"))
+              else delay(10).flatMap(_ => loop())
+          case other => Future.failed(new IllegalStateException(s"$what: a device not loaded: $other"))
+      loop()
+    def recordOf(id: StorageDeviceId): Future[StorageDeviceState.HealthStatus] =
+      client.getStorageDeviceState(id).map(_.health)
+    for
+      r <- rig(hungFromStart = false, probe = fast)
+      _ <- await("A and B loaded")(host.getDevicePath(r.idA).isDefined && host.getDevicePath(r.idB).isDefined)
+      _ <- judgeUntil("A Healthy, its probe run", r)(a => Future.successful(
+             a.status == Healthy && r.ioA.probe.lastResult.exists(_.error.isEmpty)))
+      _ = gate.shut()
+      hung <- judgeUntil("A Hung", r)(a => Future.successful(a.status == Hung))
+      _ <- judgeUntil("A's record Hung", r)(_ => recordOf(r.idA).map(_ == Hung))
+      _ = gate.open()
+      healed <- judgeUntil("A Healthy again", r)(a => Future.successful(a.status == Healthy))
+      _ <- judgeUntil("A's record Healthy", r)(_ => recordOf(r.idA).map(_ == Healthy))
+      recordB <- recordOf(r.idB)
+      _ <- quiesce()
+    yield
+      hung.evidence should include("probe in flight")
+      // The probe's own attempt is stamped in the observer before the gate, so it is listed in flight
+      hung.evidence should include("HealthProbe")
+      healed.since should be > hung.since
+      bSeen should not be empty
+      bSeen.filter(_.status != Healthy) should be(Nil)
+      recordB should be(Healthy)

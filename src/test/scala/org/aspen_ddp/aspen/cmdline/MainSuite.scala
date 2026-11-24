@@ -31,7 +31,7 @@ import java.util.UUID
 import java.util.concurrent.TimeoutException
 import scala.collection.mutable
 import scala.concurrent.{Await, Future}
-import scala.concurrent.duration.{DAYS, Duration, HOURS, MINUTES, SECONDS}
+import scala.concurrent.duration.{DAYS, Duration, DurationInt, HOURS, MINUTES, SECONDS}
 
 class MainSuite extends AnyFunSuite with Matchers:
 
@@ -1043,6 +1043,17 @@ class MainSuite extends AnyFunSuite with Matchers:
         Some((2, 10))
       parse("--device-io-threads=0") shouldBe None
       parse("--device-read-bound=0") shouldBe None
+
+  test("host --device-probe-interval and --device-hang-threshold take positive seconds, defaulting to 90 and 120"):
+    withTempDir("parse-device-health"): dir =>
+      def parse(args: String*) = Console.withErr(OutputStream.nullOutputStream()):
+        Main.buildParser.parse(Seq("host", dir.toString) ++ args, Main.Args())
+      parse().map(c => (c.deviceProbeInterval, c.deviceHangThreshold)) shouldBe Some((90, 120))
+      parse("--device-probe-interval", "45", "--device-hang-threshold", "300")
+        .map(c => Main.deviceIoConfig(c).probe) shouldBe
+        Some(org.aspen_ddp.aspen.server.host.HealthProbe.Config(interval = 45.seconds, hangThreshold = 300.seconds))
+      parse("--device-probe-interval=0") shouldBe None
+      parse("--device-hang-threshold=0") shouldBe None
 
   test("startHost loads user jars before starting anything and reports a failure clearly"):
     withTempDir("start-host-jars"): dir =>

@@ -29,7 +29,7 @@ import org.aspen_ddp.aspen.server.crl.{AdmissionTier, CrashRecoveryLog, CrashRec
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.DeviceMarkers
-import org.aspen_ddp.aspen.server.host.{CopyLayout, DeviceIo, StoreThreadPool}
+import org.aspen_ddp.aspen.server.host.{CopyLayout, DeviceIo, HealthProbe, StoreThreadPool}
 import org.aspen_ddp.aspen.vdisk.{DiskCatalog, DiskHandle, DiskInfo, VDiskError}
 import org.aspen_ddp.aspen.vdisk.tcmu.{LinuxTcmuKernel, TcmuEvent, TcmuNetlink, TcmuService}
 import org.aspen_ddp.aspen.vdisk.tcmu.dbus.{HandlerLogic, TcmuDbusService}
@@ -146,9 +146,17 @@ object Main {
                   storeThreads:Option[Int]=None,
                   deviceIoThreads:Int=DeviceIo.Config().dataThreads,
                   deviceReadBound:Int=DeviceIo.Config().readBound,
+                  deviceProbeInterval:Int=HealthProbe.Config().interval.toSeconds.toInt,
+                  deviceHangThreshold:Int=HealthProbe.Config().hangThreshold.toSeconds.toInt,
                   outputClientConfig:Option[os.Path]=None)
 
   class ConfigError(msg: String) extends AspenError(msg)
+
+  /** The `host` command's device I/O configuration, from its `--device-*` flags */
+  def deviceIoConfig(cfg: Args): DeviceIo.Config =
+    DeviceIo.Config(dataThreads = cfg.deviceIoThreads, readBound = cfg.deviceReadBound,
+      probe = HealthProbe.Config(interval = Duration(cfg.deviceProbeInterval, SECONDS),
+        hangThreshold = Duration(cfg.deviceHangThreshold, SECONDS)))
 
   private case class GroupNotFound(name: String) extends Exception(s"allocation group '$name' not found")
 
@@ -478,7 +486,19 @@ object Main {
         text("The most backend reads a storage device may have outstanding before its stores drop new client reads " +
              s"unanswered (default: ${DeviceIo.Config().readBound})").
         action((x, c) => c.copy(deviceReadBound = x)).
-        validate(x => if x >= 1 then success else failure("--device-read-bound must be at least 1"))
+        validate(x => if x >= 1 then success else failure("--device-read-bound must be at least 1")),
+
+      opt[Int]("device-probe-interval").valueName("<seconds>").
+        text("Seconds between a storage device's health probes, each a 4 KiB write and sync " +
+             s"(default: ${HealthProbe.Config().interval.toSeconds})").
+        action((x, c) => c.copy(deviceProbeInterval = x)).
+        validate(x => if x >= 1 then success else failure("--device-probe-interval must be at least 1")),
+
+      opt[Int]("device-hang-threshold").valueName("<seconds>").
+        text("Seconds a storage device's health probe may stay unanswered before the device is judged Hung " +
+             s"(default: ${HealthProbe.Config().hangThreshold.toSeconds})").
+        action((x, c) => c.copy(deviceHangThreshold = x)).
+        validate(x => if x >= 1 then success else failure("--device-hang-threshold must be at least 1"))
     )
 
   private def amoebafsArgs(p: ArgParser): List[OptionDef[?, Args]] =
@@ -1064,8 +1084,7 @@ object Main {
             case "bootstrap" => bootstrap(createIDA(cfg), cfg.hostDirectory, cfg.hostName, cfg.address,
                                           cfg.dataPort, cfg.httpPort, cfg.storeTransferPort,
                                           cfg.outputClientConfig.getOrElse(os.pwd / ClientConfig.configFilename))
-            case "host" => run_host(cfg.hostDirectory, cfg.loadJars, cfg.storeThreads,
-              DeviceIo.Config(dataThreads = cfg.deviceIoThreads, readBound = cfg.deviceReadBound))
+            case "host" => run_host(cfg.hostDirectory, cfg.loadJars, cfg.storeThreads, deviceIoConfig(cfg))
             case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir)
             case "vdisk-server" => run_vdisk_server(session, cfg.networkCacheDir)
             // OBSOLETE: see the commented-out "debug" parser entry above.

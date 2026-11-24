@@ -701,43 +701,76 @@
   gate, A's backlog under a flood of ten times the read bound stays at most the bound plus one read per store
   (`ThreadedDeviceIo.outstandingReads`, `poolTasksOutstanding`) with no answer to a dropped read; a host whose device
   hangs on its first stat starts, loads and serves its other device)
-- Health probe (`HealthProbe`, spec `docs/superpowers/specs/2026-11-24-device-hang-detection-design.md` 5.1): each
-  `DeviceIo` has one (`DeviceIo.probe`; lockstep's is its internal ThreadedDeviceIo's), one daemon thread
-  `dev-<label>-probe` that overwrites `<device>/health-probe` (4 KiB, in place, `force(false)`) every
-  `DeviceIo.Config.probe.interval` (90 s) after the previous attempt completed, behind the DeviceIo's gate (a held or
-  gated path stalls it). Armed only where a load completes (`DeviceDiscovery`, after `devices +=`), disarmed by
-  `DeviceShutdown.unloadDevice`, `closeLane` and `close`; never for the host root or `ControlFixture.injectLoadedDevice`.
-  Disarming stops new attempts only: a stuck one stays in flight (`inFlightAge`, `hung` past `hangThreshold`, 120 s) and
-  a reload inherits it on the same thread. Attempts are recorded in the observer as kind `HealthProbe` but are no lane
-  job or pool task, so they never keep `DeviceIo.idle` false. The file is at the device root, so no copy listing sees it.
-  Test seams: `ThreadedDeviceIo`/`LockstepDeviceIo` take `clock` (observer and probe) and `probeWrite`
-- Health judge (`DeviceHealthJudge`, `DeviceControl.health`, spec 5.2-5.3, 5.5): `HostServices` posts
-  `Host.CheckDeviceHealth` every `DeviceHealthJudge.Period` (30 s; from construction, no task executor needed;
-  cancelled by `HostServices.shutdown`), whose `check` judges each loaded device on the control thread from non-blocking
-  reads only: Hung while `probe.hung`, else Healthy (a probe error or an old non-probe operation never trips it). A
-  transition sets `LocalStorageDeviceState.health` (`DeviceHealth`: status, HLC `since`, `evidence`, capped at
-  `MaxEvidence` 1024; `@volatile`, the publish reads it off control), logs WARN (to Hung, with the evidence) or INFO
-  (back, with the hung duration), then calls each `onTransition` hook (project 3's), a throwing hook logged at error.
-  A probe error is logged once while it persists (`probeErrorLogged`). A fresh device state starts `DeviceHealth.Initial`,
-  so a reload inheriting a stuck probe is Hung at its first pass. Then each pass publishes (spec 5.3): while
-  `health` differs from `publishedHealth` and no publish is in flight (`healthPublishing`), it calls
-  `DeviceControl.healthPublisher` (`ClientDeviceHealthPublisher`, a `DeviceHealthPublisher`; a seam for tests), which
-  runs on the client context, never on the device: one `transactUntilSuccessfulWithRecovery(unlessCollision)` that
-  reads the record and the current `health` in its body, and writes it with `state.copy` under a `KeyRevision` on
-  `StateKey`, as `updateDeviceUsage` does (`Written`); nothing for a record already holding it (`Unchanged`: same
-  status and, unless `since` is Zero, the same `since`; so a Healthy record at load gets no write, and a stale Hung one
-  is written Healthy with `since` now) or one Failed or naming another host (`Skipped`). The outcome is applied on
-  control through `onControlFuture`, only while the device state is still loaded; a failure leaves `publishedHealth`
-  for the next pass, WARN once per failure streak (`healthPublishFailureLogged`). A publish still retrying once its
-  state is unloaded (`LocalStorageDeviceState.unloaded`, set by `unloadDevice` or a load replacing it) reads None for
-  the current health and writes nothing, so a dead state never overwrites a reloaded one's record. Tests: `DeviceHealthJudgeSuite`,
-  `DeviceHealthPublishSuite`
+- Device health (hang detection, the probe on each `DeviceIo` and the judge on control): the Device health
+  section below
 - Callbacks name the control context. Work run elsewhere (backend opens, client transactions on the host's `ec`) names
   its context; timers and other non-Future callbacks post to `controlEvents` before touching control state
 - Tests use `LockstepThreading`: everything posted waits on one FIFO drained by `testingOnlyHandleEvents`, stores run
   inline, and the control context is the suite's serial `ec`, so integration suites keep their exact ordering.
   `ThreadedHostSuite` runs the TestNetwork's host on a fixed `StoreThreadPool` (`IntegrationTestSuite.testThreading`),
   and `AdaptiveThreadedHostSuite` on an adaptive one that moves stores between threads mid-test
+
+### Device health
+Spec `docs/superpowers/specs/2026-11-24-device-hang-detection-design.md`. Detection only: nothing acts on a Hung
+device (project 3's job), and a false Hung must never come from a merely busy device.
+- Probe (`HealthProbe`, spec 5.1): each `DeviceIo` has one (`DeviceIo.probe`; lockstep's is its internal
+  ThreadedDeviceIo's), its own daemon thread `dev-<label>-probe`, doing nothing else, so no work queues ahead of it.
+  Each attempt overwrites `<device>/health-probe` (4 KiB, created and filled once, then rewritten in place and
+  `force(false)`, so a full file system does not fail it) and the next starts `DeviceIo.Config.probe.interval` (90 s,
+  `aspen host --device-probe-interval`) after it completed, so attempts never overlap. It runs behind the DeviceIo's
+  gate, so a held or gated path stalls it. It publishes the attempt in flight (`inFlightAge`) and the last completed
+  one (`lastResult`: when, how long, ok or the error), thread-safe and non-blocking, and records each attempt in the
+  observer as kind `HealthProbe` (not `JobKind.DeviceProbe`, discovery's probe of a path). An attempt is no lane job
+  or pool task, so it never keeps `DeviceIo.idle` false. The file is at the device root, so no copy listing sees it.
+  Test seams: `ThreadedDeviceIo`/`LockstepDeviceIo` take `clock` (observer and probe) and `probeWrite`
+- Probe lifecycle: armed only where a load completes (`DeviceDiscovery`, after `devices +=`), disarmed by
+  `DeviceShutdown.unloadDevice`, `closeLane` and `close`; never for the host root, a path holding no device, a
+  rejected, foreign or Failed device, or `ControlFixture.injectLoadedDevice`. Disarming stops new attempts only: an
+  attempt stuck in a hung syscall stays in flight on its thread, which cannot be reclaimed. While the path keeps its
+  `DeviceIo`, a reload inherits that attempt on the same thread and starts no second one, so the reloaded device is
+  Hung at its first pass. After `DeviceIos.forget` (the directory left the `storage-devices/` listing; only an idle
+  DeviceIo is forgotten, and a probe attempt does not count as busy) a directory that returns gets a fresh DeviceIo
+  and probe, with a new thread beside any stuck one
+- Judge (`DeviceHealthJudge`, `DeviceControl.health`, spec 5.2): `HostServices` posts `Host.CheckDeviceHealth` every
+  `DeviceHealthJudge.Period` (30 s, a constant; from construction, no task executor needed; cancelled by
+  `HostServices.shutdown`). `check` judges each loaded device on the control thread from non-blocking reads only
+  (probe, observer, `readsOverBound`): it never blocks and never submits device I/O. Hung means only that the probe's
+  attempt in flight is older than `probe.hangThreshold` (120 s, `--device-hang-threshold`; `HealthProbe.hung`);
+  otherwise Healthy, and a Hung device is Healthy again at the first pass after its stuck probe returns. A probe error
+  alone never makes a device Hung (logged once while it persists, `probeErrorLogged`), nor does any other observer
+  operation however old. Worst-case detection is interval + threshold + period, about 4 min with the defaults
+- State and logging (spec 5.3): `LocalStorageDeviceState.health` (`DeviceHealth`: status, HLC `since` of the last
+  transition, `evidence`; `@volatile`, the publish reads it off control) starts `DeviceHealth.Initial` (Healthy,
+  `since` Zero) at each load. A transition rebuilds the evidence (the probe's in-flight age or last result; each
+  observer kind in flight with its count and oldest age, naming no store; `dropping client reads` when
+  `readsOverBound`; capped at `MaxEvidence` 1024 characters) and logs WARN (to Hung, with the evidence) or INFO (back,
+  with how long it was hung). A pass with no change logs nothing
+- Publishing (spec 5.3): after judging a device, each pass publishes while `health` differs from `publishedHealth`
+  (initialised from the record at load) and no publish is in flight (`healthPublishing`), through
+  `DeviceControl.healthPublisher` (`ClientDeviceHealthPublisher`, a `DeviceHealthPublisher`; a seam for tests). It runs
+  on the client context, never on the device, so a hung device's health is published through the network: one
+  `transactUntilSuccessfulWithRecovery(unlessCollision)` that reads the record and the current `health` in its body,
+  and writes it with `state.copy` under a `KeyRevision` on `StateKey`, as `updateDeviceUsage` does (`Written`), so a
+  later transition never loses to an earlier publish and no usage or store-entry write loses its fields. It writes
+  nothing for a record already holding it (`Unchanged`: same status and, unless `since` is Zero, the same `since`; so
+  a Healthy record at load gets no write, and a stale Hung one a previous incarnation left is written Healthy with
+  `since` now) or one Failed or naming another host (`Skipped`). The outcome is applied on control through
+  `onControlFuture`, only while the device state is still loaded; a failure leaves `publishedHealth` for the next pass
+  to retry, WARN once per failure streak (`healthPublishFailureLogged`). A publish still retrying once its state is
+  unloaded (`LocalStorageDeviceState.unloaded`, set by `unloadDevice` or a load replacing it) reads None for the
+  current health and writes nothing, so a dead state never overwrites a reloaded one's record. A host that dies
+  leaves its last value in the record: host liveness is a separate signal
+- Hook (spec 5.5): `DeviceHealthJudge.onTransition(f)` calls `f(sds, health)` on the control thread after each
+  transition, after the log; a throwing hook is logged at error. Project 3 attaches its response there
+- Limits: no partial-hang detection (files on the device that stop returning while the probe's file still works go
+  unnoticed; the backup trigger on old in-flight operations was dropped, since legitimately long work such as a large
+  store delete, RocksDB recovery on open or rebuild staging would raise false Hungs), and a device that hangs before
+  its load completes is never judged (its probe is not armed; it stays unloaded and undecided, as discovery leaves a
+  hung path). Slowness is not detected (Backlog "Slow-device detection")
+- Tests: `HealthProbeSuite` and `ThreadedDeviceIoSuite` (the probe), `DeviceHealthJudgeSuite` (passes driven by
+  posting `Host.CheckDeviceHealth` and draining, with manual clocks), `DeviceHealthPublishSuite`, and
+  `ThreadedHungDeviceSuite`'s "a hung device is judged Hung, the other stays Healthy, and it recovers" (real threads,
+  a 50 ms interval and 500 ms threshold, passes run by `check()` on the control thread)
 
 ### Host and StorageDevice Management
 - Most administration is done by reading and writing host and device objects containing the desired state

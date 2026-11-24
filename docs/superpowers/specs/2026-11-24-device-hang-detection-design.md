@@ -140,7 +140,9 @@ also dropped B's proposed backup trigger, which fired on an observer operation o
   - A publish writes nothing when the record's status is Failed: an operator has declared the device dead, and its
     record is a tombstone. It also writes nothing when the record names another host.
 - On load, the last-published value is initialised from the device's record. A stale Hung left by an earlier
-  incarnation is then republished as Healthy once the first judge pass finds the device working.
+  incarnation is then republished as Healthy once the first judge pass finds the device working. As built, the
+  last-published value starts unknown instead: the first pass's publish reads the record and writes only if it
+  differs.
 - Every other writer of `StorageDeviceState` uses `state.copy(...)`, so the health fields carry through unchanged
   (verified). The only writer that builds a record from scratch is device creation (`BaseAspenClient`), where the
   defaults apply.

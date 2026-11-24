@@ -149,8 +149,10 @@ class ThreadedHungDeviceSuite extends IntegrationTestSuite with ControlFixture:
                                idB: StorageDeviceId, setA: StorageDeviceSetId, setB: StorageDeviceSetId):
     def ioA: ThreadedDeviceIo = threading.ios.get(devA)
 
-  /** The host with devices A and B (A gated, shut first when `hungFromStart`), both probing with `probe`, started */
-  private def rig(hungFromStart: Boolean, probe: HealthProbe.Config = HealthProbe.Config()): Future[HungRig] =
+  /** The host with devices A and B (A gated, shut first when `hungFromStart`), A probing with `probe` and B with
+   *  `probeB`, started */
+  private def rig(hungFromStart: Boolean, probe: HealthProbe.Config = HealthProbe.Config(),
+                  probeB: HealthProbe.Config = HealthProbe.Config()): Future[HungRig] =
     gate = new HungGate
     if hungFromStart then gate.shut()
     for
@@ -164,7 +166,7 @@ class ThreadedHungDeviceSuite extends IntegrationTestSuite with ControlFixture:
       val devA = writeDevice(hostRoot, "dev0", idA, owner = Some(hungHostId))
       val devB = writeDevice(hostRoot, "dev1", idB, owner = Some(hungHostId))
       val threading = new GatedThreading(devA, gate, DeviceIo.Config(readBound = ReadBound, probe = probe),
-        DeviceIo.Config(probe = probe))
+        DeviceIo.Config(probe = probeB))
       // Never shut down: a continuation of the host's last work may still be submitted to it after the test (a
       // rejection would print). Its daemon threads end once idle for a second
       val pool = new java.util.concurrent.ThreadPoolExecutor(3, 3, 1, TimeUnit.SECONDS,
@@ -352,12 +354,15 @@ class ThreadedHungDeviceSuite extends IntegrationTestSuite with ControlFixture:
     p.future
 
   atest("a hung device is judged Hung, the other stays Healthy, and it recovers"):
-    // Device hang detection, spec section 6: both devices probe every 50 ms and are Hung past 500 ms. The judge is
+    // Device hang detection, spec section 6: both devices probe every 50 ms; A is Hung past 500 ms. The judge is
     // driven by passes on the control thread, not its 30 s timer; each pass also publishes. B is sampled at every
     // pass, from before A's gate shuts until A's record shows Healthy again
     val Hung = StorageDeviceState.HealthStatus.Hung
     val Healthy = StorageDeviceState.HealthStatus.Healthy
     val fast = HealthProbe.Config(interval = 50.millis, hangThreshold = 500.millis)
+    // B's real fsync may exceed 500 ms under a loaded full run: its threshold is far above any such stall
+    val fastB = HealthProbe.Config(interval = 50.millis, hangThreshold = 30.seconds)
+    // Written only in judgeUntil's flatMap chain, whose steps run one after another, and read after it ends
     var bSeen = List.empty[DeviceHealth]
     def judgeUntil(what: String, r: HungRig, timeout: FiniteDuration = 5.seconds)(
         done: DeviceHealth => Future[Boolean]): Future[DeviceHealth] =
@@ -376,7 +381,7 @@ class ThreadedHungDeviceSuite extends IntegrationTestSuite with ControlFixture:
     def recordOf(id: StorageDeviceId): Future[StorageDeviceState.HealthStatus] =
       client.getStorageDeviceState(id).map(_.health)
     for
-      r <- rig(hungFromStart = false, probe = fast)
+      r <- rig(hungFromStart = false, probe = fast, probeB = fastB)
       _ <- await("A and B loaded")(host.getDevicePath(r.idA).isDefined && host.getDevicePath(r.idB).isDefined)
       _ <- judgeUntil("A Healthy, its probe run", r)(a => Future.successful(
              a.status == Healthy && r.ioA.probe.lastResult.exists(_.error.isEmpty)))

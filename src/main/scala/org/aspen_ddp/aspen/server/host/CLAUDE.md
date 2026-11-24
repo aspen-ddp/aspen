@@ -746,7 +746,8 @@ device (project 3's job), and a false Hung must never come from a merely busy de
   `readsOverBound`; capped at `MaxEvidence` 1024 characters) and logs WARN (to Hung, with the evidence) or INFO (back,
   with how long it was hung). A pass with no change logs nothing
 - Publishing (spec 5.3): after judging a device, each pass publishes while `health` differs from `publishedHealth`
-  (initialised from the record at load) and no publish is in flight (`healthPublishing`), through
+  (None at load: unknown, so the first pass publishes, and its read of the record writes only if it differs) and no
+  publish is in flight (`healthPublishing`), through
   `DeviceControl.healthPublisher` (`ClientDeviceHealthPublisher`, a `DeviceHealthPublisher`; a seam for tests). It runs
   on the client context, never on the device, so a hung device's health is published through the network: one
   `transactUntilSuccessfulWithRecovery(unlessCollision)` that reads the record and the current `health` in its body,
@@ -770,7 +771,8 @@ device (project 3's job), and a false Hung must never come from a merely busy de
 - Tests: `HealthProbeSuite` and `ThreadedDeviceIoSuite` (the probe), `DeviceHealthJudgeSuite` (passes driven by
   posting `Host.CheckDeviceHealth` and draining, with manual clocks), `DeviceHealthPublishSuite`, and
   `ThreadedHungDeviceSuite`'s "a hung device is judged Hung, the other stays Healthy, and it recovers" (real threads,
-  a 50 ms interval and 500 ms threshold, passes run by `check()` on the control thread)
+  a 50 ms interval for both devices, a 500 ms threshold for A and 30 s for B so a slow real fsync never trips B,
+  passes run by `check()` on the control thread)
 
 ### Host and StorageDevice Management
 - Most administration is done by reading and writing host and device objects containing the desired state

@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.{Host, StoreConfig}
+import org.aspen_ddp.aspen.server.Host
 import scribe.Logging
 
 import scala.concurrent.Future
@@ -28,7 +28,13 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   // Stores whose leftover device-CRL entries are being dropped (dropLeftoverCrlState)
   private var crlDropsRunning: Set[StoreId] = Set()
 
+  // The periodic device jobs outstanding, by device path and kind (ReconcileInputs, Usage): at most one of each per
+  // device. A request that finds one pending skips that device; the mark clears on every outcome of the job
+  private var outstanding: Set[(os.Path, JobKind)] = Set()
+
   private[server] def activeDeviceChecks: Set[StorageDeviceId] = activeChecks
+
+  private[server] def outstandingJobs: Set[(os.Path, JobKind)] = outstanding
 
   private[server] def leftoverCrlDropsRunning: Set[StoreId] = crlDropsRunning
 
@@ -56,6 +62,32 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     ctx.discovery.endStartupGate()
     ctx.discovery.checkForNewDevices(scan = true)
     ctx.loader.retryFailedLoads()
+
+  /** The usage poll (HostServices' periodic usage update): measures each loaded device's usage in one `Usage` job on
+   *  its lane (ReconcileDisk.usage), at most one outstanding per device (a device with one pending is skipped this
+   *  tick), and, once a device's result is applied while it is still the loaded one, sets its `usage` and calls
+   *  `publish` with it. Each device is published on its own: none waits for another, so a hung device's usage only
+   *  stops being updated. A failed measurement leaves the last value */
+  def pollUsage(publish: (LocalStorageDeviceState, Long, Long) => Unit): Unit =
+    ctx.devices.devices.valuesIterator.foreach: sds =>
+      val key = (sds.devicePath, JobKind.Usage)
+      if !outstanding.contains(key) then
+        val configFile = sds.configFile
+        try
+          val job = sds.io.submit(JobKind.Usage, None)(ReconcileDisk.usage(configFile))
+          outstanding += key
+          ctx.onControl(DeviceReconciler.UsageJob, job): result =>
+            outstanding -= key
+            result match
+              case Success((used, total)) =>
+                if ctx.devices.isLoaded(sds) then
+                  sds.usage = Some((used, total))
+                  publish(sds, used, total)
+              case Failure(t) =>
+                if t != DeviceIo.Cancelled then
+                  logger.warn(s"Failed to measure the usage of storage device ${sds.storageDeviceId}: $t")
+        catch case NonFatal(t) =>
+          logger.warn(s"Failed to submit the usage measurement of storage device ${sds.storageDeviceId}: $t")
 
   /** A CheckStorageDevice message. */
   def handleCheckMessage(m: CheckStorageDevice): Unit =
@@ -92,7 +124,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  charges its crl_save.log state under the same id (CrlAdmission.tryChargeLoaded) for records saved behind the drop,
    *  which the drop does not remove; its recovery releases the whole charge once it has counted them, so the records
    *  stay counted throughout (crash-recovery-log 6.1). */
-  private def dropLeftoverCrlState(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+  private def dropLeftoverCrlState(local: LocalStorageDeviceState, remote: StorageDeviceState,
+                                   disk: ReconcileDisk.ReconcileDiskInputs): Unit =
     val deviceId = local.storageDeviceId
     val listed =
       try local.crl.storesWithEntries()
@@ -102,9 +135,12 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         logger.error(s"Failed to list the stores in the CRL of storage device $deviceId. Retrying at its next " +
                      s"check. Error: $t")
       case Success(stores) =>
+        // A store whose record names another path than the check's disk inputs stat'd is no leftover this round
         def leftover(storeId: StoreId): Boolean =
+          val path = ctx.copyRegistry.pathOf(local, storeId)
           !remote.stores.contains(storeId) && !ctx.copyRegistry.openCopies(local).contains(storeId) &&
-            ctx.copyRegistry.existence(local, storeId).contains(false) &&
+            (path.isEmpty || disk.current(storeId, path)) &&
+            ctx.copyRegistry.existence(local, storeId, disk).contains(false) &&
             !crlDropsRunning.contains(storeId) &&
             !ctx.copies.isRetiring(storeId)
         // Only while the device is still loaded: an unloaded one's CRL is shut down
@@ -155,7 +191,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // resync is still asked for, and copies whose move to lost/ failed are moved (StoreRebuilds.moveToLost)
       try
         ctx.moves.resync(local)(())
-        ctx.rebuilds.retryPendingLost(local)
+        ctx.rebuilds.retryPendingLost(local, None)
         deviceLevel(local, remote)
       finally ended()
     else
@@ -164,12 +200,50 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // hung device's check waits with it, and its later checks are deferred behind it). Then copies whose move to
       // lost/ failed are moved (StoreRebuilds.moveToLost)
       ctx.moves.resync(local):
+        var handedOff = false
         try
           if ctx.devices.isLoaded(local) then
-            ctx.rebuilds.retryPendingLost(local)
-            // The tree read before the resync may have changed meanwhile; the next check reads it again
-            operational(local, remote)
-        finally ended()
+            handedOff = gatherInputs(local):
+              case Some(disk) =>
+                // The tree read before the resync may have changed meanwhile; the next check reads it again
+                try
+                  ctx.rebuilds.retryPendingLost(local, Some(disk))
+                  operational(local, remote, disk)
+                finally ended()
+              case None => ended()
+        finally
+          if !handedOff then ended()
+
+  /** Reads every disk-derived input of `local`'s store decisions in one `ReconcileInputs` job on its lane
+   *  (ReconcileDisk.gather: the stats of each recorded copy and of each listed one, the copy listing with its phase
+   *  parameters), and runs `andThen` with them on the control thread once the result is applied, for a device still
+   *  the loaded one, None for a failed or cancelled job or a device unloaded meanwhile (the decisions are skipped;
+   *  the next check gathers again). At most one is outstanding per device: a request that finds one pending submits
+   *  none and returns false, as does a submission that throws; true once `andThen` is sure to run. The mark clears on
+   *  every outcome */
+  private def gatherInputs(local: LocalStorageDeviceState)
+                          (andThen: Option[ReconcileDisk.ReconcileDiskInputs] => Unit): Boolean =
+    val key = (local.devicePath, JobKind.ReconcileInputs)
+    if outstanding.contains(key) then
+      false
+    else
+      val recorded = ctx.copyRegistry.copiesOf(local).toList.flatMap: copies =>
+        copies.copies.keys.flatMap(s => copies.pathOf(s).map(s -> _))
+      val devicePath = local.devicePath
+      try
+        val job = local.io.submit(JobKind.ReconcileInputs, None)(ReconcileDisk.gather(devicePath, recorded.toMap))
+        outstanding += key
+        ctx.onControl(DeviceReconciler.ReconcileInputsJob, job): result =>
+          outstanding -= key
+          result.failed.foreach: t =>
+            if t != DeviceIo.Cancelled then
+              logger.warn(s"Failed to read the disk inputs of storage device ${local.storageDeviceId}'s check. " +
+                          s"Retrying at its next check. Error: $t")
+          andThen(result.toOption.filter(_ => ctx.devices.isLoaded(local)))
+        true
+      catch case NonFatal(t) =>
+        logger.warn(s"Failed to submit the disk inputs read of storage device ${local.storageDeviceId}'s check: $t")
+        false
 
   /** reconcileDeviceState's device-level branches: a Failed device, one owned elsewhere, one shutting down */
   private def deviceLevel(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
@@ -193,7 +267,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       ctx.shutdown.shutDownDevice(local, remote)
 
   /** reconcileDeviceState's Operational branch, after its resync */
-  private def operational(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+  private def operational(local: LocalStorageDeviceState, remote: StorageDeviceState,
+                          disk: ReconcileDisk.ReconcileDiskInputs): Unit =
     if ctx.shutdown.isShuttingDown(local.storageDeviceId) then
       // A shutdown began while the resync ran: its own sequence owns the device now
       ctx.shutdown.shutDownDevice(local, remote)
@@ -202,10 +277,10 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       ()
     else
       // Any entries a store transferred away left in the device CRL go
-      dropLeftoverCrlState(local, remote)
+      dropLeftoverCrlState(local, remote, disk)
       // A store a cancelled shutdown closed, or whose load an unsynced move held back, is loaded by its decision
       // (CopyDecision.Load)
-      reconcileStores(local, remote)
+      reconcileStores(local, remote, disk)
       ctx.rebuilds.sweepUnlistedStaging(local, remote)
       // Pending deletes: retired copies whose store is Active on its owner device, and the remains of interrupted
       // deletes
@@ -219,7 +294,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  to exactly the stores given DeclareMissing: a declared store stays declared while its entry is Active here and
    *  it is not served. The record is in memory only: a restart's device load serves a store whose directory is back,
    *  with its kept CRL entries. */
-  private def reconcileStores(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+  private def reconcileStores(local: LocalStorageDeviceState, remote: StorageDeviceState,
+                              disk: ReconcileDisk.ReconcileDiskInputs): Unit =
     val declaredBefore = local.declaredMissing
     // Read once: a store is in either set only by Rebuild work of its own, which only its own actions change, and each
     // store has one turn, so the sets read now are what each store's turn would read
@@ -232,20 +308,30 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       copies.map(_.work.keySet).getOrElse(Set()) ++
       ctx.transfers.pendingStartTransfers.keySet ++
       ctx.transfers.transferInRetries.keySet
+    var skipped = false
     stores.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
-      // An Active entry whose config is known absent at its record's path (or with no record) is the Missing Stores
-      // case's: its copies are re-read from the disk first, since the registry learns them only at the device load.
-      // A directory absent then and back now is registered (and loaded, unless already declared), and the record of
-      // one gone since its load is forgotten
-      if remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
-         ctx.copyRegistry.existence(local, storeId, Some(StoreConfig.configFilename)).contains(false) then
-        ctx.copyRegistry.reread("missing stores", local, storeId): Unit
-      CopyDecision.decide(storeInputs(local, remote, storeId, declaredBefore, rebuildReads, rebuildHolds)).foreach:
-        action =>
-          action match
-            case CopyDecision.Action.DeclareMissing(_) => declared += storeId
-            case _ => ()
-          run(local, storeId, action)
+      if !disk.current(storeId, ctx.copyRegistry.pathOf(local, storeId)) then
+        // Its record changed since the disk inputs were read (a move, a retire, a rebuild's finish recorded): they
+        // are not its copy's, so it is not decided this round. Its declaration stands, and the device is checked
+        // again shortly
+        skipped = true
+        if declaredBefore.contains(storeId) then declared += storeId
+      else
+        // An Active entry whose config is known absent at its record's path (or with no record) is the Missing Stores
+        // case's: its copies are re-read from the disk inputs first, since the registry learns them only at the device
+        // load. A directory absent then and back now is registered (and loaded, unless already declared), and the
+        // record of one gone since its load is forgotten
+        if remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
+           ctx.copyRegistry.existence(local, storeId, disk, config = true).contains(false) then
+          ctx.copyRegistry.reread("missing stores", local, storeId, disk): Unit
+        CopyDecision.decide(storeInputs(local, remote, storeId, declaredBefore, rebuildReads, rebuildHolds, disk))
+          .foreach: action =>
+            action match
+              case CopyDecision.Action.DeclareMissing(_) => declared += storeId
+              case _ => ()
+            run(local, storeId, action, disk)
+    if skipped then
+      scheduleDeviceRecheck(local.storageDeviceId)
     local.declaredMissing = declared
     ctx.copyRegistry.missingIs(local)
 
@@ -254,7 +340,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  `rebuilding(RebuildReads)` and `rebuilding(RebuildHolds)`, read before the loop */
   private def storeInputs(local: LocalStorageDeviceState, remote: StorageDeviceState, storeId: StoreId,
                           declaredBefore: Set[StoreId], rebuildReads: Set[StoreId],
-                          rebuildHolds: Set[StoreId]): CopyDecision.StoreInputs =
+                          rebuildHolds: Set[StoreId], disk: ReconcileDisk.ReconcileDiskInputs): CopyDecision.StoreInputs =
     val registry = ctx.copyRegistry
     val copies = registry.copiesOf(local)
     val copy = copies.flatMap(_.copies.get(storeId)).map: r =>
@@ -274,15 +360,16 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       rebuildReadsOnHost = rebuildReads.contains(storeId),
       rebuildHoldsOnHost = rebuildHolds.contains(storeId),
       rebuildHandle = ctx.rebuilds.hasRunningRebuild(storeId),
-      dirPresent = registry.existence(local, storeId),
-      configPresent = registry.existence(local, storeId, Some(StoreConfig.configFilename)),
+      dirPresent = registry.existence(local, storeId, disk),
+      configPresent = registry.existence(local, storeId, disk, config = true),
       declaredMissing = declaredBefore.contains(storeId),
       tracked = tracked)
     CopyDecision.StoreInputs(local.storageDeviceId, storeId, remote.stores.get(storeId), copy,
       copies.flatMap(_.work.get(storeId)), facts)
 
   /** Carries out one of `storeId`'s actions on `local` (CopyDecision.decide has the rule for each) */
-  private def run(local: LocalStorageDeviceState, storeId: StoreId, action: CopyDecision.Action): Unit =
+  private def run(local: LocalStorageDeviceState, storeId: StoreId, action: CopyDecision.Action,
+                  disk: ReconcileDisk.ReconcileDiskInputs): Unit =
     import CopyDecision.Action.*
     val deviceId = local.storageDeviceId
     action match
@@ -339,7 +426,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       case StartTransferIn(fromDevice, transferId) =>
         startTransferIn(local, storeId, fromDevice, transferId)
       case StartRebuild(episode, acceptLoss) =>
-        ctx.rebuilds.startRebuild(local, storeId, episode, acceptLoss)
+        ctx.rebuilds.startRebuild(local, storeId, episode, acceptLoss, disk = Some(disk))
 
   /** Starts, resumes or abandons the transfer in of `storeId` onto `local` from `fromDeviceId`, its entry there
    *  TransferringIn, once the source's state is read */
@@ -421,9 +508,9 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  branch chosen at dispatch time would then record a loaded device's stores as an unloaded
    *  device's, silent until its next reconcile, rather than reconciling it now.
    *
-   *  The lookup is issued on the control thread and the callback runs there too, so the whole
-   *  of reconcileDeviceState -- filesystem work included -- runs with the control thread busy.
-   *  That same thread is what makes the load-state re-read safe: every handler runs on it, so
+   *  The lookup is issued on the control thread and the callback runs there too, as does every
+   *  later step of reconcileDeviceState (its disk reads are jobs on the device's lane, whose
+   *  results are applied in control events: the resync, then ReconcileInputs). That same thread is what makes the load-state re-read safe: every handler runs on it, so
    *  no device can be loading while the callback runs.
    *
    *  It is also what keeps a deferral from being stranded. checkStorageDevice's deferral
@@ -445,9 +532,10 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  which treats such a throw as a failed lookup. Releasing on fewer than all four would skip
    *  every later check of that device for the life of the process.
    *
-   *  The callback-body path is not hypothetical: the reconcile touches the filesystem and
-   *  issues transactions, so it can throw. It and the synchronous throw are both covered by
-   *  HostDeviceDiscoverySuite.
+   *  The callback-body path is not hypothetical: the reconcile's decisions start moves and
+   *  loads and issue transactions, so they can throw, in the callback or in the apply of its
+   *  disk-inputs job, whose finally ends the check the same way. It and the synchronous throw
+   *  are both covered by HostDeviceDiscoverySuite.
    *
    *  Treating a synchronous throw as a failed lookup rather than letting it propagate leaves
    *  this method with no non-fatal synchronous throw path, and that is what makes
@@ -561,3 +649,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
         logger.warn(s"Lookup of state for storage device $storageDeviceId threw instead of " +
                     s"returning a pending read", err)
         endDeviceCheck()
+
+object DeviceReconciler:
+  /** The names of the device check's disk-inputs job and the usage poll's job results (Host.DeviceJobDone) */
+  val ReconcileInputsJob = "reconcile inputs"
+  val UsageJob = "device usage"

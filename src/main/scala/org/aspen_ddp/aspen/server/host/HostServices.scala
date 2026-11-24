@@ -129,16 +129,17 @@ class HostServices(ctx: DeviceControl) extends Logging:
       // and devices it reads.
       Future.delegate:
         val slist = ctx.router.loaded.keysIterator.toList
-        val dlist = ctx.devices.devices.valuesIterator.toList
         val fs = runSequentially(slist): storeId =>
           // The size estimate reads the backend, so it runs on the store's executor
           ctx.router.onStore(storeId)(_.estimateSize()).flatMap:
             case Some(size) => poolUsageManager.updateStoreSize(storeId, size)
             case None => Future.unit
-        val fd = runSequentially(dlist): sds =>
-          deviceUsageManager.updateDeviceUsage(sds.storageDeviceId, sds.currentUsage, sds.totalSize)
-
-        Future.sequence(List(fs, fd))
+        // Each device's usage is measured by a job on its own lane and published when that job's result is applied,
+        // never joined with another device's: the poll does not wait for them, so a hung device stalls only its own
+        ctx.reconciler.pollUsage: (sds, used, total) =>
+          deviceUsageManager.updateDeviceUsage(sds.storageDeviceId, used, total).failed.foreach: t =>
+            logger.warn(s"Failed to publish the usage of storage device ${sds.storageDeviceId}: $t")
+        fs
     )
 
   def getTaskExecutor(): Future[TaskExecutor] = taskExecutorPromise.future

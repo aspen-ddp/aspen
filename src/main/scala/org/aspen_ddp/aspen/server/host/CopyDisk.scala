@@ -50,6 +50,11 @@ object CopyDisk extends Logging:
   /** Whether `path` exists, as FileStat.existence: None where the stat fails */
   def existence(path: os.Path): Option[Boolean] = FileStat.existence(path)
 
+  /** The phase directory holding the copy of `storeId` named `copyId` on the device at `devicePath`
+   *  (CopyLayout.locate); None where none does or the location cannot be read */
+  def locate(devicePath: os.Path, storeId: StoreId, copyId: UUID): Option[Phase] =
+    Try(CopyLayout.locate(devicePath, storeId, copyId)).toOption.flatten
+
   /** The device's copies (CopyLayout.list) */
   def list(devicePath: os.Path): CopyLayout.Listing = CopyLayout.list(devicePath)
 

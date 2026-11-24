@@ -768,6 +768,16 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
 
   /** Handles `host`'s events, yielding between rounds, until `condition` holds. Silent on exhaustion: the caller
    *  asserts the end state. */
+  /** Yields until device A's check has ended, running its lane's copy and reconcile-inputs jobs (runCopyJobs: their
+   *  results applied only from the FIFO's head) on the way: this suite's hosts are not newHost's, so yieldUntil does
+   *  not run them */
+  private def checkEnded(host: Host, rounds: Int = 100): Future[Unit] =
+    runCopyJobs(host)
+    if !host.control.reconciler.activeDeviceChecks.contains(deviceA) || rounds == 0 then
+      Future.unit
+    else
+      Future(()).flatMap(_ => checkEnded(host, rounds - 1))
+
   private def handleUntil(host: Host, rounds: Int = 100)(condition: => Boolean): Future[Unit] =
     host.testingOnlyHandleEvents()
     if condition || rounds == 0 then
@@ -827,7 +837,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       fsif(host).deviceStates = Map(deviceA -> deviceState(deviceA,
         Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
       checkAllNow(host)
-      yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).map: _ =>
+      checkEnded(host).map: _ =>
         host.control.reconciler.activeDeviceChecks should not contain deviceA
         CopyFixtures.phaseOf(deviceDir, storeId).exists(_.isInstanceOf[Phase.Outbound]) should be(false)
         // The load's config read, on the device's lane, queues the open
@@ -960,7 +970,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     fsif(host).deviceStates = Map(deviceA -> deviceState(deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
     checkAllNow(host)
-    yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).flatMap: _ =>
+    checkEnded(host).flatMap: _ =>
       host.control.reconciler.activeDeviceChecks should not contain deviceA
       // Opened synchronously, but not gossiped until its LoadStore has served it (X-W15): silent while it opens
       host.control.copyRegistry.silence(storeId) should be(Silence.Silent(Set(SilenceReason.Opening)))
@@ -1018,7 +1028,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     fsif(host).deviceStates = Map(deviceA -> deviceState(deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
     checkAllNow(host)
-    yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).flatMap: _ =>
+    checkEnded(host).flatMap: _ =>
       // The load's config read, on the device's lane, fails
       host.testingOnlyHandleEvents()
       // Moved back to Live in live/ (T7), so only the retry can take the store up again

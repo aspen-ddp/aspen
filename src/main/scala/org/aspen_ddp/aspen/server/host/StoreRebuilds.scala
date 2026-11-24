@@ -275,7 +275,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  (rebuild-process.md 5.1).
    */
   def startRebuild(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
-                   acceptLoss: Boolean, handoff: Boolean = false): Unit =
+                   acceptLoss: Boolean, handoff: Boolean = false,
+                   disk: Option[ReconcileDisk.ReconcileDiskInputs] = None): Unit =
     val deviceId = local.storageDeviceId
     val held = StoreRebuilds.HeldRebuild(deviceId, episode, acceptLoss)
     // Host-wide by store id: a rebuild of the store runs (on any device), so nothing more starts for it. Its handle
@@ -316,7 +317,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       ctx.reconciler.scheduleDeviceRecheck(deviceId)
     if !closing && !refused && !shipping && !runs && !scheduledRebuildRetries.get(storeId).contains(held) &&
        slotsTaken(Option.when(handoff)((deviceId, storeId))) < ctx.maxConcurrentRebuilds &&
-       ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId, episode) &&
+       ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId, episode, disk) &&
        discardLostStore(local, storeId, episode, held) then
       // The copy already there, as its record has it: the rebuild's start (on this thread, in its constructor) takes
       // this episode's Rebuilt copy for done and fails on any other
@@ -695,11 +696,14 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  before the checkpoint stale with no mark, so the store's staging checkpoint is first removed durably, making the
    *  next pass a first pass (dropStagingCheckpoint). No rebuild of the store runs here when this is called. Returns
    *  whether the rebuild may go on now. */
-  private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID]): Boolean =
-    // The record is re-read from the disk first (HostCopies.reread): a copy back since the device's load is retired
-    // with its device-CRL entries, and the record of one gone since is forgotten, rather than its move to lost/
-    // failing for good. A re-read that fails waits for a later check
-    if !registry.reread("retireForeignCopy", local, storeId) then
+  private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
+                                disk: Option[ReconcileDisk.ReconcileDiskInputs]): Boolean =
+    // The record is first matched to the device check's disk inputs (HostCopies.reread): a copy back since the
+    // device's load is retired with its device-CRL entries, and the record of one gone since is forgotten, rather than
+    // its move to lost/ failing for good. A re-read that fails waits for a later check. A start with no inputs (the
+    // handoff after a discard, whose own start re-read them moments before) re-reads nothing: a copy that came back
+    // in between fails the rebuild's start, and the backoff's check re-reads it
+    if disk.exists(d => !registry.reread("retireForeignCopy", local, storeId, d)) then
       return false
     val storePath = ctx.copyRegistry.pathOf(local, storeId)
     // Some(None): no copy or this episode's finished copy; Some(Some(lost)): another copy, Lost (in lost/) or not
@@ -838,11 +842,12 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       case _ => ()
 
   /** Retries the move to lost/ of every copy of `local` whose move failed (CopyMoves.pendingLost): each device check
-   *  does, before its passes */
-  def retryPendingLost(local: LocalStorageDeviceState): Unit =
+   *  does, before its passes. `disk`: the check's disk inputs (ReconcileDisk.gather), None for a device-level branch,
+   *  which re-reads nothing */
+  def retryPendingLost(local: LocalStorageDeviceState, disk: Option[ReconcileDisk.ReconcileDiskInputs]): Unit =
     ctx.moves.pendingLost(local).toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach: storeId =>
       // A copy whose directory is gone has its record forgotten, which releases the hold: no move can succeed
-      registry.reread("retry move to lost", local, storeId): Unit
+      disk.foreach(d => registry.reread("retry move to lost", local, storeId, d): Unit)
       if ctx.moves.isPendingLost(local, storeId) then
         moveToLost("retry move to lost", local, storeId): Unit
 

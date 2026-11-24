@@ -253,10 +253,12 @@
   (create, rebuild finish's handler, transfer-in promotion, every move, retire into pending-delete, discards) updates it
   right after its durable step. A copy changed by hand while the device stays loaded (a directory absent at the load
   and back later, a mount or restore finishing late; one removed) is read again from the disk where it matters
-  (`HostCopies.reread`, listing only that store's copies, `CopyLayout.copiesOf`): by the reconcile for an Active entry
+  (`HostCopies.reread`, from the device check's disk inputs, `ReconcileDisk.gather`: no disk is read on control;
+  a record whose path changed since they were read waits): by the reconcile for an Active entry
   whose config is known absent (the Missing Stores case: a copy back before the declaration is registered and loaded),
   by `retireForeignCopy` before it retires (so the rebuild retires what is on disk, with its device-CRL entries), and
-  by `retryPendingLost` (a record whose directory a stat answers absent is forgotten, which releases the hold). It
+  by `retryPendingLost` (a record whose directory a stat answers absent is forgotten, which releases the hold; the
+  device-level branches and a discard's rebuild handoff pass no inputs and re-read nothing). It
   forgets the record of an offline, synced copy whose directory is known gone, then registers the least copy id the
   phase directories hold for a store with no record, leaving a record in use or unsynced, and a rebuild's finish in
   flight, alone; a failed stat or listing changes nothing and its caller waits. A copy back while a rebuild runs (after
@@ -354,11 +356,20 @@
   shutting down handed to `shutDownDevice`. Otherwise the device-level steps run around the store loop:
   `dropLeftoverCrlState`, then `reconcileStores`, then
   `StoreRebuilds.sweepUnlistedStaging` (the `rebuilding/` staging of stores no longer listed), then
-  `StoreCopies.release` (which asks `CopyDecision.release`). `reconcileStores` takes every store the entries name, that
+  `StoreCopies.release` (which asks `CopyDecision.release`). After the resync, every disk-derived input of the
+  decisions is read in one `ReconcileInputs` job on the device's lane (`ReconcileDisk.gather`: the dir and config
+  stats of each recorded copy and of each listed one, and the copy listing with its phase parameters, all plain
+  values in `ReconcileDiskInputs`), at most one outstanding per device (`DeviceReconciler.outstanding`, cleared on
+  every outcome); the Operational steps run in its apply, for a device still loaded (a failed, cancelled or stale
+  result decides nothing and ends the check). `StoreFacts.dirPresent`/`configPresent` (`HostCopies.existence(sds,
+  storeId, disk)`), `dropLeftoverCrlState`'s absence test, `reread` and `retireForeignCopy` (via `startRebuild(...,
+  disk)`) read those values only. A store whose record names another path than the gather stat'd (or that gained or
+  lost its record meanwhile: `ReconcileDiskInputs.current`) is skipped that round, never decided from stale stats:
+  its declaration stands and the device is rechecked shortly (`scheduleDeviceRecheck`). `reconcileStores` takes every store the entries name, that
   has a copy or work on the device, or whose transfer in the host tracks (`pendingStartTransfers`, `transferInRetries`,
   any device), in `(poolId.uuid, poolIndex)` order (D2, store-major): for each in turn it reads its inputs fresh
   (`storeInputs`: the entry, the copy's record, its work and the `CopyDecision.StoreFacts`, each field naming its
-  source), runs the pure `CopyDecision.decide` and carries out its actions in order (`run`, one case per
+  source; the stats from the gathered inputs), runs the pure `CopyDecision.decide` and carries out its actions in order (`run`, one case per
   `CopyDecision.Action`, onto the handlers) before the next store's inputs are read. (The steps after the resync run in
   its continuation, `operational`.) The former passes are decide's
   cases, in this order, each with its rationale there: EndQueuedRebuild (queued Rebuild work of a store no longer
@@ -398,11 +409,20 @@
   before them (every `yieldUntil` calls it for the suite's lockstep hosts; `newHost` handles the startup gate's
   `StoresReady` at the head so later results are not stuck behind it; `settled(host, f)` drains until a retire's
   future completes; `CopyIoSuite` holds each);
+  `ReconcileInputs` jobs and their results (`DeviceReconciler.ReconcileInputsJob`) run under `runCopyJobs` too, and
+  it runs any other lane job that reaches the FIFO's head, as a drain would (`ReconcileIoSuite` holds them);
   `ControlFixture.awaitLoudly` waits on work that crosses real-time hops and fails, naming what it waited for, when
   its time runs out. `LocalDevices.isLoaded(sds)`
   says whether a device state is still the loaded one. `CopyDecisionSuite` checks decide's invariants over every
   combination of its inputs; a test whose host reads the real tree through a recording host (copies the tree does not
   list) holds the device's checks with an armed lookup when a reconcile would act on them
+- Device usage (`HostServices`' 20 s usage poll): `DeviceReconciler.pollUsage` submits one `Usage` job per loaded
+  device (`ReconcileDisk.usage`: free and total space of the config file's file system), at most one outstanding per
+  device (a tick that finds one pending skips that device). Its apply, for a device still loaded, sets
+  `LocalStorageDeviceState.usage: Option[(currentUsage, totalSize)]` (None until first measured) and publishes that
+  device alone (`StorageDeviceUsageManager.updateDeviceUsage`); the poll joins no device's result, so a hung device
+  only stops updating. A load's `readAtLoad` whose record the phase table refuses takes its copy's location from a
+  `CopyLayout` job (`CopyDisk.locate`), applied while the device is loaded and the record unchanged
 
 ### Host threading model
 - `HostThreading` decides where a host's work runs. It is a `Host` constructor parameter, chosen in code. The default

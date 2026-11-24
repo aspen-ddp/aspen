@@ -551,28 +551,24 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     p1.success(deviceState(deviceA, Map(storeId -> StorageDeviceState.StoreEntry(
       StorageDeviceState.StoreStatus.Active, None))))
 
-    yieldUntil(recorded(host).lookupAttempts.size == 2).map: _ =>
-      // yieldUntil gives up silently, so assert its condition first. It also proves the
-      // re-dispatch happened, without which the assertions below would pass vacuously.
+    // The store decisions run in the apply of the check's disk-inputs job (ReconcileInputs), a control event: the
+    // reconcile's throw escapes that event (the event loop's catch-all logs it in production), and the check's guard
+    // is released by the apply's finally, whose re-dispatch absorbs its own lookup's throw
+    def reconcileThrow(rounds: Int): Future[Throwable] =
+      scala.util.Try(runCopyJobs(host)) match
+        case scala.util.Failure(t) => Future.successful(t)
+        case _ if rounds == 0 => Future.failed(new AssertionError("the reconcile never threw"))
+        case _ => Future(()).flatMap(_ => reconcileThrow(rounds - 1))
+
+    reconcileThrow(100).map: thrown =>
+      // It also proves the re-dispatch happened, without which the assertions below would pass vacuously.
       recorded(host).lookupAttempts.toList should be(List(deviceA, deviceA))
 
-      // The discriminating pair, deliberately ahead of the release assertions below. Against the
-      // pre-fix code those two failed with the same "was not empty" message the synchronous-throw
-      // test above already reported, so leading with them left this test's red output saying
-      // nothing about the defect it is named for. Ordered this way, a regression that revives the
-      // masking reports the wrong exception by name instead.
-      //
-      // Old code records exactly one failure and it is redispatchError, because the throw out
-      // of the finally replaced the reconcile's. New code absorbs redispatchError inside the
-      // re-dispatch and lets the reconcile's escape, so the one recorded failure is the simulated
-      // store load failure.
-      //
-      // Size before content, because this recorder sees every callback the host runs
-      // through its ExecutionContext: a bare non-empty check would also pass on an unrelated
-      // failure with the reconcile silently not throwing at all. Matched on the message
-      // fragment rather than RuntimeException, which is too common a class to pin anything to.
-      recordingEc.failures should have size 1
-      recordingEc.failures.head.getMessage should include("Simulated store load failure")
+      // The discriminating assertion: had the re-dispatch's throw replaced the reconcile's, the escaping exception
+      // would be redispatchError. Matched on the message fragment rather than RuntimeException, which is too common a
+      // class to pin anything to. Nothing else failed on the recorder: the re-dispatch absorbed its throw
+      thrown.getMessage should include("Simulated store load failure")
+      recordingEc.failures should be(empty)
 
       // The finally still released, even though the try body threw.
       host.control.reconciler.activeDeviceChecks should be(empty)
@@ -1591,6 +1587,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(!outbound(deviceDir, movingStore) &&
                      !host.control.reconciler.activeDeviceChecks.contains(sourceId))
     yield
+      println("DEBUGQ " + host.threading.asInstanceOf[org.aspen_ddp.aspen.server.host.LockstepThreading].queuedItems.map{ case e: Host.EventTask => e.event.toString; case t: org.aspen_ddp.aspen.server.host.LockstepThreading.DeviceTask => t.kind.toString; case t => t.getClass.getName } + " " + host.control.reconciler.activeDeviceChecks + host.control.reconciler.scheduledDeviceRechecks)
       markedBeforeAbort should be(true)
       outbound(deviceDir, movingStore) should be(false)
       storeDir / os.up should be(deviceDir / CopyLayout.OutboundDirectory)

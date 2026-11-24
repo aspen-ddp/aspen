@@ -37,8 +37,9 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
 
   private var reconciled: Option[Map[StoreId, StorageDeviceState.StoreEntry]] = None
 
-  def totalSize: Long = configFile.toIO.getTotalSpace
-  def currentUsage: Long = totalSize - configFile.toIO.getFreeSpace
+  /** The device's (currentUsage, totalSize) in bytes, as its latest `Usage` job measured them (ReconcileDisk.usage,
+   *  DeviceReconciler.pollUsage); None until its first measurement is applied. Set on the control thread only */
+  var usage: Option[(Long, Long)] = None
 
 /** Runs only on the control thread. See HostThreading.scala.
  *

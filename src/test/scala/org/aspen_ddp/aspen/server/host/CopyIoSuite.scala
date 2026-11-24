@@ -248,14 +248,15 @@ class CopyIoSuite extends IntegrationTestSuite with ControlFixture:
     val registry = host.control.copyRegistry
     registry.diskJob(sds, s, JobKind.Move) should be(true)
     host.control.moves.holdLost(sds, s, held = true)
-    host.control.rebuilds.retryPendingLost(sds)
+    def disk() = Some(ReconcileDisk.gather(devA, Map(s -> CopyFixtures.copyPath(devA, s).get)))
+    host.control.rebuilds.retryPendingLost(sds, disk())
     CopyFixtures.phaseOf(devA, s) should be(Some(Phase.Live))
     host.control.moves.isPendingLost(sds, s) should be(true)
     recordOn(host, deviceA, s).map(r => (r.phase, r.activity)) should be(
       Some((Phase.Live, Activity.DiskJob(JobKind.Move, Activity.Idle))))
     // Once the job ends, the next retry moves it
     registry.diskJobEnded(sds, s)
-    host.control.rebuilds.retryPendingLost(sds)
+    host.control.rebuilds.retryPendingLost(sds, disk())
     CopyFixtures.phaseOf(devA, s) should be(Some(Phase.Lost))
     host.control.moves.isPendingLost(sds, s) should be(false)
     drain(host)

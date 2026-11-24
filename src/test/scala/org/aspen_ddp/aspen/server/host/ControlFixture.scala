@@ -763,20 +763,21 @@ trait ControlFixture:
       batch.foreach(_.run())
       batch = ls.removeQueued(isLoadRead)
 
-  /** Runs the queued copy jobs (StoreCopies, CopyMoves: `Move`, `Retire`, `Release`, `Delete`) wherever they are
-   *  queued (running a lane job early is legal: its result is posted at the FIFO's tail), and applies their results
-   *  (DeviceJobDone named "copy ...") only from the head of the FIFO, so no result is applied ahead of an event queued
-   *  before it. Stops at the first other event at the head, left for a real drain. No disk check. A held path's jobs
-   *  stay held */
+  /** Runs the queued copy jobs (StoreCopies, CopyMoves: `Move`, `Retire`, `Release`, `Delete`) and device checks'
+   *  disk-inputs jobs (DeviceReconciler: `ReconcileInputs`) wherever they are queued (running a lane job early is
+   *  legal: its result is posted at the FIFO's tail), and applies their results (DeviceJobDone named "copy ..." or
+   *  DeviceReconciler.ReconcileInputsJob) only from the head of the FIFO, so no result is applied ahead of an event
+   *  queued before it. A lane job of any other kind at the head is run, as a drain runs it next. Stops at the first
+   *  other event at the head, left for a real drain. No disk check. A held path's jobs stay held */
   protected def runCopyJobs(host: Host): Unit =
     val ls = lockstep(host)
-    val kinds = Set[JobKind](JobKind.Move, JobKind.Retire, JobKind.Release, JobKind.Delete)
+    val kinds = Set[JobKind](JobKind.Move, JobKind.Retire, JobKind.Release, JobKind.Delete, JobKind.ReconcileInputs)
     def isCopyTask(task: Runnable): Boolean = task match
       case t: LockstepThreading.DeviceTask => kinds.contains(t.kind)
       case _ => false
     def isCopyResult(task: Runnable): Boolean = task match
       case t: Host.EventTask => t.event match
-        case e: Host.DeviceJobDone => e.what.startsWith("copy ")
+        case e: Host.DeviceJobDone => e.what.startsWith("copy ") || e.what == DeviceReconciler.ReconcileInputsJob
         case _ => false
       case _ => false
     var progress = true
@@ -786,7 +787,8 @@ trait ControlFixture:
       tasks.foreach(_.run())
       progress = tasks.nonEmpty
       var head = ls.queuedItems.headOption
-      while head.exists(isCopyResult) do
+      // A lane job of another kind at the head runs too, as the drain would run it next: its result goes to the tail
+      while head.exists(t => isCopyResult(t) || t.isInstanceOf[LockstepThreading.DeviceTask]) do
         ls.removeQueued(_ eq head.get).foreach(_.run())
         progress = true
         head = ls.queuedItems.headOption

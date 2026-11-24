@@ -2895,6 +2895,10 @@ object Main {
     val lines = scala.collection.mutable.ListBuffer[String]()
     lines += s"Storage Device: ${s.storageDeviceId.uuid}"
     lines += s"  Status:     ${s.status}"
+    lines += (s.health match
+      case StorageDeviceState.HealthStatus.Healthy => "  Health:     Healthy"
+      case StorageDeviceState.HealthStatus.Hung =>
+        s"  Health:     Hung since ${formatWallTime(s.healthSince.wallTime)} (${s.healthEvidence})")
     lines += s"  Host:       $host (${s.hostId.uuid})"
     lines += s"  Device Set: $set (${s.storageDeviceSet.uuid})"
     lines += f"  Usage:      ${formatBytes(s.currentUsage)} / ${formatBytes(s.totalSize)} ($pct%.1f%%)"

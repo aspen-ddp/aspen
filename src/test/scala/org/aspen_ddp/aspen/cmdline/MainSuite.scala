@@ -158,6 +158,19 @@ class MainSuite extends AnyFunSuite with Matchers:
     out should include ("  Status:     ShuttingDown")
     out should include (s"$storeId  Offline")
 
+  test("formatDeviceState renders health"):
+    val devId  = StorageDeviceId(UUID.fromString("22222222-2222-2222-2222-222222222222"))
+    val hostId = HostId(UUID.fromString("11111111-1111-1111-1111-111111111111"))
+    val setId  = StorageDeviceSetId(UUID.fromString("33333333-3333-3333-3333-333333333333"))
+    val plain = StorageDeviceState(devId, hostId, 0L, 0L, Map.empty, setId)
+    Main.formatDeviceState(plain, None, None) should include ("  Health:     Healthy")
+    val hung = plain.copy(health = StorageDeviceState.HealthStatus.Hung,
+      healthSince = HLCTimestamp(1700000000000L << 16),
+      healthEvidence = "probe in flight 3m12s")
+    val out = Main.formatDeviceState(hung, None, None)
+    out should include ("  Health:     Hung since ")
+    out should include ("probe in flight 3m12s")
+
   test("formatDeviceState falls back to raw UUIDs when names are None"):
     val devId  = StorageDeviceId(UUID.fromString("22222222-2222-2222-2222-222222222222"))
     val hostId = HostId(UUID.fromString("11111111-1111-1111-1111-111111111111"))

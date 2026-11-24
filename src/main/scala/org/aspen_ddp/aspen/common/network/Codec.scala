@@ -1480,6 +1480,15 @@ object Codec extends Logging:
     case codec.StorageDeviceStatus.STORAGE_DEVICE_STATUS_FAILED => StorageDeviceState.DeviceStatus.Failed
     case codec.StorageDeviceStatus.Unrecognized(v) => throw new EncodingError(f"Invalid StorageDeviceStatus: $v")
 
+  def encodeStorageDeviceHealth(o: StorageDeviceState.HealthStatus): codec.StorageDeviceHealth = o match
+    case StorageDeviceState.HealthStatus.Healthy => codec.StorageDeviceHealth.STORAGE_DEVICE_HEALTH_HEALTHY
+    case StorageDeviceState.HealthStatus.Hung => codec.StorageDeviceHealth.STORAGE_DEVICE_HEALTH_HUNG
+
+  def decodeStorageDeviceHealth(m: codec.StorageDeviceHealth): StorageDeviceState.HealthStatus = m match
+    case codec.StorageDeviceHealth.STORAGE_DEVICE_HEALTH_HEALTHY => StorageDeviceState.HealthStatus.Healthy
+    case codec.StorageDeviceHealth.STORAGE_DEVICE_HEALTH_HUNG => StorageDeviceState.HealthStatus.Hung
+    case codec.StorageDeviceHealth.Unrecognized(v) => throw new EncodingError(f"Invalid StorageDeviceHealth: $v")
+
   def encodeStorageDeviceStoreStatus(o: StorageDeviceState.StoreStatus): codec.StorageDeviceStoreStatus = o match
     case StorageDeviceState.StoreStatus.Initializing => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_INITIALIZING
     case StorageDeviceState.StoreStatus.Active => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_ACTIVE
@@ -1526,7 +1535,10 @@ object Codec extends Logging:
       currentUsage = o.currentUsage,
       totalSize = o.totalSize,
       storageDeviceSet = Some(encodeUUID(o.storageDeviceSet.uuid)),
-      status = encodeStorageDeviceStatus(o.status)
+      status = encodeStorageDeviceStatus(o.status),
+      health = encodeStorageDeviceHealth(o.health),
+      healthSince = o.healthSince.asLong,
+      healthEvidence = o.healthEvidence
     )
 
   def decode(m: codec.StorageDeviceState): StorageDeviceState =
@@ -1541,7 +1553,8 @@ object Codec extends Logging:
     val storageDeviceSet = StorageDeviceSetId(decodeUUID(m.storageDeviceSet.get))
 
     new StorageDeviceState(storageDeviceId, hostId, m.currentUsage, m.totalSize, stores, storageDeviceSet,
-      decodeStorageDeviceStatus(m.status))
+      decodeStorageDeviceStatus(m.status), decodeStorageDeviceHealth(m.health),
+      HLCTimestamp(m.healthSince), m.healthEvidence)
 
   def encodeSteppedDurableTaskState(step: Int, state: Map[String, Array[Byte]]): Array[Byte] =
     codec.SteppedDurableTaskState(

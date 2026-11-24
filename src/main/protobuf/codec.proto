@@ -782,6 +782,11 @@ enum StorageDeviceStatus {
   STORAGE_DEVICE_STATUS_FAILED = 3;
 }
 
+enum StorageDeviceHealth {
+  STORAGE_DEVICE_HEALTH_HEALTHY = 0;
+  STORAGE_DEVICE_HEALTH_HUNG = 1;
+}
+
 message StorageDeviceStoreEntry {
   StorageDeviceStoreStatus status = 1;
   StorageDeviceId transfer_device = 2; // Optional field
@@ -802,6 +807,9 @@ message StorageDeviceState {
   int64 total_size = 5;
   UUID storage_device_set = 6;
   StorageDeviceStatus status = 7;
+  StorageDeviceHealth health = 8;
+  uint64 health_since = 9; // HLCTimestamp
+  string health_evidence = 10;
 }
 
 //---------------------------------------------------------------------------

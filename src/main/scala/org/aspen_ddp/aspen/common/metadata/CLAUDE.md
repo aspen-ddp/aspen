@@ -75,6 +75,9 @@ on changes: administration means writing desired state here, not sending message
   (`AspenClient.acceptRebuildLoss`, `accept-rebuild-loss`), that its rebuild may finish past objects the pool cannot
   supply (`server/rebuild/CLAUDE.md`); `acceptRebuildLoss` keeps the episode. `setStoreEntry` writes a fresh entry,
   so the promoting flip clears both
+- `health` / `healthSince` / `healthEvidence`: the hosting host's hang verdict, Healthy (default) or Hung, since when
+  (HLC) and a short evidence string (never names a store). Written only by the hosting host (device hang detection);
+  every other writer of the state carries them through `copy`. Shown by `show-device` as the Health line
 - `DeviceStatus`: Operational; ShuttingDown and Shutdown bracket a planned physical move; Failed is the one-way
   tombstone written by `failStorageDevice`. A failed device stays readable (its store map is the list awaiting
   rebuild) but is in no set or host and is never a destination. `failStorageDevice` is for a physically failed drive

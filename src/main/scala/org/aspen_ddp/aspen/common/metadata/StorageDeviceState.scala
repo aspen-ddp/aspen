@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.common.metadata
 
 import org.aspen_ddp.aspen.client.KeyValueObjectState
 import org.aspen_ddp.aspen.codec
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.objects.Key
@@ -42,6 +43,11 @@ object StorageDeviceState:
   enum DeviceStatus:
     case Operational, ShuttingDown, Shutdown, Failed
 
+  /** Hung means the hosting host's probe write to the device has been in flight longer than the hang threshold.
+   *  Published by the hosting host; see common/metadata/CLAUDE.md. */
+  enum HealthStatus:
+    case Healthy, Hung
+
   /** `transferId` identifies one logical transfer and is shared by the source's TransferringOut
    *  and the destination's TransferringIn entries. It is carried in the on-disk transfer markers
    *  so a copy left behind by an earlier, aborted transfer is never mistaken for this one's. */
@@ -66,7 +72,10 @@ case class StorageDeviceState(storageDeviceId: StorageDeviceId,
                               totalSize: Long,
                               stores: Map[StoreId, StorageDeviceState.StoreEntry],
                               storageDeviceSet: StorageDeviceSetId,
-                              status: StorageDeviceState.DeviceStatus = StorageDeviceState.DeviceStatus.Operational):
+                              status: StorageDeviceState.DeviceStatus = StorageDeviceState.DeviceStatus.Operational,
+                              health: StorageDeviceState.HealthStatus = StorageDeviceState.HealthStatus.Healthy,
+                              healthSince: HLCTimestamp = HLCTimestamp.Zero,
+                              healthEvidence: String = ""):
   
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
 

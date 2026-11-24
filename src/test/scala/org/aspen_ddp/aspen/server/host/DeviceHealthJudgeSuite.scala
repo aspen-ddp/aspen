@@ -34,7 +34,8 @@ class DeviceHealthJudgeSuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(dev)
     // The injected device has no record: a publisher that finds every record already holding the health
     host.control.healthPublisher = (_, current) =>
-      Future.successful(DeviceHealthPublisher.Outcome.Unchanged(current()))
+      Future.successful(current().fold(DeviceHealthPublisher.Outcome.Skipped)(
+        DeviceHealthPublisher.Outcome.Unchanged(_)))
     var sds: LocalStorageDeviceState = inject()
     val transitions = new ConcurrentLinkedQueue[(LocalStorageDeviceState, DeviceHealth)]()
     host.control.health.onTransition((s, h) => transitions.add(s -> h))

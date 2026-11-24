@@ -31,11 +31,24 @@ class DeviceHealthPublishSuite extends IntegrationTestSuite with ControlFixture:
   /** Records each publish, completed by the test */
   private final class FakePublisher extends DeviceHealthPublisher:
     val calls = new ConcurrentLinkedQueue[(Promise[Outcome], () => DeviceHealth)]()
-    def publish(id: StorageDeviceId, current: () => DeviceHealth): Future[Outcome] =
+    def publish(id: StorageDeviceId, current: () => Option[DeviceHealth]): Future[Outcome] =
       val p = Promise[Outcome]()
-      calls.add(p -> current)
+      calls.add(p -> (() => current().get))
       p.future
     def call(i: Int): (Promise[Outcome], () => DeviceHealth) = calls.asScala.toList(i)
+
+  /** Holds the first publish until `release` completes, then runs it, and every later one at once, through `to` */
+  private final class HoldFirst(to: DeviceHealthPublisher) extends DeviceHealthPublisher:
+    val release = Promise[Unit]()
+    @volatile private var first = true
+    @volatile var firstDone: Option[Future[Outcome]] = None
+    def publish(id: StorageDeviceId, current: () => Option[DeviceHealth]): Future[Outcome] =
+      if first then
+        first = false
+        val f = release.future.flatMap(_ => to.publish(id, current))(using executionContext)
+        firstDone = Some(f)
+        f
+      else to.publish(id, current)
 
   /** A host with one injected device `deviceId` whose probe writes with `write`, under a manual clock */
   private final class PublishRig(val deviceId: StorageDeviceId, write: os.Path => Unit,
@@ -45,9 +58,18 @@ class DeviceHealthPublishSuite extends IntegrationTestSuite with ControlFixture:
     publisher.foreach(host.control.healthPublisher = _)
     val dev: os.Path = host.control.rootDir / os.up / "published-device"
     os.makeDir.all(dev)
-    val sds = new LocalStorageDeviceState(deviceId, dev, dev / "dummy.file", new TestNetwork.TestCRL(),
-      host.control.deviceIos.forPath(dev))
-    injectLoadedDevice(host, sds)
+    var sds: LocalStorageDeviceState = inject()
+
+    private def inject(): LocalStorageDeviceState =
+      val s = new LocalStorageDeviceState(deviceId, dev, dev / "dummy.file", new TestNetwork.TestCRL(),
+        host.control.deviceIos.forPath(dev))
+      injectLoadedDevice(host, s)
+      s
+
+    /** Unloads the device and loads a fresh state for it, on the same path */
+    def reload(): Unit =
+      host.control.shutdown.unloadDevice(deviceId)
+      sds = inject()
 
     def probe: HealthProbe = sds.io.probe
 
@@ -144,29 +166,45 @@ class DeviceHealthPublishSuite extends IntegrationTestSuite with ControlFixture:
 
   // ---- With a fake publisher ----
 
-  atest("a transition is published and a failure is retried next pass"):
+  atest("a transition is published and a failure is retried next pass, warned once per streak"):
+    given ExecutionContext = executionContext
     val fake = new FakePublisher
-    withHungRig(freshId(), Some(fake)): (rig, _) =>
+    withHungRig(freshId(), Some(fake)): (rig, latch) =>
+      def fail(i: Int): List[(scribe.Level, String)] = judgeLog(rig.deviceId):
+        fake.call(i)._1.failure(new IOException(s"injected publish failure $i"))
+        rig.drain()
       rig.pass()
       rig.sds.health.status should be(Hung)
       fake.calls.size should be(1)
-      val log = judgeLog(rig.deviceId):
-        fake.call(0)._1.failure(new IOException("injected publish failure"))
-        rig.drain()
-      log.map(_._1) should be(List(scribe.Level.Warn))
-      log.head._2 should include("injected publish failure")
+      val first = fail(0)
+      first.map(_._1) should be(List(scribe.Level.Warn))
+      first.head._2 should include("injected publish failure 0")
       rig.sds.healthPublishing should be(false)
       rig.sds.publishedHealth should be(None)
 
+      // The streak goes on: retried, and not warned again
       rig.pass()
       fake.calls.size should be(2)
-      val (p, current) = fake.call(1)
+      fail(1) should be(Nil)
+      rig.sds.publishedHealth should be(None)
+
+      rig.pass()
+      fake.calls.size should be(3)
+      val (p, current) = fake.call(2)
       current().status should be(Hung)
       p.success(Outcome.Written(current()))
       rig.drain()
       rig.sds.publishedHealth should be(Some(rig.sds.health))
       rig.pass()
-      fake.calls.size should be(2)
+      fake.calls.size should be(3)
+
+      // After a success, the next failure starts a new streak: warned again
+      latch.countDown()
+      eventually("the probe to return")(rig.probe.inFlightAge.isEmpty).map: _ =>
+        judgeLog(rig.deviceId)(rig.pass())
+        rig.sds.health.status should be(Healthy)
+        fake.calls.size should be(4)
+        fail(3).map(_._1) should be(List(scribe.Level.Warn))
 
   atest("a transition during a publish ends with the newer value"):
     given ExecutionContext = executionContext
@@ -284,6 +322,36 @@ class DeviceHealthPublishSuite extends IntegrationTestSuite with ControlFixture:
           yield
             after should be(before)
             rig.sds.publishedHealth should be(Some(rig.sds.health))
+
+  atest("a publish of an unloaded state writes nothing over the reloaded state's"):
+    given ExecutionContext = executionContext
+    newRecord().flatMap: id =>
+      // The ControlFixture host is the bootstrap host, the record's owner
+      val hold = new HoldFirst(new ClientDeviceHealthPublisher(client, HostId.BootstrapHostId))
+      withHungRig(id, Some(hold)): (rig, latch) =>
+        rig.pass()
+        val old = rig.sds
+        old.health.status should be(Hung)
+        old.healthPublishing should be(true)
+        latch.countDown()
+        for
+          _ <- eventually("the probe to return")(rig.probe.inFlightAge.isEmpty)
+          before <- revisionOf(id)
+          _ = rig.reload()
+          _ <- rig.passAndSettle()
+          _ = rig.sds.health should be(DeviceHealth.Initial)
+          _ = rig.sds.publishedHealth should be(Some(DeviceHealth.Initial))
+          _ = hold.release.success(())
+          outcome <- hold.firstDone.get
+          _ <- waitForTransactionsToComplete()
+          _ = rig.drain()
+          after <- revisionOf(id)
+          state <- stateOf(id)
+        yield
+          outcome should be(Outcome.Skipped)
+          after should be(before)
+          state.health should be(Healthy)
+          old.publishedHealth should be(None)
 
   atest("usage and store-entry writes keep the health fields, and health keeps theirs"):
     given ExecutionContext = executionContext

@@ -389,6 +389,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    */
   def unloadDevice(storageDeviceId: StorageDeviceId): Unit =
     ctx.devices.devices.get(storageDeviceId).foreach: sds =>
+      sds.unloaded = true
       // No new probe attempt; one stuck in flight stays, for a reload of the path to inherit
       sds.io.probe.disarm()
       shutDownCrl(sds.devicePath, sds.crl)

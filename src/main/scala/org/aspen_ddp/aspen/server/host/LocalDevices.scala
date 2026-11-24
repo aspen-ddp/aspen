@@ -52,6 +52,10 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
   var probeErrorLogged: Boolean = false
   /** The judge has logged a failed health publish, until a publish succeeds. Control thread only */
   var healthPublishFailureLogged: Boolean = false
+  /** This state is no longer the loaded one (DeviceShutdown.unloadDevice, or a load replacing it). Set on the control
+   *  thread; @volatile because a health publish still retrying reads it on the client context and then writes
+   *  nothing */
+  @volatile var unloaded: Boolean = false
 
 /** Runs only on the control thread. See HostThreading.scala.
  *

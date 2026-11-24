@@ -68,12 +68,15 @@ final class DeviceHealthJudge(ctx: DeviceControl) extends Logging:
    *  (spec section 5.3). The publisher reads `health` when its transaction body runs, on the client context, so a
    *  transition meanwhile is written by this publish or, failing that, by the next pass's. The outcome is applied
    *  here, on the control thread, only while `sds` is still the loaded state; a failure leaves `publishedHealth` for
-   *  the next pass to retry, logged once per streak of failures */
+   *  the next pass to retry, logged once per streak of failures. A publish still retrying when `sds` is unloaded
+   *  writes nothing (`unloaded`), so a dead state's health never lands over a later state's. A publish Future that
+   *  never completes leaves `healthPublishing` set for the state's life: acceptable, since a client read that never
+   *  resolves is a metadata outage beyond the failure margin */
   private def publish(sds: LocalStorageDeviceState): Unit =
     if !sds.healthPublishing && !sds.publishedHealth.contains(sds.health) then
       sds.healthPublishing = true
       val f =
-        try ctx.healthPublisher.publish(sds.storageDeviceId, () => sds.health)
+        try ctx.healthPublisher.publish(sds.storageDeviceId, () => Option.unless(sds.unloaded)(sds.health))
         catch case NonFatal(t) => Future.failed(t)
       ctx.onControlFuture(s"health publish ${sds.storageDeviceId}", f): result =>
         if ctx.devices.isLoaded(sds) then

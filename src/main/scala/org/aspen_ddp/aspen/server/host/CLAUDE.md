@@ -728,7 +728,9 @@
   status and, unless `since` is Zero, the same `since`; so a Healthy record at load gets no write, and a stale Hung one
   is written Healthy with `since` now) or one Failed or naming another host (`Skipped`). The outcome is applied on
   control through `onControlFuture`, only while the device state is still loaded; a failure leaves `publishedHealth`
-  for the next pass, WARN once per failure streak (`healthPublishFailureLogged`). Tests: `DeviceHealthJudgeSuite`,
+  for the next pass, WARN once per failure streak (`healthPublishFailureLogged`). A publish still retrying once its
+  state is unloaded (`LocalStorageDeviceState.unloaded`, set by `unloadDevice` or a load replacing it) reads None for
+  the current health and writes nothing, so a dead state never overwrites a reloaded one's record. Tests: `DeviceHealthJudgeSuite`,
   `DeviceHealthPublishSuite`
 - Callbacks name the control context. Work run elsewhere (backend opens, client transactions on the host's `ec`) names
   its context; timers and other non-Future callbacks post to `controlEvents` before touching control state

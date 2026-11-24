@@ -913,6 +913,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             abandon()
             throw t
       if attached then
+        ctx.devices.devices.get(sdCfg.storageDeviceId).foreach(_.unloaded = true)
         ctx.devices.devices += sdCfg.storageDeviceId -> sds
         // Its health probe runs while the device stays loaded here (DeviceShutdown.unloadDevice disarms it)
         sds.io.probe.arm()

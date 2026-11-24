@@ -1587,7 +1587,6 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(!outbound(deviceDir, movingStore) &&
                      !host.control.reconciler.activeDeviceChecks.contains(sourceId))
     yield
-      println("DEBUGQ " + host.threading.asInstanceOf[org.aspen_ddp.aspen.server.host.LockstepThreading].queuedItems.map{ case e: Host.EventTask => e.event.toString; case t: org.aspen_ddp.aspen.server.host.LockstepThreading.DeviceTask => t.kind.toString; case t => t.getClass.getName } + " " + host.control.reconciler.activeDeviceChecks + host.control.reconciler.scheduledDeviceRechecks)
       markedBeforeAbort should be(true)
       outbound(deviceDir, movingStore) should be(false)
       storeDir / os.up should be(deviceDir / CopyLayout.OutboundDirectory)

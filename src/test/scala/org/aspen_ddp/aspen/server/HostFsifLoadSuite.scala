@@ -766,8 +766,6 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.control.loader.awaitingRetryWaitScans(storeId) should be(None)
       host.getStoreIds should not contain storeId
 
-  /** Handles `host`'s events, yielding between rounds, until `condition` holds. Silent on exhaustion: the caller
-   *  asserts the end state. */
   /** Yields until device A's check has ended, running its lane's copy and reconcile-inputs jobs (runCopyJobs: their
    *  results applied only from the FIFO's head) on the way: this suite's hosts are not newHost's, so yieldUntil does
    *  not run them */
@@ -778,6 +776,8 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     else
       Future(()).flatMap(_ => checkEnded(host, rounds - 1))
 
+  /** Handles `host`'s events, yielding between rounds, until `condition` holds. Silent on exhaustion: the caller
+   *  asserts the end state. */
   private def handleUntil(host: Host, rounds: Int = 100)(condition: => Boolean): Future[Unit] =
     host.testingOnlyHandleEvents()
     if condition || rounds == 0 then

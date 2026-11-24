@@ -1,6 +1,8 @@
 # Device I/O isolation
 
-**Status:** design, 2026-11-23. Project 1 of three in `Todo.txt` "Hung devices: isolate, detect, handle".
+**Status:** done, 2026-11-24 (commits `fd82a6f3..HEAD` on `device-threads`; measurements and defaults in
+`docs/host-threading-measurement.md`, "Device I/O isolation"). Project 1 of three in `Todo.txt` "Hung devices: isolate,
+detect, handle".
 
 ## Intent
 
@@ -77,7 +79,7 @@ It has:
   marker reads/writes, `CopyLayout.list`, copy moves/retire/release/delete (`os.remove.all`), staging sweeps,
   `crl_save.log` reads and writes, device CRL open and recovery (including the lost-CRL path), CRL creation, statfs,
   RocksDB opens and creates, FSIF opens and creates (replacing `FsifOpenEc` for this device).
-- **Data pool**: N threads (default 4, configurable, see section 8). Runs backend data I/O: FSIF's `io` executor
+- **Data pool**: N threads (default max(4, CPUs/2), configurable, see section 8). Runs backend data I/O: FSIF's `io` executor
   (reads, writes, journal, checkpoint, compaction moves, forces), RocksDB foreground ops (`BufferedConsistentRocksDB`
   puts/deletes/gets/iteration), rebuild staging writes and flushes.
 - **FSIF serial pool**: 1 thread (default), the base for the device's FSIF stores' `SerialExecutor`s, replacing

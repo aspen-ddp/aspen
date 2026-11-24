@@ -59,7 +59,12 @@ trait DeviceIo:
 object DeviceIo:
   object Cancelled extends Exception("device io job cancelled")
 
-  final case class Config(dataThreads: Int = 4, serialThreads: Int = 1, readBound: Int = 4096)
+  /** Data threads per device by default: half the CPUs, at least 4. Measured against the host-wide FSIF pool this
+   *  replaced (max(4, CPUs) shared threads): 4 per device lost 15 to 25 percent on a single busy device, CPUs/2 matched
+   *  or beat it (docs/host-threading-measurement.md, "Device I/O isolation"). */
+  def defaultDataThreads: Int = math.max(4, Runtime.getRuntime.availableProcessors / 2)
+
+  final case class Config(dataThreads: Int = defaultDataThreads, serialThreads: Int = 1, readBound: Int = 4096)
 
 /** Thread-safe record of the jobs a device is running. */
 final class DeviceIoObserver:

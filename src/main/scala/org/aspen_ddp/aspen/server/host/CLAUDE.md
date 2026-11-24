@@ -660,7 +660,7 @@
   executor (`StoreRouter.onStore`) and gets results back through a Future whose callbacks name the control context
 - Device I/O isolation (`DeviceIo`, `DeviceIos`; spec `docs/superpowers/specs/2026-11-23-device-io-isolation-design.md`):
   each device directory has a `DeviceIo`: a serial management lane (`submit(kind, store)`, one thread, cancellable
-  while queued), a data pool and a serial pool (`dataEc`, `serialEc`) and an observer of what it runs, all on daemon
+  while queued), a data pool (`--device-io-threads`, default `DeviceIo.defaultDataThreads` = max(4, CPUs/2)) and a serial pool (`dataEc`, `serialEc`) and an observer of what it runs, all on daemon
   threads of that device, so a hung device stalls only its own work. `HostThreading.newDeviceIo(path)` builds it
   (`ThreadedDeviceIo` for StoreThreadPool and SingleThreadThreading, configured by `DeviceIo.Config`;
   `LockstepDeviceIo` under lockstep). `DeviceControl.deviceIos` (`DeviceIos`, control-owned) keeps one per path from

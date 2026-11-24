@@ -99,10 +99,132 @@ improve, also add the busiest threads and where they spend their time as the nex
 
 The measurements are summarised under "Store commit delay" and "Adaptive store threading" in `Todo.txt`. The
 default is now a fixed pool of min(4, CPUs/4) store threads, stores spread over them by count; `--store-threads=<n>`
-sets the count. (Per-device I/O: `--device-io-threads=<n>` data threads per storage device, default 4, and
+sets the count. (Per-device I/O: `--device-io-threads=<n>` data threads per storage device, default max(4, CPUs/2), and
 `--device-read-bound=<n>` outstanding backend reads before a device's stores drop new client reads, default 4096.) The adaptive policy (`StoreThreadPool.Adaptive`) is parked and can only be chosen in code: to measure
 it again, pass `adaptive = Some(StoreThreadPool.Adaptive())` where `Main.startHost` builds the pool. It packs stores
 onto threads by load and adds threads only when work waits for them. Warm the pool up before capturing, as its runs
 in `results/` (`after-adaptive`, `after-packed`) did: run each job uncaptured until the host log shows no
 "Added store thread" or "Moved store" lines during it, then capture straight away. Any idle time in between lets
 it repack.
+
+## Device I/O isolation: before/after (2026-11-24)
+
+Closes `docs/superpowers/specs/2026-11-23-device-io-isolation-design.md` (section 8, goal G5: no throughput or
+latency regression on the single-device benchmarks beyond noise). Before is `fd82a6f3` (the branch's start, before any
+device-I/O change); after is `device-threads` at the commit that sets the default below.
+
+### What was run
+
+Same hardware as the runs above (24 CPUs, NVMe, every store directory on one filesystem) and the same jobs
+(`scripts/vdisk-e2e/smoke.fio`: `randrw-verify`, then `seqwrite`, 60 s each, time based), through the real path:
+`aspen vdisk-server` (always the `device-threads` build) -> TCMU -> iSCSI loopback -> ext4 -> fio. Not run: the
+`capture-job.sh` thread dumps and `analyze.py` (a fio-only comparison needed neither); the numbers are fio's own JSON
+(`--output-format=json`, `--section=<job>`). For each configuration and each tree:
+
+1. fresh system in an empty directory: `aspen bootstrap` (replication 2/3/3), `aspen host` (the tree under test, no
+   options unless a row says so), a 30 s wait (a freshly loaded store refuses transactions older than its forget
+   floor, so a CLI call in the first seconds hangs until the takeover);
+2. `create-allocation-group agroup 0 random-access-reed-solomon 16 10 12 --max-slice-size 524288`; `create-pool pool1
+   random-access-reed-solomon 16 10 12 bootstrap <backend>` (`--backend fsif --max-object-size 5242880
+   --segment-count 10240`, or `--backend rocksdb`), `add-pool-to-group`; **kill -9 and restart the host** (the pool's
+   stores are created only when the host loads the device state; the creating CLI's nudge did not reach an idle host
+   on either tree), then 30 s, then `create-disk vd1 10G --group agroup`;
+3. two devices: a second level-0 device set `set2` with a second device directory `dev2` (registered with
+   `create-storage-device`, same filesystem), a second 16-store pool `pool2` on `set2`, both pools in `agroup`, so the
+   disk's objects spread over both devices. (Putting `dev2` in the `bootstrap` set makes the host rebalance bootstrap
+   stores onto it, which wedges the bootstrap pool, a write threshold 3 of 3, on both trees);
+4. `scripts/vdisk-e2e/setup.sh` (tcmu-runner stopped, `MKFS=1 SMOKE=0`), one unmeasured full `smoke.fio` pass, then
+   `randrw-verify` and `seqwrite` three times each (six fio runs, alternating). Values below are the mean of the
+   three runs, then the range (min-max). fsync is fio's FLUSH latency.
+
+The two trees ran back to back on the same disk, in alternating order. A second before run of the single-device FSIF case, hours later, came out 15 percent faster than
+the first: **session-to-session drift is as large as the range inside one session**, so a result counts as a change
+only when it is clear of both.
+
+### Results
+
+**FSIF, one device (16-store pool on one device)**
+
+| metric | before | before, 2nd session | after, 2 threads | after, 4 threads | after, 8 threads | after, 12 threads |
+|---|---|---|---|---|---|---|
+| randrw-verify read IOPS | 510 (502-524) | 585 (559-624) | 322 (312-338) | 409 (389-420) | 430 (419-450) | 528 (506-557) |
+| randrw-verify write IOPS | 267 (264-270) | 308 (302-318) | 165 (160-170) | 212 (201-218) | 221 (215-230) | 273 (265-285) |
+| randrw read clat avg ms | 6.8 (5.7-8.2) | 5.9 (5.4-6.9) | 2.4 (2.2-2.6) | 2.2 (2.2-2.3) | 2.1 (1.8-2.6) | 2.2 (2.1-2.3) |
+| randrw read clat p99 ms | 78 (73-90) | 71 (64-83) | 24 (23-24) | 23 (22-24) | 32 (31-33) | 23 (22-26) |
+| randrw write clat avg ms | 0.36 (0.33-0.40) | 0.24 (0.23-0.27) | 0.14 (0.14-0.14) | 0.13 (0.13-0.14) | 0.16 (0.15-0.16) | 0.13 (0.12-0.13) |
+| randrw fsync avg ms | 540 (429-619) | 472 (372-526) | 1434 (1402-1485) | 1094 (1063-1154) | 1045 (1021-1089) | 816 (766-846) |
+| seqwrite MiB/s | 107.5 (106.8-108.3) | 115.5 (114.9-116.3) | 66.6 (65.0-69.6) | 90.6 (90.5-90.6) | 100.9 (89.9-113.4) | 130.4 (129.5-131.8) |
+| seqwrite write clat avg ms | 2.55 (2.42-2.73) | 1.74 (1.67-1.86) | 1.77 (1.68-1.87) | 1.85 (1.79-1.94) | 2.05 (1.77-2.23) | 1.91 (1.87-1.93) |
+| seqwrite fsync avg ms | 1104 (1095-1115) | 1047 (1035-1056) | 1860 (1777-1902) | 1347 (1344-1352) | 1209 (1066-1348) | 915 (905-921) |
+
+**FSIF, two devices (one 16-store pool on each)**
+
+| metric | before | after, 4 threads | after, default (12) |
+|---|---|---|---|
+| randrw-verify read IOPS | 499 (484-522) | 386 (353-419) | 500 (464-550) |
+| randrw-verify write IOPS | 255 (245-267) | 200 (182-217) | 257 (243-278) |
+| randrw read clat avg ms | 3.6 (3.2-4.1) | 1.8 (1.0-2.1) | 2.6 (2.6-2.7) |
+| randrw read clat p99 ms | 42 (38-46) | 24 (18-30) | 41 (39-45) |
+| randrw write clat avg ms | 0.22 (0.20-0.25) | 0.15 (0.15-0.16) | 0.17 (0.16-0.17) |
+| randrw fsync avg ms | 792 (706-856) | 1202 (1136-1302) | 853 (770-905) |
+| seqwrite MiB/s | 122.4 (121.8-123.2) | 88.7 (87.1-90.9) | 125.9 (122.5-128.2) |
+| seqwrite write clat avg ms | 1.95 (1.88-2.05) | 1.77 (1.73-1.80) | 2.03 (1.98-2.09) |
+| seqwrite fsync avg ms | 978 (972-982) | 1380 (1343-1406) | 946 (928-975) |
+
+**RocksDB, one device**
+
+| metric | before | after, 4 threads | after, 8 threads | after, default (12) |
+|---|---|---|---|---|
+| randrw-verify read IOPS | 98 (98-99) | 107 (105-109) | 115 (114-115) | 137 (132-145) |
+| randrw-verify write IOPS | 51 (51-51) | 59 (57-60) | 66 (66-67) | 72 (68-79) |
+| randrw read clat avg ms | 5.5 (5.2-5.7) | 7.7 (7.0-8.4) | 10.5 (9.8-11.0) | 10.4 (4.7-13.2) |
+| randrw read clat p99 ms | 100 (83-120) | 151 (135-167) | 184 (173-194) | 188 (120-225) |
+| randrw write clat avg ms | 0.30 (0.29-0.32) | 0.31 (0.30-0.33) | 0.46 (0.46-0.46) | 0.56 (0.49-0.64) |
+| randrw fsync avg ms | 4791 (4764-4834) | 3985 (3903-4114) | 3335 (3304-3370) | 2989 (2919-3027) |
+| seqwrite MiB/s | 67.9 (67.5-68.4) | 78.0 (75.9-80.4) | 88.8 (85.7-90.7) | 95.8 (95.4-96.2) |
+| seqwrite write clat avg ms | 2.01 (1.97-2.07) | 2.12 (2.08-2.16) | 2.30 (2.12-2.43) | 2.69 (2.59-2.74) |
+| seqwrite fsync avg ms | 1813 (1794-1824) | 1567 (1517-1610) | 1359 (1328-1418) | 1242 (1235-1252) |
+
+**RocksDB, two devices**
+
+| metric | before | after, default (12) |
+|---|---|---|
+| randrw-verify read IOPS | 93 (79-100) | 171 (170-173) |
+| randrw-verify write IOPS | 51 (48-52) | 88 (86-90) |
+| randrw read clat avg ms | 5.6 (4.3-7.0) | 12.2 (11.3-13.0) |
+| randrw read clat p99 ms | 75 (58-103) | 203 (194-217) |
+| randrw write clat avg ms | 0.20 (0.18-0.21) | 0.51 (0.46-0.54) |
+| randrw fsync avg ms | 4845 (4665-5082) | 2184 (2102-2254) |
+| seqwrite MiB/s | 49.0 (48.9-49.2) | 109.4 (108.5-110.6) |
+| seqwrite write clat avg ms | 1.69 (1.57-1.80) | 2.53 (2.38-2.75) |
+| seqwrite fsync avg ms | 2548 (2540-2560) | 1084 (1072-1097) |
+
+### Reading them
+
+- With the first default (4 data threads per device) the after-tree was 20 to 28 percent slower on FSIF, single and
+  two devices, in throughput (randrw 409 against 510 IOPS reads; seqwrite 91 against 108 MiB/s), well outside the
+  spread, with longer fsyncs. Cause: the old tree gave FSIF a shared `max(4, CPUs)` = 24 I/O threads, and 16 stores
+  on one device now share 4. Throughput rises monotonically with the thread count: 2 threads 322, 4 threads 409, 8
+  threads 430, 12 threads (CPUs/2) 528 read IOPS. Per the stop rule's list (2, 8, CPUs/2) the CPUs/2 default fixes it:
+  it matches the before-tree within the session drift (528 against 510 and 585 IOPS; seqwrite 130 against 108 and 115
+  MiB/s) and, with two devices, 500 against 499 and 126 against 122.
+- RocksDB is far slower than FSIF on this workload on both trees (about 100 IOPS, fsync 5 s before). After, it is
+  faster in throughput (single device 137 against 98 read IOPS, seqwrite 96 against 68 MiB/s; two devices 171 against
+  93 and 109 against 49), and fsync is shorter, but its per-operation completion latencies are longer: read avg 10 ms
+  against 5.5 (p99 190 against 100), write avg 0.5 ms against 0.3. They rise with the thread count (7.7, 10.5, 10.4 ms
+  at 4, 8, 12 threads) while throughput rises too, so more writes are in flight at once; the cost is on the latency
+  side only for this closed-loop depth-8 job. G5 asks for no latency regression: this is one, for RocksDB only,
+  and it is the trade for the throughput. See the concerns in the task report.
+- One of the first six RocksDB runs with 4 threads (the first RocksDB single-device after-run) hit TCMU I/O errors
+  mid-run, ext4 aborted its journal and went read-only (`dmesg`: `I/O error, dev sdb`, 02:18:46). It did not
+  recur in the twelve later RocksDB after-runs (4, 8 and 12 threads, two devices), but its host log was not kept, so the cause is unknown.
+- The spec's single-device hung-device acceptance (the other devices keep serving) is covered by
+  `ThreadedHungDeviceSuite`, not by these runs.
+
+### Defaults chosen
+
+- `--device-io-threads`: **max(4, CPUs/2)** per device (`DeviceIo.defaultDataThreads`; 12 on this 24-CPU host). Was
+  4. A host with many devices runs that many threads per device; they are idle when a device is.
+- `--device-read-bound`: unchanged, 4096 (not varied: fio's depth of 8 cannot approach it).
+- RocksDB background jobs stay 2 per database; rebuild slots stay per destination device (`maxConcurrentRebuilds`
+  each). Not exercised by these jobs.

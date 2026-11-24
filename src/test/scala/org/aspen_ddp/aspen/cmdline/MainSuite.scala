@@ -1021,11 +1021,11 @@ class MainSuite extends AnyFunSuite with Matchers:
       parse("--store-threads=0") shouldBe None
       parse("--store-threads=two") shouldBe None
 
-  test("host --device-io-threads and --device-read-bound take positive counts, defaulting to 4 and 4096"):
+  test("host --device-io-threads and --device-read-bound take positive counts, defaulting to max(4, CPUs/2) and 4096"):
     withTempDir("parse-device-io"): dir =>
       def parse(args: String*) = Console.withErr(OutputStream.nullOutputStream()):
         Main.buildParser.parse(Seq("host", dir.toString) ++ args, Main.Args())
-      parse().map(c => (c.deviceIoThreads, c.deviceReadBound)) shouldBe Some((4, 4096))
+      parse().map(c => (c.deviceIoThreads, c.deviceReadBound)) shouldBe Some((org.aspen_ddp.aspen.server.host.DeviceIo.defaultDataThreads, 4096))
       parse("--device-io-threads=2", "--device-read-bound=10").map(c => (c.deviceIoThreads, c.deviceReadBound)) shouldBe
         Some((2, 10))
       parse("--device-io-threads=0") shouldBe None

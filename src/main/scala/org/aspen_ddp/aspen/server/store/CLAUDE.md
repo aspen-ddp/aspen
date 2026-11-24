@@ -386,7 +386,7 @@
   (`dropForReadBound`). Counting: FSIF counts each disk read task from `io.execute` until the task has run (a rejected
   task is ended at once; a retry is a new task), RocksDB counts each `getValue` attempt until its Future completes. Every
   outcome ends the count; the Future always completes (a closed database fails it with `DBClosed`), and FSIF's close
-  waits for reads in flight. Limit: `--device-read-bound` (default 4096), threads `--device-io-threads` (default 4)
+  waits for reads in flight. Limit: `--device-read-bound` (default 4096), threads `--device-io-threads` (default max(4, CPUs/2), `DeviceIo.defaultDataThreads`: measured, 4 lost 15 to 25 percent on one busy FSIF device against the old host-wide pool)
 - Parked reads (client 1-RTT commit design section 5): a client read whose `Read.awaitCommit` names a transaction
   holding a write lock on the object's in-memory state (`lockedWriteTransactions`) is parked (`parkRead`, keyed by
   object and `readUUID`: a resent read replaces its entry) instead of answered: the client knows that transaction

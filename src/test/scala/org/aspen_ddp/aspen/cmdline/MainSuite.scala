@@ -541,7 +541,7 @@ class MainSuite extends AnyFunSuite with Matchers:
                        tmp / "aspen-client-config.yaml")
       result shouldBe 0
       val devDir = hostDir / StorageDeviceManager.StorageDevicesDirName / "bootstrap-device"
-      val listing = org.aspen_ddp.aspen.server.host.CopyLayout.list(devDir)
+      val listing = org.aspen_ddp.aspen.server.host.CopyLayoutDisk.list(devDir)
       val expected = (0 until 3).flatMap(i =>
         List(StoreId(PoolId.BootstrapPoolId, i.toByte), StoreId(PoolId.InitialMetadataPoolId, i.toByte))).toSet
       listing.copies.map(_.storeId).toSet shouldBe expected
@@ -581,7 +581,7 @@ class MainSuite extends AnyFunSuite with Matchers:
 
   /** The one Live copy of `storeId` on the device at `devDir` */
   private def liveCopy(devDir: os.Path, storeId: StoreId): os.Path =
-    val List(f) = org.aspen_ddp.aspen.server.host.CopyLayout.list(devDir).copies.filter(_.storeId == storeId): @unchecked
+    val List(f) = org.aspen_ddp.aspen.server.host.CopyLayoutDisk.list(devDir).copies.filter(_.storeId == storeId): @unchecked
     f.path
 
   private def bootstrapInto(hostDir: os.Path, clientCfgDir: os.Path): Int =

@@ -19,7 +19,10 @@ import scala.jdk.CollectionConverters.*
 class LockstepThreading(ec: ExecutionContext) extends HostThreading:
   private val queue = new LinkedBlockingQueue[Runnable]()
 
-  private val enqueue: Executor = task => queue.put(task)
+  // Every put and runInPlace's reordering hold it, so no task posted meanwhile lands out of order
+  private val queueLock = new Object
+
+  private val enqueue: Executor = task => queueLock.synchronized(queue.put(task))
 
   override def control: ExecutionContext = ec
   override def controlEvents: Executor = enqueue
@@ -40,7 +43,7 @@ class LockstepThreading(ec: ExecutionContext) extends HostThreading:
   private[host] def enqueueDevice(path: os.Path, task: LockstepThreading.DeviceTask): Unit =
     holdLock.synchronized:
       if holds.contains(path) then heldTasks += path -> (heldTasks.getOrElse(path, Vector()) :+ task)
-      else queue.put(task)
+      else queueLock.synchronized(queue.put(task))
 
   /** Blocks the calling (device) thread while `path` is held. */
   private[host] def awaitReleased(path: os.Path): Unit =
@@ -56,7 +59,7 @@ class LockstepThreading(ec: ExecutionContext) extends HostThreading:
   /** Testing hook: puts the path's held jobs on the FIFO in submission order and frees its blocked threads. */
   def release(path: os.Path): Unit =
     val latch = holdLock.synchronized:
-      heldTasks.getOrElse(path, Vector()).foreach(queue.put)
+      queueLock.synchronized(heldTasks.getOrElse(path, Vector()).foreach(queue.put))
       heldTasks -= path
       val l = holds.get(path)
       holds -= path
@@ -69,7 +72,7 @@ class LockstepThreading(ec: ExecutionContext) extends HostThreading:
     holdLock.synchronized:
       heldTasks.getOrElse(path, Vector()) match
         case first +: rest =>
-          queue.put(first)
+          queueLock.synchronized(queue.put(first))
           if rest.isEmpty then heldTasks -= path else heldTasks += path -> rest
           Some(first.kind)
         case _ => None
@@ -95,6 +98,31 @@ class LockstepThreading(ec: ExecutionContext) extends HostThreading:
   /** Testing hook: the queued tasks, in order. */
   private[aspen] def queuedItems: List[Runnable] = queue.asScala.toList
 
+  /** Testing hook: runs the queued `task` where it stands, as if it had run the moment it was queued: it is removed
+   *  and run, and whatever is queued while it runs (a lane job's result) takes its place in the FIFO, ahead of the
+   *  tasks that were behind it. False, running nothing, if `task` is not queued. A test runs a lane job early this way
+   *  so that its result is applied after every event queued before the job, and never after one queued since that it
+   *  could have preceded */
+  private[aspen] def runInPlace(task: Runnable): Boolean =
+    val split = queueLock.synchronized:
+      val items = queue.asScala.toList
+      val i = items.indexWhere(_ eq task)
+      if i < 0 then
+        None
+      else
+        queue.remove(task)
+        Some((items.take(i), items.drop(i + 1)))
+    split.foreach: (ahead, behind) =>
+      def in(ts: List[Runnable])(t: Runnable) = ts.exists(_ eq t)
+      try task.run()
+      finally
+        queueLock.synchronized:
+          val now = queue.asScala.toList
+          val added = now.filterNot(t => in(ahead)(t) || in(behind)(t))
+          queue.clear()
+          (now.filter(in(ahead)) ++ added ++ now.filter(in(behind))).foreach(queue.put)
+    split.isDefined
+
   /** Testing hook: removes the queued tasks matching `p` and returns them in queue order, leaving the rest queued. */
   private[aspen] def removeQueued(p: Runnable => Boolean): List[Runnable] =
     val it = queue.iterator()
@@ -108,5 +136,5 @@ class LockstepThreading(ec: ExecutionContext) extends HostThreading:
 
 object LockstepThreading:
   /** One management-lane job of a LockstepDeviceIo. `state`: 0 queued, 1 running, 2 cancelled. */
-  abstract class DeviceTask(val kind: JobKind) extends Runnable:
+  abstract class DeviceTask(val kind: JobKind, val path: os.Path) extends Runnable:
     val state = new AtomicInteger(0)

@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.rebuild.RebuildDisk
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.{TestTransactions, Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
@@ -108,8 +109,8 @@ class RebuiltVoterLockIntegrationSuite extends IntegrationTestSuite with org.sca
     val lostData = net.stores(1).m
     for
       _ <- pump(net.hostFor(sid(1)).control.loader.closeStore(sid(1), extractCrl = false), clock = false)
-      _ = RebuildingStore.writeAcceptorSince(rebuiltDir, HLCTimestamp.now)
-      _ = RebuildingStore.writeInheritedVotes(rebuiltDir, System.currentTimeMillis())
+      _ = RebuildDisk.writeAcceptorSince(rebuiltDir, HLCTimestamp.now)
+      _ = RebuildDisk.writeInheritedVotes(rebuiltDir, System.currentTimeMillis())
       _ = StoreIncarnationFile.writeFresh(rebuiltDir)
       rebuilt = new MapBackend(sid(1)):
         override def path: os.Path = rebuiltDir

@@ -209,7 +209,16 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
     route(storeId, notHosted)(_.repairDelete(objectId, storePointer, completion))
 
   /** One dispatch step that posts `store.heartbeat()` to each loaded store's executor. */
-  def heartbeat(): Unit = postToEachStore(_.heartbeat())
+  def heartbeat(): Unit = postToEachStore: store =>
+    store.heartbeat()
+    heartbeats.computeIfAbsent(store.storeId, _ => new java.util.concurrent.atomic.LongAdder).increment()
+
+  // Heartbeats each store has run on its executor (heartbeat): one increment per store per heartbeat period, read by
+  // tests to see a host's heartbeats continue
+  private val heartbeats = new ConcurrentHashMap[StoreId, java.util.concurrent.atomic.LongAdder]()
+
+  /** How many heartbeats store `storeId` has run on its executor. Any thread */
+  private[aspen] def heartbeatsRun(storeId: StoreId): Long = Option(heartbeats.get(storeId)).map(_.sum).getOrElse(0L)
 
   /** `store` was built with its recovery deferred (Frontend.deferRecovery) and the CRL holds its state. On its
    *  executor, if it is still the store installed: recovers its transactions. Its transaction messages are held
@@ -277,14 +286,6 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   private[host] def crlLoaded(store: Store, saveFile: os.Path, p: Promise[Unit]): Unit =
     route(store.storeId, () => { p.success(()); () }): installed =>
       if installed eq store then
-        def removeFile(): Unit =
-          try
-            StoreDisk.removeSaveFile(saveFile)
-            saveFileRemovals.remove(saveFile)
-          catch
-            case NonFatal(err) =>
-              saveFileRemovals.add(saveFile)
-              throw err
         def removed(result: Try[Unit]): Unit =
           result match
             case Success(_) =>
@@ -296,10 +297,15 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
               ctx.post(Host.SaveFileRemovalFailed(store.storeId, store))
               p.failure(err)
         store.deviceIo match
-          case None => removed(Try(removeFile()))
+          // Every Store StoreLoader builds has a lane; a stand-in without one has no save file to remove
+          case None => removed(Failure(IllegalStateException(s"Store ${store.storeId} has no device lane")))
           case Some(io) =>
-            val job = io.submit(JobKind.SaveFile, Some(store.storeId))(removeFile())
+            val job = io.submit(JobKind.SaveFile, Some(store.storeId))(StoreDisk.removeSaveFile(saveFile))
             job.future.onComplete { result =>
+              // Recorded as the job ends (parasitic: on its own thread), before the store sees the result
+              result match
+                case Success(_) => saveFileRemovals.remove(saveFile)
+                case Failure(_) => saveFileRemovals.add(saveFile)
               // Back on the store's executor, where the store may have been closed or replaced meanwhile
               route(store.storeId, () => { p.success(()); () }): nowInstalled =>
                 if nowInstalled eq store then removed(result) else p.success(())

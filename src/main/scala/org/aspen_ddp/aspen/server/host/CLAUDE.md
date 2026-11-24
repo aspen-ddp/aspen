@@ -27,16 +27,19 @@
 - Copy layout (store copy state machine, stage 2; spec "Device layout"): `CopyLayout` says where each copy lives. Each
   phase is a directory under the device root holding copies named `<storeId.directoryName>.<copyId>`
   (`copyName`/`parseName`; the store id comes from the name only), its parameter in the copy's own file for that phase,
-  `phase-param.<phase directory>` (`paramFile`, `param`, `readParam(copy, phase)`: "" when known absent, a failed stat
-  throws). Each location reads only its own phase's file and a move writes only its target's, so a failed move or a
+  `phase-param.<phase directory>` (`paramFile`, `param`; `CopyLayoutDisk.readParam(copy, phase)`: "" when known absent, a
+  failed stat throws). Each location reads only its own phase's file and a move writes only its target's, so a failed move or a
   crash before the rename leaves the source's parameter as it was; an earlier phase's file is inert. Live is `live/`
   (`CopyLayout.LiveDirectory`), Arrived `arrived/` (`ArrivedDirectory`, its transfer id in `phase-param.arrived`),
   Outbound `outbound/` (`OutboundDirectory`, its transfer id in `phase-param.outbound`), Rebuilt `rebuilt/`
   (`RebuiltDirectory`, its episode in `phase-param.rebuilt`), Parked `parked/` (`ParkedDirectory`), Lost `lost/`
   (`LostDirectory`) and Retired `pending-delete/` (`dirOf`, total). A copy has its phase by location
-  (`CopyLayout.phaseAt` for a path; `locate(devicePath, storeId, copyId)` finds which phase directory holds a copy id,
-  the fallback of a refused phase fact; `isLivePath`). `CopyLayout.list` is the one listing of a device's copies (device
-  load, its CRL-lost decision and P2, `storesIn`, `HostCopies.attach`/`rescan`/ `verifyAgainstDisk`): each phase
+  (`CopyLayoutDisk.phaseAt` for a path; `CopyLayoutDisk.locate(devicePath, storeId, copyId)` finds which phase
+  directory holds a copy id, the fallback of a refused phase fact; `isLivePath`; `CopyLayout.phaseByLocation` reads
+  only the path, its parameter left ""). `CopyLayout` is pure; every function that reads a device is
+  `CopyLayoutDisk`'s, called only inside a `*Disk` job (Task 16). `CopyLayoutDisk.list` is the one listing of a
+  device's copies (device load, its CRL-lost decision and P2, `storesIn`, `HostCopies.attach`/`rescan`/
+  `verifyAgainstDisk`): each phase
   directory's children (config or not); a child that is no directory named as a copy (a stat that fails counts as a
   copy) is a stray, logged at warn at the device's load and never touched, and anything at the device root (a stage-1
   store-named directory included) is no copy. Code never builds a copy's path: it asks `HostCopies.pathOf` (the
@@ -77,7 +80,7 @@
   `moveOnLane`'s own job holds the mark itself and records through it), and a copy unsynced before a move stays unsynced after it (its
   earlier directories still to force move with it), until the resync. A move whose target is the copy's own path is
   NotMoved (no move changes only a parameter). A failed read of an `arrived/`, `outbound/` or `rebuilt/` copy's
-  parameter file, or a phase directory that cannot be listed, fails `CopyLayout.list`: the device stays unloaded,
+  parameter file, or a phase directory that cannot be listed, fails `CopyLayoutDisk.list`: the device stays unloaded,
   nothing on it moved, for the next scan (P6; `DeviceDiscovery.loadOwnedDevice` lists before anything but the scratch
   sweeps)
 - Device discovery (`DeviceDiscovery`, disk work in `DiscoveryDisk`) does no disk I/O on the control thread for a
@@ -119,8 +122,14 @@
   discovery results named "adoption ..."); the path stays pending, its stores awaiting, through each. A device such a
   continuation loads is probed and loaded as a scan's are, with `check`: its check runs as the load applies, which is
   always after the threading's start, so it needs no CheckLoadedDevice.
-  Tests run discovery's work, and only it, with `ControlFixture.runDiscovery` (and `checkAllNow`, `scanNow`, `discoverNow`,
-  `nudgeNow`, which call and then run it; `newHost` and `handleMarkerEvents` run it too)
+  Tests run discovery's work with `ControlFixture.runDiscovery` (and `checkAllNow`, `scanNow`, `discoverNow`,
+  `nudgeNow`, which call and then run it; `newHost` and `handleMarkerEvents` run it too), in an order a drain could
+  produce (`runOrdered`, Task 16): a discovery job runs where it stands (`LockstepThreading.runInPlace`: its result
+  takes its place in the FIFO, after every event queued before the job), unless a lane job of its path is queued
+  ahead of it, and a result is applied only from the FIFO's head, the tasks ahead of it run first whatever they are;
+  everything behind the last discovery task stays queued. `runLoadReads`, `handleMarkerEvents` and
+  `DiscoveryIoSuite`'s result runs (`runInOrder`) work the same way; `runCopyJobs` runs its jobs anywhere (results at
+  the tail) and applies results from the head only
 - Device load (`DeviceDiscovery.loadOwnedDevice`): one `Sweep` job (`DiscoveryDisk.sweepAtLoad`: transfer staging,
   `creating/`, `deleting/`, `crl.creating`; then the listing, P6), one `CrlOpen` job for the device CRL's open
   (`DeviceCrlDisk.open`, below: recovery and the whole lost-CRL path, its result a `CrlOpenResult` Opened, Lost or
@@ -320,7 +329,7 @@
   kinds (R22): a **fact** (`HostCopies.fact`: something that
   already happened, i.e. an install, a router removal, the end of a close, an open, a retire or a retry, a retire's
   start, a phase a move reached, a copy leaving its path) is applied even where the transition table refuses it
-  (`DeviceCopies.applyActivity`/`applyPhase`; a refused phase is set to where the copy is, `CopyLayout.locate`), and the
+  (`DeviceCopies.applyActivity`/`applyPhase`; a refused phase is set to where the copy is, `CopyDisk.locate` on the lane), and the
   violation recorded. A **claim** (`HostCopies.claim`: Opening, AwaitingRetry, a work's start or update, a new record)
   that the table refuses is refused, recorded and returned `false`, and its caller backs off: `startOpen` opens nothing;
   `createNewStore`, `startRebuild`'s queuing, `startOut`, `returnLostTransferToRebuild` and `startIn`'s receive,
@@ -398,8 +407,9 @@
   a device a test pulled from under its running host (`host.testingOnlySkipDiskCheck(deviceId)`; a device directory
   that is merely missing is reported); and a copy path a test moves by hand while the host runs, to show the host
   re-reading it (`host.testingOnlySkipDiskCheckAt(path)`). A test that places a copy by hand after its device's load registers it
-  before the next drain with `host.testingOnlyRescan(deviceId)` (`HostCopies.rescan`: each unrecorded store
-  directory with its phase, as the load registers them) or `ControlFixture.placedCopies`; a fake rebuild places its
+  before the next drain with `host.testingOnlyRescan(deviceId)` (`HostCopies.rescan(sds, listing)`: each unrecorded
+  store directory with its phase, as the load registers them, from a listing `Host` reads on the test's thread; no
+  production path calls it, and `HostCopies` itself lists nothing) or `ControlFixture.placedCopies`; a fake rebuild places its
   copy as finish does (in `rebuilt/` with a config and its episode's `phase-param.rebuilt`) before completing with the
   copy's id (`CopyFixtures.copyIdOf`/`copyIdOn`)
 - The reconcile (store copy state machine stage 3): an Operational device of this host is reconciled store by store.
@@ -655,20 +665,37 @@
   (`ThreadedDeviceIo` for StoreThreadPool and SingleThreadThreading, configured by `DeviceIo.Config`;
   `LockstepDeviceIo` under lockstep). `DeviceControl.deviceIos` (`DeviceIos`, control-owned) keeps one per path from
   first sight, so a reload reuses it (`forPath`, `get`, `forget` only when `DeviceIo.idle`, `hostRoot`, `all`);
-  `Host.shutdown` closes them all without waiting. `Store.deviceIo` (set by `StoreLoader` from `sds.io`; None runs inline, tests only) is how code on a store's
+  `Host.shutdown` closes them all without waiting. A closed DeviceIo (`forget`, `Host.shutdown`) runs nothing more: every
+  job queued on it, and every later `submit` at once, fails with `DeviceIo.Cancelled`, which every apply treats as
+  "nothing happened" (so a caller holding a forgotten `sds.io` never waits forever); a job that ran always completes
+  its future, whatever it threw (fatal throwables and a throwing gate included), its observer entry ended first.
+  `Store.deviceIo` (always set by `StoreLoader`: `sds.io`, or the host root's lane for the test seam's unloaded-device
+  CRL; the host's save and save-file removal fail without one, so no store of a host does device I/O inline) is how code on a store's
   executor reaches its device: store-thread code never touches the disk, it submits a job and applies the result back
   on the executor after rechecking that the store is still the installed one (`crlLoaded`; the transfer-out close
   saves `crl_save.log` as a `SaveFile` job through `StoreDisk.saveState` and only then closes the store on its
   executor, so a failed or hung save still ends in the close; `Frontend.removeInheritedStateWhenDone` removes the
   inherited-votes file as a job with nothing to apply; FSIF's `estimateSize` answers from sizes kept in memory,
   `SizeTrackedFiles`). `LocalStorageDeviceState.io` is its device's. Control code does no
-  device I/O itself (rule 2 of `HostThreading`): `DeviceIoUsageSuite` scans `server/host`, `rebuild` and `transfer`
-  for the forbidden direct disk calls and requires each file's count to equal its `baseline` literal (files named
-  `*Disk.scala` and the DeviceIo classes are exempt), so a task that moves calls behind a lane lowers its entries in
-  the same commit. Lockstep: only management jobs go on the FIFO (with the other posted tasks, so order is the drain's);
+  device I/O itself (rule 2 of `HostThreading`), enforced by `DeviceIoUsageSuite` over `server/host`, `rebuild` and
+  `transfer` (comments and strings blanked; `*Disk.scala` and the DeviceIo classes exempt), with no baseline left
+  (Task 16): no direct disk call (os-lib, `DurableFiles`, `FileStat`, `DeviceMarkers`, CRL save-file and `RebuildState`
+  I/O, free space, `CopyLayoutDisk`'s reads), and every `XDisk.op(...)` call must be the argument of a lane helper
+  (`submit`, `submitFor`, `laneJob`, `laneFuture`, `onLane`, `writeMarker`, `staging`), directly or as a `({ ...;
+  XDisk.op(..) })` block, so a job body never runs on its caller's thread. Its allowlists name a reason each:
+  `JoinCeiling` (host-root persistence on the renew timer) and `StoreTransferManager` (a transfer's own connection
+  thread, its directory removals on its TransferLane). A new disk step goes into a `*Disk` object and is submitted. Lockstep: only management jobs go on the FIFO (with the other posted tasks, so order is the drain's);
   data and serial tasks run on real threads. `LockstepThreading.hold(path)` parks the path's later management jobs on a
   side queue and blocks its data and serial tasks, `held(path)` lists the held jobs, `release(path)` queues them again
-  in order and frees the threads; `ControlFixture.holdDevice`/`releaseDevice`/`heldJobs` wrap them
+  in order and frees the threads; `ControlFixture.holdDevice`/`releaseDevice`/`heldJobs` wrap them. The project's
+  done-criterion tests: `HungDeviceSuite` (lockstep, A held: a scan, a load, a transfer in and a rebuild onto B
+  complete while A's work waits in `heldJobs`, its rebuild holding only A's slot; a store rebuilt onto its owner B
+  while its Lost copy is on A comes Active and is served, A's retire and release of the old copy held until A's
+  release) and `ThreadedHungDeviceSuite` (StoreThreadPool, A's `ThreadedDeviceIo` gated shut: B's RocksDB and FSIF
+  stores commit and answer, every store heartbeats, `StoreRouter.heartbeatsRun`, no thread outside A's waits in A's
+  gate, A's backlog under a flood of ten times the read bound stays at most the bound plus one read per store
+  (`ThreadedDeviceIo.outstandingReads`, `poolTasksOutstanding`) with no answer to a dropped read; a host whose device
+  hangs on its first stat starts, loads and serves its other device)
 - Callbacks name the control context. Work run elsewhere (backend opens, client transactions on the host's `ec`) names
   its context; timers and other non-Future callbacks post to `controlEvents` before touching control state
 - Tests use `LockstepThreading`: everything posted waits on one FIFO drained by `testingOnlyHandleEvents`, stores run
@@ -697,7 +724,7 @@
 - A store loaded from its `crl_save.log` first drops whatever the device CRL holds for it (`StoreLoader.awaitCrlLoad`):
   the file is its whole state, and anything else there is a copy of part of it or an earlier tenancy's leftover,
   never to be recovered as its own (crash-recovery-log 3.3 step 4). A rebuilt copy carries an empty one
-  (`RebuildingStore.writeEmptyCrlState`), so its first load drops what an earlier copy left; a late save by a
+  (`RebuildDisk.writeEmptyCrlState`), so its first load drops what an earlier copy left; a late save by a
   fail-stopped earlier copy's close precedes that drop, since the new store cannot install until the close releases
   its executor slot (`HostThreading.AlreadyAssigned`). Once the CRL holds the file's state, `StoreRouter.crlLoaded`
   removes the file durably, as a `SaveFile` job on the store's device lane (`StoreDisk.removeSaveFile`; the store's

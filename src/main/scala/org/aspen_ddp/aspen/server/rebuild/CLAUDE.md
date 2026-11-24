@@ -17,7 +17,9 @@
 - A rebuilt store lost its Paxos acceptor state. `RebuildingStore.finish` writes `acceptor-since` (finish time plus
   `AcceptorSinceMargin`, 10 s) into its directory; how the Frontend enforces it: `server/store/CLAUDE.md`. The
   margin covers `Frontend.MaxStartLead` (2 s) plus host-to-host clock skew; client clocks do not enter into it.
-  `readAcceptorSince` and `readInheritedVotes` stat with `server.FileStat`: None only for a file known absent; a
+  The gate files' reads and writes are `RebuildDisk`'s (`writeAcceptorSince`, `readAcceptorSince`, `writeInheritedVotes`,
+  `readInheritedVotes`, `writeEmptyCrlState`), run only inside device jobs (finish's completion job, a load's
+  `LoadDisk.readLoadInputs`). `readAcceptorSince` and `readInheritedVotes` stat with `server.FileStat`: None only for a file known absent; a
   failed stat throws, and `StoreLoader.handleLoad` holds the load back. An unreadable file reads late (only mutes more)
 - `finish` also writes `inherited-votes` (`writeInheritedVotes`): the pass start (`passStartMillis`, reset by each
   `runPass`) plus the `horizon` parameter (default `TransactionHorizon.Horizon`, the longest a host uses) plus twice
@@ -28,7 +30,7 @@
   rebuild itself does nothing for it
 - `finish` also writes a fresh `incarnation` file (`StoreIncarnationFile.writeFresh`) into staging, overwriting any
   present, after `acceptor-since` and before `phase-param.rebuilt`: a rebuilt store is a new incarnation
-- `finish` also writes an empty `crl_save.log` (`RebuildingStore.writeEmptyCrlState`) before `phase-param.rebuilt`: the
+- `finish` also writes an empty `crl_save.log` (`RebuildDisk.writeEmptyCrlState`) before `phase-param.rebuilt`: the
   rebuilt store's whole transaction state. Its first load, by any path, is then a save-file load, which drops whatever
   the device CRL holds under its id (an earlier copy's leftovers: one removed without a retire, or a fail-stopped copy's
   close saving behind its retire's drop) before loading it (`server/host/CLAUDE.md`). `keepRebuiltStoreOffline` relies

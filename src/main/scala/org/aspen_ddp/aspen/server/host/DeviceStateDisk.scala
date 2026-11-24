@@ -33,7 +33,7 @@ object DeviceStateDisk extends Logging:
    *  names (CopyLayout.list). A listing or a config stat that fails throws (FileStat): a store it cannot see is never
    *  taken for none */
   def storesIn(path: os.Path): Set[StoreId] =
-    CopyLayout.list(path).copies.filter(f =>
+    CopyLayoutDisk.list(path).copies.filter(f =>
       f.phase != Phase.Retired && FileStat.isFile(f.path / StoreConfig.configFilename)).map(_.storeId).toSet
 
   /** Whether the device directory `path` still names `previousHost` as the marker the ownership lookup was made for
@@ -87,7 +87,7 @@ object DeviceStateDisk extends Logging:
   /** The entries of `state` an adoption serves (Offline ones, and the Active ones of a device not shut down) in
    *  adoption class `cls`, by their copies under `path`. A failed listing throws */
   def servedStoresIn(path: os.Path, state: StorageDeviceState, cls: AdoptionClass): List[StoreId] =
-    val copies = CopyLayout.list(path).copies.filter(_.phase != Phase.Retired)
+    val copies = CopyLayoutDisk.list(path).copies.filter(_.phase != Phase.Retired)
     state.stores.collect {
       case (storeId, entry) if (entry.status == StorageDeviceState.StoreStatus.Offline ||
                                 entry.status == StorageDeviceState.StoreStatus.Active) &&
@@ -112,7 +112,7 @@ object DeviceStateDisk extends Logging:
    *  failed to move, which stops the rest (the adoption's transaction then fails for the next scan) */
   def moveToLost(path: os.Path, stores: List[StoreId], syncDirectory: os.Path => Unit,
                  rename: (os.Path, os.Path) => Unit): List[Moved] =
-    val listing = CopyLayout.list(path).copies
+    val listing = CopyLayoutDisk.list(path).copies
     var moved = List[Moved]()
     val it = stores.iterator
     var failed = false
@@ -138,7 +138,7 @@ object DeviceStateDisk extends Logging:
   def bringIntoService(path: os.Path, stores: Set[StoreId], rewriteOwner: Boolean, hostId: HostId,
                        reinstate: Set[StoreId], syncDirectory: os.Path => Unit,
                        rename: (os.Path, os.Path) => Unit): List[Moved] =
-    val listing = CopyLayout.list(path).copies
+    val listing = CopyLayoutDisk.list(path).copies
     if rewriteOwner then
       listing.filter(f => stores.contains(f.storeId) && (f.phase == Phase.Live || mayGoLive(f.phase)))
         .map(_.path).filter(FileStat.isDir(_)).foreach(LoadDisk.writeArrivedAt)

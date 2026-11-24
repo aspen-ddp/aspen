@@ -761,10 +761,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     if alreadyLoaded(storageDevicePath, sdCfg) then
       end(storageDevicePath, b)
     else
-      submitFor(storageDevicePath, b, JobKind.LoadSweep, "device load sweep")({
-        DiscoveryDisk.sweepAtLoad(storageDevicePath)
-        Try(CopyLayout.list(storageDevicePath))
-      })(_ => ()):
+      submitFor(storageDevicePath, b, JobKind.LoadSweep, "device load sweep")(
+        DiscoveryDisk.sweepAndList(storageDevicePath))(_ => ()):
         case _ if alreadyLoaded(storageDevicePath, sdCfg) =>
           end(storageDevicePath, b)
         case Failure(t) =>

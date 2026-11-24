@@ -412,6 +412,8 @@ trait ControlFixture:
   override def subFixtureTeardown(): Unit =
     tempRoots.foreach(deleteTree)
     tempRoots.clear()
+    // The hosts runAllCopyJobs and drainAllHosts run are this test's only: an earlier test's directories are gone
+    rigs.clear()
 
   /** Removes a tree. Failures are ignored; these are temp dirs. */
   protected def deleteTree(root: os.Path): Unit =
@@ -618,7 +620,7 @@ trait ControlFixture:
     require(!devices.devices.contains(sds.storageDeviceId),
             s"${sds.storageDeviceId} is already loaded; injectLoadedDevice does not replace")
     // Its copies registered as a device load registers them
-    host.control.copyRegistry.attach(sds)
+    host.control.copyRegistry.attach(sds, CopyDisk.list(sds.devicePath))
     devices.devices += (sds.storageDeviceId -> sds)
     host.control.publishView()
 
@@ -757,10 +759,7 @@ trait ControlFixture:
         case e: Host.DeviceJobDone => e.discovery
         case _ => false
       case _ => false
-    var batch = ls.removeQueued(isDiscovery)
-    while batch.nonEmpty do
-      batch.foreach(_.run())
-      batch = ls.removeQueued(isDiscovery)
+    runOrdered(ls, isDiscovery)
 
   /** Runs the queued store-load reads (StoreLoader: a load's config read, `ReadConfig`, and a LoadStore's inputs,
    *  `LoadInputs`) and their results, including what those queue of the same, ahead of and leaving queued everything
@@ -776,10 +775,33 @@ trait ControlFixture:
         case e: Host.DeviceJobDone => results.contains(e.what)
         case _ => false
       case _ => false
-    var batch = ls.removeQueued(isLoadRead)
-    while batch.nonEmpty do
-      batch.foreach(_.run())
-      batch = ls.removeQueued(isLoadRead)
+    runOrdered(ls, isLoadRead)
+
+  /** Runs the queued lane jobs and results `isWork` matches, and what they queue of the same, in an order a drain on
+   *  real threads could produce: a matching job runs where it stands (`runInPlace`: its result takes its place, so it
+   *  is applied after every event queued before the job), unless a lane job of its path is queued ahead of it (a lane
+   *  runs its jobs in order), and a result is applied only from the FIFO's head: the tasks ahead of it run first, in
+   *  order, whatever they are, as a drain would run them. Stops once no matching task is queued, leaving queued
+   *  everything behind the last one */
+  protected def runInOrder(host: Host)(isWork: Runnable => Boolean): Unit = runOrdered(lockstep(host), isWork)
+
+  private def runOrdered(ls: LockstepThreading, isWork: Runnable => Boolean): Unit =
+    def laneAhead(items: List[Runnable], i: Int, path: os.Path): Boolean =
+      items.take(i).exists:
+        case d: LockstepThreading.DeviceTask => d.path == path
+        case _ => false
+    def runnableJob(items: List[Runnable]): Option[Runnable] =
+      items.zipWithIndex.collectFirst {
+        case (t: LockstepThreading.DeviceTask, i) if isWork(t) && !laneAhead(items, i, t.path) => t
+      }
+    var go = true
+    while go do
+      val items = ls.queuedItems
+      runnableJob(items) match
+        case Some(job) => ls.runInPlace(job): Unit
+        case None =>
+          if items.exists(isWork) then ls.removeQueued(_ eq items.head).foreach(_.run())
+          else go = false
 
   /** Runs the queued copy jobs (StoreCopies, CopyMoves: `Move`, `Retire`, `Release`, `Delete`), device checks'
    *  disk-inputs jobs (DeviceReconciler: `ReconcileInputs`) and rebuild bookkeeping jobs (StoreRebuilds:
@@ -843,9 +865,11 @@ trait ControlFixture:
   protected def queuedMarkerEvents(host: Host): Int =
     lockstep(host).queuedItems.count(isMarkerResolution)
 
-  /** Removes the queued DeviceOwnershipResolved events and handles them, leaving every other event queued. */
+  /** Handles the queued DeviceOwnershipResolved events (runOrdered: whatever is queued ahead of one runs first),
+   *  leaving every event behind the last of them queued, then runs the discovery they queue */
   protected def handleMarkerEvents(host: Host): Unit =
-    lockstep(host).removeQueued(isMarkerResolution).foreach(_.run())
+    // In FIFO order: the tasks queued ahead of a resolution run before it, as a drain would run them
+    runOrdered(lockstep(host), isMarkerResolution)
     // A device an outcome loads is probed and loaded by discovery jobs
     runDiscovery(host)
 

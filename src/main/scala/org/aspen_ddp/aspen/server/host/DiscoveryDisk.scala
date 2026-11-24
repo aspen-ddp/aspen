@@ -61,6 +61,12 @@ object DiscoveryDisk extends Logging:
     CopyDisk.sweepDeleting(devicePath)
     remove(CrashRecoveryLog.replacementCrlDir(devicePath), "the unfinished replacement CRL directory")
 
+  /** A load's first job (DeviceDiscovery.loadOwnedDevice): sweepAtLoad, then the device's listing (P6: a failed one
+   *  leaves the device unloaded for the next scan) */
+  def sweepAndList(devicePath: os.Path): Try[CopyLayout.Listing] =
+    sweepAtLoad(devicePath)
+    Try(CopyLayoutDisk.list(devicePath))
+
   /** retireDuplicates' outcome: the listing after its moves, or the error that stopped them, and every move whose
    *  rename landed unforced, (from, to) in order, for the caller to hold for the resync (CopyMoves.heldUnforced,
    *  HostCopies.unsynced) whatever the outcome */
@@ -90,7 +96,7 @@ object DiscoveryDisk extends Logging:
           throw t
       target
     val outcome = Try:
-      val listing = CopyLayout.list(devicePath)
+      val listing = CopyLayoutDisk.list(devicePath)
       val duplicated = listing.copies.filter(_.phase != Phase.Retired).groupBy(_.storeId).filter(_._2.size > 1)
       if duplicated.isEmpty then
         listing
@@ -105,5 +111,5 @@ object DiscoveryDisk extends Logging:
             else move(f.path, storeId, f.copyId, Phase.Lost)
           ordered.zip(lost).drop(1).foreach: (f, path) =>
             move(path, storeId, f.copyId, Phase.Retired)
-        CopyLayout.list(devicePath)
+        CopyLayoutDisk.list(devicePath)
     Duplicates(outcome, unsynced)

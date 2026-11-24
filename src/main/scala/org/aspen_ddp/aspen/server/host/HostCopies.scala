@@ -219,11 +219,11 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
   /** Test-only (Host.testingOnlyRescan): registers each copy on `sds` whose store has no record, with its phase,
    *  as `attach` registers the directories a device load finds: copies a test placed by hand after the load. Records
    *  already there are left as they are, and so is a copy a rebuild's finish placed whose completion's handler has
-   *  not yet run (finishInFlight): the handler records it. Returns the stores registered. A test seam only: it lists
-   *  the device inline, on the test's own (lockstep control) thread, and no production path calls it */
-  def rescan(sds: LocalStorageDeviceState): List[StoreId] =
+   *  not yet run (finishInFlight): the handler records it. Returns the stores registered. A test seam only: `listing`
+   *  is the device's, which its caller (Host.testingOnlyRescan) read on the test's own thread; no production path
+   *  calls it */
+  def rescan(sds: LocalStorageDeviceState, listing: Try[CopyLayout.Listing]): List[StoreId] =
     copiesOf(sds).toList.flatMap: copies =>
-      val listing = Try(CopyDisk.list(sds.devicePath))
       listing.get.copies.collect:
         case f if f.phase != Phase.Retired && !copies.copies.contains(f.storeId) &&
                   !finishInFlight(sds.storageDeviceId, listing, f.storeId) =>
@@ -287,16 +287,6 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
           logger.warn(s"Could not re-read the copies of store $storeId on device ${sds.storageDeviceId} ($site). " +
                       s"Leaving its record as it is: $t")
           false
-
-  /** As attach, listing the device itself (ControlFixture.injectLoadedDevice, a test seam: it lists inline on the
-   *  test's thread, and no production path calls it). A listing that fails registers none */
-  def attach(sds: LocalStorageDeviceState): Unit =
-    val listing =
-      try CopyDisk.list(sds.devicePath)
-      catch case NonFatal(t) =>
-        fact("attach")(throw t)
-        CopyLayout.Listing(Nil, Nil)
-    attach(sds, listing)
 
   /** A load (StoreLoader.tryLoadStore) read the copy at `storePath`, whose config names `storeId`, in `phase`. A copy
    *  with no record is registered and reported as learned; a record of another copy or phase is a miswired site:
@@ -478,7 +468,9 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         val copyId = CopyLayout.nameOf(storePath).filter(_._1 == storeId).map(_._2).getOrElse(
           throw IllegalStateException(s"Store $storeId at $storePath on device $id has no copy record, and its path " +
                                       "names no copy of it"))
-        val phase = Try(CopyLayout.phaseAt(storePath)).toOption.flatten.getOrElse(Phase.Live)
+        // By location only, reading no parameter file (control does no device I/O): a phase that carries one is
+        // learned with "", and the drain's disk check of a test (the only callers) reports the difference
+        val phase = CopyLayout.phaseByLocation(storePath).getOrElse(Phase.Live)
         logger.warn(s"The copy of store $storeId at $storePath was not known to the copy registry. Learned at its " +
                     s"$site, $phase")
         learnedCopy(s"device $id: $storeId learned at $site, $phase")

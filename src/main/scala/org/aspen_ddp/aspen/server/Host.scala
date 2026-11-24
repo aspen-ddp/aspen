@@ -593,7 +593,10 @@ class Host(val client: AspenClient,
    *  directories a test placed by hand on loaded device `deviceId` after its load, as the device's load registers the
    *  directories it finds (HostCopies.rescan). Returns the stores registered */
   private[aspen] def testingOnlyRescan(deviceId: StorageDeviceId): List[StoreId] =
-    deviceControl.devices.devices.get(deviceId).toList.flatMap(deviceControl.copyRegistry.rescan)
+    // The listing is read here, on the test's thread: a test seam, never a production path
+    deviceControl.devices.devices.get(deviceId).toList.flatMap: sds =>
+      val listing = scala.util.Try(org.aspen_ddp.aspen.server.host.CopyDisk.list(sds.devicePath))
+      deviceControl.copyRegistry.rescan(sds, listing)
 
   /** Test-only, on the control thread: the drain's disk check skips loaded device `deviceId`, whose directory the
    *  test removed while the host has it loaded (a drive pulled from its running host) */

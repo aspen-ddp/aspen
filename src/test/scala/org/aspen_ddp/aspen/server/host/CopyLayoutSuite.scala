@@ -41,14 +41,14 @@ class CopyLayoutSuite extends FileBasedTests:
   test("locate finds a copy's phase by its location, and None where no phase directory holds it"):
     val dev = tdir / "dev-locate"
     val u = UUID.randomUUID()
-    CopyLayout.locate(dev, s, u) should be(None)
+    CopyLayoutDisk.locate(dev, s, u) should be(None)
     os.makeDir.all(CopyLayout.path(dev, s, u, Phase.Outbound("")))
     os.write(CopyLayout.path(dev, s, u, Phase.Outbound("")) / CopyLayout.paramFile(Phase.Outbound("")).get, "t-1")
-    CopyLayout.locate(dev, s, u) should be(Some(Phase.Outbound("t-1")))
-    CopyLayout.locate(dev, s, UUID.randomUUID()) should be(None)
+    CopyLayoutDisk.locate(dev, s, u) should be(Some(Phase.Outbound("t-1")))
+    CopyLayoutDisk.locate(dev, s, UUID.randomUUID()) should be(None)
     // A phase directory without search permission: its stat fails, which is no absence
     os.perms.set(dev / "outbound", "rw-------")
-    try an[java.io.IOException] should be thrownBy CopyLayout.locate(dev, s, u)
+    try an[java.io.IOException] should be thrownBy CopyLayoutDisk.locate(dev, s, u)
     finally os.perms.set(dev / "outbound", "rwx------")
 
   test("param is the phase's parameter"):
@@ -68,17 +68,17 @@ class CopyLayoutSuite extends FileBasedTests:
   test("readParam reads an absent file as empty and throws a failed stat"):
     val copy = tdir / "copy"
     os.makeDir.all(copy)
-    CopyLayout.readParam(copy, Phase.Rebuilt("")) should be("")
+    CopyLayoutDisk.readParam(copy, Phase.Rebuilt("")) should be("")
     os.write(copy / CopyLayout.paramFile(Phase.Rebuilt("")).get, "e-1")
     // Each phase reads only its own file
-    CopyLayout.readParam(copy, Phase.Rebuilt("")) should be("e-1")
-    CopyLayout.readParam(copy, Phase.Outbound("")) should be("")
-    CopyLayout.readParam(copy, Phase.Live) should be("")
+    CopyLayoutDisk.readParam(copy, Phase.Rebuilt("")) should be("e-1")
+    CopyLayoutDisk.readParam(copy, Phase.Outbound("")) should be("")
+    CopyLayoutDisk.readParam(copy, Phase.Live) should be("")
     // A parent without search permission: the stat fails (EACCES), which is no absence
     val locked = tdir / "locked"
     os.makeDir.all(locked / "copy")
     os.perms.set(locked, "rw-------")
-    try an[java.io.IOException] should be thrownBy CopyLayout.readParam(locked / "copy", Phase.Rebuilt(""))
+    try an[java.io.IOException] should be thrownBy CopyLayoutDisk.readParam(locked / "copy", Phase.Rebuilt(""))
     finally os.perms.set(locked, "rwx------")
 
   test("a child whose name is not a copy name is reported, not listed"):
@@ -90,7 +90,7 @@ class CopyLayoutSuite extends FileBasedTests:
       os.makeDir.all(dev / d / "stray")
       os.write(dev / d / "notes.txt", "")
       List(dev / d / "stray", dev / d / "notes.txt")
-    val listing = CopyLayout.list(dev)
+    val listing = CopyLayoutDisk.list(dev)
     listing.strays.toSet should be(strays.toSet)
     listing.copies.map(f => (f.storeId, f.phase, f.path)).toSet should be(Set(
       (s, Phase.Retired, retired),
@@ -106,7 +106,7 @@ class CopyLayoutSuite extends FileBasedTests:
     os.makeDir.all(dev / StoreId(s.poolId, 6).directoryName)
     List("creating", "deleting", "transferring-in", "rebuilding", "crl", "crl.creating").foreach(d =>
       os.makeDir.all(dev / d / CopyLayout.copyName(StoreId(s.poolId, 8), UUID.randomUUID())))
-    val listing = CopyLayout.list(dev)
+    val listing = CopyLayoutDisk.list(dev)
     listing.copies.map(f => (f.storeId, f.phase, f.path)).toSet should be(Set(
       (s, Phase.Live, live), (StoreId(s.poolId, 5), Phase.Live, unconfigured)))
     listing.strays should be(Nil)
@@ -123,7 +123,7 @@ class CopyLayoutSuite extends FileBasedTests:
     os.symlink(unstat, closed / "inside")
     os.perms.set(closed, "rw-------")
     try
-      val listing = CopyLayout.list(dev)
+      val listing = CopyLayoutDisk.list(dev)
       listing.strays should be(List(file))
       listing.copies.map(_.path).toSet should be(Set(real, unstat))
     finally os.perms.set(closed, "rwx------")
@@ -135,14 +135,14 @@ class CopyLayoutSuite extends FileBasedTests:
         val copy = CopyFixtures.placeCopy(dev, StoreId(s.poolId, i.toByte))
         os.write(copy / marker._1, marker._2)
         copy
-    CopyLayout.list(dev).copies.map(f => (f.phase, f.path)).toSet should be(copies.map(Phase.Live -> _).toSet)
+    CopyLayoutDisk.list(dev).copies.map(f => (f.phase, f.path)).toSet should be(copies.map(Phase.Live -> _).toSet)
 
   test("a failed listing throws"):
     val dev = tdir / "dev"
     CopyFixtures.placeCopy(dev, s, Phase.Retired)
     val dir = dev / CopyLayout.dirOf(Phase.Retired)
     os.perms.set(dir, "-wx------")
-    try an[java.io.IOException] should be thrownBy CopyLayout.list(dev)
+    try an[java.io.IOException] should be thrownBy CopyLayoutDisk.list(dev)
     finally os.perms.set(dir, "rwx------")
 
   test("a rebuilt copy's episode is read from its own parameter file, and a parked copy's phase is its location"):
@@ -153,16 +153,16 @@ class CopyLayoutSuite extends FileBasedTests:
     os.write(rebuilt / CopyLayout.paramFile(Phase.Outbound("")).get, "t-other")
     os.write(parked / CopyLayout.paramFile(Phase.Rebuilt("")).get, "e-other")
     os.write(parked / "rebuild-complete", "e-other")
-    CopyLayout.list(dev).copies.map(f => (f.storeId, f.phase, f.path)).toSet should be(Set(
+    CopyLayoutDisk.list(dev).copies.map(f => (f.storeId, f.phase, f.path)).toSet should be(Set(
       (s, Phase.Rebuilt("e-1"), rebuilt),
       (StoreId(s.poolId, 7), Phase.Parked, parked)))
     rebuilt / os.up should be(dev / "rebuilt")
     parked / os.up should be(dev / "parked")
-    CopyLayout.phaseAt(rebuilt) should be(Some(Phase.Rebuilt("e-1")))
+    CopyLayoutDisk.phaseAt(rebuilt) should be(Some(Phase.Rebuilt("e-1")))
     os.perms.set(rebuilt, "rw-------")
     try
-      an[java.io.IOException] should be thrownBy CopyLayout.list(dev)
-      an[java.io.IOException] should be thrownBy CopyLayout.phaseAt(rebuilt)
+      an[java.io.IOException] should be thrownBy CopyLayoutDisk.list(dev)
+      an[java.io.IOException] should be thrownBy CopyLayoutDisk.phaseAt(rebuilt)
     finally os.perms.set(rebuilt, "rwx------")
 
   test("an outbound copy's phase is read from its own parameter file, and a failed read throws"):
@@ -172,13 +172,13 @@ class CopyLayoutSuite extends FileBasedTests:
     // Another phase's parameter file is inert there, and an outbound copy may have none
     os.write(sending / CopyLayout.paramFile(Phase.Arrived("")).get, "t-other")
     os.remove(parked / CopyLayout.paramFile(Phase.Outbound("")).get)
-    CopyLayout.list(dev).copies.map(f => (f.storeId, f.phase, f.path)).toSet should be(Set(
+    CopyLayoutDisk.list(dev).copies.map(f => (f.storeId, f.phase, f.path)).toSet should be(Set(
       (s, Phase.Outbound("t-1"), sending),
       (StoreId(s.poolId, 7), Phase.Outbound(""), parked)))
-    CopyLayout.phaseAt(sending) should be(Some(Phase.Outbound("t-1")))
+    CopyLayoutDisk.phaseAt(sending) should be(Some(Phase.Outbound("t-1")))
     // The copy without search permission: its parameter file cannot be stat'd
     os.perms.set(sending, "rw-------")
     try
-      an[java.io.IOException] should be thrownBy CopyLayout.list(dev)
-      an[java.io.IOException] should be thrownBy CopyLayout.phaseAt(sending)
+      an[java.io.IOException] should be thrownBy CopyLayoutDisk.list(dev)
+      an[java.io.IOException] should be thrownBy CopyLayoutDisk.phaseAt(sending)
     finally os.perms.set(sending, "rwx------")

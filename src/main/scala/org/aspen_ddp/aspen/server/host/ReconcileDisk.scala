@@ -29,7 +29,7 @@ object ReconcileDisk:
 
   /** A device check's disk inputs for the device at `devicePath`, whose copy records name `recorded` */
   def gather(devicePath: os.Path, recorded: Map[StoreId, os.Path]): ReconcileDiskInputs =
-    val listing = Try(CopyLayout.list(devicePath))
+    val listing = Try(CopyLayoutDisk.list(devicePath))
     val listed = listing.toOption.toList.flatMap(_.copies).filter(_.phase != Phase.Retired).map(_.path)
     val stats = (recorded.values ++ listed).toSet.iterator.map: p =>
       p -> PathStats(FileStat.existence(p), FileStat.existence(p / StoreConfig.configFilename))

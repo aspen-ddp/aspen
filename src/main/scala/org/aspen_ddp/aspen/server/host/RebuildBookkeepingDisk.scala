@@ -63,4 +63,4 @@ object RebuildBookkeepingDisk extends Logging:
   /** The copies of `storeId` on the device at `devicePath` outside pending-delete/ (CopyLayout.copiesOf): what a
    *  rebuild's completion lists before its flip. Throws a failed listing */
   def copiesOf(devicePath: os.Path, storeId: StoreId): List[CopyLayout.Found] =
-    CopyLayout.copiesOf(devicePath, storeId)
+    CopyLayoutDisk.copiesOf(devicePath, storeId)

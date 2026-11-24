@@ -10,11 +10,10 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjec
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.network.PendingAllocation
 import org.aspen_ddp.aspen.common.transaction.{TransactionHorizon, TransactionId}
-import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, StoreConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
+import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
 import org.aspen_ddp.aspen.server.host.{CopyLayout, Phase}
 import org.aspen_ddp.aspen.server.store.{Frontend, StoreIncarnationFile}
-import org.aspen_ddp.aspen.server.host.{DeviceIo, JobKind}
+import org.aspen_ddp.aspen.server.host.{CopyDisk, DeviceIo, JobKind}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, StoreCreation}
 import scribe.Logging
 
@@ -40,18 +39,6 @@ object RebuildingStore:
    *  on its owner device (StoreCopies.release): a rebuild that cannot finish destroys nothing. Never loaded: the
    *  loader is offered only live/ copies. */
   val PendingDeleteDirectory = "pending-delete"
-
-  /** Writes the rebuilt store's whole transaction state, which is empty, as the crl_save.log of the store directory
-   *  at `storePath` (finish, in staging before its episode's phase-param.rebuilt). A rebuilt store has never served, so
-   *  whatever the device CRL holds under its id was left by an earlier copy of the store on this device whose
-   *  directory left its path without a retire (removed by hand, or a fail-stopped copy's close saving behind the
-   *  retire's drop). Its first load, wherever it comes from (the flip, the Completed Rebuilds pass, a restart, a
-   *  reinstated transfer out, an adoption), is a save-file load, which drops those entries durably before loading the
-   *  file (StoreLoader.awaitCrlLoad); a transfer out of the unloaded copy ships the file and drops them likewise
-   *  (StoreTransfersOut.extractUnloaded). Without it the copy would recover their votes, locks and applied stubs as its
-   *  own under its new incarnation, and a stale commit vote could apply again. */
-  def writeEmptyCrlState(storePath: os.Path, storeId: StoreId): Unit =
-    CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, Backend.crlSaveFile(storePath))
 
   /** The parameter a Rebuilt copy of `episode` carries (phase-param.rebuilt): the episode, "" for None */
   def rebuildCompleteContent(episode: Option[UUID]): String = episode.map(_.toString).getOrElse("")
@@ -81,24 +68,8 @@ object RebuildingStore:
    *  incarnation's host and the rebuilding one */
   val AcceptorSinceMargin: FiniteDuration = FiniteDuration(10, SECONDS)
 
-  private def acceptorSinceAfter(now: HLCTimestamp): HLCTimestamp =
+  private[rebuild] def acceptorSinceAfter(now: HLCTimestamp): HLCTimestamp =
     HLCTimestamp(now.asLong + (AcceptorSinceMargin.toMillis << 16))
-
-  def writeAcceptorSince(storePath: os.Path): Unit = writeAcceptorSince(storePath, acceptorSinceAfter(HLCTimestamp.now))
-
-  /** Writes `at` as the store's acceptor start (finish passes now plus AcceptorSinceMargin) */
-  def writeAcceptorSince(storePath: os.Path, at: HLCTimestamp): Unit =
-    DurableFiles.write(storePath / AcceptorSinceFile, at.asLong.toString)
-
-  /** The store's acceptor start, if it was rebuilt. A file that cannot be read counts as now plus the margin: later
-   *  than the truth, which only mutes more transactions. A stat that fails throws (FileStat): None only for a file known
-   *  absent, never for one that may be there (StoreLoader.handleLoad holds the load back) */
-  def readAcceptorSince(storePath: os.Path): Option[HLCTimestamp] =
-    val file = storePath / AcceptorSinceFile
-    if !FileStat.exists(file) then
-      None
-    else
-      Some(scala.util.Try(HLCTimestamp(os.read(file).trim.toLong)).getOrElse(acceptorSinceAfter(HLCTimestamp.now)))
 
   /** In a rebuilt store's directory until its inherited votes are released: the wall-clock time, in milliseconds,
    *  from which its peers' held votes are complete (Frontend.inheritedVotesAfter, inheritedVoteLock). Written by
@@ -114,20 +85,6 @@ object RebuildingStore:
    *  the other skew */
   def inheritedVotesAfter(passStartMillis: Long, horizon: FiniteDuration): Long =
     passStartMillis + horizon.toMillis + 2 * AcceptorSinceMargin.toMillis
-
-  def writeInheritedVotes(storePath: os.Path, afterMillis: Long): Unit =
-    DurableFiles.write(storePath / InheritedVotesFile, afterMillis.toString)
-
-  /** The store's inherited-votes gate, if it holds inherited votes. A file that cannot be read counts as now plus the
-   *  horizon and both margins: later than the truth, as the store loads after its rebuild's pass began */
-  def readInheritedVotes(storePath: os.Path, horizon: FiniteDuration): Option[Long] =
-    val file = storePath / InheritedVotesFile
-    // A stat that fails throws (FileStat), as readAcceptorSince's does
-    if !FileStat.exists(file) then
-      None
-    else
-      Some(scala.util.Try(os.read(file).trim.toLong)
-        .getOrElse(inheritedVotesAfter(System.currentTimeMillis(), horizon)))
 
   /** How long the sweep waits on listed allocations before it records what is still unsettled for repair
    *  (sweepPending). Every listed transaction started before the query, at most MaxStartLead ahead of its stores'
@@ -212,7 +169,7 @@ class RebuildingStore(client: AspenClient,
                       /** How long the peer query waits for its quorum before the pass fails (PeerQueryTimeout) */
                       peerQueryTimeout: FiniteDuration = RebuildingStore.PeerQueryTimeout,
                       /** How finish's rename into rebuilt/ forces its directories. Replaced only by tests */
-                      syncDirectory: os.Path => Unit = DurableFiles.syncDirectory)
+                      syncDirectory: os.Path => Unit = CopyDisk.DefaultSyncDirectory)
   extends StoreRebuild with Logging:
 
   import RebuildingStore.*
@@ -232,7 +189,7 @@ class RebuildingStore(client: AspenClient,
   private val completionPromise: Promise[UUID] = Promise()
   def complete: Future[UUID] = completionPromise.future
 
-  // Set by completeStaging, before the completion, for a rename into rebuilt/ that landed unforced
+  // Set by finish's completion job, before the completion, for a rename into rebuilt/ that landed unforced
   @volatile private var unforcedPlacement: Option[DurableFiles.MoveNotForced] = None
   override def placedUnforced: Option[DurableFiles.MoveNotForced] = unforcedPlacement
 
@@ -774,7 +731,11 @@ class RebuildingStore(client: AspenClient,
         val inheritedAfter = inheritedVotesAfter(passStartMillis, horizon)
         backend.rebuildFlush()
           .flatMap(_ => closeBackend())
-          .flatMap(_ => staging(completeStaging(inheritedAfter)))
+          .flatMap(_ => staging({
+            checkFinishable()
+            RebuildDisk.complete(stagingPath, devicePath, storeId, episode, inheritedAfter, syncDirectory,
+                                 t => unforcedPlacement = Some(t))
+          }))
       catch case NonFatal(t) => Future.failed(t)
     done.transform:
       case scala.util.Failure(err) if isOutOfSpace(err) =>
@@ -782,12 +743,10 @@ class RebuildingStore(client: AspenClient,
         scala.util.Failure(err)
       case other => other
 
-  /** finish's work once the staging backend is closed, as a device job: the abort latch's last check, then
-   *  RebuildDisk.complete. Returns the fresh copy id the copy took in rebuilt/ */
-  private def completeStaging(inheritedAfter: Long): UUID =
+  /** finish's check once the staging backend is closed, first in its completion job (RebuildDisk.complete, which
+   *  returns the fresh copy id the copy took in rebuilt/): the abort latch's last check */
+  private def checkFinishable(): Unit =
     testingOnlyOnFinishClosed()
     // An abort latched while the backend closed (a fail-stop of the staging store's last I/O, a cancel)
     // means the staging copy must not become the live store: the pass fails with the checkpoint left in place
     synchronized(abortCause).foreach(cause => throw cause)
-    RebuildDisk.complete(stagingPath, devicePath, storeId, episode, inheritedAfter, syncDirectory,
-                         t => unforcedPlacement = Some(t))

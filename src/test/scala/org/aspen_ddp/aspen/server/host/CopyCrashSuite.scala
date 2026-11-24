@@ -25,7 +25,7 @@ class CopyCrashSuite extends IntegrationTestSuite with CopyHostFixture:
 
   /** The copies of `sid` on the device, in every phase directory but pending-delete/ unless `retired` */
   private def copiesOf(dev: os.Path, sid: StoreId, retired: Boolean = false): List[CopyLayout.Found] =
-    CopyLayout.list(dev).copies.filter(f => f.storeId == sid && (retired || f.phase != Phase.Retired))
+    CopyLayoutDisk.list(dev).copies.filter(f => f.storeId == sid && (retired || f.phase != Phase.Retired))
 
   /** The one copy of `sid` on the device, in any phase directory pending-delete/ included: fails unless there is
    *  exactly one */

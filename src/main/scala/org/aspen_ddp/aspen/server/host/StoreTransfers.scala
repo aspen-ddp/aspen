@@ -63,9 +63,7 @@ object StoreTransfers:
     private def usable(h: JobHandle[Unit]): Boolean = h.future.value.forall(_.isSuccess)
 
     private def submit(first: () => Unit): Future[Unit] =
-      val h = io.submit(JobKind.Delete, Some(storeId)):
-        first()
-        TransferDisk.removeStaging(staging)
+      val h = io.submit(JobKind.Delete, Some(storeId))({ first(); TransferDisk.removeStaging(staging) })
       queued = Some(h)
       h.future
 

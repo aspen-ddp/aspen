@@ -340,8 +340,8 @@ class TransferIoSuite extends IntegrationTestSuite with ControlFixture:
       CrashRecoveryLog.saveStoreState(first, StoreRecoveryState.Empty, Backend.crlSaveFile(staged))
       TransferDisk.promote(first, staged, staging, target, Phase.Arrived("t"), sync, rename) should be(
         TransferDisk.Promotion.Moved(MoveResult.Durable))
-      CopyLayout.phaseAt(target) should be(Some(Phase.Arrived("t")))
-      CopyLayout.readParam(target, Phase.Arrived("")) should be("t")
+      CopyLayoutDisk.phaseAt(target) should be(Some(Phase.Arrived("t")))
+      CopyLayoutDisk.readParam(target, Phase.Arrived("")) should be("t")
       os.exists(staging) should be(false)
       // A rename that lands unforced keeps the staging, which the resync forces
       os.makeDir.all(staged)

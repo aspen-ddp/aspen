@@ -774,7 +774,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                 poolIDA = poolIDA,
                 admissionTier = admissionTier,
                 onThisHost = id => router.get(id).isDefined,
-                deviceIo = ctx.devices.devices.get(storageDeviceId).map(_.io),
+                // Always a lane: the device's, or the host root's for the test seam's unloaded-device CRL (as for the
+                // load's reads), so no store of a host ever does its own device I/O inline
+                deviceIo = Some(ctx.devices.devices.get(storageDeviceId).map(_.io).getOrElse(ctx.deviceIos.hostRoot)),
                 // Its backend's completion handler is set below, after the Store is built: recovered transactions read
                 // their objects once it is installed (awaitCrlLoad)
                 deferRecovery = true,
@@ -892,8 +894,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     val held = !replaced && ctx.copyRegistry.closingUnserved(storageDeviceId, storeId, "abandonLoad",
       keepRetry = true)
     // Its device's unload waits for the close (StoreRebuilds.closeStarted): unloaded and loaded again meanwhile, the
-    // device's Idle Live copy would be a Load candidate, opening a second backend over the closing one
-    val tracked = Option.when(ctx.devices.devices.contains(storageDeviceId))(ctx.rebuilds.closeStarted(storageDeviceId))
+    // device's Idle Live copy would be a Load candidate, opening a second backend over the closing one. Tracked
+    // whether or not the device is loaded now (a stale apply after an unload): a reload of the device meanwhile then
+    // waits for it at its own unload, as for any close running on it
+    val tracked = Some(ctx.rebuilds.closeStarted(storageDeviceId))
     val closed =
       try backend.close()
       catch case NonFatal(t) => Future.failed(t)
@@ -1089,7 +1093,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             case Success(Some(trs)) =>
               store.deviceIo match
                 case Some(io) => io.submit(JobKind.SaveFile, Some(storeId))(StoreDisk.saveState(storeId, saveFile, trs)).future
-                case None => Future.fromTry(Try(StoreDisk.saveState(storeId, saveFile, trs)))
+                case None => Future.failed(IllegalStateException(s"Store $storeId has no device lane"))
           savedFuture.transformWith { saved =>
             onExecutor(entry):
               store.close().flatMap(_ => Future.fromTry(saved))(using ExecutionContext.parasitic)

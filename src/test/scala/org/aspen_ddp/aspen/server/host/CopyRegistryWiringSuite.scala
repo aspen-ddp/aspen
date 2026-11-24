@@ -223,7 +223,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       val sds = new LocalStorageDeviceState(deviceB, other, other / StorageDeviceConfig.configFilename,
         new org.aspen_ddp.aspen.TestNetwork.TestCRL, host.control.deviceIos.forPath(other))
       os.makeDir.all(other / "not-a-store")
-      noException should be thrownBy host.control.copyRegistry.attach(sds, CopyLayout.list(other))
+      noException should be thrownBy host.control.copyRegistry.attach(sds, CopyLayoutDisk.list(other))
       phases(host, deviceB) should be(Map(sid(0) -> Phase.Live))
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
     finally os.perms.set(closed, "rwx------")

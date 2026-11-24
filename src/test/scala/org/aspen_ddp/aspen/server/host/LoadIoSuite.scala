@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.host
 
+import org.aspen_ddp.aspen.server.rebuild.RebuildDisk
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{Host, StoreConfig}
@@ -214,8 +215,8 @@ class LoadIoSuite extends IntegrationTestSuite with CopyHostFixture:
     given ExecutionContext = executionContext
     loadWith(dir =>
       LoadDisk.writeArrivedAt(dir)
-      RebuildingStore.writeAcceptorSince(dir)
-      RebuildingStore.writeInheritedVotes(dir, System.currentTimeMillis()), served(_, s)).flatMap: (host, _) =>
+      RebuildDisk.writeAcceptorSince(dir)
+      RebuildDisk.writeInheritedVotes(dir, System.currentTimeMillis()), served(_, s)).flatMap: (host, _) =>
       val store = host.control.router.loaded(s)
       store.frontend.acceptorSince should be(defined)
       store.frontend.inheritedVotesAfter should be(defined)

@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.host
 
+import org.aspen_ddp.aspen.server.rebuild.RebuildDisk
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -207,7 +208,7 @@ trait CopyHostFixture extends ControlFixture:
       val copy =
         if real then
           val flat = rocksCopy(devicePath, id)
-          RebuildingStore.writeEmptyCrlState(flat, id)
+          RebuildDisk.writeEmptyCrlState(flat, id)
           CopyFixtures.markCopy(devicePath, id, rebuilt)
         else
           CopyFixtures.placeCopy(devicePath, id, rebuilt)

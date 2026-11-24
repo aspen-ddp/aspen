@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.host
 
+import org.aspen_ddp.aspen.server.rebuild.RebuildDisk
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -667,7 +668,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       val from = sends.sources.head._2
       from / os.up should be(dev / CopyLayout.OutboundDirectory)
       CopyLayout.parseName(from.last).map(_._1) should be(Some(shipped))
-      CopyLayout.readParam(from, Phase.Outbound("")) should be(tid)
+      CopyLayoutDisk.readParam(from, Phase.Outbound("")) should be(tid)
       CopyFixtures.phaseOf(dev, shipped) should be(Some(Phase.Outbound(tid)))
       CopyFixtures.copyPath(dev, shipped) should be(Some(from))
       os.exists(flat) should be(false)
@@ -811,7 +812,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       from / os.up should be(dev / CopyLayout.OutboundDirectory)
       // One copy, moved: the same copy id
       from.last should be(parkedAt.last)
-      CopyLayout.readParam(from, Phase.Outbound("")) should be(tid)
+      CopyLayoutDisk.readParam(from, Phase.Outbound("")) should be(tid)
       CopyFixtures.phaseOf(dev, shipped) should be(Some(Phase.Outbound(tid)))
       os.list(dev / CopyLayout.ParkedDirectory) should be(Nil)
       recordOf(host, local, shipped).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Outbound(tid), false)))
@@ -837,7 +838,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       started should be(Success(()))
       renames() should be(Vector(before -> flat, flat -> before))
       sends.sources should be(Vector(shipped -> before))
-      CopyLayout.readParam(before, Phase.Outbound("")) should be(tid)
+      CopyLayoutDisk.readParam(before, Phase.Outbound("")) should be(tid)
       CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(before), shipped).isRight should be(true)
       recordOf(host, local, shipped).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Outbound(tid), false)))
       host.control.copyRegistry.takeRegistryErrors() should be(Vector())
@@ -867,7 +868,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       saveFileKept should be(true)
       second should be(Success(()))
       sends.sources.map(_._1) should be(Vector(shipped))
-      CopyLayout.readParam(sends.sources.head._2, Phase.Outbound("")) should be(tid)
+      CopyLayoutDisk.readParam(sends.sources.head._2, Phase.Outbound("")) should be(tid)
       recordOf(host, local, shipped).map(_.phase) should be(Some(Phase.Outbound(tid)))
 
   atest("a copy that must move is not moved while an earlier send of its store is registered"):
@@ -892,7 +893,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       afterEnd should be(Success(()))
       retransmit should be(Success(()))
       sends.sources should be(Vector.fill(3)(shipped -> before))
-      CopyLayout.readParam(before, Phase.Outbound("")) should be(tid)
+      CopyLayoutDisk.readParam(before, Phase.Outbound("")) should be(tid)
       renames().size should be(2)
 
   atest("a move out of live drops the copy's load retry, and a move into live retargets it"):
@@ -955,7 +956,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
         case _ =>
           val n = placements.incrementAndGet()
           val flat = rocksCopy(devicePath, id)
-          RebuildingStore.writeEmptyCrlState(flat, id)
+          RebuildDisk.writeEmptyCrlState(flat, id)
           val placed = CopyFixtures.markCopy(devicePath, id, rebuilt)
           // The staging area it was renamed from, which the resync forces
           os.makeDir.all(devicePath / RebuildingStore.RebuildDirectory)
@@ -1025,7 +1026,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
     given ExecutionContext = executionContext
     val (hostRoot, dev) = device()
     val flat = rocksCopy(dev, s)
-    RebuildingStore.writeEmptyCrlState(flat, s)
+    RebuildDisk.writeEmptyCrlState(flat, s)
     CopyFixtures.markCopy(dev, s, Phase.Parked)
     val opener = new TestOpener
     val host = realHost(hostRoot, opener)
@@ -1162,7 +1163,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       CopyFixtures.phaseOf(dev, moving) should be(Some(Phase.Arrived(tid.toString)))
       val arrived = CopyFixtures.copyPath(dev, moving).get
       arrived / os.up should be(dev / CopyLayout.ArrivedDirectory)
-      CopyLayout.readParam(arrived, Phase.Arrived("")) should be(tid.toString)
+      CopyLayoutDisk.readParam(arrived, Phase.Arrived("")) should be(tid.toString)
       // The attempt's staging went with it
       os.exists(staging) should be(false)
       recordOf(host, loadedDevices(host)(net.secondDeviceId), moving).map(_.copyId) should be(
@@ -1483,7 +1484,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       _ = checkAllNow(host)
       _ <- pumpTx(host, host.control.router.loaded.contains(created) && !host.control.copyRegistry.isCreating(created))
     yield
-      val listing = CopyLayout.list(dev)
+      val listing = CopyLayoutDisk.list(dev)
       listing.copies.map(f => (f.storeId, f.phase)) should be(List((created, Phase.Live)))
       val copy = listing.copies.head.path
       copy / os.up should be(dev / CopyLayout.LiveDirectory)
@@ -1517,7 +1518,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
     val live = rocksCopy(dev, s)
     os.write(live / "data-live", "live")
     val outbound = CopyFixtures.placeCopy(dev, s, Phase.Outbound("t-1"))
-    RebuildingStore.writeEmptyCrlState(outbound, s)
+    RebuildDisk.writeEmptyCrlState(outbound, s)
     os.write(outbound / "data-outbound", "outbound")
     val ids = Set(CopyFixtures.copyIdOf(live), CopyFixtures.copyIdOf(outbound))
     val rebuilds = new HeldRebuilds
@@ -1588,7 +1589,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
       val (hostRoot, dev) = device()
       val live = CopyFixtures.placeCopy(dev, s)
       val sending = CopyFixtures.placeCopy(dev, StoreId(s.poolId, 1), Phase.Outbound("t-1"))
-      val before = CopyLayout.list(dev).copies.toSet
+      val before = CopyLayoutDisk.list(dev).copies.toSet
       val target = unreadable(dev, sending)
       val perms = os.perms(target)
       os.perms.set(target, if os.isDir(target) then "-wx------" else "---------")
@@ -1600,7 +1601,7 @@ class PhaseDirectoriesSuite extends IntegrationTestSuite with CopyHostFixture:
         finally os.perms.set(target, perms)
       val loadedWhileUnreadable = loadedDevices(host).contains(deviceA)
       val attemptsWhileUnreadable = recorded(host).storeLoadAttempts.toList
-      val afterFailure = CopyLayout.list(dev).copies.toSet
+      val afterFailure = CopyLayoutDisk.list(dev).copies.toSet
       discoverNow(host)
       host.testingOnlyHandleEvents()
       Future.successful:

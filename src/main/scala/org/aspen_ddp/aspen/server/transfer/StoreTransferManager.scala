@@ -223,13 +223,13 @@ class StoreTransferManager(port: Int,
 
       write(encodeHeader(storeId, out.transferUUID), HeaderSize)
 
-      // os.spawn leaks a throwing shutdown hook if the process cannot start, so check the cwd first
-      if !StoreTransferDisk.isDirectory(sourceDirectory) then
-        throw new Exception(s"source directory $sourceDirectory does not exist")
       val tmp = os.temp.dir(prefix = "store-transfer-out")
       archiverTmp = Some(tmp)
+      // No shutdown hook (destroyOnExit): os-lib registers it before starting the process, so a start that fails (a
+      // source directory gone) would leave a hook that starts the process again at JVM exit and prints its failure.
+      // The archiver ends on its own once its socket or pipes close
       val p = os.spawn(cmd = ("jar", s"-J-Djava.io.tmpdir=$tmp", "--create", "--no-manifest", "."),
-                       cwd = sourceDirectory, stderr = os.Pipe)
+                       cwd = sourceDirectory, stderr = os.Pipe, destroyOnExit = false)
       if !attach(out, p) then
         throw new Exception("aborted before archiving")
       logger.info(s"Sending store $storeId, transfer ${out.transferUUID}, to $host:$port")
@@ -380,7 +380,8 @@ class StoreTransferManager(port: Int,
     val (extractor, aborted) = lockFor(reg).synchronized:
       StoreTransferDisk.prepareDirectory(storeDir)
       directoryOwners.put(storeDir, reg)
-      val p = os.spawn(cmd = ("jar", "--extract"), cwd = storeDir, stderr = os.Pipe)
+      // No shutdown hook, as for the archiver (send)
+      val p = os.spawn(cmd = ("jar", "--extract"), cwd = storeDir, stderr = os.Pipe, destroyOnExit = false)
       val aborted = synchronized:
         if !reg.done then
           reg.extractor = Some(p)

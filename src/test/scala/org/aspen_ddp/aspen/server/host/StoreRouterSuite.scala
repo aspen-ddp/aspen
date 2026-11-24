@@ -244,7 +244,7 @@ object StoreRouterSuite:
     def addDevice(storeId: StoreId, wrap: DeviceIo => DeviceIo = io => io): LocalStorageDeviceState = onControl:
       val dir = os.temp.dir()
       val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, wrap(ctx.deviceIos.forPath(dir)))
-      ctx.copyRegistry.attach(sds)
+      ctx.copyRegistry.attach(sds, CopyDisk.list(sds.devicePath))
       ctx.devices.devices += deviceId -> sds
       sds
 
@@ -607,7 +607,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       fx.onControl:
         val dir = os.temp.dir()
         val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, fx.ctx.deviceIos.forPath(dir), admission)
-        fx.ctx.copyRegistry.attach(sds)
+        fx.ctx.copyRegistry.attach(sds, CopyDisk.list(sds.devicePath))
         fx.ctx.devices.devices += deviceId -> sds
       intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, copyDir(s0)))))
       admission.admittedBytes should be(0)
@@ -651,7 +651,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       fx.onControl:
         val dir = os.temp.dir()
         val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, fx.ctx.deviceIos.forPath(dir), admission)
-        fx.ctx.copyRegistry.attach(sds)
+        fx.ctx.copyRegistry.attach(sds, CopyDisk.list(sds.devicePath))
         fx.ctx.devices.devices += deviceId -> sds
       val first = bootstrappedBackend(s0)
       await(fx.load(first))
@@ -696,7 +696,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
                                 admission: CrlAdmission): LocalStorageDeviceState = fx.onControl:
     val dir = os.temp.dir()
     val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg", crl, fx.ctx.deviceIos.forPath(dir), admission)
-    fx.ctx.copyRegistry.attach(sds)
+    fx.ctx.copyRegistry.attach(sds, CopyDisk.list(sds.devicePath))
     fx.ctx.devices.devices += deviceId -> sds
     sds
 

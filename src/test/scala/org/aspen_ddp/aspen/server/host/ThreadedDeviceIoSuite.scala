@@ -104,3 +104,66 @@ class ThreadedDeviceIoSuite extends AnyFunSuite with Matchers:
       io.endRead()
       io.readsOverBound should be(false)
     finally io.close()
+
+  // ---- Lifecycle: no job is ever left with a future that never completes ----
+
+  test("a job submitted to a closed DeviceIo fails with Cancelled at once and never runs"):
+    val io = new ThreadedDeviceIo(os.Path("/tmp/devX"), cfg)
+    io.close()
+    val ran = new AtomicBoolean(false)
+    val h = io.submit(JobKind.Scan, None)(ran.set(true))
+    h.future.value.map(_.failed.get) should be(Some(DeviceIo.Cancelled))
+    h.cancel() should be(false)
+    ran.get should be(false)
+
+  test("a job submitted to a closed DeviceIo whose lane ran fails with Cancelled at once"):
+    val io = new ThreadedDeviceIo(os.Path("/tmp/devX"), cfg)
+    Await.result(io.submit(JobKind.Scan, None)(()).future, wait)
+    io.close()
+    io.submit(JobKind.Scan, None)(()).future.value.map(_.failed.get) should be(Some(DeviceIo.Cancelled))
+
+  test("close fails every queued job with Cancelled, and a running job's interrupt fails it"):
+    val entered = new CountDownLatch(1)
+    val io = new ThreadedDeviceIo(os.Path("/tmp/devX"), cfg)
+    val running = io.submit(JobKind.Scan, None):
+      entered.countDown()
+      new CountDownLatch(1).await()
+    entered.await()
+    val queued = (0 until 5).map(_ => io.submit(JobKind.Scan, None)(()))
+    io.close()
+    queued.foreach: h =>
+      intercept[Throwable](Await.result(h.future, wait)) should be theSameInstanceAs DeviceIo.Cancelled
+    // A Future fails with a fatal throwable wrapped in an ExecutionException
+    intercept[java.util.concurrent.ExecutionException](Await.result(running.future, wait))
+      .getCause shouldBe an[InterruptedException]
+    io.observer.inFlight should be(Map())
+
+  test("a fatal throwable from a job fails its future and ends its observer entry"):
+    withIo() : io =>
+      val h = io.submit(JobKind.Scan, None)(throw new StackOverflowError("injected"))
+      intercept[java.util.concurrent.ExecutionException](Await.result(h.future, wait))
+        .getCause shouldBe a[StackOverflowError]
+      io.observer.inFlight should be(Map())
+      // The lane goes on
+      Await.result(io.submit(JobKind.Scan, None)(7).future, wait) should be(7)
+
+  test("a throwing gate fails the job's future rather than leaving it running"):
+    val fail = new AtomicBoolean(true)
+    withIo(() => if fail.getAndSet(false) then throw new IllegalStateException("injected gate")) : io =>
+      val h = io.submit(JobKind.Scan, None)(())
+      intercept[IllegalStateException](Await.result(h.future, wait))
+      io.observer.inFlight should be(Map())
+      Await.result(io.submit(JobKind.Scan, None)(1).future, wait) should be(1)
+
+  test("a lockstep DeviceIo, closed, cancels its queued jobs and every later submit"):
+    val threading = new LockstepThreading(scala.concurrent.ExecutionContext.parasitic)
+    val io = threading.newDeviceIo(os.Path("/tmp/devX"))
+    val ran = new AtomicBoolean(false)
+    val queued = io.submit(JobKind.Scan, None)(ran.set(true))
+    io.close()
+    val later = io.submit(JobKind.Scan, None)(ran.set(true))
+    later.future.value.map(_.failed.get) should be(Some(DeviceIo.Cancelled))
+    threading.drain()
+    queued.future.value.map(_.failed.get) should be(Some(DeviceIo.Cancelled))
+    ran.get should be(false)
+    io.idle should be(true)

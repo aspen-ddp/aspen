@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.store
 
+import org.aspen_ddp.aspen.server.rebuild.RebuildDisk
 import org.aspen_ddp.aspen.LogCapture
 import org.aspen_ddp.aspen.server.host.JoinCeiling
 import java.util.UUID
@@ -1397,7 +1398,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
                                      (f: (Frontend, ManualHeldVoteQuery, os.Path, TestClock) => Unit): Unit =
     val clock = new TestClock(System.currentTimeMillis())
     val dir = os.temp.dir(deleteOnExit = true)
-    RebuildingStore.writeInheritedVotes(dir, after)
+    RebuildDisk.writeInheritedVotes(dir, after)
     val (frontend, query) = openRebuilt(dir, clock)
     f(frontend, query, dir, clock)
 
@@ -1410,7 +1411,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val since = ago(FiniteDuration(2, SECONDS))
     val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
       new TestCrl, new TransactionStatusCache(), acceptorSince = Some(since),
-      inheritedVotesAfter = RebuildingStore.readInheritedVotes(dir, FiniteDuration(20, SECONDS)),
+      inheritedVotesAfter = RebuildDisk.readInheritedVotes(dir, FiniteDuration(20, SECONDS)),
       heldVoteQuery = query, loadedAt = Some(since.wallTime - Frontend.MaxStartLead.toMillis),
       wallClockMillis = () => clock.now)
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))

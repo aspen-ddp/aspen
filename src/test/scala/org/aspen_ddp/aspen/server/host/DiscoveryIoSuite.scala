@@ -28,12 +28,12 @@ class DiscoveryIoSuite extends IntegrationTestSuite with ControlFixture:
     jobs.size should be(1)
     jobs.foreach(_.run())
 
-  /** Applies the queued job results (Host.DeviceJobDone), leaving everything else queued */
+  /** Applies the queued job results (Host.DeviceJobDone) in FIFO order (ControlFixture.runInOrder: what is queued
+   *  ahead of a result runs first), leaving everything behind the last of them queued */
   private def applyResults(host: Host): Unit =
-    lockstep(host).removeQueued:
+    runInOrder(host):
       case t: Host.EventTask => t.event.isInstanceOf[Host.DeviceJobDone]
       case _ => false
-    .foreach(_.run())
 
   private def warningsAt(host: Host, path: os.Path): List[String] =
     recorded(host).deviceDirWarnings.toList.collect { case (p, m) if p == path => m }

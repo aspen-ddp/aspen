@@ -71,6 +71,10 @@ abstract class BaseAspenClient(
 
   private val rmgr = new ReadManager(this, readDriverFactory)
 
+  /** Reads begun and not yet completed. Tests wait for it to fall to zero before they stop the hosts a read may be
+   *  waiting on */
+  private[aspen] def testingOnlyOutstandingReads: Int = rmgr.outstandingReadCount
+
   private val objectRegistry = new UUIDObjectRegistry(this, radicle, Radicle.ObjectRegistryKey)
   private val namespacedRegistry = new NamespacedUUIDRegistry(this, radicle, Radicle.NamespacedRegistryKey)
 

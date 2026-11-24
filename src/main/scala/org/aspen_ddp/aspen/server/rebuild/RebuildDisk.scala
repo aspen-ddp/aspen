@@ -2,12 +2,16 @@ package org.aspen_ddp.aspen.server.rebuild
 
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.loadYamlFile
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.server.{DurableFiles, FileStat}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, StoreRecoveryState}
+import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.host.{CopyLayout, Phase}
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import scribe.Logging
 
 import java.util.UUID
+import scala.concurrent.duration.FiniteDuration
 import scala.util.control.NonFatal
 
 /** A rebuild's staging-directory disk work: the checkpoint's reads and writes, finish's completion files and move, and
@@ -88,14 +92,14 @@ object RebuildDisk extends Logging:
                syncDirectory: os.Path => Unit,
                onUnforced: DurableFiles.MoveNotForced => Unit): UUID =
     // The rebuilt store has no Paxos state: it takes no part in transactions started before now (plus the margin)
-    RebuildingStore.writeAcceptorSince(staging)
+    writeAcceptorSince(staging)
     // Its old incarnation's commit votes may still count, with none of their locks held here: the store votes abort
     // on what they may lock until its peers' held votes, complete from this time on, release them
-    RebuildingStore.writeInheritedVotes(staging, inheritedVotesAfter)
+    writeInheritedVotes(staging, inheritedVotesAfter)
     // A new life for the store, replacing any incarnation the staging directory carried
     StoreIncarnationFile.writeFresh(staging)
     // Its whole transaction state: its first load drops whatever the device CRL holds under its id
-    RebuildingStore.writeEmptyCrlState(staging, storeId)
+    writeEmptyCrlState(staging, storeId)
     // Last write before the move: the copy's episode, which its location in rebuilt/ reads (T2). Kept out of service
     // there until its flip commits
     val rebuilt = Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode))
@@ -124,3 +128,48 @@ object RebuildDisk extends Logging:
       logger.error(s"Rebuild of $storeId: store in place at $finalPath, but its move could not be forced: $t")
       onUnforced(t)
     copyId
+
+  // A rebuilt store's gate files and empty CRL state (RebuildingStore's constants): finish writes them in staging,
+  // a load reads them (LoadDisk.readLoadInputs), each inside a job on the store's device lane
+
+  /** Writes the rebuilt store's whole transaction state, which is empty, as the crl_save.log of the store directory
+   *  at `storePath` (finish, in staging before its episode's phase-param.rebuilt). A rebuilt store has never served, so
+   *  whatever the device CRL holds under its id was left by an earlier copy of the store on this device whose
+   *  directory left its path without a retire (removed by hand, or a fail-stopped copy's close saving behind the
+   *  retire's drop). Its first load, wherever it comes from (the flip, the Completed Rebuilds pass, a restart, a
+   *  reinstated transfer out, an adoption), is a save-file load, which drops those entries durably before loading the
+   *  file (StoreLoader.awaitCrlLoad); a transfer out of the unloaded copy ships the file and drops them likewise
+   *  (StoreTransfersOut.extractUnloaded). Without it the copy would recover their votes, locks and applied stubs as its
+   *  own under its new incarnation, and a stale commit vote could apply again. */
+  def writeEmptyCrlState(storePath: os.Path, storeId: StoreId): Unit =
+    CrashRecoveryLog.saveStoreState(storeId, StoreRecoveryState.Empty, Backend.crlSaveFile(storePath))
+
+  def writeAcceptorSince(storePath: os.Path): Unit = writeAcceptorSince(storePath, RebuildingStore.acceptorSinceAfter(HLCTimestamp.now))
+
+  /** Writes `at` as the store's acceptor start (finish passes now plus AcceptorSinceMargin) */
+  def writeAcceptorSince(storePath: os.Path, at: HLCTimestamp): Unit =
+    DurableFiles.write(storePath / RebuildingStore.AcceptorSinceFile, at.asLong.toString)
+
+  /** The store's acceptor start, if it was rebuilt. A file that cannot be read counts as now plus the margin: later
+   *  than the truth, which only mutes more transactions. A stat that fails throws (FileStat): None only for a file known
+   *  absent, never for one that may be there (StoreLoader.handleLoad holds the load back) */
+  def readAcceptorSince(storePath: os.Path): Option[HLCTimestamp] =
+    val file = storePath / RebuildingStore.AcceptorSinceFile
+    if !FileStat.exists(file) then
+      None
+    else
+      Some(scala.util.Try(HLCTimestamp(os.read(file).trim.toLong)).getOrElse(RebuildingStore.acceptorSinceAfter(HLCTimestamp.now)))
+
+  def writeInheritedVotes(storePath: os.Path, afterMillis: Long): Unit =
+    DurableFiles.write(storePath / RebuildingStore.InheritedVotesFile, afterMillis.toString)
+
+  /** The store's inherited-votes gate, if it holds inherited votes. A file that cannot be read counts as now plus the
+   *  horizon and both margins: later than the truth, as the store loads after its rebuild's pass began */
+  def readInheritedVotes(storePath: os.Path, horizon: FiniteDuration): Option[Long] =
+    val file = storePath / RebuildingStore.InheritedVotesFile
+    // A stat that fails throws (FileStat), as readAcceptorSince's does
+    if !FileStat.exists(file) then
+      None
+    else
+      Some(scala.util.Try(os.read(file).trim.toLong)
+        .getOrElse(RebuildingStore.inheritedVotesAfter(System.currentTimeMillis(), horizon)))

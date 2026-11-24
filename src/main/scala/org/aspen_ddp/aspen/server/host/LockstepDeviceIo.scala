@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.host
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.Try
+import scala.util.{Failure, Success, Try}
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -28,19 +28,31 @@ final class LockstepDeviceIo(val path: os.Path, threading: LockstepThreading, cf
 
   def idle: Boolean = laneJobs.get() == 0 && threaded.poolIdle
 
+  @volatile private var closed = false
+
   def submit[T](jobKind: JobKind, store: Option[StoreId])(job: => T): JobHandle[T] =
     val p = Promise[T]()
-    val task = new LockstepThreading.DeviceTask(jobKind):
+    val task = new LockstepThreading.DeviceTask(jobKind, path):
       def run(): Unit =
         try
-          if state.compareAndSet(0, 1) then
+          if closed && state.compareAndSet(0, 2) then
+            p.tryFailure(DeviceIo.Cancelled)
+          else if state.compareAndSet(0, 1) then
             val token = observer.started(kind.label, store, 0L)
-            val r = Try(job)
+            // Every throwable fails the future, fatal ones included, as ThreadedDeviceIo's
+            val r: Try[T] =
+              try Success(job)
+              catch case t: Throwable => Failure(t)
             observer.finished(token, r.isSuccess)
             p.complete(r)
         finally laneJobs.decrementAndGet(): Unit
-    laneJobs.incrementAndGet()
-    threading.enqueueDevice(path, task)
+    // As ThreadedDeviceIo: a closed DeviceIo runs nothing more, and a job queued before its close fails Cancelled
+    if closed then
+      task.state.set(2)
+      p.tryFailure(DeviceIo.Cancelled)
+    else
+      laneJobs.incrementAndGet()
+      threading.enqueueDevice(path, task)
     new JobHandle[T]:
       def future: Future[T] = p.future
       def cancel(): Boolean =
@@ -49,4 +61,6 @@ final class LockstepDeviceIo(val path: os.Path, threading: LockstepThreading, cf
           true
         else false
 
-  def close(): Unit = threaded.close()
+  def close(): Unit =
+    closed = true
+    threaded.close()

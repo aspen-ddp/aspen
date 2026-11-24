@@ -71,7 +71,7 @@ class ReadManager(val client: ReadDriverClient, val driverFactory: ReadDriver.Fa
       synchronized { outstandingReads -= m.readUUID }
   }
 
-  private[read] def outstandingReadCount: Int = synchronized { outstandingReads.size }
+  private[internal] def outstandingReadCount: Int = synchronized { outstandingReads.size }
 
   def receive(m: TransactionCompletionResponse): Unit = synchronized {
     completionQueries.get(m.queryUUID).foreach(_.update(m.fromStore, m.isComplete))

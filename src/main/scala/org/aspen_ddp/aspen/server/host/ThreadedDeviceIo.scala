@@ -4,7 +4,7 @@ import java.util.concurrent.{ExecutorService, Executors, LinkedBlockingQueue, Th
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.Try
+import scala.util.{Failure, Success, Try}
 
 import scribe.Logging
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
@@ -57,13 +57,22 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
       while !closed do
         val e = lane.take()
         try
-          if e.state.compareAndSet(Queued, Running) then
-            gate()
-            e.run()
+          if e.state.compareAndSet(Queued, Running) then e.run()
           else e.skip()
-        catch case t: Throwable => logger.error(s"device io lane task failed: $t")
         finally laneJobs.decrementAndGet(): Unit
     catch case _: InterruptedException => ()
+    finally cancelQueued()
+
+  /** Fails every job still queued with `DeviceIo.Cancelled` (close): none is left with a future that never completes */
+  private def cancelQueued(): Unit =
+    var e = lane.poll()
+    while e != null do
+      try
+        // Polled, so the lane never takes it: Queued, or Cancelled by its handle
+        e.state.set(Cancelled)
+        e.skip()
+      finally laneJobs.decrementAndGet(): Unit
+      e = lane.poll()
 
   private val laneStarted = new java.util.concurrent.atomic.AtomicBoolean(false)
 
@@ -75,16 +84,30 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
   def submit[T](kind: JobKind, store: Option[StoreId])(job: => T): JobHandle[T] =
     val p = Promise[T]()
     val state = new AtomicInteger(Queued)
+    // Everything the job (or the gate) throws fails the future, fatal throwables included (an InterruptedException
+    // from close): a job that ran never leaves its future incomplete or its observer entry open
     val run: () => Unit = () =>
       val token = observer.started(kind.label, store, 0L)
-      val r = Try(job)
+      val r: Try[T] =
+        try
+          gate()
+          Success(job)
+        catch case t: Throwable => Failure(t)
+      // Finished before the future completes, so a caller that saw the result sees the job ended
       observer.finished(token, r.isSuccess)
       p.complete(r)
       ()
     val skip: () => Unit = () => { p.tryFailure(DeviceIo.Cancelled); () }
-    laneJobs.incrementAndGet()
-    lane.add(new Entry(state, run, skip))
-    startLane()
+    if closed then
+      // A closed DeviceIo (DeviceIos.forget, Host.shutdown) runs nothing more: Cancelled at once, "nothing happened"
+      state.set(Cancelled)
+      p.tryFailure(DeviceIo.Cancelled)
+    else
+      laneJobs.incrementAndGet()
+      lane.add(new Entry(state, run, skip))
+      startLane()
+      // Closed meanwhile: the lane thread may already have drained its queue, so drain it here too
+      if closed then cancelQueued()
     new JobHandle[T]:
       def future: Future[T] = p.future
       def cancel(): Boolean =
@@ -126,13 +149,23 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
   def endRead(): Unit = reads.decrementAndGet()
   def readsOverBound: Boolean = reads.get() >= cfg.readBound
 
+  /** Backend reads begun and not ended (beginRead, endRead): the backlog the read bound limits */
+  private[aspen] def outstandingReads: Long = reads.get()
+
+  /** Data and serial tasks executed and not yet ended: queued or running on the pools */
+  private[aspen] def poolTasksOutstanding: Int = poolTasks.get()
+
   def idle: Boolean = laneJobs.get() == 0 && poolIdle
 
   /** No data or serial task queued or running */
   private[host] def poolIdle: Boolean = poolTasks.get() == 0
 
+  /** Stops the lane and both pools without waiting. Every lane job not yet started fails with `DeviceIo.Cancelled`,
+   *  and every later submit at once. A running job is interrupted (a hung syscall is not: its thread stays, confined
+   *  to this device); a data or serial task not yet started is dropped, which only the owner of a device no longer in
+   *  use (DeviceIos.forget closes only an idle one) or a host shutting down ever does */
   def close(): Unit =
     closed = true
-    laneThread.interrupt()
+    if laneStarted.get() then laneThread.interrupt() else cancelQueued()
     dataExec.shutdownNow()
     serialExec.shutdownNow()

@@ -44,7 +44,7 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     val rename = host.control.moves.rename
     host.control.moves.rename = (a, b) =>
       renames ::= (a, b)
-      CopyLayout.param(Phase.Retired).foreach(p => CopyLayout.readParam(a, Phase.Retired) should be(p))
+      CopyLayout.param(Phase.Retired).foreach(p => CopyLayoutDisk.readParam(a, Phase.Retired) should be(p))
       rename(a, b)
     CopyFixtures.moveNow(host, "test", local, s, Phase.Retired) should be(MoveResult.Durable)
     host.testingOnlyHandleEvents()
@@ -66,14 +66,14 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
     var seen = List.empty[(os.Path, os.Path, String)]
     val rename = host.control.moves.rename
     host.control.moves.rename = (x, y) =>
-      seen ::= (x, y, CopyLayout.readParam(x, Phase.Outbound("")))
+      seen ::= (x, y, CopyLayoutDisk.readParam(x, Phase.Outbound("")))
       rename(x, y)
     CopyFixtures.moveNow(host, "test", local, s, Phase.Outbound("t-7")) should be(MoveResult.Durable)
     host.testingOnlyHandleEvents()
     val newPath = CopyFixtures.copyPath(dev, s).get
     seen should be(List((flat, newPath, "t-7")))
     newPath / os.up should be(dev / CopyLayout.OutboundDirectory)
-    CopyLayout.readParam(newPath, Phase.Outbound("")) should be("t-7")
+    CopyLayoutDisk.readParam(newPath, Phase.Outbound("")) should be("t-7")
     CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Outbound("t-7")))
     record(host, s).map(r => (r.phase, r.unsynced)) should be(Some((Phase.Outbound("t-7"), false)))
     host.control.copyRegistry.pathOf(local, s) should be(Some(newPath))
@@ -118,9 +118,9 @@ class CopyMovesSuite extends IntegrationTestSuite with ControlFixture:
       host.control.moves.syncDirectory, host.control.moves.rename) shouldBe a[MoveResult.NotMoved]
     host.testingOnlyHandleEvents()
     os.isDir(copy) should be(true)
-    CopyLayout.readParam(copy, Phase.Rebuilt("")) should be("episode-e")
+    CopyLayoutDisk.readParam(copy, Phase.Rebuilt("")) should be("episode-e")
     // The target's file written ahead of the rename is inert where the copy still is
-    CopyLayout.readParam(copy, Phase.Outbound("")) should be("transfer-t")
+    CopyLayoutDisk.readParam(copy, Phase.Outbound("")) should be("transfer-t")
     record(host, s) should be(before)
     host.control.copyRegistry.takeRegistryErrors() should be(Vector())
 

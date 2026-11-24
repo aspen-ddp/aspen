@@ -57,10 +57,10 @@ object CopyDisk extends Logging:
   /** The phase directory holding the copy of `storeId` named `copyId` on the device at `devicePath`
    *  (CopyLayout.locate); None where none does or the location cannot be read */
   def locate(devicePath: os.Path, storeId: StoreId, copyId: UUID): Option[Phase] =
-    Try(CopyLayout.locate(devicePath, storeId, copyId)).toOption.flatten
+    Try(CopyLayoutDisk.locate(devicePath, storeId, copyId)).toOption.flatten
 
   /** The device's copies (CopyLayout.list) */
-  def list(devicePath: os.Path): CopyLayout.Listing = CopyLayout.list(devicePath)
+  def list(devicePath: os.Path): CopyLayout.Listing = CopyLayoutDisk.list(devicePath)
 
   /** Retire step 2 (StoreCopies.retire) for the copy durably in lost/ at `storePath`: its CRL state saved in the copy
    *  as RebuildingStore.LostCrlStateFile. An existing one is kept (a crash left it). Else the copy's `crl_save.log` is

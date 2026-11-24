@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.host
 
+import org.aspen_ddp.aspen.server.rebuild.RebuildDisk
 import org.aspen_ddp.aspen.client.StopRetrying
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
@@ -704,7 +705,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
   /** Keeps a rebuilt store whose entry was written Offline (RebuildOutcome.AdoptOffline) out of service: it is not
    *  loaded, and its copy is parked, moved from rebuilt/ to parked/ in one move (T4), beside the empty CRL save file
-   *  the rebuild wrote (RebuildingStore.writeEmptyCrlState). A restart keeps it offline there until the reconcile
+   *  the rebuild wrote (RebuildDisk.writeEmptyCrlState). A restart keeps it offline there until the reconcile
    *  (the Abandoned Transfers Out pass) or bringIntoService finds its entry Active with no transfer device and moves it
    *  Live (T5), and an adoption classes it Clean.
    *

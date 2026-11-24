@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.rebuild
 
 import org.aspen_ddp.aspen.server.TestDeviceIo
-import org.aspen_ddp.aspen.server.host.{CopyFixtures, CopyLayout, DeviceIo, Phase}
+import org.aspen_ddp.aspen.server.host.{CopyFixtures, CopyLayout, CopyLayoutDisk, DeviceIo, Phase}
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.scalatest.compatible
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, Transaction}
@@ -443,7 +443,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- rebuild.complete
       after = HLCTimestamp.now
     yield
-      val since = RebuildingStore.readAcceptorSince(CopyFixtures.copyPath(dev, storeId).get)
+      val since = RebuildDisk.readAcceptorSince(CopyFixtures.copyPath(dev, storeId).get)
       since.isDefined should be(true)
       // At least the margin past the start of the rebuild, and no more than the margin past its end
       (since.get - before) should be >= RebuildingStore.AcceptorSinceMargin.asInstanceOf[scala.concurrent.duration.Duration]
@@ -462,7 +462,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- rebuild.complete
       after = System.currentTimeMillis()
     yield
-      val gate = RebuildingStore.readInheritedVotes(CopyFixtures.copyPath(dev, storeId).get, horizon)
+      val gate = RebuildDisk.readInheritedVotes(CopyFixtures.copyPath(dev, storeId).get, horizon)
       val lead = horizon.toMillis + 2 * RebuildingStore.AcceptorSinceMargin.toMillis
       gate.isDefined should be(true)
       // The pass started between the two readings
@@ -488,10 +488,10 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
   atest("an unreadable acceptor-since file reads as now plus the margin, and an absent one as none"):
     given ExecutionContext = executionContext
     val dir = deviceDir()
-    val absent = RebuildingStore.readAcceptorSince(dir)
+    val absent = RebuildDisk.readAcceptorSince(dir)
     os.write.over(dir / RebuildingStore.AcceptorSinceFile, "not a timestamp")
     val before = HLCTimestamp.now
-    val unreadable = RebuildingStore.readAcceptorSince(dir)
+    val unreadable = RebuildDisk.readAcceptorSince(dir)
     Future.successful:
       absent should be(None)
       unreadable.isDefined should be(true)
@@ -524,7 +524,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     // Its stat succeeds and its open fails (EACCES): a read error that says nothing of the episode it names
     os.perms.set(param, "---------")
     // The listing a device's load registers its copies from (and a rebuild's existingCopy is a record of) throws
-    val unreadable = Try(CopyLayout.list(dev))
+    val unreadable = Try(CopyLayoutDisk.list(dev))
     os.perms.set(param, "rw-------")
     val found = CopyFixtures.existingCopy(dev, storeId)
     Future.successful:
@@ -534,7 +534,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       RebuildingStore.isRebuiltFor(found.get._1, Some(UUID.randomUUID())) should be(false)
       RebuildingStore.isRebuiltFor(found.get._1, None) should be(false)
       RebuildingStore.isRebuiltFor(Phase.Live, episode) should be(false)
-      CopyLayout.list(dev / "absent").copies should be(Nil)
+      CopyLayoutDisk.list(dev / "absent").copies should be(Nil)
 
   atest("a pre-existing final directory skips straight to completion"):
     given ExecutionContext = executionContext
@@ -574,11 +574,11 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
                                     TestDeviceIo.of(dev), CopyFixtures.existingCopy(dev, storeId), Some(episode))
       copyId <- rebuild.complete
     yield
-      val copies = CopyLayout.list(dev).copies.filter(_.storeId == storeId)
+      val copies = CopyLayoutDisk.list(dev).copies.filter(_.storeId == storeId)
       copies.map(f => (f.phase, f.copyId)) should be(List((Phase.Rebuilt(episode.toString), copyId)))
       copies.head.path should be(CopyLayout.path(dev, storeId, copyId, Phase.Rebuilt(episode.toString)))
       copies.head.path / os.up should be(dev / CopyLayout.RebuiltDirectory)
-      CopyLayout.readParam(copies.head.path, Phase.Rebuilt("")) should be(episode.toString)
+      CopyLayoutDisk.readParam(copies.head.path, Phase.Rebuilt("")) should be(episode.toString)
       os.exists(dev / RebuildingStore.RebuildDirectory / storeId.directoryName) should be(false)
       // Nothing in live/
       os.exists(dev / CopyLayout.LiveDirectory) should be(false)
@@ -604,7 +604,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
     yield
       failed should be(1)
-      val copies = CopyLayout.list(dev).copies.filter(_.storeId == storeId)
+      val copies = CopyLayoutDisk.list(dev).copies.filter(_.storeId == storeId)
       copies.map(f => (f.phase, f.copyId)) should be(List((Phase.Rebuilt(episode.toString), copies.head.copyId)))
       outcome should be(scala.util.Success(copies.head.copyId))
       rebuild.placedUnforced.map(_.target) should be(Some(copies.head.path))

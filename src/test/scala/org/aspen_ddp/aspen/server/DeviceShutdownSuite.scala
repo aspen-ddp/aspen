@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.rebuild.RebuildDisk
 import org.aspen_ddp.aspen.server.host.{CopyFixtures, JobKind, Phase}
 import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 import org.aspen_ddp.aspen.IntegrationTestSuite
@@ -563,7 +564,7 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       // The rebuilt store lands in rebuilt/, with the empty save file finish writes.
       _ = rebuiltCopy(deviceDir, s0)
-      _ = RebuildingStore.writeEmptyCrlState(copyAt(deviceDir, s0), s0)
+      _ = RebuildDisk.writeEmptyCrlState(copyAt(deviceDir, s0), s0)
       _ = rebuilds.created.head.completeFromDisk()
       _ <- pumpUntil(recorded(host).rebuildFlipSeq.contains((deviceA, s0)))
       entryAfterFlip <- state(deviceA).map(_.stores.get(s0))

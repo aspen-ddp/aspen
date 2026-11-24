@@ -97,3 +97,18 @@ class LockstepThreadingSuite extends AnyFunSuite with Matchers:
     t.held(p) should be(Nil)
     io.close()
     other.close()
+
+  test("runInPlace runs a queued task where it stands: what it queues takes its place"):
+    val t = threading
+    val order = ListBuffer[String]()
+    t.controlEvents.execute(() => order += "before")
+    val job: Runnable = () =>
+      order += "job"
+      t.controlEvents.execute(() => order += "result")
+    t.controlEvents.execute(job)
+    t.controlEvents.execute(() => order += "after")
+    t.runInPlace(job) should be(true)
+    order.toList should be(List("job"))
+    t.drain()
+    order.toList should be(List("job", "before", "result", "after"))
+    t.runInPlace(job) should be(false)

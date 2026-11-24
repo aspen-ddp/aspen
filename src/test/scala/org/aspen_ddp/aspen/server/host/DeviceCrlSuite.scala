@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.host
 
+import org.aspen_ddp.aspen.server.rebuild.RebuildDisk
 import org.aspen_ddp.aspen.server.host.{DeviceIo, JobKind}
 
 import org.aspen_ddp.aspen.server.store.backend.{DefaultBackendOpener, StoreCreation}
@@ -1284,7 +1285,7 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
   /** Writes into the store directory at `storeDir` the files RebuildingStore.finish leaves beside the rebuilt
    *  backend, for a test whose rebuild only lands a store there: the copy of `storeId` on the device at `deviceDir` */
   private def landRebuiltCopy(deviceDir: os.Path, episode: Option[UUID]): Unit =
-    RebuildingStore.writeEmptyCrlState(CopyFixtures.copyPath(deviceDir, storeId).get, storeId)
+    RebuildDisk.writeEmptyCrlState(CopyFixtures.copyPath(deviceDir, storeId).get, storeId)
     CopyFixtures.markCopy(deviceDir, storeId, Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(episode)))
 
   atest("a discarded store is kept in pending-delete with its CRL entries until the store is Active again"):
@@ -1619,8 +1620,8 @@ class DeviceCrlSuite extends IntegrationTestSuite with ControlFixture:
         (hostRoot, deviceDir, storeDir) <- activeStoreDevice()
         // A rebuilt store: both gates written by its finish. The one under test is reached through a link into a
         // directory without search permission, so its stat alone fails (EACCES) while the rest of the directory reads
-        _ = RebuildingStore.writeAcceptorSince(storeDir, since)
-        _ = RebuildingStore.writeInheritedVotes(storeDir, gateAfter)
+        _ = RebuildDisk.writeAcceptorSince(storeDir, since)
+        _ = RebuildDisk.writeInheritedVotes(storeDir, gateAfter)
         locked = hostRoot / "locked"
         _ = os.makeDir(locked)
         _ = os.move(storeDir / gate, locked / gate)

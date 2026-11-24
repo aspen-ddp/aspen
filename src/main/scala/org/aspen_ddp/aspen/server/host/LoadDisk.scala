@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.host
 
+import org.aspen_ddp.aspen.server.rebuild.RebuildDisk
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.store.{StoreId, StoreIncarnation}
 import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, StoreConfig}
@@ -60,8 +61,8 @@ object LoadDisk:
                      horizon: FiniteDuration): LoadInputs =
     val hasSaveFile = Try(FileStat.exists(saveFile))
     val incarnation = Try(StoreIncarnationFile.load(storePath, storeId))
-    val rebuiltGates = Try((RebuildingStore.readAcceptorSince(storePath),
-                            RebuildingStore.readInheritedVotes(storePath, horizon)))
+    val rebuiltGates = Try((RebuildDisk.readAcceptorSince(storePath),
+                            RebuildDisk.readInheritedVotes(storePath, horizon)))
     val savedRead: Either[Throwable, Either[Exception, Option[StoreRecoveryState]]] =
       if !hasSaveFile.getOrElse(false) then
         Right(Right(None))

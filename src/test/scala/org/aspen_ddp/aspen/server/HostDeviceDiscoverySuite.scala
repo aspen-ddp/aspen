@@ -918,16 +918,25 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
    *  Gives up silently after `rounds`, for the same reason yieldUntil does: the caller's own
    *  assertion reports what went wrong far better than a timeout would. Callers MUST assert.
    */
-  private def pumpUntil(condition: => Boolean, rounds: Int = 20): Future[Unit] =
+  /** Pumps until `condition`: for `rounds` rounds when given, otherwise until it holds or 20 s pass (a count of
+   *  rounds alone gives up early on a loaded machine, where each round's real-time hops take longer). Each round
+   *  drains `drain`, so an event that arrives after a drain (a tree lookup's result, posted once its read returns)
+   *  is run by the next one rather than left at the FIFO's head, where the copy jobs' runner stops. Callers assert
+   *  what they waited on */
+  private def pumpUntil(condition: => Boolean, rounds: Int = -1, drain: List[Host] = Nil): Future[Unit] =
     given ExecutionContext = executionContext
-    if condition || rounds == 0 then
-      Future.unit
-    else
-      for
-        _ <- yieldUntil(condition, 20)
-        _ <- waitForTransactionsToComplete()
-        _ <- pumpUntil(condition, rounds - 1)
-      yield ()
+    val deadline = System.nanoTime() + 20_000_000_000L
+    def loop(left: Int): Future[Unit] =
+      if condition || left == 0 || (left < 0 && System.nanoTime() > deadline) then
+        Future.unit
+      else
+        drain.foreach(_.testingOnlyHandleEvents())
+        for
+          _ <- yieldUntil(condition, 20)
+          _ <- waitForTransactionsToComplete()
+          _ <- loop(left - 1)
+        yield ()
+    loop(rounds)
 
   atest("a transfer finishing after its source was drained is discarded, not loaded"):
     given ExecutionContext = executionContext
@@ -1079,7 +1088,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ = transfers.startedTransfersIn should contain(movingStore)
 
       _ = transfers.finishTransferIn(movingStore)
-      _ <- pumpUntil(recorded(host).transferOutcomes.contains(movingStore))
+      // The outcome is recorded before the move to Live (a lane job) applies and asks for the load
+      _ <- pumpUntil(recorded(host).transferOutcomes.contains(movingStore) &&
+                     recorded(host).loadStoreByIdRequests.nonEmpty, drain = List(host))
 
       poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
     yield
@@ -1182,7 +1193,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     for
       t <- startTransferIn()
       _ = t.transfers.finishTransferIn(t.movingStore)
-      _ <- pumpUntil(recorded(t.host).transferOutcomes.contains(t.movingStore))
+      // The pool update's outcome is recorded before its move to Live, a lane job its apply submits, has run
+      _ <- pumpUntil(recorded(t.host).transferOutcomes.contains(t.movingStore) &&
+                     CopyFixtures.phaseOf(t.deviceDir, t.movingStore).contains(Phase.Live), drain = List(t.host))
     yield
       val dirName = t.movingStore.directoryName
 
@@ -1534,7 +1547,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ = checkAllNow(t.host)
       _ <- pumpUntil(startTransferSent(t.transfers, t.movingStore, 2))
       _ = t.transfers.finishTransferIn(t.movingStore)
-      _ <- pumpUntil(recorded(t.host).transferOutcomes.contains(t.movingStore))
+      // The outcome is recorded before the move to Live (a lane job) applies and asks for the load
+      _ <- pumpUntil(recorded(t.host).transferOutcomes.contains(t.movingStore) &&
+                     recorded(t.host).loadStoreByIdRequests.nonEmpty, drain = List(t.host))
 
       poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
       dest <- client.getStorageDeviceState(net.secondDeviceId)
@@ -1721,7 +1736,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
     for
       t <- startTransferOut()
       _ = runDeviceRechecks(t.host)
-      _ <- pumpUntil(!t.host.control.reconciler.activeDeviceChecks.contains(t.sourceId))
+      _ <- pumpUntil(!t.host.control.reconciler.activeDeviceChecks.contains(t.sourceId), drain = List(t.host))
     yield
       t.host.control.reconciler.activeDeviceChecks should not contain t.sourceId
       t.host.control.reconciler.scheduledDeviceRechecks should be(Set())

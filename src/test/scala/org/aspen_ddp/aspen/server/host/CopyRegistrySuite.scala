@@ -269,7 +269,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
     val dev = os.temp.dir(dir = root, prefix = "dev", deleteOnExit = false)
     val sds = new LocalStorageDeviceState(StorageDeviceId(UUID.randomUUID()), dev, dev / "config", null, ctx.deviceIos.forPath(dev))
     val path = CopyFixtures.placeCopy(dev, storeId, from)
-    ctx.copyRegistry.attach(sds, CopyLayout.list(dev))
+    ctx.copyRegistry.attach(sds, CopyLayoutDisk.list(dev))
     if from == Phase.Retired then
       // Not recorded once durable (P3): recorded only as an unsynced move to Retired leaves it
       sds.copies.register(storeId, from, CopyFixtures.copyIdOf(path), unsynced = true)
@@ -371,7 +371,7 @@ class CopyRegistrySuite extends AnyFunSuite with Matchers:
           result should be(MoveResult.Durable)
           os.exists(at) should be(false)
           os.isDir(target) should be(true)
-          CopyLayout.phaseAt(target) should be(Some(to))
+          CopyLayoutDisk.phaseAt(target) should be(Some(to))
           val moved = moveSds.copies.copies.get(storeId)
           if to == Phase.Retired && from != Phase.Retired then
             moved should be(None)

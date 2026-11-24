@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.rebuild.RebuildDisk
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.{TestTransactions, Transaction, TransactionAborted, TransactionOutcomeUnknown}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
@@ -464,7 +465,7 @@ class HorizonIntegrationSuite extends IntegrationTestSuite with org.scalatest.Pa
       _ = net.dropTxMessage = (m: TxMessage) => m.transactionId == tx.id && m.to == absent &&
             !m.isInstanceOf[TxStatusRequest]
       _ = net.crl.deleteTransaction(sid(lost), tx.id)
-      _ = RebuildingStore.writeAcceptorSince(rebuiltDir)
+      _ = RebuildDisk.writeAcceptorSince(rebuiltDir)
       rebuilt = new MapBackend(sid(lost)):
         override def path: os.Path = rebuiltDir
       _ = rebuilt.m = lostData

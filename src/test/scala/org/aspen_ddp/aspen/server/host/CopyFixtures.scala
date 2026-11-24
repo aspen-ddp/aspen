@@ -78,7 +78,7 @@ object CopyFixtures:
 
   /** The copies of `storeId` on the device, outside pending-delete/ */
   private def copies(deviceDir: os.Path, storeId: StoreId): List[CopyLayout.Found] =
-    CopyLayout.list(deviceDir).copies.filter(f => f.storeId == storeId && f.phase != Phase.Retired)
+    CopyLayoutDisk.list(deviceDir).copies.filter(f => f.storeId == storeId && f.phase != Phase.Retired)
 
   private def one(deviceDir: os.Path, storeId: StoreId): Option[CopyLayout.Found] =
     copies(deviceDir, storeId) match

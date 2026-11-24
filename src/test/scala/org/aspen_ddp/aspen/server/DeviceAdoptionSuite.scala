@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.rebuild.RebuildDisk
 import org.aspen_ddp.aspen.server.host.{AdoptionClass, CopyFixtures, CopyLayout, DeviceStateDisk, JobKind, LockstepThreading, Phase}
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService, StoreLoader}
@@ -956,7 +957,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(!loadedDevices(oldHost).contains(deviceA))
       // The rebuild, past its last read, lands its store and finishes on the unloaded device.
       flatOld = writeStoreConfig(oldDir, s0)
-      _ = RebuildingStore.writeEmptyCrlState(flatOld, s0)
+      _ = RebuildDisk.writeEmptyCrlState(flatOld, s0)
       _ = CopyFixtures.markCopy(oldDir, s0,
             Phase.Rebuilt(RebuildingStore.rebuildCompleteContent(rebuilds.created.head.episode)))
       _ = rebuilds.created.head.completeFromDisk()
@@ -1189,7 +1190,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       case ((phase, cls), i) =>
         val copy = CopyFixtures.placeCopy(deviceDir, sid(i), phase)
         if phase.isInstanceOf[Phase.Outbound] && cls == AdoptionClass.Clean then
-          RebuildingStore.writeEmptyCrlState(copy, sid(i))
+          RebuildDisk.writeEmptyCrlState(copy, sid(i))
     // No copy at all
     val absent = sid(placements.size)
     val expected = placements.zipWithIndex.map((p, i) => sid(i) -> p._2).toMap + (absent -> AdoptionClass.Unclean)

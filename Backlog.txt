@@ -17,6 +17,7 @@ Operator alerts
     after delivery succeeds (at least once).
   - Open points: where the service runs (a Durable Task, or a designated host), how sinks are configured in
     metadata, how the operator acknowledges and clears alerts, and a cmdline view (`show-alerts`).
+  - First item to notify is of a Hung Disk for which detection was recently added.
 
 Slow-device detection (follow-up to Todo.txt "Hung devices" project 2, which detects hangs only; 2026-11-24)
   - Goal: notice a device that still completes I/O but has become slow enough to matter (ailing hardware: retries,

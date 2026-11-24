@@ -147,6 +147,7 @@ object StoreRouterSuite:
     def dataEc: ExecutionContext = under.dataEc
     def serialEc: ExecutionContext = under.serialEc
     def observer: DeviceIoObserver = under.observer
+    def probe: HealthProbe = under.probe
     def beginRead(): Unit = under.beginRead()
     def endRead(): Unit = under.endRead()
     def readsOverBound: Boolean = under.readsOverBound

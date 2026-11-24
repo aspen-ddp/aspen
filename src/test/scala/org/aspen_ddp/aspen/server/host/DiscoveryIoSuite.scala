@@ -273,6 +273,41 @@ class DiscoveryIoSuite extends IntegrationTestSuite with ControlFixture:
     // Its check began at its load
     Future.successful(recorded(host).lookupAttempts.toList should contain(deviceA))
 
+  atest("a device whose root holds health-probe loads and lists exactly as before"):
+    val hostRoot = newHostDir()
+    val host = newHost(hostRoot)
+    val dev = device(hostRoot, "dev0", deviceA)
+    val live = writeStoreConfig(dev, storeId)
+    val before = CopyDisk.list(dev)
+    // As a previous incarnation's probe left it
+    HealthProbe.writeAndForce(dev / HealthProbe.FileName)
+    CopyDisk.list(dev) should be(before)
+    before.strays should be(Nil)
+    checkAllNow(host)
+    loadedDevices(host).keySet should be(Set(deviceA))
+    recorded(host).storeLoadAttempts.toList should be(List((deviceA, live)))
+    loadedDevices(host)(deviceA).copies.copies.keySet should be(Set(storeId))
+    CopyDisk.list(dev) should be(before)
+    Future.successful(host.control.deviceIos.get(dev).map(_.probe.armed) should be(Some(true)))
+
+  atest("unloading a device disarms its probe"):
+    val hostRoot = newHostDir()
+    val host = newHost(hostRoot)
+    val dev = device(hostRoot, "dev0", deviceA)
+    checkAllNow(host)
+    val probe = host.control.deviceIos.get(dev).get.probe
+    probe.armed should be(true)
+    host.control.shutdown.unloadDevice(deviceA)
+    Future.successful(probe.armed should be(false))
+
+  atest("the host root's DeviceIo never arms its probe"):
+    val hostRoot = newHostDir()
+    val host = newHost(hostRoot)
+    device(hostRoot, "dev0", deviceA)
+    checkAllNow(host)
+    loadedDevices(host).keySet should be(Set(deviceA))
+    Future.successful(host.control.deviceIos.hostRoot.probe.armed should be(false))
+
   atest("a probe of a device carrying shutdown.state hands it to the ownership decision"):
     val hostRoot = newHostDir()
     val host = newHost(hostRoot)

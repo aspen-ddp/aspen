@@ -168,6 +168,41 @@ class ThreadedDeviceIoSuite extends AnyFunSuite with Matchers:
     ran.get should be(false)
     io.idle should be(true)
 
+  test("close disarms the probe, even while an attempt is stuck"):
+    val entered = new CountDownLatch(1)
+    val unhang = new CountDownLatch(1)
+    val io = new ThreadedDeviceIo(os.Path("/tmp/devX"), cfg, probeWrite = _ =>
+      entered.countDown()
+      unhang.await())
+    try
+      io.probe.arm()
+      entered.await(wait.toSeconds, TimeUnit.SECONDS) should be(true)
+      val closed = Future(io.close())(using scala.concurrent.ExecutionContext.global)
+      Await.result(closed, wait)
+      io.probe.armed should be(false)
+      io.probe.inFlightAge.isDefined should be(true)
+    finally unhang.countDown()
+    val deadline = System.nanoTime() + wait.toNanos
+    while io.probe.threadAlive && System.nanoTime() < deadline do Thread.sleep(1)
+    io.probe.threadAlive should be(false)
+
+  test("the lane closing disarms the probe, which does not hold the DeviceIo busy"):
+    val entered = new CountDownLatch(1)
+    val unhang = new CountDownLatch(1)
+    val io = new ThreadedDeviceIo(os.Path("/tmp/devX"), cfg, probeWrite = _ =>
+      entered.countDown()
+      unhang.await())
+    try
+      io.probe.arm()
+      entered.await(wait.toSeconds, TimeUnit.SECONDS) should be(true)
+      // A stuck probe attempt is no lane job and no pool task: DeviceIos.forget may close the lane
+      io.idle should be(true)
+      io.closeLane()
+      io.probe.armed should be(false)
+    finally
+      unhang.countDown()
+      io.close()
+
   test("close fails the jobs queued behind a lane job hung past its interrupt"):
     val entered = new CountDownLatch(1)
     val unhang = new CountDownLatch(1)

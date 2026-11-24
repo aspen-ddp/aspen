@@ -47,6 +47,10 @@ trait DeviceIo:
   def dataEc: ExecutionContext
   def serialEc: ExecutionContext
   def observer: DeviceIoObserver
+  /** The device's health probe (HealthProbe): armed while a storage device is loaded at this path, disarmed at its
+   *  unload, `closeLane` and `close`; never armed for the host root. Its attempts are recorded in `observer` but are
+   *  no lane job or pool task, so they never keep `idle` false */
+  def probe: HealthProbe
   def beginRead(): Unit
   def endRead(): Unit
   def readsOverBound: Boolean
@@ -71,12 +75,13 @@ object DeviceIo:
   def defaultDataThreads: Int = math.max(4, Runtime.getRuntime.availableProcessors / 2)
 
   /** `poolKeepAliveMillis`: how long an idle data or serial thread lives before it exits (a device with no backend
-   *  work holds no pool thread) */
+   *  work holds no pool thread). `probe`: the health probe's interval and hang threshold */
   final case class Config(dataThreads: Int = defaultDataThreads, serialThreads: Int = 1, readBound: Int = 4096,
-                          poolKeepAliveMillis: Long = 30000)
+                          poolKeepAliveMillis: Long = 30000, probe: HealthProbe.Config = HealthProbe.Config())
 
-/** Thread-safe record of the jobs a device is running. */
-final class DeviceIoObserver:
+/** Thread-safe record of the jobs a device is running, each stamped with `clock` (nanoseconds; injectable so tests
+ *  control every age). */
+final class DeviceIoObserver(clock: () => Long = () => System.nanoTime()):
   private final case class Entry(kind: String, store: Option[StoreId], bytes: Long, startNanos: Long)
 
   private val tokens = new AtomicLong(0)
@@ -85,7 +90,7 @@ final class DeviceIoObserver:
 
   def started(kind: String, store: Option[StoreId], bytes: Long): Long =
     val token = tokens.incrementAndGet()
-    running.put(token, Entry(kind, store, bytes, System.nanoTime()))
+    running.put(token, Entry(kind, store, bytes, clock()))
     token
 
   def finished(token: Long, ok: Boolean): Unit =
@@ -93,7 +98,10 @@ final class DeviceIoObserver:
     if e != null then
       done.computeIfAbsent(e.kind, _ => new LongAdder).increment()
 
-  /** kind -> (count, oldest start in nanoTime) */
+  /** The observer's clock now, against which `inFlight`'s start times are aged */
+  def now: Long = clock()
+
+  /** kind -> (count, oldest start by `clock`) */
   def inFlight: Map[String, (Int, Long)] =
     running.values.asScala.groupBy(_.kind).map: (k, es) =>
       k -> (es.size, es.map(_.startNanos).min)

@@ -914,6 +914,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             throw t
       if attached then
         ctx.devices.devices += sdCfg.storageDeviceId -> sds
+        // Its health probe runs while the device stays loaded here (DeviceShutdown.unloadDevice disarms it)
+        sds.io.probe.arm()
         ctx.publishView()
         loadedDirs += storageDevicePath -> sdCfg.storageDeviceId
         reportedDirs -= storageDevicePath

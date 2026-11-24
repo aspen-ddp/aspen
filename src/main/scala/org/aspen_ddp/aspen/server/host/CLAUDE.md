@@ -701,6 +701,16 @@
   gate, A's backlog under a flood of ten times the read bound stays at most the bound plus one read per store
   (`ThreadedDeviceIo.outstandingReads`, `poolTasksOutstanding`) with no answer to a dropped read; a host whose device
   hangs on its first stat starts, loads and serves its other device)
+- Health probe (`HealthProbe`, spec `docs/superpowers/specs/2026-11-24-device-hang-detection-design.md` 5.1): each
+  `DeviceIo` has one (`DeviceIo.probe`; lockstep's is its internal ThreadedDeviceIo's), one daemon thread
+  `dev-<label>-probe` that overwrites `<device>/health-probe` (4 KiB, in place, `force(false)`) every
+  `DeviceIo.Config.probe.interval` (90 s) after the previous attempt completed, behind the DeviceIo's gate (a held or
+  gated path stalls it). Armed only where a load completes (`DeviceDiscovery`, after `devices +=`), disarmed by
+  `DeviceShutdown.unloadDevice`, `closeLane` and `close`; never for the host root or `ControlFixture.injectLoadedDevice`.
+  Disarming stops new attempts only: a stuck one stays in flight (`inFlightAge`, `hung` past `hangThreshold`, 120 s) and
+  a reload inherits it on the same thread. Attempts are recorded in the observer as kind `HealthProbe` but are no lane
+  job or pool task, so they never keep `DeviceIo.idle` false. The file is at the device root, so no copy listing sees it.
+  Test seams: `ThreadedDeviceIo`/`LockstepDeviceIo` take `clock` (observer and probe) and `probeWrite`
 - Callbacks name the control context. Work run elsewhere (backend opens, client transactions on the host's `ec`) names
   its context; timers and other non-Future callbacks post to `controlEvents` before touching control state
 - Tests use `LockstepThreading`: everything posted waits on one FIFO drained by `testingOnlyHandleEvents`, stores run

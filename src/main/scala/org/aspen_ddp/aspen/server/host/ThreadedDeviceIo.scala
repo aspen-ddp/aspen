@@ -10,11 +10,15 @@ import scribe.Logging
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
 
-/** `gate` runs before every task on every thread of this DeviceIo; hang tests pass a latch await. */
-class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit = () => ()) extends DeviceIo, Logging:
+/** `gate` runs before every task on every thread of this DeviceIo, the health probe's attempts included; hang tests
+ *  pass a latch await. `clock` stamps the observer's entries and the probe's attempts, and `probeWrite` is the probe's
+ *  write: both are test seams (manual clocks, a probe write that blocks or fails). */
+class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit = () => (),
+                       clock: () => Long = () => System.nanoTime(),
+                       probeWrite: os.Path => Unit = HealthProbe.writeAndForce) extends DeviceIo, Logging:
   private val baseName: String = path.segments.toList.lastOption.getOrElse("root")
   @volatile private var currentLabel: String = baseName
-  val observer: DeviceIoObserver = new DeviceIoObserver
+  val observer: DeviceIoObserver = new DeviceIoObserver(clock)
 
   private final class Named(val role: String, val index: Int, val thread: Thread)
   private val threads = new java.util.concurrent.ConcurrentLinkedQueue[Named]()
@@ -35,6 +39,10 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
       t
 
   def label: String = currentLabel
+
+  /** Its thread, `dev-<label>-probe`, is named when the probe arms (after `setDeviceId`, at the device's load) */
+  val probe: HealthProbe = new HealthProbe(path, cfg.probe, observer, () => threadName("probe", -1), gate, probeWrite,
+    clock)
 
   def setDeviceId(id: StorageDeviceId): Unit =
     currentLabel = s"$baseName-${id.uuid}"
@@ -172,8 +180,10 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
 
   /** Stops the lane without waiting: every lane job not yet started fails with `DeviceIo.Cancelled` now, even behind
    *  a running job hung in a syscall, and every later submit at once. The running job is interrupted (a hung syscall
-   *  is not: its thread stays, confined to this device). The pools are untouched */
+   *  is not: its thread stays, confined to this device). The probe is disarmed (an attempt in flight stays, never
+   *  waited for). The pools are untouched */
   def closeLane(): Unit =
+    probe.disarm()
     closed = true
     if laneStarted.get() then laneThread.interrupt()
     // Here, not only in the lane thread's finally, which a hung job never reaches. Each entry is polled by one party

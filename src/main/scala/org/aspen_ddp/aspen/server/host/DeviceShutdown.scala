@@ -389,6 +389,8 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    */
   def unloadDevice(storageDeviceId: StorageDeviceId): Unit =
     ctx.devices.devices.get(storageDeviceId).foreach: sds =>
+      // No new probe attempt; one stuck in flight stays, for a reload of the path to inherit
+      sds.io.probe.disarm()
       shutDownCrl(sds.devicePath, sds.crl)
       // Its last tree entry's stores, and the copies it holds: an unload before its first reconcile lists those
       ctx.copyRegistry.detach(storageDeviceId,

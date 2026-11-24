@@ -614,7 +614,7 @@ trait ControlFixture:
    *  Named for what it does to the load state, not the storage-devices tree: this registers nothing there, and a
    *  lookup of the injected device still resolves however the test arms it. Refuses to replace an existing entry, so
    *  a test that both writes a device to disk and injects one for the same id fails here rather than in a confusing
-   *  assertion later. */
+   *  assertion later. Its health probe is left unarmed (a load arms it): no probe thread writes into its directory. */
   protected def injectLoadedDevice(host: Host, sds: LocalStorageDeviceState): Unit =
     val devices = host.control.devices
     require(!devices.devices.contains(sds.storageDeviceId),

@@ -5,7 +5,7 @@ import scala.util.Try
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.host.{DeviceIo, DeviceIoObserver, JobHandle, JobKind}
+import org.aspen_ddp.aspen.server.host.{DeviceIo, DeviceIoObserver, HealthProbe, JobHandle, JobKind}
 
 /** A deterministic DeviceIo for tests that drive a BackendOpener or a RebuildingStore without a host (a host owns its
  *  own, `DeviceControl.deviceIos`): `submit` runs the job in the caller before returning, so the Future is completed
@@ -15,6 +15,8 @@ final class TestDeviceIo(val path: os.Path, readBound: Int = Int.MaxValue) exten
   /** Reads begun and not ended, as ThreadedDeviceIo counts them; over the bound once it reaches `readBound` */
   val reads = new java.util.concurrent.atomic.AtomicInteger(0)
   val observer: DeviceIoObserver = new DeviceIoObserver
+  /** Never armed: no host loads a device on it */
+  val probe: HealthProbe = new HealthProbe(path, HealthProbe.Config(), observer, () => "test-probe")
   def label: String = "test"
   def setDeviceId(id: StorageDeviceId): Unit = ()
   def dataEc: ExecutionContext = ExecutionContext.global

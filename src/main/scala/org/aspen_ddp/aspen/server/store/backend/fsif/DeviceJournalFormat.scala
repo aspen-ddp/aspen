@@ -11,6 +11,7 @@ final case class JournalSizing(journalId: UUID, files: Int, fileSize: Long):
   require(files >= 3, s"a journal needs at least 3 files, not $files")
   require(fileSize % 4096 == 0, s"journal file size $fileSize is not a multiple of 4096")
   require(fileSize > DeviceJournalFormat.HeaderSize, s"journal file size $fileSize does not exceed the header")
+  require(fileSize <= (1L << 30), s"journal file size $fileSize exceeds 1 GiB")
 
 /** `first` is the serial of the file's first batch, `oldestNeeded` the oldest serial still needed at the pass's start */
 final case class FileHeader(journalId: UUID, salt: Long, first: Long, oldestNeeded: Long)
@@ -79,7 +80,7 @@ object DeviceJournalFormat:
       val id = getId(bb)
       val files = bb.getInt()
       val size = bb.getLong()
-      if files >= 3 && size % 4096 == 0 && size > HeaderSize then Some(JournalSizing(id, files, size)) else None
+      if files >= 3 && size % 4096 == 0 && size > HeaderSize && size <= (1L << 30) then Some(JournalSizing(id, files, size)) else None
 
   def encodeHeader(h: FileHeader): Array[Byte] =
     val arr = new Array[Byte](HeaderSize)

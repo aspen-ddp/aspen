@@ -50,6 +50,8 @@ class DeviceJournalFormatSuite extends FileBasedTests:
     an[IllegalArgumentException] should be thrownBy JournalSizing(jid, 2, 8192)
     an[IllegalArgumentException] should be thrownBy JournalSizing(jid, 3, 8191)
     an[IllegalArgumentException] should be thrownBy JournalSizing(jid, 3, 4096)
+    an[IllegalArgumentException] should be thrownBy JournalSizing(jid, 3, (1L << 30) + 4096)
+    JournalSizing(jid, 3, 1L << 30)
 
   test("a header round-trips only under its own journal id"):
     val h = FileHeader(jid, Salt, 17, 9)

@@ -80,12 +80,25 @@ class DeviceJournalScanSuite extends AnyFunSuite:
     val Scan.Valid(_, tail) = s: @unchecked
     assert(tail == Tail(0, pos, 2, salt(0)))
 
-  test("a valid later batch with the next serial after an invalid one is Corrupt"):
+  test("a rotted batch followed by a valid next batch is Corrupt"):
     val files = newFiles()
-    writeRing(files, sizing, Seq((0, 1L, 1L, Seq(batch(1), batch(2)))))
+    writeRing(files, sizing, Seq((0, 1L, 1L, Seq(batch(1), batch(2), batch(3)))))
     put(files, "0.fj", 4096L + batchLen(1) + 10, Array[Byte](0x55, 0x66))
-    // the batch with the serial the invalid one should have carried, one boundary later
-    put(files, "0.fj", 4096L + 2 * batchLen(1), DeviceJournalFormat.encodeBatch(jid, salt(0), batch(2)))
+    assert(DeviceJournalScan.scan(files, sizing).isInstanceOf[Scan.Corrupt])
+
+  test("a rotted batch below oldestNeeded is not read"):
+    val files = newFiles()
+    writeRing(files, sizing, Seq((0, 1L, 3L, Seq(batch(1), batch(2), batch(3), batch(4)))))
+    put(files, "0.fj", 4096L + batchLen(1) + 10, Array[Byte](0x55, 0x66))
+    val s = DeviceJournalScan.scan(files, sizing)
+    assert(serials(s) == Vector(3L, 4L))
+    val Scan.Valid(_, tail) = s: @unchecked
+    assert(tail.nextSerial == 5)
+
+  test("a rotted batch below oldestNeeded with oldestNeeded unreachable is Corrupt"):
+    val files = newFiles()
+    writeRing(files, sizing, Seq((0, 1L, 3L, Seq(batch(1), batch(2)))))
+    put(files, "0.fj", 4096L + batchLen(1) + 10, Array[Byte](0x55, 0x66))
     assert(DeviceJournalScan.scan(files, sizing).isInstanceOf[Scan.Corrupt])
 
   test("a torn header rewrite of the file being entered is ignored"):

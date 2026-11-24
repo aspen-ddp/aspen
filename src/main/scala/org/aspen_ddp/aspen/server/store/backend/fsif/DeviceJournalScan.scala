@@ -14,9 +14,10 @@ enum Scan:
 object DeviceJournalScan:
   def fileName(n: Int): String = s"$n.fj"
 
-  private final case class Found(index: Int, header: FileHeader, bytes: Array[Byte])
+  private final case class Found(index: Int, header: FileHeader)
 
-  private def load(files: FsifFiles, sizing: JournalSizing, n: Int): Option[Found] =
+  /** Reads only the header (4096 bytes) */
+  private def loadHeader(files: FsifFiles, sizing: JournalSizing, n: Int): Option[Found] =
     val name = fileName(n)
     if !files.exists(name) || files.size(name) < DeviceJournalFormat.HeaderSize then
       None
@@ -24,12 +25,20 @@ object DeviceJournalScan:
       val f = files.open(name)
       try
         f.force()
-        val bytes = f.read(0, f.size.toInt)
-        DeviceJournalFormat.decodeHeader(bytes, sizing.journalId).map(h => Found(n, h, bytes))
+        DeviceJournalFormat.decodeHeader(f.read(0, DeviceJournalFormat.HeaderSize), sizing.journalId)
+          .map(h => Found(n, h))
       finally f.close()
 
+  /** The whole file, read only while it is walked */
+  private def loadBytes(files: FsifFiles, f: Found): Array[Byte] =
+    val h = files.open(fileName(f.index))
+    try
+      h.force()
+      h.read(0, h.size.toInt)
+    finally h.close()
+
   def scan(files: FsifFiles, sizing: JournalSizing): Scan =
-    val found = (0 until sizing.files).flatMap(load(files, sizing, _)).sortBy(_.header.first).toVector
+    val found = (0 until sizing.files).flatMap(loadHeader(files, sizing, _)).sortBy(_.header.first).toVector
     if found.isEmpty then
       Scan.Empty
     else
@@ -45,62 +54,67 @@ object DeviceJournalScan:
           val f = found(i)
           val last = found(i + 1).header.first - 1
           if last >= oldestNeeded then
-            failure = readClosed(f, last, oldestNeeded, sizing, out)
+            failure = walk(f, loadBytes(files, f), Some(last), oldestNeeded, sizing, out).left.toOption
           i += 1
         failure match
           case Some(r) => Scan.Corrupt(r)
-          case None => readNewest(newest, oldestNeeded, sizing, out)
+          case None =>
+            walk(newest, loadBytes(files, newest), None, oldestNeeded, sizing, out) match
+              case Left(r) => Scan.Corrupt(r)
+              case Right((pos, serial)) =>
+                Scan.Valid(out.result(), Tail(newest.index, pos, serial, newest.header.salt))
 
-  /** A non-newest file: every batch from its first to `last` must be Ok. One below oldestNeeded that cannot be read
-    * leaves the position of the needed ones unknown, so it fails too.
-    */
-  private def readClosed(f: Found, last: Long, oldestNeeded: Long, sizing: JournalSizing,
-                         out: scala.collection.mutable.Builder[Batch, Vector[Batch]]): Option[String] =
-    var pos = DeviceJournalFormat.HeaderSize
-    var serial = f.header.first
-    var failure: Option[String] = None
-    while failure.isEmpty && serial <= last do
-      DeviceJournalFormat.decodeBatchAt(f.bytes, pos, sizing.journalId, f.header.salt) match
-        case BatchRead.Ok(b, next) if b.serial == serial =>
-          if serial >= oldestNeeded then
-            out += b
-          pos = next
-          serial += 1
-        case BatchRead.Ok(b, _) =>
-          failure = Some(s"${fileName(f.index)} holds batch ${b.serial} where $serial belongs")
-        case BatchRead.Invalid =>
-          failure = Some(s"${fileName(f.index)} has no valid batch $serial at $pos")
-        case BatchRead.Unparseable(r) =>
-          failure = Some(s"${fileName(f.index)} batch at $pos is unparseable: $r")
-    failure
-
-  private def readNewest(f: Found, oldestNeeded: Long, sizing: JournalSizing,
-                         out: scala.collection.mutable.Builder[Batch, Vector[Batch]]): Scan =
-    var pos = DeviceJournalFormat.HeaderSize
-    var serial = f.header.first
-    var result: Option[Scan] = None
-    while result.isEmpty do
-      DeviceJournalFormat.decodeBatchAt(f.bytes, pos, sizing.journalId, f.header.salt) match
-        case BatchRead.Ok(b, next) if b.serial == serial =>
-          if serial >= oldestNeeded then
-            out += b
-          pos = next
-          serial += 1
-        case BatchRead.Unparseable(r) =>
-          result = Some(Scan.Corrupt(s"${fileName(f.index)} batch at $pos is unparseable: $r"))
-        case _ =>
-          if laterBatchExists(f, pos, serial, sizing) then
-            result = Some(Scan.Corrupt(s"${fileName(f.index)} has batch $serial after an invalid one at $pos"))
-          else
-            result = Some(Scan.Valid(out.result(), Tail(f.index, pos, serial, f.header.salt)))
-    result.get
-
-  private def laterBatchExists(f: Found, pos: Int, serial: Long, sizing: JournalSizing): Boolean =
-    var p = pos + 4096
-    var found = false
-    while !found && p < f.bytes.length do
-      DeviceJournalFormat.decodeBatchAt(f.bytes, p, sizing.journalId, f.header.salt) match
-        case BatchRead.Ok(b, _) if b.serial == serial => found = true
+  /** The position of an Ok batch with serial `target` at a 4096 boundary at or after `from` */
+  private def findLater(bytes: Array[Byte], from: Int, target: Long, sizing: JournalSizing, salt: Long): Option[Int] =
+    var p = from
+    var found: Option[Int] = None
+    while found.isEmpty && p < bytes.length do
+      DeviceJournalFormat.decodeBatchAt(bytes, p, sizing.journalId, salt) match
+        case BatchRead.Ok(b, _) if b.serial == target => found = Some(p)
         case _ => ()
       p += 4096
     found
+
+  /** Walks a file's batches from its first. `last` is the last serial a closed file must hold; None for the newest
+    * file, which ends at the first position that is not an Ok batch of the next serial. A batch below oldestNeeded is
+    * not read: where one fails, the walk resumes at the later boundary holding oldestNeeded. Otherwise a failed batch
+    * of a closed file is Corrupt, as is a failed one in the newest file when the next serial exists after it, or an
+    * Unparseable one. Right is the position and serial after the last batch.
+    */
+  private def walk(f: Found, bytes: Array[Byte], last: Option[Long], oldestNeeded: Long, sizing: JournalSizing,
+                   out: scala.collection.mutable.Builder[Batch, Vector[Batch]]): Either[String, (Int, Long)] =
+    val salt = f.header.salt
+    val name = fileName(f.index)
+    var pos = DeviceJournalFormat.HeaderSize
+    var serial = f.header.first
+    var result: Option[Either[String, (Int, Long)]] = None
+    while result.isEmpty do
+      if last.exists(serial > _) then
+        result = Some(Right((pos, serial)))
+      else
+        DeviceJournalFormat.decodeBatchAt(bytes, pos, sizing.journalId, salt) match
+          case BatchRead.Ok(b, next) if b.serial == serial =>
+            if serial >= oldestNeeded then
+              out += b
+            pos = next
+            serial += 1
+          case read =>
+            if serial < oldestNeeded then
+              findLater(bytes, pos + 4096, oldestNeeded, sizing, salt) match
+                case Some(p) =>
+                  pos = p
+                  serial = oldestNeeded
+                case None =>
+                  result = Some(Left(s"$name has no readable batch $oldestNeeded after the invalid one at $pos"))
+            else read match
+              case BatchRead.Unparseable(r) =>
+                result = Some(Left(s"$name batch at $pos is unparseable: $r"))
+              case _ if last.isDefined =>
+                result = Some(Left(s"$name has no valid batch $serial at $pos"))
+              case _ =>
+                result =
+                  if findLater(bytes, pos + 4096, serial + 1, sizing, salt).isDefined then
+                    Some(Left(s"$name has batch ${serial + 1} after an invalid one at $pos"))
+                  else
+                    Some(Right((pos, serial)))
+    result.get

@@ -237,8 +237,8 @@ only guarantees that such a move onto a healthy device is not blocked by the hun
 
 ### 8. Thread budget and performance
 
-Per device: 1 management thread, N data threads (default 4), 1 FSIF serial thread, the existing CRL threads, plus 2
-RocksDB background slots per RocksDB store. Today FSIF has max(4, CPUs) io threads shared by all devices, so one busy
+Per device: 1 management thread, N data threads (default max(4, CPUs/2), chosen by measurement), 1 FSIF serial
+thread, the existing CRL threads, plus 2 RocksDB background slots per RocksDB store. Today FSIF has max(4, CPUs) io threads shared by all devices, so one busy
 NVMe device could use more than 4. The defaults must be measured against the benchmarks in
 `docs/host-threading-measurement.md` (single and multiple devices, randrw and seqwrite) before and after; G5 is the
 acceptance bar. N is a host option (e.g. `--device-io-threads`), and the builder may pick a different default (e.g.

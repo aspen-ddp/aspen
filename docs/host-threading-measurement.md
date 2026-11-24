@@ -113,10 +113,16 @@ Closes `docs/superpowers/specs/2026-11-23-device-io-isolation-design.md` (sectio
 latency regression on the single-device benchmarks beyond noise). Before is `fd82a6f3` (the branch's start, before any
 device-I/O change); after is `device-threads` at the commit that sets the default below.
 
+**G5 status.** FSIF met at the default. RocksDB randrw without fsync is 15-25% below baseline at the default
+(understood: a commit-rate effect on a co-located vdisk-server). Single-read latency is equal after the vdisk fix.
+The user accepted this on 2026-11-24. The remedies are in `Backlog.txt`. The tables and the "Reading them" section
+below were taken before the vdisk fix; where their conclusions differ from "RocksDB latency follow-up" at the end of
+this section, the follow-up supersedes them.
+
 ### What was run
 
 Same hardware as the runs above (24 CPUs, NVMe, every store directory on one filesystem) and the same jobs
-(`scripts/vdisk-e2e/smoke.fio`: `randrw-verify`, then `seqwrite`, 60 s each, time based), through the real path:
+(`scripts/vdisk-e2e/smoke.fio`: the `randrw-verify` and `seqwrite` jobs, 60 s each, time based), through the real path:
 `aspen vdisk-server` (always the `device-threads` build) -> TCMU -> iSCSI loopback -> ext4 -> fio. Not run: the
 `capture-job.sh` thread dumps and `analyze.py` (a fio-only comparison needed neither); the numbers are fio's own JSON
 (`--output-format=json`, `--section=<job>`). For each configuration and each tree:
@@ -136,6 +142,9 @@ Same hardware as the runs above (24 CPUs, NVMe, every store directory on one fil
 4. `scripts/vdisk-e2e/setup.sh` (tcmu-runner stopped, `MKFS=1 SMOKE=0`), one unmeasured full `smoke.fio` pass, then
    `randrw-verify` and `seqwrite` three times each (six fio runs, alternating). Values below are the mean of the
    three runs, then the range (min-max). fsync is fio's FLUSH latency.
+
+Warning: a TCMU SYNCHRONIZE CACHE that takes over 30 s makes the initiator time out and ext4 go read-only. This is
+pre-existing and seen on both trees. Avoid it by laying out small files one at a time, not many at once.
 
 The two trees ran back to back on the same disk, in alternating order. A second before run of the single-device FSIF case, hours later, came out 15 percent faster than
 the first: **session-to-session drift is as large as the range inside one session**, so a result counts as a change
@@ -212,9 +221,10 @@ only when it is clear of both.
   faster in throughput (single device 137 against 98 read IOPS, seqwrite 96 against 68 MiB/s; two devices 171 against
   93 and 109 against 49), and fsync is shorter, but its per-operation completion latencies are longer: read avg 10 ms
   against 5.5 (p99 190 against 100), write avg 0.5 ms against 0.3. They rise with the thread count (7.7, 10.5, 10.4 ms
-  at 4, 8, 12 threads) while throughput rises too, so more writes are in flight at once; the cost is on the latency
-  side only for this closed-loop depth-8 job. G5 asks for no latency regression: this is one, for RocksDB only,
-  and it is the trade for the throughput. See the concerns in the task report.
+  at 4, 8, 12 threads) while throughput rises too. The follow-up below explains why: the job is fsync-bound (Little's
+  law: 0.56 outstanding before, 0.84-1.44 after), so the rise comes from fsync overlap, not from a higher per-op
+  cost. G5 asks for no latency regression: this is one in the per-op completion numbers, for RocksDB only, and it is
+  the trade for the throughput.
 - One of the first six RocksDB runs with 4 threads (the first RocksDB single-device after-run) hit TCMU I/O errors
   mid-run, ext4 aborted its journal and went read-only (`dmesg`: `I/O error, dev sdb`, 02:18:46). It did not
   recur in the twelve later RocksDB after-runs (4, 8 and 12 threads, two devices), but its host log was not kept, so the cause is unknown.

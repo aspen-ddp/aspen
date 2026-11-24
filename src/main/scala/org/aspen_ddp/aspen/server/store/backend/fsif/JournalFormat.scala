@@ -45,7 +45,7 @@ object JournalFormat:
     bb.putInt(crc(arr, 0, 24))
     arr
 
-  private def encodeRecord(r: JournalRecord): Array[Byte] =
+  private[fsif] def encodeRecord(r: JournalRecord): Array[Byte] =
     r match
       case JournalRecord.Mapping(ext, slot, id) =>
         val bb = ByteBuffer.allocate(4 + 1 + 24)
@@ -133,7 +133,7 @@ object JournalFormat:
       pos = end
     out.result()
 
-  private def parseRecord(bytes: Array[Byte], start: Int, end: Int): JournalRecord =
+  private[fsif] def parseRecord(bytes: Array[Byte], start: Int, end: Int): JournalRecord =
     val bb = ByteBuffer.wrap(bytes, start + 1, end - start - 1)
     bytes(start) match
       case MappingType =>

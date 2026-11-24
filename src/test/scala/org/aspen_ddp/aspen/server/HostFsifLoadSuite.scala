@@ -493,10 +493,10 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
     FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
-      // The open waits on the device's lane, not in the load that started it
+      // The load's config read, and the open after it, wait on the device's lane, not in the load that started it
       holdDevice(host, deviceDir)
       load(host)
-      heldJobs(host, deviceDir) should be(List(JobKind.BackendOpen))
+      heldJobs(host, deviceDir) should be(List(JobKind.ReadConfig))
       host.getStoreIds should not contain storeId
       host.control.router.silentStores should contain(storeId)
       releaseDevice(host, deviceDir)
@@ -830,6 +830,8 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).map: _ =>
         host.control.reconciler.activeDeviceChecks should not contain deviceA
         CopyFixtures.phaseOf(deviceDir, storeId).exists(_.isInstanceOf[Phase.Outbound]) should be(false)
+        // The load's config read, on the device's lane, queues the open
+        host.testingOnlyHandleEvents()
         queued.size should be(1)
 
   atest("an FSIF store reinstated after an abandoned transfer out gossips StoreMoved once its open completes"):
@@ -931,7 +933,8 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
           host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(true))
           fsif(host).gossipedOnline should be(Nil)
       waited.andThen(_ => os.perms.set(storeDir, "rwx------")).flatMap: _ =>
-        scanNow(host) // the retry: its open is queued
+        scanNow(host) // the retry
+        host.testingOnlyHandleEvents() // its config read: its open is queued
         queued.size should be(1)
         queued.poll().run()
         host.testingOnlyHandleEvents()
@@ -1016,6 +1019,8 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
     checkAllNow(host)
     yieldUntil(!host.control.reconciler.activeDeviceChecks.contains(deviceA)).flatMap: _ =>
+      // The load's config read, on the device's lane, fails
+      host.testingOnlyHandleEvents()
       // Moved back to Live in live/ (T7), so only the retry can take the store up again
       CopyFixtures.phaseOf(deviceDir, storeId).exists(_.isInstanceOf[Phase.Outbound]) should be(false)
       CopyFixtures.copyPath(deviceDir, storeId) should be(Some(storeDir))
@@ -1045,7 +1050,8 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       fsif(host).gossipedOnline should be(Nil)
       host.control.loader.awaitingRetryHasCallback(storeId) should be(Some(true))
 
-      scanNow(host) // the retry: its open is queued
+      scanNow(host) // the retry
+      host.testingOnlyHandleEvents() // its config read: its open is queued
       queued.size should be(1)
       fsif(host).gossipedOnline should be(Nil)
       queued.poll().run()

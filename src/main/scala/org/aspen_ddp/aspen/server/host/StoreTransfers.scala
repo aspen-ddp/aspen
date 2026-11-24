@@ -305,7 +305,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
       case Some(r) if r.phase.isInstanceOf[Phase.Arrived] =>
         val path = CopyLayout.path(sds.devicePath, storeId, r.copyId, r.phase)
         try
-          StoreLoader.writeArrivedAt(path)
+          LoadDisk.writeArrivedAt(path)
           ctx.moves.move("arrived copy goes live", sds, storeId, Phase.Live)
         catch case NonFatal(t) =>
           logger.error(s"Failed to record the arrival of store $storeId at $path before moving it live. The store " +

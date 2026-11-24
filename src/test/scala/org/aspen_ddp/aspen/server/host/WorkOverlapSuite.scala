@@ -614,6 +614,7 @@ class WorkOverlapSuite extends IntegrationTestSuite with ControlFixture:
       val closedInWindow = closed.isCompleted
       val openingInWindow = host.control.loader.isOpening(moving)
       loads.foreach(_.run())
+      runLoadReads(host) // the LoadStore's inputs, read on the device's lane, then its install
       val installed = host.control.router.loaded.contains(moving)
 
       for

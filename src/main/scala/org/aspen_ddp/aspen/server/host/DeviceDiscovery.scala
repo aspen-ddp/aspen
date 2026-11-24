@@ -600,7 +600,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       // goes Live at the Completed Rebuilds pass. A directory stat that fails throws (FileStat), leaving the owner
       // unwritten and the adoption to the next scan
       listing.filter(f => state.stores.contains(f.storeId) && (f.phase == Phase.Live || mayGoLive(f.phase)))
-        .map(_.path).filter(FileStat.isDir(_)).foreach(StoreLoader.writeArrivedAt)
+        .map(_.path).filter(FileStat.isDir(_)).foreach(LoadDisk.writeArrivedAt)
       DeviceMarkers.writeOwningHost(path, ctx.hostId)
 
     val active = state.stores.collect {

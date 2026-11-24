@@ -14,13 +14,13 @@ class ArrivedAtSuite extends AnyFunSuite with Matchers:
   test("a store with no arrival file has no arrival"):
     withStoreDir: store =>
       os.makeDir(store)
-      StoreLoader.readArrivedAt(store) should be(None)
+      LoadDisk.readArrivedAt(store) should be(None)
 
   test("a written arrival is read back"):
     withStoreDir: store =>
       os.makeDir(store)
       os.write(store / StoreLoader.ArrivedAtFile, "12345")
-      StoreLoader.readArrivedAt(store) should be(Some(12345L))
+      LoadDisk.readArrivedAt(store) should be(Some(12345L))
 
   test("a failed stat of the arrival file counts as an arrival now, keeping the arrival margin (X-W26)"):
     withStoreDir: store =>
@@ -29,6 +29,6 @@ class ArrivedAtSuite extends AnyFunSuite with Matchers:
       // A directory without search permission fails every stat beneath it with EACCES, where os.exists answers false
       os.perms.set(store, "rw-------")
       val before = System.currentTimeMillis()
-      val arrived = StoreLoader.readArrivedAt(store)
+      val arrived = LoadDisk.readArrivedAt(store)
       arrived.isDefined should be(true)
       arrived.get should be >= before

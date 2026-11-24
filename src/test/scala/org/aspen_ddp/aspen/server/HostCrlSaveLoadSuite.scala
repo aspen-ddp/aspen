@@ -16,7 +16,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, CrlClosed, CrlFailed,
   StoreRecoveryState, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.StorageDeviceConfig
-import org.aspen_ddp.aspen.server.host.{Activity, ClosePurpose, ControlFixture, CopyFixtures, CopyLayout, LockstepThreading, Phase,
+import org.aspen_ddp.aspen.server.host.{Activity, ClosePurpose, ControlFixture, CopyFixtures, CopyLayout, LoadDisk, LockstepThreading, Phase,
   StoreLoader}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.{Frontend, Store, StoreIncarnationFile}
@@ -446,7 +446,7 @@ class HostCrlSaveLoadSuite extends IntegrationTestSuite with ControlFixture:
   atest("a store that arrived from another host loads with AcceptorSinceMargin on its load floor"):
     given ExecutionContext = executionContext
     val backend = storeInDirectory()
-    StoreLoader.writeArrivedAt(backend.path)
+    LoadDisk.writeArrivedAt(backend.path)
     loadFloorLead(backend).map(_ should be (RebuildingStore.AcceptorSinceMargin.toMillis))
 
   atest("a store restarted on its own host loads with MaxStartLead on its load floor"):

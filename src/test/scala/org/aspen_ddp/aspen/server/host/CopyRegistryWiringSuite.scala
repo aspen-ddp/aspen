@@ -242,6 +242,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
         // The fixture's tryLoadStore only records, so the loader's own is called, as a device scan's retry calls it
         // No drain until the learn is taken: a strict drain fails on any copy a load had to learn
         host.control.loader.tryLoadStore(local, dir)
+        runLoadReads(host) // its config read, on the device's lane
         host.control.loader.awaitingRetryWaitScans(sid(0))
       finally os.perms.set(dir, "rwx------")
     val learnedAtRetry = phases(host, deviceA)
@@ -267,6 +268,7 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
       dir, dev / org.aspen_ddp.aspen.server.store.backend.StoreCreation.CreatingDirectory)
     host.control.copyRegistry.verifyAgainstDisk().size should be(1)
     host.control.loader.tryLoadStore(local, dir)
+    runLoadReads(host) // its config read, on the device's lane
     phases(host, deviceA) should be(Map(sid(0) -> Phase.Live))
     host.control.copyRegistry.takeLearned().size should be(1)
     host.control.copyRegistry.verifyAgainstDisk() should be(Nil)

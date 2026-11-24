@@ -11,7 +11,9 @@ import org.aspen_ddp.aspen.common.store.StoreId
 
 enum JobKind:
   case Scan, ReadConfig, Markers, CopyLayout, Move, Retire, Release, Delete, Sweep, SaveFile, CrlOpen, CrlCreate,
-    BackendOpen, BackendCreate, Usage, Staging, ReconcileInputs
+    BackendOpen, BackendCreate, Usage, Staging, ReconcileInputs,
+    /** A store load's reads before its Store is built (StoreLoader.handleLoad, LoadDisk.readLoadInputs) */
+    LoadInputs
   /** Device discovery's own jobs (DeviceDiscovery), used by nothing else: the listing of storage-devices/ on the host
    *  root's lane, a path's probe, and a load's sweep and P2. A load's device CRL open (DeviceCrlDisk.open) is
    *  `CrlOpen`, used by discovery only */

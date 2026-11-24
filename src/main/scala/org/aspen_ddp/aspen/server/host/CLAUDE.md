@@ -403,10 +403,32 @@
   drained, and `ControlFixture.runUntilLoadQueued` runs an open and stops before its LoadStore). A rebuild's staging
   store opens the same way on the destination device's `DeviceIo` (`StoreRebuildFactory.createRebuild`'s `io`). A
   backend open that hangs stalls only its own device's lane. A store stays opening (`StoreLoader.isOpening`: its copy's Opening activity on
-  any device of the host) from `startOpen` until its open fails or the LoadStore `serveOpened` queued is handled
-  (`handleLoad` installs it or gives up in that one task), so a second load offer in between (a duplicate
-  `LoadStoreById`) starts no second open, and a ShutdownStore then waits for the install (`deferredCloses`) and closes
-  the served store. A `serveOpened` that throws (its LoadStore not queued) ends the open as a failed one: the backend is
+  any device of the host) from its open's claim (`StoreLoader.claimOpen`: `tryLoadStore` claims before its config
+  read, `startOpen` for a create) until its open fails or the LoadStore `serveOpened` queued has been decided
+  (`applyLoadInputs` installs it or gives up), so a second load offer in between (a duplicate `LoadStoreById`) starts
+  no second open, and a ShutdownStore then waits for the install (`deferredCloses`) and closes the served store.
+  A store load does no disk I/O on the control thread (device I/O isolation, Task 11; disk work in `LoadDisk`):
+  `tryLoadStore`'s config read is one `ReadConfig` job on the device's lane (`LoadDisk.probeStoreConfig`, a
+  `ConfigRead`: Found, Absent, Unreadable), applied by `applyConfig` once it rechecks that the device is still the
+  loaded one and the copy still `Opening` for this open id (otherwise it only ends; a device taken out of service
+  meanwhile opens nothing): Found opens the backend (`openClaimed`), Unreadable or a failed job records the
+  unreadable-config retry (backing off from the retry the claim took), Absent ends the open (Idle, any retry dropped:
+  this replaced `retryFailedLoads`' own stat of a retry's config), a config naming another store than the copy name
+  is logged at error and not loaded. A copy with no record naming the offered path (put there after the device's
+  load, or a record of another copy or phase) is read first and taken at the apply (`readAtLoad`) only once a config
+  there names its store, then claimed and opened with that read. `handleLoad` submits one
+  `LoadInputs` job (`LoadDisk.readLoadInputs`: the `crl_save.log` stat and read, `incarnation`, `acceptor-since`,
+  `inherited-votes` and `arrived-at`, as a `LoadInputs` value whose fields each hold their own failure) on the
+  store's device's lane (the host root's for the test seam's unloaded-device CRL; none for a failed backend or a
+  device not loaded, decided at once), and `applyLoadInputs` decides on it with the decisions `handleLoad` made
+  inline before. Its recheck: a load its open queued whose device is no longer the loaded one, whose open no longer
+  awaits this backend's install, or whose copy is no longer Opening (or a cancelled job) serves nothing: the backend
+  is closed unserved the tracked way (`abandonLoad`, its copy on a device loaded again meanwhile held Closing(Unserved)
+  unless another open or a served store holds it). The open's deferred closes are put again after the apply. A failed
+  create's outcome carries whether it left nothing at its path (`BackendOpened.leftNothing`, a stat made on the lane
+  after the failed create). `HostCopies.installed` over a copy busy with a disk job (`DiskJob`) records a violation
+  and keeps the mark (Served beneath it); no load path installs over one (a load's copy is Opening). Lockstep tests
+  run a load's reads, and only them, with `ControlFixture.runLoadReads` (`LoadIoSuite` holds each read). A `serveOpened` that throws (its LoadStore not queued) ends the open as a failed one: the backend is
   closed unserved, the copy AwaitingRetry, and the deferred closes put again. A rebuild's staging store opens through
   the same opener (passed by `StoreRebuildFactory.createRebuild`). The host and the rebuild see only
   `Backend.hasFailed`/`isWriteFrozen`, `BackendStateLost` and `Backend.isOutOfSpace`; only `DefaultBackendOpener` names
@@ -476,13 +498,13 @@
   false on any stat error; `FileStatUsageSuite` fails on one): absent only on ENOENT (or a parent that is no directory),
   otherwise it throws. A new site decides whether a failed stat waits, throws or is safe either way, and says so where
   it stands. `tryLoadStore`'s config check and `handleLoad`'s `crl_save.log`, `acceptor-since` and `inherited-votes`
-  checks hold a load whose stat fails back through `awaitUnreadRetry` (a rebuilt store loaded without its gates would be
+  checks (all in `LoadDisk` jobs) hold a load whose stat fails back through `awaitUnreadRetry` (a rebuilt store loaded without its gates would be
   a full acceptor of its old incarnation's transactions); the Missing Stores case, `dropLeftoverCrlState` and the
   Deleted Stores case skip such a store; `StoreCopies.retire` fails rather than report a clear path, and
   `StoreCopies.delete` reports gone only a copy known absent; `DeviceCrlDisk.open` fails (device left for
   the next scan; a child whose config cannot be stat'd counts as a store directory) and so does `holdsOwnState`.
   `tryLoadDevice` leaves a device whose directory, config or `failed` marker cannot be stat'd for the next scan, and
-  `DeviceMarkers`' host-id reads and `storesIn` throw too. `StoreLoader.readArrivedAt` counts a failed stat as an
+  `DeviceMarkers`' host-id reads and `storesIn` throw too. `LoadDisk.readArrivedAt` counts a failed stat as an
   arrival now; `adoptionClass` throws (adoption retried next scan), and so does `bringIntoService` on a store directory
   it cannot stat, before it rewrites `owning-host`, so no adopted store loads without its `ArrivedAtFile`; a
   `phase-param.rebuilt` that cannot be stat'd or read fails the device's listing (P6); `startOut` never ships a Lost
@@ -493,7 +515,7 @@
   (`Frontend.loadedAt`), so after a restart, adoption or transfer in it refuses, for good, each transaction it does not
   hold that started before the load plus `MaxStartLead`. A store that arrived from another host had joined by that
   host's clock: `StoreTransfers.bringArrivedLive` (before the move out of arrived/) and an adopting
-  `DeviceDiscovery.bringIntoService` (before `owning-host` is rewritten) durably write `StoreLoader.ArrivedAtFile`, and
+  `DeviceDiscovery.bringIntoService` (before `owning-host` is rewritten) durably write `StoreLoader.ArrivedAtFile` (`LoadDisk.writeArrivedAt`, still on the control thread there), and
   a load less than `RebuildingStore.AcceptorSinceMargin` (10 s) after it adds that margin instead
   (`Frontend.arrivedAt`). A same-host restart past the margin adds only the lead. The exception is a store this process
   just created (`StoreLoader.newStores`: a `startOpen` with `create`, made only by `StoreRebuilds.createNewStore` for a

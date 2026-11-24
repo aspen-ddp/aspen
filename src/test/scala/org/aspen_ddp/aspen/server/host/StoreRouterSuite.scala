@@ -132,9 +132,10 @@ object StoreRouterSuite:
       completionHandler()
     def deleteAppliedStub(storeId: StoreId, txid: TransactionId): Unit = ()
 
-  /** A DeviceIo whose management lane is held: submitted jobs wait unrun, their kinds in `held`, until `release`, which
-   *  runs them on the device's own lane in submission order. Everything else is the wrapped DeviceIo's. */
-  private class HoldableDeviceIo(under: DeviceIo) extends DeviceIo:
+  /** A DeviceIo whose management lane is held: submitted jobs of the kinds `holds` names wait unrun, their kinds in
+   *  `held`, until `release`, which runs them on the device's own lane in submission order. Everything else is the
+   *  wrapped DeviceIo's. */
+  private class HoldableDeviceIo(under: DeviceIo, holds: JobKind => Boolean = _ => true) extends DeviceIo:
     private val lock = new Object
     private var holding = true
     private var parked = Vector.empty[() => Unit]
@@ -170,7 +171,7 @@ object StoreRouterSuite:
       val promise = Promise[T]()
       def run(): Unit = promise.completeWith(under.submit(kind, store)(job).future)
       lock.synchronized:
-        if holding then
+        if holding && holds(kind) then
           parked :+= (() => run())
           kinds.put(kind)
         else
@@ -208,6 +209,7 @@ object StoreRouterSuite:
       case e: Host.ShutdownStore => ctx.loader.handleClose(e)
       case e: Host.UnloadFailedStore => ctx.loader.handleUnloadFailed(e)
       case e: Host.SaveFileRemovalFailed => ctx.loader.handleSaveFileRemovalFailed(e)
+      case e: Host.DeviceJobDone => e.apply()
       case _ => ()
 
     if ready then
@@ -219,11 +221,18 @@ object StoreRouterSuite:
       ctx.post(Host.LoadStore(deviceId, backend, None, p))
       p.future
 
-    /** Returns once every control task posted before it has run. */
+    /** Returns once every control task posted before it has run, and the outcome of every management job those
+     *  tasks submitted to the device's lane (a LoadStore's inputs read, StoreLoader.handleLoad) has been applied: a
+     *  barrier job queued behind them on that lane, then the control tasks they posted. */
     def awaitControl(): Unit =
-      val done = new CountDownLatch(1)
-      threading.controlEvents.execute(() => done.countDown())
-      assert(done.await(Bound, TimeUnit.SECONDS))
+      def control(): Unit =
+        val done = new CountDownLatch(1)
+        threading.controlEvents.execute(() => done.countDown())
+        assert(done.await(Bound, TimeUnit.SECONDS))
+      control()
+      val io = onControl(ctx.devices.devices.get(deviceId).map(_.io).getOrElse(ctx.deviceIos.hostRoot))
+      Await.result(io.submit(JobKind.Other("test barrier"), None)(()).future, Duration(Bound, SECONDS))
+      control()
 
     /** Runs `f` on the control thread and returns its result. */
     def onControl[T](f: => T): T =
@@ -466,7 +475,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
     val txid = TransactionId(new UUID(15, 31))
     withRouter(emptyCrl): fx =>
       var holdable: Option[HoldableDeviceIo] = None
-      fx.addDevice(s0, io => { val h = new HoldableDeviceIo(io); holdable = Some(h); h })
+      fx.addDevice(s0, io => { val h = new HoldableDeviceIo(io, _ == JobKind.SaveFile); holdable = Some(h); h })
       val io = holdable.get
       val backend = bootstrappedBackend(s0)
       CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(List(voteState(s0, txid))), backend.crlSaveFile)
@@ -491,7 +500,7 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
     val crl = emptyCrl.asInstanceOf[GatedCrl]
     withRouter(crl): fx =>
       var holdable: Option[HoldableDeviceIo] = None
-      val sds = fx.addDevice(s0, io => { val h = new HoldableDeviceIo(io); holdable = Some(h); h })
+      val sds = fx.addDevice(s0, io => { val h = new HoldableDeviceIo(io, _ == JobKind.SaveFile); holdable = Some(h); h })
       val io = holdable.get
       val backend = bootstrappedBackend(s0)
       CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(List(voteState(s0, txid))), backend.crlSaveFile)

@@ -734,6 +734,25 @@ trait ControlFixture:
       batch.foreach(_.run())
       batch = ls.removeQueued(isDiscovery)
 
+  /** Runs the queued store-load reads (StoreLoader: a load's config read, `ReadConfig`, and a LoadStore's inputs,
+   *  `LoadInputs`) and their results, including what those queue of the same, ahead of and leaving queued everything
+   *  else (backend opens, LoadStores, closes): what a load once did inline in the call that asked for it. A held
+   *  path's jobs stay held */
+  protected def runLoadReads(host: Host): Unit =
+    val ls = lockstep(host)
+    val kinds = Set[JobKind](JobKind.ReadConfig, JobKind.LoadInputs)
+    val results = Set(StoreLoader.ConfigReadJob, StoreLoader.LoadInputsJob)
+    def isLoadRead(task: Runnable): Boolean = task match
+      case t: LockstepThreading.DeviceTask => kinds.contains(t.kind)
+      case t: Host.EventTask => t.event match
+        case e: Host.DeviceJobDone => results.contains(e.what)
+        case _ => false
+      case _ => false
+    var batch = ls.removeQueued(isLoadRead)
+    while batch.nonEmpty do
+      batch.foreach(_.run())
+      batch = ls.removeQueued(isLoadRead)
+
   /** The kinds of the management jobs held on `path`, in submission order. */
   protected def heldJobs(host: Host, path: os.Path): List[JobKind] = lockstep(host).held(path)
 

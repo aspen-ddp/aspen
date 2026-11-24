@@ -117,10 +117,11 @@ object Host:
   /** A backend open (`create = false`, from tryLoadStore) or create (createNewStore) started by StoreLoader.startOpen
    *  has ended. `previous` is the store's out-of-space wait before the open, for the backoff; `created` is completed
    *  for a create once its store is loaded, or failed; `onServed` is tryLoadStore's, run only if the store is served.
-   */
+   *  `leftNothing`: a failed create left nothing at `storePath` (the open job's stat of it, LoadDisk.existence) */
   private[server] case class BackendOpened(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                                 create: Boolean, previous: Option[LoadRetry], result: Try[Backend],
-                                created: Option[Promise[Unit]], onServed: Option[() => Unit]) extends Event
+                                created: Option[Promise[Unit]], onServed: Option[() => Unit],
+                                leftNothing: Boolean = false) extends Event
   private[server] case class InitializeTaskExecutor() extends Event
   /** Posted once the startup device scan has decided every path it listed (DeviceDiscovery.startupScan): each device
    *  it loads attached, so its stores are silent until served. From then on the router answers messages for stores not

@@ -417,14 +417,19 @@ final class HostCopies(ctx: DeviceControl) extends Logging:
         case CopyRecord(storeId, _, _, _, Activity.AwaitingRetry(r)) => storeId -> r
 
   /** The router installed `storeId`, loaded from device `id` at `storePath` (StoreRouter.install): its record
-   *  (`known`) is Served */
+   *  (`known`) is Served. A copy busy with a disk job (DiskJob) keeps its busy mark, Served beneath it: an install over
+   *  it is a load path's bug, recorded as a violation, and the job's end restores Served */
   def installed(id: StorageDeviceId, storeId: StoreId, storePath: os.Path): Unit =
     fact("install"):
       known("install", id, storeId, storePath)
       // Served -> Served: a reload over the served store (StoreRouter.install replacing an entry)
       device(id).foreach: copies =>
-        if copies.copies.contains(storeId) then
-          activityFact("install", copies, storeId, Activity.Served)
+        copies.copies.get(storeId).map(_.activity).foreach:
+          case Activity.DiskJob(kind, _) =>
+            violation("install", s"store $storeId installed on device $id while its copy is busy with a $kind job")
+            copies.applyActivity(storeId, Activity.DiskJob(kind, Activity.Served)): Unit
+          case _ =>
+            activityFact("install", copies, storeId, Activity.Served)
 
   /** A LoadStore of `storeId` onto device `id`, its backend at `storePath`, is handled (StoreLoader.handleLoad): its
    *  copy has a record before the load's outcome, whatever it is (see `known`) */

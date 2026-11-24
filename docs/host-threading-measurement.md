@@ -228,3 +228,20 @@ only when it is clear of both.
 - `--device-read-bound`: unchanged, 4096 (not varied: fio's depth of 8 cannot approach it).
 - RocksDB background jobs stay 2 per database; rebuild slots stay per destination device (`maxConcurrentRebuilds`
   each). Not exercised by these jobs.
+
+### RocksDB latency follow-up (2026-11-24)
+
+- The smoke randrw job is fsync-bound. By Little's law it has 0.56 operations outstanding before and 0.84-1.44 after.
+  Its per-op completion latency rise comes from fsync overlap, not from a higher per-op cost.
+- The iodepth-1 read cost (37 us before against 92-111 us after) was vdisk-server's full piece scan of a fragmented
+  clean cache, present on both trees. Commits `dda89905` and `6e18b13d` fixed it: both trees now read at 35-42 us
+  (HEAD 34.7-39.2, baseline 39.3-42.2, p99 91-114).
+- The no-fsync randrw gap is a commit-rate effect. More data threads let the host commit faster, so vdisk sends more,
+  smaller transactions, each costing the host a fixed ~380M instructions. On this co-located machine that extra host
+  CPU starves vdisk-server. Read IOPS on runs 2-3 after the vdisk fix: baseline 9954-10773; HEAD at 4 threads
+  10445-10571, 8 threads 9278-9376, 12 threads 7453-8564.
+- The tables above were taken before the vdisk fix, which sped the baseline's randrw by about 45%.
+- The TCMU 30 s SYNCHRONIZE CACHE timeout (ext4 goes read-only) is pre-existing and seen on both trees. Avoid it by
+  laying out small files one at a time.
+- The default stays max(4, CPUs/2); the user decided this on 2026-11-24. Remedies for the remaining gap are in
+  `Backlog.txt` (bigger vdisk transactions, RocksDB ranged writes).

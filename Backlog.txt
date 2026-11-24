@@ -134,6 +134,16 @@ vdisk (native TCMU frontend) follow-ups:
 vdisk: before the ALUA failover work, verify that readRanges always returns the newest committed revision of an
 object (not a stale one from lagging stores). "Flushed data survives a takeover" depends on it.
 
+vdisk: make transactions bigger under random writes, e.g. a minimum interval between commits of one block. Today
+each transaction costs the host a fixed ~380M instructions however few 4 KiB writes it carries, so a faster host
+commits more, smaller transactions and, on a co-located machine, starves vdisk-server (RocksDB randrw without fsync
+is 15-25% slower at 12 device data threads). Remaining vdisk full passes to remove too: `st.dirty.snapshot` /
+`SegmentSnapshot.overlay` on every read, and the BlockCommitter `clean.filter(... writes.exists ...)` on every commit
+(O(pieces x writes)).
+
+RocksDB backend: stop rewriting the whole slice (~500 KB per store) on every ranged write (store deltas, or split
+slices into chunks).
+
 vdisk: Add ALUA failover support
 
 vdisk: Rename "vdisk" to "amoeba_disk"

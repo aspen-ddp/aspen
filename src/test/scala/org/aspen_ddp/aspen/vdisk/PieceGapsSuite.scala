@@ -51,6 +51,21 @@ class PieceGapsSuite extends AnyFunSuite with Matchers:
 
   test("assemble of a block held as many small pieces looks only at the pieces under the segment"):
     val n = 1280
-    val ps = Counting(pieces((0 until n).map(i => (i * 4096, 4096))*))
-    VirtualDisk.assemble(BlockSegment(0, 700 * 4096, 4096, 0), ps, Nil, SegmentSnapshot(Vector.empty, 0))
+    val ps = Counting(Vector.tabulate(n)(i => (i * 4096, Array.fill[Byte](4096)(if i == 700 then 7 else 0))))
+    val out = VirtualDisk.assemble(BlockSegment(0, 700 * 4096, 4096, 0), ps, Nil, SegmentSnapshot(Vector.empty, 0))
+    out.length should be(4096)
+    out.forall(_ == 7) should be(true)
     ps.touched should be < 40
+
+  test("gaps edge cases: empty range, range at offset 0, earlier piece ending at from, range ending at block end"):
+    val ps = pieces((0, 10), (10, 10), (30, 10))
+    VirtualDisk.gaps(15, 15, ps) should be(Nil)
+    VirtualDisk.covers(ps, 25, 25) should be(true)
+    VirtualDisk.gaps(0, 0, ps) should be(Nil)
+    VirtualDisk.gaps(0, 10, ps) should be(Nil)
+    VirtualDisk.gaps(0, 25, ps) should be(List((20, 25)))
+    VirtualDisk.gaps(10, 20, ps) should be(Nil)
+    VirtualDisk.gaps(15, 35, ps) should be(List((20, 30)))
+    VirtualDisk.gaps(20, 40, ps) should be(List((20, 30)))
+    VirtualDisk.gaps(35, 40, ps) should be(Nil)
+    VirtualDisk.gaps(20, 45, ps) should be(List((20, 30), (40, 45)))

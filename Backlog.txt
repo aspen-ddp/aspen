@@ -18,6 +18,24 @@ Operator alerts
   - Open points: where the service runs (a Durable Task, or a designated host), how sinks are configured in
     metadata, how the operator acknowledges and clears alerts, and a cmdline view (`show-alerts`).
 
+Slow-device detection (follow-up to Todo.txt "Hung devices" project 2, which detects hangs only; 2026-11-24)
+  - Goal: notice a device that still completes I/O but has become slow enough to matter (ailing hardware: retries,
+    remapped sectors, a failing controller), and report it in the device's health state alongside a hang.
+  - Why it is separate: hang detection needs only the age of the oldest in-flight operation. Slowness needs latency,
+    and a slow-but-legitimate operation must not raise a false alarm.
+  - What it needs that the hang work does not build:
+    - Per-operation kinds on backend work. `DeviceIoObserver` records data- and serial-pool tasks only as `data` or
+      `serial`, with no store or size, so a 1 ms read, a 500 ms fsync and an FSIF compaction truncate look alike.
+      Backends would tag their operations (read, write, force, truncate; store; bytes), or the device would time a
+      narrow class of operations itself (e.g. every fsync, the device CRL's writes).
+    - A per-device latency history (e.g. a decaying histogram per kind), not just counters.
+    - Context from the backends that explains legitimate slowness, so the judge can discount it: RocksDB compaction
+      and write stalls (its flush and compaction run on RocksDB's own threads, invisible to the observer), FSIF
+      journal and checkpoint work. `BackendTiming` (process-wide today) may seed a per-device version.
+    - Thresholds: start conservative (relative to the device's own history, not an absolute number, since NVMe and
+      spinning disks differ by orders of magnitude). False positives are the main risk.
+  - Same rule as hangs: detection reports and alerts; it takes no action (no fail-stop, no migration).
+
 Mixed-Version Support / Upgrade Process
   - Need a mechanism for handling rolling updates that can take hours or even days to complete. During that
     time we either need to block the creation/use of new features that old deployments do not support or,

@@ -625,7 +625,7 @@ of a site that runs off the control thread.
 | `StoreCopies.moveToPendingDelete` | `host/StoreCopies.scala:108-122` (move `:116`), from retire's `transform` `:94-105` | Lost → Retired (`pending-delete/<storeDir>-<uuid>`) (T11 step 4) | CT |
 | `StoreCopies.retire` callers | Deleted Stores `host/DeviceReconciler.scala:448`; discard `host/StoreRebuilds.scala:855`; earlier tenancy `host/StoreTransfers.scala:566` | — | CT |
 | `StoreCopies.release` → `delete` | `host/StoreCopies.scala:151`, `:168` → `:209-223` (move into `deleting/` `:217`, then remove) | Retired → gone (T12) | CT |
-| `LocalDevices.discardStoreDirectory` → `StoreCopies.delete` | `host/LocalDevices.scala:61-78`. Callers: `RebuildOutcome.Discard` `host/StoreRebuilds.scala:343`; `discardArrivedTransferIn` `host/StoreTransfers.scala:136-139` ← `:325` (SourceRestored/Aborted) | Rebuilt → gone (**not in the table**); Arrived → gone (T13) | CT |
+| `LocalDevices.discardStoreDirectory` → `CopyDisk.delete` | `host/LocalDevices.scala:61-78`. Callers: `RebuildOutcome.Discard` `host/StoreRebuilds.scala:343`; `discardArrivedTransferIn` `host/StoreTransfers.scala:136-139` ← `:325` (SourceRestored/Aborted) | Rebuilt → gone (**not in the table**); Arrived → gone (T13) | CT |
 | `startIn`: unusable or stale arrived copy | `host/StoreTransfers.scala:400` | Arrived (wrong tid, invalid save) or Lost (RR+TI) → gone | CT |
 
 **Scratch only (no copy phase; listed for Task 4 completeness)**

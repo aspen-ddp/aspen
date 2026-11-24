@@ -439,7 +439,7 @@ episode as `phase-param`. AdoptOffline moves Rebuilt to `parked/` (T4). `Phase.P
   `isRebuiltFor(phase: Phase, episode: Option[UUID]): Boolean`. `RebuildCompleteMarkerFile` is deleted.
 - Modify: `StoreRebuilds` (`keepRebuiltStoreOffline` → one move to Parked; `clearRebuildCompleteMarker` →
   `bringRebuiltLive(sds, storeId): MoveResult`, a move Rebuilt → Live; `RebuildOutcome.Discard` deletes the Rebuilt
-  copy (T13, through `StoreCopies.delete` of its path); `retireForeignCopy` keys off the record's phase;
+  copy (T13, through `CopyDisk.delete` of its path); `retireForeignCopy` keys off the record's phase;
   `finishPlacing` exemption reads the `rebuilt/` copy's `phase-param`), `DeviceReconciler.completeRebuilds` (selects
   Rebuilt records), the Parked → Live paths (Abandoned Transfers Out pass and `bringIntoService` for Parked, T5),
   `DeviceDiscovery.holdsOwnState` (Rebuilt by location), `StoreTransfers.recordTransferIn` (no RC removal: a

@@ -714,7 +714,9 @@
   - This approach is preferred over sending messages directly to the host, since those messages could be lost
   - An example is seeing that a DataStore is marked for transfer in or out. When seen, the host will start the process
 - Each storage device has its own CRL (`<device>/crl`, opened when the device loads; `server/crl/CLAUDE.md`) shared by
-  its stores. An unloaded device is not loaded again until its CRL has shut down (`LocalDevices.closingCrls`). A
+  its stores. An unloaded device is not loaded again until its CRL has shut down (`LocalDevices.closingCrls`).
+  The shutdown runs on `DeviceShutdown.CrlShutdownEc`, a cached pool shared by all devices but isolating each: it
+  queues nothing and starts a thread whenever none is idle, so a hung device's shutdown holds only its own thread. A
   CRL that fails (`CrashRecoveryLog.failed`) takes its device out of service (`DeviceShutdown.crlFailed`): the
   directory is disowned, the stores closed and gossiped offline, the device unloaded, and nothing written. The device
   stays unloaded until the host restarts: it is not reloaded, which could loop into a lost-CRL declaration

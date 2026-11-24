@@ -64,7 +64,7 @@ System-level protection against correlated "lost store" declarations
     - Instead, keep it for longer (as `<storage-device>/suspected-loss/<store-dir>-<uuid>`, or by holding the
       pending-delete release). Record why, when, which software version, and which check fired.
     - A rebuild can still proceed into a fresh directory, so availability doesn't depend on the decision.
-    - A device CRL that fails to open is the same kind of local detection: `DeviceDiscovery.openDeviceCrl` moves it
+    - A device CRL that fails to open is the same kind of local detection: `DeviceCrlDisk.open` moves it
       aside as `<device>/crl.lost-<uuid>` (up to num-streams x file size, 900 MB by default) and marks every store on
       the device rebuild-required. Those directories are kept forever today, deliberately: they are suspected-loss
       content, held for the system-level check below, never deleted on local evidence alone.
@@ -104,7 +104,7 @@ System-level protection against correlated "lost store" declarations
       anything but ObjectNotFound (`Frontend.failStop`). A bug in the requirement checker or applier would trip this
       on every replica of an object at once;
     - a failure during a store's close (`StoreRebuilds.failedOnClose`), an unusable `crl_save.log`
-      (`crlSaveFileLost`), a lost or unopenable device CRL (`DeviceDiscovery.openDeviceCrl`).
+      (`crlSaveFileLost`), a lost or unopenable device CRL (`DeviceCrlDisk.open`).
     - Out of space must never be one of them: it freezes writes and keeps serving reads (see "Full storage devices").
   - Related: a rebuild that can't find enough healthy peers must fail loudly rather than rebuild from what's left.
   - Track suspected-loss space use per device, including `crl.lost-*` directories, since retained copies compete
@@ -160,7 +160,7 @@ Off-device CRLs
     (docs/superpowers/specs/2026-11-08-unclean-device-adoption-design.md), so a drive pulled before that rename (or
     without a shutdown) is refused until it returns to its host. The device directory must therefore never carry a
     stale `crl` from an earlier move: delete it (durably) once the CRL lives elsewhere again.
-  - The lost-CRL rule in DeviceDiscovery.openDeviceCrl (stores but no `<device>/crl`) must check the configured
+  - The lost-CRL rule in DeviceCrlDisk.open (stores but no `<device>/crl`) must check the configured
     location instead.
   - An adopting host whose own config puts the device's CRL elsewhere may move it off the device: copy, force, then
     switch atomically, never leaving two live copies that could both be opened.

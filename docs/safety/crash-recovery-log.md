@@ -242,7 +242,7 @@ data. A save that changes the update count makes SimpleCRL write the updates aga
    served nowhere since it was written), and the device CRL can hold only a copy of part of it (10.11, or a crashed
    earlier load) or entries an earlier tenancy of the store left on this device, whose copy left its path without a
    retire (removed by hand) before the safety net (`dropLeftoverCrlState`) could drop them. A rebuilt copy carries such
-   a file too, empty, written by `RebuildingStore.writeEmptyCrlState`, from `finish` (rebuild-process.md 5.6), so its first load drops what an
+   a file too, empty, written by `RebuildDisk.writeEmptyCrlState`, from `finish` (rebuild-process.md 5.6), so its first load drops what an
    earlier copy left. Recovered as the store's own, such entries would rejoin transactions it has since forgotten, and a
    stale commit vote would find its own UnackedCommits entry (a transfer keeps the incarnation) and apply again. The
    drop first is why neither can happen.

@@ -279,7 +279,7 @@ The premises other subsystems take from this:
   a store). So do the opens they lead to: the CRL open's own tests (a failed stat throws, transient to
   `DeviceCrlDisk.open`, and no stream file is created under `mustExist`), the backend opens and FSIF recovery (an
   `IOException` the load retries, never `BackendStateLost`), and the rebuilt store's `acceptor-since` and
-  `inherited-votes` reads (the load held back as for the save file). `StoreCopies.delete` reports gone only a copy
+  `inherited-votes` reads (the load held back as for the save file). `CopyDisk.delete` reports gone only a copy
   known absent. No existence test under `server/` uses os-lib's `os.exists`/`os.isDir`/`os.isFile`, which answer
   absent on a failed stat (`FileStatUsageSuite` fails on one). Where a false absence would lead the host to act, a
   failed stat holds back or throws: `DeviceDiscovery.tryLoadDevice` leaves the device unloaded for the next scan, so a
@@ -320,7 +320,7 @@ The premises other subsystems take from this:
   flip settles after the store came to be served from another device here, leaves the store served there; and a
   removed copy's record goes alone, so the store stays silent while another device here holds a copy of it or Rebuild
   work silences it. A rebuilt copy carries an empty
-  `crl_save.log` (`RebuildingStore.writeEmptyCrlState`), so its first load (by the flip, the Completed Rebuilds case,
+  `crl_save.log` (`RebuildDisk.writeEmptyCrlState`), so its first load (by the flip, the Completed Rebuilds case,
   a restart, a reinstatement or an adoption) drops whatever device-CRL entries an earlier copy left under its id
   (`StoreLoader.awaitCrlLoad`), and a transfer out of the unloaded copy ships the file and drops them
   (`StoreTransfersOut.extractUnloaded`). Such a transfer (an `Unconfirmed` copy whose entry went TransferringOut) ships the copy

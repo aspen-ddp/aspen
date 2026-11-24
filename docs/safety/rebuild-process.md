@@ -226,9 +226,10 @@ design; automating it is in `Backlog.txt` ("Automate re-placement of a rebuild w
 
 `StoreRebuilds.startRebuild` first silences the store (section 6.2, it queues its Rebuild work; the registry may refuse it while other work holds the copy), then proceeds only if all hold, in order: no transfer out is still closing (`StoreTransfersOut.rebuildWaitsForClose`) or sending (`isTransferringOut`, re-checked shortly) the store, whose discard would move the directory being shipped; the
 store is not already rebuilding here (a running handle counts); running rebuilds plus discards (Rebuild work `DiscardingLost`) `< maxConcurrentRebuilds`
-(default 2, `Host`); the device is not shutting down; `retireForeignCopy` clears the path (T12; it waits, returning
+on the destination device (default 2, `Host`; slots are per destination device, `StoreRebuilds.slotsTaken`, so a
+host runs up to devices x 2); the device is not shutting down; `retireForeignCopy` clears the path (T12; it waits, returning
 false, while the store's backend is opening, `StoreLoader.isOpening`, after fail-stopping a copy served from the path,
-and when a stat or the re-read of the store's copies fails); and `discardLostStore` reports the path clear (a copy whose move to `lost/` failed, or whose last move is not yet forced, waits too). A served copy of the store at the path is thus left serving while the host's slots are full. The
+and when a stat or the re-read of the store's copies fails); and `discardLostStore` reports the path clear (a copy whose move to `lost/` failed, or whose last move is not yet forced, waits too). A served copy of the store at the path is thus left serving while the device's slots are full. The
 order of the Rebuilding case is the pool index, and a store inside its backoff (5.7) is skipped, so stores whose passes keep failing cannot retake the slots at each check from those queued behind them.
 For a copy in `lost/`, `discardLostStore` retires the copy (`StoreCopies.retire`, the one path by
 which any store copy that is no longer its owner's leaves its phase directory; every retire goes through Lost):
@@ -328,7 +329,7 @@ ErrorTree entries there, so the earlier episode's copy of every object is stale 
 * A per-object read failure is recorded in `failed` and the checkpoint advances past it. A read that gets no answer
   (its pool below `r` with the missing stores silent, an allocation a commit voter parks, `Frontend.parkAllocationRead`)
   fails with `ReadTimeout` after `ObjectReadTimeout` and stops its driver: it is one such failure, so it holds the
-  walk, the host's rebuild slot and a cancel for at most that long. The same bound covers the
+  walk, the device's rebuild slot and a cancel for at most that long. The same bound covers the
   sweep's reads (5.3: the object stays pending for the next round) and the retries (5.4). More than
   `RebuildState.MaxFailedObjects` (10,000) failures latch an abort; a resumed pass keeps its checkpoint's failed list,
   counted once per object, so an earlier pass's failures count toward it. `MaxConsecutiveReadTimeouts` (100) read
@@ -435,7 +436,7 @@ acceptance: a pool below its read threshold is not papered over.
 pass), write `acceptor-since` (`writeAcceptorSince`: now plus `AcceptorSinceMargin`, 10 s), write `inherited-votes`
 (`writeInheritedVotes`: the pass start plus the horizon plus twice the margin; section 6.4, inherited votes), write a
 fresh `incarnation` (`StoreIncarnationFile.writeFresh`), write an empty `crl_save.log`
-(`RebuildingStore.writeEmptyCrlState`), write the episode durably as `phase-param.rebuilt` (the last write), remove the
+(`RebuildDisk.writeEmptyCrlState`), write the episode durably as `phase-param.rebuilt` (the last write), remove the
 checkpoint and temp file, and rename staging into `<device>/rebuilt/<copy>` under a fresh copy id (`DurableFiles.move`:
 both directories forced; the target name is fresh). A rename that lands but cannot be forced (`DurableFiles.MoveNotForced`) still completes the pass (`placedUnforced`): the host records the copy unsynced and flips it only once a device check has forced it, restarting the rebuild, which takes the copy for done (never a second rebuild). Every file is written durably in staging before the move, so the
 copy carries them from the instant it appears in `rebuilt/`. The save file is the rebuilt store's whole transaction state, which is empty, so its
@@ -468,7 +469,7 @@ since. It answers `Unconfirmed` instead.
 Before the flip, the completion lists the store's copies on the device (`CopyLayout.copiesOf`). A copy other than the
 rebuilt one there came back while the rebuild ran (a mount or restore finishing late, after T12's retire): its
 device-CRL entries must be saved into it before the rebuilt copy's first load drops them, and the device holds one
-copy of a store. The rebuilt copy, never served, is discarded unflipped (`LocalDevices.discardStoreDirectory`), the
+copy of a store. The rebuilt copy, never served, is discarded unflipped (`StoreCopies.discard`), the
 work queued again and the device re-checked, and the next pass's T12 retires the returned copy with its entries
 before the store is rebuilt again. A listing that fails flips nothing yet, as for an unsynced copy: the re-check's
 pass takes the copy for done (5.1) and lists again, as it does after a discard that failed. A copy that appears after the
@@ -485,7 +486,7 @@ listing, before the flip commits, is not seen; the listing narrows the window fo
   pending-delete copy elsewhere is released by the Active entry.
 * `AdoptOffline`: `keepRebuiltStoreOffline` moves the copy from `rebuilt/` to `parked/` (T4, one move; the empty
   `crl_save.log` `finish` wrote stays in it); an adopter classes it Clean and a restart's reinstatement loads it.
-* `Discard`: deletes the final directory (`LocalDevices.discardStoreDirectory`).
+* `Discard`: deletes the final directory (`StoreCopies.discard`).
 * `NotOwned`: leaves the copy for the new owner, whose rebuild finds the Rebuilt copy and only flips.
 * `Unconfirmed`: leaves the copy at the final path, offline and unpromoted (its Rebuilt record: an offline copy, as a
   restart's load leaves it), for the pass
@@ -725,7 +726,7 @@ is never repaired (5.2's locked copies are marked for this reason).
   timeout. The walk is sequential, so a pool whose objects all time out aborts after `MaxConsecutiveReadTimeouts`
   (100 timeouts, about 50 minutes) and retries with backoff; a pool where only some objects time out goes on, one
   timeout per such object. Fewer than `w - t + 1` answering peers fail the pass at its peer query after
-  `PeerQueryTimeout` (60 s), into the backoff re-check, so neither case holds a host rebuild slot for long. The allocation-tree reads (the walk's node reads, the retries' `allocationTree.get`), the pool lookups and
+  `PeerQueryTimeout` (60 s), into the backoff re-check, so neither case holds a rebuild slot for long. The allocation-tree reads (the walk's node reads, the retries' `allocationTree.get`), the pool lookups and
   the ErrorTree marks are not timed: they use the metadata pool, and a metadata pool short of `r` stalls the rebuild
   (FS14).
 * An amnesiac rebuilt store answers `ObjectNotFound` for an allocation its old incarnation voted and its peers have not
@@ -734,8 +735,9 @@ is never repaired (5.2's locked copies are marked for this reason).
   (repair, this rebuild's sweep, the allocation and split finalizers) drops or skips a restorable object for it.
 * Two stores of one pool rebuilding at once each read the other as missing. With Replication(3,2) neither can read
   anything (`r = 2` of one live store): their queries wait (each needs both peers) until a store with data returns.
-  With Reed-Solomon, both complete while `w - 2 >= r`. The concurrency bound is per host (`maxConcurrentRebuilds`),
-  not per pool.
+  With Reed-Solomon, both complete while `w - 2 >= r`. The concurrency bound is per destination device
+  (`maxConcurrentRebuilds` each, `StoreRebuilds.slotsTaken`), so a host runs up to devices x `maxConcurrentRebuilds`
+  rebuilds and discards at once; it is not per pool or per host.
 
 ---
 

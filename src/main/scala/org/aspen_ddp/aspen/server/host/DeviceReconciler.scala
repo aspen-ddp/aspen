@@ -188,7 +188,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     if remote.isFailed || remote.hostId != ctx.hostId || shuttingDown then
       // The device-level branches need no copy synced, so they never wait for the resync: a device whose lane hangs
       // (a failing directory sync is what leaves a copy unsynced) is still retired, relinquished or shut down. The
-      // resync is still asked for, and copies whose move to lost/ failed are moved (StoreRebuilds.moveToLost)
+      // resync is still asked for, and copies whose move to lost/ failed are moved (StoreRebuilds.moveToLostOnLane)
       try
         ctx.moves.resync(local)(())
         ctx.rebuilds.retryPendingLost(local, None)
@@ -198,7 +198,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // Copies whose move was not durable (CopyMoves) are forced again first, a job on the device's lane, so the
       // store decisions see them synced: they run once its result is applied, the device's check held until then (a
       // hung device's check waits with it, and its later checks are deferred behind it). Then copies whose move to
-      // lost/ failed are moved (StoreRebuilds.moveToLost)
+      // lost/ failed are moved (StoreRebuilds.moveToLostOnLane)
       ctx.moves.resync(local):
         var handedOff = false
         try
@@ -281,7 +281,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // A store a cancelled shutdown closed, or whose load an unsynced move held back, is loaded by its decision
       // (CopyDecision.Load)
       reconcileStores(local, remote, disk)
-      ctx.rebuilds.sweepUnlistedStaging(local, remote)
+      ctx.rebuilds.sweepUnlistedStaging(local, remote, disk)
       // Pending deletes: retired copies whose store is Active on its owner device, and the remains of interrupted
       // deletes
       ctx.copies.release(local, remote)
@@ -410,8 +410,10 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       case BringRebuiltLive =>
         logger.warn(s"Store $storeId on device $deviceId is Active but its copy is still in rebuilt/. " +
                     s"Completing the rebuild and loading the store")
-        if ctx.rebuilds.bringRebuiltLive(local, storeId) == MoveResult.Durable then
-          ctx.copyRegistry.pathOf(local, storeId).foreach(ctx.tryLoadStore(local, _, None))
+        // A lane job: the load follows a durable move, on a device still the loaded one (moveOnLane's recheck)
+        ctx.rebuilds.bringRebuiltLiveOnLane(local, storeId): moved =>
+          if moved == MoveResult.Durable && ctx.devices.isLoaded(local) then
+            ctx.copyRegistry.pathOf(local, storeId).foreach(ctx.tryLoadStore(local, _, None))
       case Load =>
         // Its online gossip goes with the load, as a reinstated transfer out's does
         logger.info(s"Loading store $storeId on device $deviceId: its copy is Live, synced and served nowhere")

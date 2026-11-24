@@ -44,22 +44,25 @@
   rename that landed but was not forced (`DurableFiles.MoveNotForced`; the sync is the `syncDirectory` constructor
   seam) completes all the same, reported by `placedUnforced`: the host records the copy unsynced and flips it only once
   a device check has forced it, by restarting the rebuild, which takes the copy for done (never a second rebuild). A
-  copy in `rebuilt/` is a finished rebuild awaiting its flip: `start()`, run by the constructor on the control thread,
-  reads its `existingCopy: Option[(Phase, os.Path)]` (`StoreRebuildFactory.createRebuild`'s, built by
+  copy in `rebuilt/` is a finished rebuild awaiting its flip: `start()`, run by the constructor on the control thread
+  (no disk work there: the checkpoint's load and any staging cleanup are its own `Staging` jobs, so `StoreRebuilds`
+  constructs it directly), reads its `existingCopy: Option[(Phase, os.Path)]` (`StoreRebuildFactory.createRebuild`'s, built by
   `StoreRebuilds.startRebuild` from the store's copy record on the device; nothing lists the device) and takes a copy
   for done only when it is Rebuilt for its own episode (`RebuildingStore.isRebuiltFor`), failing on any other copy of
   the store outside `pending-delete/`. Tests build it with `CopyFixtures.existingCopy`. `StoreLoader.tryLoadStore`
   leaves a Rebuilt copy offline, and `StoreRebuilds` moves it once the flip commits: `Adopt` to Live before the load
-  (`bringRebuiltLive`, T3), `AdoptOffline` to `parked/` in one move (`keepRebuiltStoreOffline`, T4), `Discard` deletes
+  (`bringRebuiltLiveOnLane`, T3), `AdoptOffline` to `parked/` in one move (`keepRebuiltStoreOffline`, T4), each a
+  `Move` job on the device's lane whose applied result releases the rebuild's slot, `Discard` deletes
   it rename-first (T13). The reconcile's Completed Rebuilds case moves an offline Rebuilt copy of an Active entry Live
   after a crash. A copy of a Rebuilding store that is not this episode's Rebuilt copy (a copy finished for an earlier
   episode included), told by its record's phase, is retired as a lost copy (`StoreRebuilds.retireForeignCopy`: moved to
   `lost/`, then retired into `pending-delete/`, rebuilt). Such a copy, or one already in `lost/`, may have served since
-  the first pass began, so the store's staging checkpoint is first removed durably (`dropStagingCheckpoint`) and the
-  next pass is a first pass: a resume would leave the walked objects' updates stale. The record is read again from the
+  the first pass began, so the store's staging checkpoint is first removed durably (`dropStagingCheckpoint`, a `RebuildBookkeeping` job on
+  the device's lane whose apply continues the start) and the next pass is a first pass: a resume would leave the
+  walked objects' updates stale. The record is read again from the
   disk first (`HostCopies.reread`), so a copy back since the device's load is retired with its device-CRL entries. One
-  back while the rebuild runs is found by its completion, which lists the store's copies before the flip and discards
-  the rebuilt copy unflipped, so the next pass retires the returned copy and rebuilds again (`host/CLAUDE.md`)
+  back while the rebuild runs is found by its completion, which lists the store's copies before the flip (a
+  `RebuildBookkeeping` job, its slot held until the outcome releases it) and discards the rebuilt copy unflipped, so the next pass retires the returned copy and rebuilds again (`host/CLAUDE.md`)
 - Pending allocations (rebuild-process 5.3): before each pass's walk, `queryPeers` asks the pool's other stores
   (`CurrentAllocationsRequest`) and waits, resending, for `width - writeThreshold + 1` answers, at most
   `peerQueryTimeout` (default `PeerQueryTimeout`, 60 s, noticed at the next resend): then the pass fails with

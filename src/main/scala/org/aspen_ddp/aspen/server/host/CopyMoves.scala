@@ -36,7 +36,7 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
   // Each unsynced move's copy, by its new path: the directories it still needs forced (its source's and target's)
   private var unforced: Map[os.Path, List[os.Path]] = Map()
 
-  // The copies whose move to Lost failed (StoreRebuilds.moveToLost), by device: held offline, never loaded, shipped
+  // The copies whose move to Lost failed (StoreRebuilds.moveToLostOnLane), by device: held offline, never loaded, shipped
   // or retired, until a device check moves them (retryPendingLost). In memory only: a crash forgets the hold, and the
   // copy then reloads from where it is, as after any crash (P5)
   private var lostPending: Map[StorageDeviceId, Set[StoreId]] = Map()
@@ -185,6 +185,30 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
       case MoveResult.Unsynced(_) => ctx.copyRegistry.unsynced(site, target)
       case _ => ()
     (result, target)
+
+  /** `moveUnattached` run as one `Move` job on `io`, the lane of the device the copy is on (CopyDisk.relocate), its
+   *  result and the copy's new path given to `andThen` on the control thread. Nothing is recorded but an Unsynced
+   *  result, held for the device's attach as moveUnattached holds one: a load of the device submitted after this job
+   *  runs behind it on the same lane, so its listing finds the copy where the move left it. A cancelled job is
+   *  NotMoved */
+  def moveUnattachedOnLane(site: String, io: DeviceIo, from: os.Path, storeId: StoreId, copyId: UUID, to: Phase)
+                          (andThen: (MoveResult, os.Path) => Unit): Unit =
+    val target = CopyLayout.path(from / os.up / os.up, storeId, copyId, to)
+    val sync = syncDirectory
+    val renameCopy = rename
+    val job = io.submit(JobKind.Move, Some(storeId))(CopyDisk.relocate(from, target, to, sync, renameCopy))
+    ctx.onControl(s"copy move ($site)", job): done =>
+      val result = done match
+        case scala.util.Success(m) => m
+        case scala.util.Failure(t) => MoveResult.NotMoved(t)
+      if done != scala.util.Failure(DeviceIo.Cancelled) then
+        logMove(site, from, target, result)
+      result match
+        case MoveResult.Unsynced(_) =>
+          heldUnforced(from, target)
+          ctx.copyRegistry.unsynced(site, target)
+        case _ => ()
+      andThen(result, target)
 
   /** The directories still to force of each unsynced move's copy on the device at `devicePath`, by the copy's path:
    *  what a lost device CRL's open (DeviceCrlDisk.open) forces with its lost/ copies, off the control thread */

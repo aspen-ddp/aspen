@@ -190,7 +190,9 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
   /** As pumpUntil, never draining `host`: a rebuild's copy is placed off the control thread before its completion's
    *  callback registers it, and a drain check in between would see a directory with no record */
   private def awaitRebuild(host: Host, deviceId: StorageDeviceId, storeId: StoreId): Future[Unit] =
-    pumpUntil(host, recorded(host).rebuildOutcomes.contains((deviceId, storeId)), drain = false)
+    // The flip's outcome, then its steps (an Adopt's move to Live is a lane job) through to the slot's release
+    pumpUntil(host, recorded(host).rebuildOutcomes.contains((deviceId, storeId)) &&
+      !host.control.rebuilds.hasRunningRebuild(storeId), drain = false)
 
   /** The registry agrees with the disk, no update threw, and no load had to learn a copy */
   private def consistent(host: Host): org.scalatest.Assertion =
@@ -403,10 +405,13 @@ class CopyRegistryWiringSuite extends IntegrationTestSuite with ControlFixture:
     val host = newHost(hostRoot, verifyCopyRegistry = true)
     host.testingOnlyHandleEvents()
     val local = loadedDevices(host)(deviceA)
-    host.control.rebuilds.moveToLost("test", local, sid(0)) should be(MoveResult.Durable)
-    consistent(host)
-    val lost = phases(host, deviceA)
+    val moved = scala.concurrent.Promise[MoveResult]()
+    host.control.rebuilds.moveToLostOnLane("test", local, sid(0))(moved.success(_): Unit)
     for
+      result <- settled(host, moved.future)
+      _ = result should be(MoveResult.Durable)
+      _ = consistent(host)
+      lost = phases(host, deviceA)
       retired <- settled(host, host.control.copies.retire(local, sid(1)))
     yield
       lost should be(Map(sid(0) -> Phase.Lost, sid(1) -> Phase.Live))

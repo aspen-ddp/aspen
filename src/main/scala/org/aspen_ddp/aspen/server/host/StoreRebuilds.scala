@@ -8,8 +8,8 @@ import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.RebuildOutcome
-import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, Host, StoreConfig}
-import org.aspen_ddp.aspen.server.rebuild.{RebuildDisk, RebuildingStore, StoreRebuild}
+import org.aspen_ddp.aspen.server.{Host, StoreConfig}
+import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild}
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
@@ -276,7 +276,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    */
   def startRebuild(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
                    acceptLoss: Boolean, handoff: Boolean = false,
-                   disk: Option[ReconcileDisk.ReconcileDiskInputs] = None): Unit =
+                   disk: Option[ReconcileDisk.ReconcileDiskInputs] = None,
+                   checkpointDropped: Boolean = false): Unit =
     val deviceId = local.storageDeviceId
     val held = StoreRebuilds.HeldRebuild(deviceId, episode, acceptLoss)
     // Host-wide by store id: a rebuild of the store runs (on any device), so nothing more starts for it. Its handle
@@ -315,9 +316,12 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     if shipping then
       logger.debug(s"Not rebuilding store $storeId on device $deviceId yet: a transfer out of it is still sending")
       ctx.reconciler.scheduleDeviceRecheck(deviceId)
+    // Nor while the store's staging checkpoint drop runs (retireForeignCopy): its apply continues the start
     if !closing && !refused && !shipping && !runs && !scheduledRebuildRetries.get(storeId).contains(held) &&
+       !stagingDrops.contains((deviceId, storeId)) &&
        slotsTaken(Option.when(handoff)((deviceId, storeId))) < ctx.maxConcurrentRebuilds &&
-       ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && retireForeignCopy(local, storeId, episode, disk) &&
+       ! ctx.shutdown.isShuttingDown(local.storageDeviceId) &&
+       retireForeignCopy(local, storeId, episode, acceptLoss, checkpointDropped, disk) &&
        discardLostStore(local, storeId, episode, held) then
       // The copy already there, as its record has it: the rebuild's start (on this thread, in its constructor) takes
       // this episode's Rebuilt copy for done and fails on any other
@@ -372,9 +376,11 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       // The store's metadata is settled (a later failure starts the backoff afresh): its slot is released, then
       // `recheck` runs
       def finishSettled(recheck: => Unit): Unit =
-        rebuildFailures -= storeId
-        release()
-        recheck
+        // Once: a lane job's apply settles, and a bug's throw after it must not release the slot twice
+        if !settled.isCompleted then
+          rebuildFailures -= storeId
+          release()
+          recheck
 
       // Guard-map leak defense: invoke `complete` in a try/catch that substitutes Future.failed(t)
       // on throw, so that either way a Future exists and onComplete below is registered. That
@@ -413,37 +419,42 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           // after the retire before this pass): its device-CRL entries must be saved into it before the rebuilt copy's
           // first load drops them, and the device holds one copy of a store (P2). The rebuilt copy, never served, is
           // discarded unflipped, and the next pass's retire (retireForeignCopy, which re-reads the disk) retires the
-          // returned copy with its entries before the store is rebuilt again. A listing that fails says nothing: the
-          // copy is not flipped yet, as an unsynced one is not
-          val others = Try(CopyLayout.copiesOf(local.devicePath, storeId).filter(_.copyId != copyId))
-          others.foreach: found =>
-            if found.nonEmpty then
-              logger.error(s"Rebuild of store $storeId on device ${local.storageDeviceId}: ${found.map(_.path)
-                .mkString(", ")} came back while it ran. Discarding the rebuilt copy, so that copy is retired with " +
-                "its CRL state and the store rebuilt again")
-              ctx.copies.discard(storeId, local.storageDeviceId,
-                "Another copy of the store came back while it was rebuilt"):
-                sds => ctx.copyRegistry.removed("rebuild finish beside a returned copy", sds, storeId)
-          if !others.toOption.exists(_.isEmpty) then
-            try
-              others.failed.foreach: t =>
-                logger.warn(s"Rebuild of store $storeId on device ${local.storageDeviceId}: its device's copies of " +
-                            s"the store cannot be listed. Not flipping it yet: $t")
-            finally
-              release()
-              ctx.reconciler.scheduleDeviceRecheck(deviceId)
-          else if registry.isUnsynced(local, storeId) then
-            // Not flipped over a copy a crash could still undo: the store would be Active with no copy, or its copy
-            // back in staging. Its work is queued again, and the device check scheduled here forces it first
-            // (CopyMoves.resync) and then restarts the rebuild, which takes this copy for done (RebuildingStore.start)
-            // and flips it. No second rebuild runs over it
-            try
-              logger.warn(s"Rebuild of store $storeId on device ${local.storageDeviceId}: its copy in rebuilt/ is " +
-                          "not forced yet. Flipping it once a device check has forced it")
-            finally
-              release()
-              ctx.reconciler.scheduleDeviceRecheck(deviceId)
-          else
+          // returned copy with its entries before the store is rebuilt again. The store's copies are listed by one
+          // RebuildBookkeeping job on the device's lane; the rebuild's Running work keeps every other decision off the
+          // copy meanwhile, and its slot stays taken until the outcome below releases it. A listing that fails (or is
+          // cancelled) says nothing: the copy is not flipped yet, as an unsynced one is not
+          def flipFinished(others: Try[List[CopyLayout.Found]]): Unit =
+            if !others.toOption.exists(_.isEmpty) then
+              try
+                others.foreach: found =>
+                  logger.error(s"Rebuild of store $storeId on device ${local.storageDeviceId}: ${found.map(_.path)
+                    .mkString(", ")} came back while it ran. Discarding the rebuilt copy, so that copy is retired with " +
+                    "its CRL state and the store rebuilt again")
+                  ctx.copies.discard(storeId, local.storageDeviceId,
+                    "Another copy of the store came back while it was rebuilt"):
+                    sds => ctx.copyRegistry.removed("rebuild finish beside a returned copy", sds, storeId)
+                others.failed.foreach: t =>
+                  if t != DeviceIo.Cancelled then
+                    logger.warn(s"Rebuild of store $storeId on device ${local.storageDeviceId}: its device's copies " +
+                                s"of the store cannot be listed. Not flipping it yet: $t")
+              finally
+                release()
+                ctx.reconciler.scheduleDeviceRecheck(deviceId)
+            else if registry.isUnsynced(local, storeId) then
+              // Not flipped over a copy a crash could still undo: the store would be Active with no copy, or its copy
+              // back in staging. Its work is queued again, and the device check scheduled here forces it first
+              // (CopyMoves.resync) and then restarts the rebuild, which takes this copy for done (RebuildingStore.start)
+              // and flips it. No second rebuild runs over it
+              try
+                logger.warn(s"Rebuild of store $storeId on device ${local.storageDeviceId}: its copy in rebuilt/ is " +
+                            "not forced yet. Flipping it once a device check has forced it")
+              finally
+                release()
+                ctx.reconciler.scheduleDeviceRecheck(deviceId)
+            else
+              flip()
+
+          def flip(): Unit =
             // Loading is downstream of the metadata decision, not ahead of it. An unconditional
             // load hands a live copy to a device that markRebuiltStoreActive may be about to
             // decide must not own it (because the device was tombstoned mid-rebuild), and nothing
@@ -458,16 +469,24 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                   // Otherwise its copy is offline on its device: a failed move leaves it Rebuilt for the Completed
                   // Rebuilds pass, and one not forced leaves it Live and unsynced, which the next check of the device
                   // forces and loads (CopyMoves, rebuild-process 5.7)
-                  if bringRebuiltLive(local, storeId) == MoveResult.Durable then
-                    ctx.loadStoreById(local.storageDeviceId, storeId)
-                finally
+                  // The move is a lane job (bringRebuiltLiveOnLane); its slot is released once its result is
+                  // applied, whatever it is (a stale or cancelled one is NotMoved), and a load follows a durable one
+                  bringRebuiltLiveOnLane(local, storeId): moved =>
+                    try
+                      if moved == MoveResult.Durable then
+                        ctx.loadStoreById(local.storageDeviceId, storeId)
+                    finally finishSettled(recheckAll())
+                catch case NonFatal(t) =>
+                  logger.error(s"Failed to bring the rebuilt store $storeId Live, a bug: $t")
                   finishSettled(recheckAll())
 
               case Success(RebuildOutcome.AdoptOffline) =>
                 try
                   workEnds = true
-                  keepRebuiltStoreOffline(local, storeId, copyId)
-                finally
+                  // A lane job too, released once its result is applied
+                  keepRebuiltStoreOffline(local, storeId, copyId)(finishSettled(recheckAll()))
+                catch case NonFatal(t) =>
+                  logger.error(s"Failed to park the rebuilt store $storeId, a bug: $t")
                   finishSettled(recheckAll())
 
               case Success(RebuildOutcome.Discard) =>
@@ -530,6 +549,20 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
                   recheckOtherDevices()
                   scheduleRebuildRetry(storeId, held)
 
+          val devicePath = local.devicePath
+          // The path's current DeviceIo: the device may have been unloaded meanwhile, and its DeviceIo forgotten
+          ctx.onControl("rebuild finish listing", ctx.deviceIos.forPath(devicePath).submit(JobKind.RebuildBookkeeping,
+              Some(storeId))(
+              RebuildBookkeepingDisk.copiesOf(devicePath, storeId))): listed =>
+            try flipFinished(listed.map(_.filter(_.copyId != copyId)))
+            catch case NonFatal(t) =>
+              // A bug (the flip's start threw): the slot is released as for a failed flip, retried after its backoff
+              logger.error(s"Failed to flip the rebuilt store $storeId on device $deviceId, a bug: $t")
+              if !settled.isCompleted then
+                release()
+                recheckOtherDevices()
+                scheduleRebuildRetry(storeId, held)
+
         case Failure(RebuildingStore.RebuildCancelled(_))
             if registry.rebuildWorkOn(deviceId, storeId).exists(_.stage == RebuildStage.Abandoned) =>
           // Its entry left this device (cancelRebuild). This device is checked once more: if the entry is
@@ -584,28 +617,50 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   /** Whether a rebuild of `storeId` holds its handle here (runningRebuilds): CopyDecision.StoreFacts.rebuildHandle */
   private[server] def hasRunningRebuild(storeId: StoreId): Boolean = runningRebuilds.contains(storeId)
 
+  // The devices (by path) with a staging sweep's removal job outstanding (sweepUnlistedStaging): at most one each
+  private var stagingSweeps: Set[os.Path] = Set()
+
+  /** Whether a staging sweep's removal job is outstanding on the device at `devicePath` (tests) */
+  private[server] def stagingSweepRunning(devicePath: os.Path): Boolean = stagingSweeps.contains(devicePath)
+
   /** Deletes each rebuild staging directory on `local` of a store whose entry there is not Rebuilding and that no
    *  rebuild reads: nothing will resume it, and a later rebuild of the store here starts over. Called by the reconcile
-   *  of a device this host owns and serves, after its stores' decisions */
-  def sweepUnlistedStaging(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+   *  of a device this host owns and serves, after its stores' decisions, with the check's disk inputs: the staging
+   *  listing is read with them (ReconcileDisk.gather), the decision made here from control state as it is now, and
+   *  the removals are one RebuildBookkeeping job on the device's lane, at most one outstanding per device (a sweep
+   *  that finds one pending removes nothing; the next check sweeps again). A rebuild of a store that starts after the
+   *  removal was submitted runs its staging jobs behind it on the same lane, so it never resumes a checkpoint being
+   *  removed: it starts over. A listing that failed removes nothing that round */
+  def sweepUnlistedStaging(local: LocalStorageDeviceState, remote: StorageDeviceState,
+                           disk: ReconcileDisk.ReconcileDiskInputs): Unit =
     def listed(storeId: StoreId): Boolean =
       remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Rebuilding)
 
-    val stagingRoot = local.devicePath / RebuildingStore.RebuildDirectory
-    val staged =
-      try
-        if FileStat.isDir(stagingRoot) then os.list(stagingRoot).filter(FileStat.isDir(_)).toList else Nil
-      catch
-        case t: Throwable =>
-          logger.warn(s"Failed to list $stagingRoot: $t")
-          Nil
-    staged.foreach: dir =>
-      scala.util.Try(StoreId(dir.last)).toOption.foreach: storeId =>
-        if !listed(storeId) && !registry.rebuilding(HostCopies.RebuildReads).contains(storeId) then
-          logger.info(s"Deleting the staging copy of store $storeId at $dir: it is no longer being rebuilt on " +
-                      s"device ${local.storageDeviceId}")
-          try os.remove.all(dir)
-          catch case t: Throwable => logger.warn(s"Failed to delete $dir. Retrying at a later check. Error: $t")
+    val devicePath = local.devicePath
+    if !stagingSweeps.contains(devicePath) then
+      disk.staging match
+        case Failure(t) =>
+          logger.warn(s"Failed to list ${RebuildBookkeepingDisk.stagingRoot(devicePath)}: $t")
+        case Success(staged) =>
+          val doomed = staged.filter: dir =>
+            Try(StoreId(dir.last)).toOption.exists: storeId =>
+              !listed(storeId) && !registry.rebuilding(HostCopies.RebuildReads).contains(storeId)
+          if doomed.nonEmpty then
+            doomed.foreach: dir =>
+              logger.info(s"Deleting the staging copy at $dir: its store is no longer being rebuilt on " +
+                          s"device ${local.storageDeviceId}")
+            stagingSweeps += devicePath
+            val job = local.io.submit(JobKind.RebuildBookkeeping, None)(RebuildBookkeepingDisk.removeStaging(doomed))
+            ctx.onControl("rebuild staging sweep", job): result =>
+              stagingSweeps -= devicePath
+              result match
+                case Success(outcomes) =>
+                  outcomes.foreach:
+                    case (dir, Some(t)) =>
+                      logger.warn(s"Failed to delete $dir. Retrying at a later check. Error: $t")
+                    case _ => ()
+                case Failure(DeviceIo.Cancelled) => ()
+                case Failure(t) => logger.warn(s"Failed to delete the staging of device ${local.storageDeviceId}: $t")
 
   /** Ends the queued Rebuild work of `storeId` on `local`, whose entry there is no longer Rebuilding and whose
    *  rebuild does not run (rebuild-process 6.2; the reconcile's CopyDecision.EndQueuedRebuild, which checked): a
@@ -651,35 +706,47 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  `copyId`: the device path is still known, and without the move an adopting host would find a Rebuilt copy whose
    *  entry is no longer Rebuilding. A disk already pulled makes the move fail, which is logged; the copy then stays
    *  Rebuilt, offline.
+   *
+   *  The move is one `Move` job on the device's lane (CopyMoves.moveOnLane, or moveUnattachedOnLane for an unloaded
+   *  device), and `andThen` runs on the control thread once its result is applied, whatever it is: the rebuild's slot
+   *  is released there.
    */
-  private def keepRebuiltStoreOffline(local: LocalStorageDeviceState, storeId: StoreId, copyId: UUID): Unit =
+  private def keepRebuiltStoreOffline(local: LocalStorageDeviceState, storeId: StoreId, copyId: UUID)
+                                     (andThen: => Unit): Unit =
     val site = "keep rebuilt store offline"
-    val result = ctx.devices.devices.get(local.storageDeviceId) match
+    def done(result: MoveResult): Unit =
+      try
+        result match
+          case MoveResult.NotMoved(_) =>
+            // Logged by the move. Offline either way: a Rebuilt copy goes Live only once its entry is Active (the
+            // Completed Rebuilds pass)
+            logger.error(s"Failed to park rebuilt store $storeId on device ${local.storageDeviceId}: it stays " +
+                         "offline, Rebuilt")
+          case _ => ()
+      finally andThen
+    ctx.devices.devices.get(local.storageDeviceId) match
       case Some(sds) if ctx.copyRegistry.copiesOf(sds).isDefined =>
-        ctx.moves.move(site, sds, storeId, Phase.Parked)
+        ctx.moves.moveOnLane(site, sds, storeId, Phase.Parked)(done)
       case _ =>
-        // Unloaded: its copy is where its rebuild finished it, in rebuilt/
+        // Unloaded: its copy is where its rebuild finished it, in rebuilt/, moved by a job on its device's lane
         val rebuilt = CopyLayout.path(local.devicePath, storeId, copyId, Phase.Rebuilt(""))
-        ctx.moves.moveUnattached(site, rebuilt, storeId, copyId, Phase.Parked)._1
-    result match
-      case MoveResult.NotMoved(_) =>
-        // Logged by the move. Offline either way: a Rebuilt copy goes Live only once its entry is Active (the
-        // Completed Rebuilds pass)
-        logger.error(s"Failed to park rebuilt store $storeId on device ${local.storageDeviceId}: it stays offline, " +
-                     "Rebuilt")
-      case _ => ()
+        // On the path's current DeviceIo: an unloaded device's may have been forgotten (DeviceIos.forget)
+        ctx.moves.moveUnattachedOnLane(site, ctx.deviceIos.forPath(local.devicePath), rebuilt, storeId, copyId,
+          Phase.Parked)((r, _) => done(r))
 
   /** T3: moves the Rebuilt copy of `storeId` on `sds`, whose entry has left Rebuilding for Active, to Live, so it can be
    *  loaded. Durable once it may be loaded. A failed move is logged and leaves the copy Rebuilt and offline, for the
    *  Completed Rebuilds pass (DeviceReconciler) at a later check; one not forced leaves it Live and unsynced, which the
    *  next check forces and loads (CopyMoves). A device no longer attached moves nothing: its next load lists the copy
-   *  Rebuilt, and that pass moves it */
-  def bringRebuiltLive(sds: LocalStorageDeviceState, storeId: StoreId): MoveResult =
+   *  Rebuilt, and that pass moves it. One `Move` job on the device's lane (CopyMoves.moveOnLane), its result given to
+   *  `andThen` on the control thread: NotMoved for a device unloaded or a record changed meanwhile, or a cancelled
+   *  job */
+  def bringRebuiltLiveOnLane(sds: LocalStorageDeviceState, storeId: StoreId)(andThen: MoveResult => Unit): Unit =
     if ctx.copyRegistry.copiesOf(sds).isEmpty then
       logger.info(s"Not moving the rebuilt copy of store $storeId Live: device ${sds.storageDeviceId} is unloaded")
-      MoveResult.NotMoved(IllegalStateException(s"Device ${sds.storageDeviceId} is unloaded"))
+      andThen(MoveResult.NotMoved(IllegalStateException(s"Device ${sds.storageDeviceId} is unloaded")))
     else
-      ctx.moves.move("rebuilt copy goes live", sds, storeId, Phase.Live)
+      ctx.moves.moveOnLane("rebuilt copy goes live", sds, storeId, Phase.Live)(andThen)
 
   /** A copy of a store being rebuilt here that is neither this `episode`'s finished rebuild (Rebuilt for it, awaiting
    *  its flip) nor Lost (in lost/, which discardLostStore clears) was not produced by this rebuild: a leftover of an
@@ -695,14 +762,20 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  copy that fails is moved to lost/. A resumed walk would leave its acknowledged updates on the objects walked
    *  before the checkpoint stale with no mark, so the store's staging checkpoint is first removed durably, making the
    *  next pass a first pass (dropStagingCheckpoint). No rebuild of the store runs here when this is called. Returns
-   *  whether the rebuild may go on now. */
+   *  whether the rebuild may go on now.
+   *
+   *  Its disk steps are lane jobs, and it returns false while one runs: the checkpoint's drop (one RebuildBookkeeping
+   *  job, dropStagingCheckpoint) and the move to lost/ (moveToLostOnLane). Each one's apply continues the start
+   *  (continueQueued) with `checkpointDropped`, so the drop is not made again, but only while the store's Rebuild work
+   *  on the device is still Queued for `episode` on a device still loaded; otherwise a later check decides afresh. */
   private def retireForeignCopy(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
+                                acceptLoss: Boolean, checkpointDropped: Boolean,
                                 disk: Option[ReconcileDisk.ReconcileDiskInputs]): Boolean =
     // The record is first matched to the device check's disk inputs (HostCopies.reread): a copy back since the
     // device's load is retired with its device-CRL entries, and the record of one gone since is forgotten, rather than
     // its move to lost/ failing for good. A re-read that fails waits for a later check. A start with no inputs (the
-    // handoff after a discard, whose own start re-read them moments before) re-reads nothing: a copy that came back
-    // in between fails the rebuild's start, and the backoff's check re-reads it
+    // handoff after a discard, whose own start re-read them moments before, or a continuation after a drop or a move)
+    // re-reads nothing: a copy that came back in between fails the rebuild's start, and the backoff's check re-reads it
     if disk.exists(d => !registry.reread("retireForeignCopy", local, storeId, d)) then
       return false
     val storePath = ctx.copyRegistry.pathOf(local, storeId)
@@ -720,7 +793,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       false
     else if found.contains(None) then
       true
-    else if !dropStagingCheckpoint(local, storeId) then
+    else if !checkpointDropped then
+      dropStagingCheckpoint(local, storeId, episode, acceptLoss)
       false
     else if found.contains(Some(true)) then
       true
@@ -736,26 +810,59 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         case _ =>
           logger.error(s"Retiring a store directory before rebuilding: ${err.getMessage}. It is kept in " +
                        s"pending-delete until the store is Active again")
-          // Durable in lost/, or the rebuild waits: a move not forced could be undone by a crash
-          moveToLost("retireForeignCopy", local, storeId) == MoveResult.Durable
+          // Durable in lost/, or the rebuild waits: a move not forced could be undone by a crash. The checkpoint was
+          // dropped just before, so the start goes on from the Lost copy's discard
+          moveToLostOnLane("retireForeignCopy", local, storeId): moved =>
+            if moved == MoveResult.Durable then
+              continueQueued(local, storeId, episode, acceptLoss)
+          false
+
+  // The (device, store) pairs with a staging checkpoint drop outstanding (dropStagingCheckpoint): at most one each, and
+  // no rebuild of the store starts on the device meanwhile
+  private var stagingDrops: Set[(StorageDeviceId, StoreId)] = Set()
+
+  /** Whether a staging checkpoint drop of `storeId` on `deviceId` is outstanding (tests) */
+  private[server] def stagingDropRunning(deviceId: StorageDeviceId, storeId: StoreId): Boolean =
+    stagingDrops.contains((deviceId, storeId))
 
   /** Removes the rebuild checkpoint of `storeId` from its staging directory on `local`, durably, then the rest of the
-   *  directory (a first pass's createStaging discards whatever is left). A staging directory without a checkpoint is a
-   *  first pass's. Returns false, logged, when the stat or the removal fails: the rebuild waits for a later check. */
-  private def dropStagingCheckpoint(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
-    val staging = local.devicePath / RebuildingStore.RebuildDirectory / storeId.directoryName
-    try
-      if FileStat.exists(staging) then
-        logger.info(s"Discarding the rebuild staging copy of store $storeId at $staging: a copy at the store's path " +
-                    "may have served since its first pass began, so the rebuild starts over")
-        RebuildDisk.removeAll(staging)
-        DurableFiles.syncDirectory(staging)
-        try os.remove.all(staging)
-        catch case NonFatal(t) => logger.warn(s"Failed to delete $staging. A first pass discards it. Error: $t")
-      true
-    catch case NonFatal(t) =>
-      logger.error(s"Failed to discard the rebuild checkpoint of store $storeId at $staging. Not rebuilding it yet: $t")
-      false
+   *  directory (a first pass's createStaging discards whatever is left), as one RebuildBookkeeping job on the device's
+   *  lane (RebuildBookkeepingDisk.dropStagingCheckpoint). A staging directory without a checkpoint is a first pass's.
+   *  The apply continues the start (continueQueued) once the drop is done (or there was nothing to drop); a stat or
+   *  removal that fails is logged and the rebuild waits for a later check, as does a cancelled job. */
+  private def dropStagingCheckpoint(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
+                                    acceptLoss: Boolean): Unit =
+    val key = (local.storageDeviceId, storeId)
+    if !stagingDrops.contains(key) then
+      val staging = RebuildBookkeepingDisk.stagingOf(local.devicePath, storeId)
+      stagingDrops += key
+      val job = local.io.submit(JobKind.RebuildBookkeeping, Some(storeId))(
+        RebuildBookkeepingDisk.dropStagingCheckpoint(staging))
+      ctx.onControl("rebuild staging checkpoint drop", job): result =>
+        stagingDrops -= key
+        result match
+          case Success(RebuildBookkeepingDisk.CheckpointDrop.Failed(t)) =>
+            logger.error(s"Failed to discard the rebuild checkpoint of store $storeId at $staging. Not rebuilding it " +
+                         s"yet: $t")
+          case Success(drop) =>
+            if drop == RebuildBookkeepingDisk.CheckpointDrop.Dropped then
+              logger.info(s"Discarded the rebuild staging copy of store $storeId at $staging: a copy at the store's " +
+                          "path may have served since its first pass began, so the rebuild starts over")
+            continueQueued(local, storeId, episode, acceptLoss)
+          case Failure(DeviceIo.Cancelled) => ()
+          case Failure(t) =>
+            logger.error(s"Failed to discard the rebuild checkpoint of store $storeId at $staging. Not rebuilding it " +
+                         s"yet: $t")
+
+  /** A lane job of a rebuild's start (a checkpoint drop, a move to lost/) has been applied: the start goes on, its
+   *  checkpoint dropped, but only while the store's Rebuild work on `local` is still Queued for `episode` and the
+   *  device still the loaded one. Otherwise nothing: the work ended or moved on (a later check decides afresh) */
+  private def continueQueued(local: LocalStorageDeviceState, storeId: StoreId, episode: Option[UUID],
+                             acceptLoss: Boolean): Unit =
+    if ctx.devices.isLoaded(local) &&
+       registry.rebuildWorkOn(local.storageDeviceId, storeId).exists(w =>
+         w.stage == RebuildStage.Queued && w.episode == episode) then
+      startRebuild(local, storeId, episode, acceptLoss, checkpointDropped = true)
 
   /** A store served from `local` that the device's entry does not list: a copy put at the store path by hand, loaded
    *  without reading the tree. Nothing ties it to the store's current state, so it is taken out of service as a
@@ -778,34 +885,41 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         case _ => ()
 
   /** T10 for a closed copy of an attached device: moves the copy of `storeId` on `sds` into lost/, where it is never
-   *  loaded, shipped or promoted, and only retired (T11). A copy already Lost is left there (Durable). A move that
+   *  loaded, shipped or promoted, and only retired (T11), as one `Move` job on the device's lane (CopyMoves.moveOnLane),
+   *  its result given to `andThen` on the control thread. A copy already Lost is left there (Durable). A move that
    *  fails is logged at error and its copy held offline (CopyMoves.pendingLost: never loaded, shipped or retired) and
    *  retried at each device check before the passes; a crash forgets the hold, and the copy then reloads from where it
    *  is, as after any crash (P5). An unsynced move leaves the copy Lost and unsynced until a device check forces it.
    *  Called once the copy is closed. One opened, opening or closing again since (a failed unserved backend's close
    *  ending after a new open began) is not moved, held or retried: logged at warn, NotMoved, left to its own open or
-   *  close (CopyMoves.move would refuse it) */
-  def moveToLost(site: String, sds: LocalStorageDeviceState, storeId: StoreId): MoveResult =
-    lostMoveDecided(site, sds, storeId).getOrElse:
-      val held = registry.copiesOf(sds).flatMap(_.copies.get(storeId)).isDefined
-      val result = ctx.moves.move(site, sds, storeId, Phase.Lost)
-      lostMoveDone(site, sds, storeId, held, result)
-      result
-
-  /** moveToLost as a lane job (CopyMoves.moveOnLane), its result given to `andThen` on the control thread. The same
-   *  decisions and holds; a device unloaded meanwhile holds nothing (its holds went with its detach) */
+   *  close (CopyMoves.move would refuse it). The copy is held offline (pendingLost) from the job's submission, so
+   *  every reader takes it for Lost while the job runs. A device unloaded meanwhile holds nothing (its holds went
+   *  with its detach). The job is tracked as a close is (closeStarted), so the device's unload waits for it: every move to
+   *  lost/ is made on the attached device */
   def moveToLostOnLane(site: String, sds: LocalStorageDeviceState, storeId: StoreId)
                       (andThen: MoveResult => Unit): Unit =
     lostMoveDecided(site, sds, storeId) match
       case Some(result) => andThen(result)
       case None =>
         val held = registry.copiesOf(sds).flatMap(_.copies.get(storeId)).isDefined
-        ctx.moves.moveOnLane(site, sds, storeId, Phase.Lost): result =>
-          if ctx.devices.isLoaded(sds) then
-            lostMoveDone(site, sds, storeId, held, result)
-          andThen(result)
+        // Held offline from now, as a failed move's copy is (CopyMoves.pendingLost: never loaded, shipped or
+        // retired): a copy on its way to lost/ is Lost to every reader. The move's record releases the hold
+        // (HostCopies.moved); a NotMoved one keeps it, for the retry at each device check
+        if held then
+          ctx.moves.holdLost(sds, storeId, held = true)
+        val tracked = closeStarted(sds.storageDeviceId)
+        try
+          ctx.moves.moveOnLane(site, sds, storeId, Phase.Lost): result =>
+            try
+              if ctx.devices.isLoaded(sds) then
+                lostMoveDone(site, sds, storeId, held, result)
+              andThen(result)
+            finally closeDone(sds.storageDeviceId, tracked)
+        catch case NonFatal(t) =>
+          closeDone(sds.storageDeviceId, tracked)
+          throw t
 
-  /** moveToLost's outcome where no move is made: a copy already Lost (Durable), or one opened, opening or closing
+  /** moveToLostOnLane's outcome where no move is made: a copy already Lost (Durable), or one opened, opening or closing
    *  since (NotMoved, its hold released). A copy busy with a disk job is held (pendingLost) and NotMoved: the move
    *  waits for the job's end, retried at the next device check, never made under it. None: the move is to be made */
   private def lostMoveDecided(site: String, sds: LocalStorageDeviceState, storeId: StoreId): Option[MoveResult] =
@@ -849,7 +963,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       // A copy whose directory is gone has its record forgotten, which releases the hold: no move can succeed
       disk.foreach(d => registry.reread("retry move to lost", local, storeId, d): Unit)
       if ctx.moves.isPendingLost(local, storeId) then
-        moveToLost("retry move to lost", local, storeId): Unit
+        moveToLostOnLane("retry move to lost", local, storeId)(_ => ())
 
   // The closes running on each device (closeStarted): a store's close (handleClose, closeUnloaded) and an unserved
   // backend's (retireUnserved, handleBackendOpened's failed backend, StoreLoader.closeAbandoned). Every unload of a
@@ -877,24 +991,29 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   private[host] def closesEnded(deviceId: StorageDeviceId): Future[Unit] =
     Future.sequence(lostCloses.getOrElse(deviceId, Set()).toList.map(_.future)).map(_ => ())
 
-  /** The closed copy of `storeId` at `path` on device `deviceId`: moved to lost/ (moveToLost), then its device checked
+  /** The closed copy of `storeId` at `path` on device `deviceId`: moved to lost/ (moveToLostOnLane), then its device checked
    *  so the reconcile flips its entry to Rebuilding. Every unload waits for the close that leads here
    *  (closeStarted), so a device not loaded is a bug: logged at error, and the copy moved all the same, unattached
-   *  (CopyMoves.moveUnattached), so that no later load or adoption takes it for a clean copy */
+   *  (CopyMoves.moveUnattachedOnLane), so that no later load or adoption takes it for a clean copy */
   private def moveClosedToLost(site: String, deviceId: StorageDeviceId, storeId: StoreId, path: os.Path): Unit =
     ctx.devices.devices.get(deviceId) match
       case Some(sds) =>
-        moveToLost(site, sds, storeId): Unit
-        ctx.reconciler.checkStorageDevice(deviceId)
+        // The move's job is tracked (moveToLostOnLane), so the device's unload waits for it after the close's end
+        moveToLostOnLane(site, sds, storeId): _ =>
+          if ctx.devices.isLoaded(sds) then
+            ctx.reconciler.checkStorageDevice(deviceId)
       case None =>
         logger.error(s"The copy of store $storeId at $path closed after its device $deviceId was unloaded ($site), " +
                      "a bug: an unload waits for its closes. Moving it to lost/ unattached")
-        // A copy in live/ (the only phase a served copy closes from); one already elsewhere is left
+        // A copy in live/ (the only phase a served copy closes from); one already elsewhere is left. Moved by a job on
+        // its device's lane
         CopyLayout.nameOf(path).filter(_ => CopyLayout.isLivePath(path)).foreach: (_, copyId) =>
-          ctx.moves.moveUnattached(site, path, storeId, copyId, Phase.Lost)._1 match
-            case MoveResult.NotMoved(t) =>
-              logger.error(s"Failed to move the copy of store $storeId at $path to lost/: $t")
-            case _ => ()
+          val io = ctx.deviceIos.forPath(path / os.up / os.up)
+          ctx.moves.moveUnattachedOnLane(site, io, path, storeId, copyId, Phase.Lost): (moved, _) =>
+            moved match
+              case MoveResult.NotMoved(t) =>
+                logger.error(s"Failed to move the copy of store $storeId at $path to lost/: $t")
+              case _ => ()
 
   /** The LoadStore handler found `backend`'s CRL save file unusable. The file sits in the store's
    *  own directory, so it is the only copy of that state: the store is permanently failed. It
@@ -995,7 +1114,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               case Some((sds, _)) =>
                 logger.error(s"Store $storeId failed on an I/O error after it stopped being served. Moving it to " +
                              s"lost/. Error: $err")
-                moveToLost("backendFailed", sds, storeId): Unit
+                moveToLostOnLane("backendFailed", sds, storeId)(_ => ())
               case None =>
                 logger.info(s"Ignoring the failure of a backend of store $storeId whose copy is not recorded at " +
                             s"${b.path}. Error: $err")

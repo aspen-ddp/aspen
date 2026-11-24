@@ -254,12 +254,15 @@ class CopyIoSuite extends IntegrationTestSuite with ControlFixture:
     host.control.moves.isPendingLost(sds, s) should be(true)
     recordOn(host, deviceA, s).map(r => (r.phase, r.activity)) should be(
       Some((Phase.Live, Activity.DiskJob(JobKind.Move, Activity.Idle))))
-    // Once the job ends, the next retry moves it
+    // Once the job ends, the next retry moves it, as a Move job of its own on the device's lane
     registry.diskJobEnded(sds, s)
     host.control.rebuilds.retryPendingLost(sds, disk())
-    CopyFixtures.phaseOf(devA, s) should be(Some(Phase.Lost))
-    host.control.moves.isPendingLost(sds, s) should be(false)
+    recordOn(host, deviceA, s).map(r => (r.phase, r.activity)) should be(
+      Some((Phase.Live, Activity.DiskJob(JobKind.Move, Activity.Idle))))
     drain(host)
+    CopyFixtures.phaseOf(devA, s) should be(Some(Phase.Lost))
+    recordOn(host, deviceA, s).map(r => (r.phase, r.activity)) should be(Some((Phase.Lost, Activity.Idle)))
+    host.control.moves.isPendingLost(sds, s) should be(false)
     noViolations(host)
 
   // ---- Resync ----

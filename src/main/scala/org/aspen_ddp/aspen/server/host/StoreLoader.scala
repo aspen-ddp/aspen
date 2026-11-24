@@ -142,7 +142,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       logger.debug(s"Not loading store $storeId again: it is already open or opening")
       true
     else if ctx.moves.isPendingLost(sds, storeId) then
-      // Its move to lost/ failed: held offline until a check of its device moves it (StoreRebuilds.moveToLost)
+      // Its move to lost/ failed: held offline until a check of its device moves it (StoreRebuilds.moveToLostOnLane)
       logger.info(s"Not loading store $storeId: its move to lost/ failed and is retried. $storePath")
       true
     else if ctx.copyRegistry.isUnsynced(sds, storeId) then
@@ -412,8 +412,10 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
               if held then
                 ctx.copyRegistry.closeEnded(sds.storageDeviceId, storeId)
               if ctx.devices.isLoaded(sds) then
-                ctx.rebuilds.moveToLost("failed unserved backend", sds, storeId): Unit
-                ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
+                // A lane job, tracked as a close is, so the device's unload waits for it past this close's end
+                ctx.rebuilds.moveToLostOnLane("failed unserved backend", sds, storeId): _ =>
+                  if ctx.devices.isLoaded(sds) then
+                    ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
             finally tracked.foreach(ctx.rebuilds.closeDone(sds.storageDeviceId, _))
       case Success(backend) =>
         if create then
@@ -441,11 +443,12 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                      s"Rebuilding it. $storePath. Error: ${e.getMessage}")
         openEnded()
         // No backend opened, so the copy is closed: moved to lost/ now. A move that fails holds it offline for the
-        // checks to retry; a crash before the move recovers the same files at the next start and lands here again
-        ctx.rebuilds.moveToLost("BackendStateLost", sds, storeId): Unit
-        // A device still being loaded is checked once it is registered.
-        if registered then
-          ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
+        // checks to retry; a crash before the move recovers the same files at the next start and lands here again.
+        // The move is a lane job; the device is checked once its result is applied (a device still being loaded is
+        // checked once it is registered)
+        ctx.rebuilds.moveToLostOnLane("BackendStateLost", sds, storeId): _ =>
+          if registered && ctx.devices.isLoaded(sds) then
+            ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
         created.foreach(_.tryFailure(e))
       case Failure(e) if create && leftNothing =>
         // The create failed and left nothing at the path (StoreCreation), so the entry is still Initializing and the

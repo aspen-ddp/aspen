@@ -337,7 +337,7 @@ final class RecordingSeams(ec: ExecutionContext, failFirstStoreLoad: Boolean = f
         endMarkedServed(storeId)
         attached.control.devices.devices.valuesIterator
           .filter(sds => attached.control.copyRegistry.copiesOf(sds).exists(_.copies.contains(storeId)))
-          .foreach(attached.control.rebuilds.moveToLost("failing shutdown close", _, storeId))
+          .foreach(attached.control.rebuilds.moveToLostOnLane("failing shutdown close", _, storeId)(_ => ()))
         Future.failed(Host.StoreFailedOnClose(storeId))
       else
         shutdownCloseGate.get match
@@ -459,7 +459,8 @@ trait ControlFixture:
    *  wait an hour: this drives checks, yields to let the async rebuilds and their completion callbacks run, and
    *  repeats until nothing is Rebuilding any more.
    *
-   *  The predicate is "nothing is Rebuilding", not "everything is Active": a store that lands in some other status
+   *  The predicate is "nothing is Rebuilding" (and every rebuild's slot released, its flip's steps done), not
+   *  "everything is Active": a store that lands in some other status
    *  is a result this helper should return so the caller's assertion can report it, not a condition to spin on until
    *  the round budget runs out.
    *
@@ -477,7 +478,15 @@ trait ControlFixture:
         Future.unit
       else
         anyRebuilding().flatMap:
-          case false => Future.unit
+          case false if host.control.rebuilds.rebuildSlotsTaken == 0 => Future.unit
+          case false =>
+            // The entries are flipped, and the flips' steps (an Adopt's move to Live, a lane job, and its load) are
+            // still running: drained until each has released its slot
+            for
+              _ <- Future { host.testingOnlyHandleEvents() }
+              _ <- waitForTransactionsToComplete()
+              _ <- loop(rounds - 1)
+            yield ()
           case true =>
             checkAllNow(host)
             for
@@ -763,21 +772,24 @@ trait ControlFixture:
       batch.foreach(_.run())
       batch = ls.removeQueued(isLoadRead)
 
-  /** Runs the queued copy jobs (StoreCopies, CopyMoves: `Move`, `Retire`, `Release`, `Delete`) and device checks'
-   *  disk-inputs jobs (DeviceReconciler: `ReconcileInputs`) wherever they are queued (running a lane job early is
+  /** Runs the queued copy jobs (StoreCopies, CopyMoves: `Move`, `Retire`, `Release`, `Delete`), device checks'
+   *  disk-inputs jobs (DeviceReconciler: `ReconcileInputs`) and rebuild bookkeeping jobs (StoreRebuilds:
+   *  `RebuildBookkeeping`, results named "rebuild ...") wherever they are queued (running a lane job early is
    *  legal: its result is posted at the FIFO's tail), and applies their results (DeviceJobDone named "copy ..." or
    *  DeviceReconciler.ReconcileInputsJob) only from the head of the FIFO, so no result is applied ahead of an event
    *  queued before it. A lane job of any other kind at the head is run, as a drain runs it next. Stops at the first
    *  other event at the head, left for a real drain. No disk check. A held path's jobs stay held */
   protected def runCopyJobs(host: Host): Unit =
     val ls = lockstep(host)
-    val kinds = Set[JobKind](JobKind.Move, JobKind.Retire, JobKind.Release, JobKind.Delete, JobKind.ReconcileInputs)
+    val kinds = Set[JobKind](JobKind.Move, JobKind.Retire, JobKind.Release, JobKind.Delete, JobKind.ReconcileInputs,
+      JobKind.RebuildBookkeeping)
     def isCopyTask(task: Runnable): Boolean = task match
       case t: LockstepThreading.DeviceTask => kinds.contains(t.kind)
       case _ => false
     def isCopyResult(task: Runnable): Boolean = task match
       case t: Host.EventTask => t.event match
-        case e: Host.DeviceJobDone => e.what.startsWith("copy ") || e.what == DeviceReconciler.ReconcileInputsJob
+        case e: Host.DeviceJobDone =>
+          e.what.startsWith("copy ") || e.what.startsWith("rebuild ") || e.what == DeviceReconciler.ReconcileInputsJob
         case _ => false
       case _ => false
     var progress = true

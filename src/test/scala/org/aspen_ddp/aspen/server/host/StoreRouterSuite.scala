@@ -679,6 +679,12 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
 
   /** Whether the copy of `s0` on `sds` is in lost/, on disk and in its record, nothing left in live/, and not
    *  held for a move's retry */
+  /** Waits until no close or move to lost/ (StoreRebuilds.closeStarted) is running on the fixture's device: a close's
+   *  end takes its move's mark before releasing its own, so the device is never idle between them */
+  private def lostMovesEnded(fx: Fixture): Unit =
+    while fx.onControl(fx.ctx.rebuilds.closesRunning(deviceId)) do
+      await(fx.onControl(fx.ctx.rebuilds.closesEnded(deviceId)))
+
   private def inLost(fx: Fixture, sds: LocalStorageDeviceState, s0: StoreId): Boolean = fx.onControl:
     fx.ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(s0)).exists(_.phase == Phase.Lost) &&
       !fx.ctx.moves.isPendingLost(sds, s0) &&
@@ -847,6 +853,9 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
         val backend = bootstrappedBackend(s0, Some(CopyFixtures.freshCopyPath(sds.devicePath, s0)))
         CrashRecoveryLog.saveStoreState(s0, StoreRecoveryState(states(s0)), backend.crlSaveFile)
         intercept[Exception](await(fx.load(backend)))
+        // The unserved close, then the move to lost/ its end makes (a lane job): each tracked, so the device's unload
+        // would wait for them too
+        lostMovesEnded(fx)
         assertAbandoned(fx, s0, sds, backend)
         admission.admittedBytes should be(0)
         inLost(fx, sds, s0) should be(true)

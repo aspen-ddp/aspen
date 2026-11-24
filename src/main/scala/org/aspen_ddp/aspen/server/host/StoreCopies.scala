@@ -31,7 +31,7 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
   private[server] def releaseLookupsInFlight: Set[os.Path] = releaseLookups
 
   /** Retires the copy of `storeId` on `local`, in a fixed order, each step durable before the next:
-   *   1. the copy moved to lost/ (T10; StoreRebuilds.moveToLost), unless it is there, where it is never loaded,
+   *   1. the copy moved to lost/ (T10; StoreRebuilds.moveToLostOnLane), unless it is there, where it is never loaded,
    *      shipped or adopted as clean;
    *   2. its CRL state saved in the copy as RebuildingStore.LostCrlStateFile: an existing one is kept (a crash left
    *      it), else the copy's `crl_save.log` is renamed to it (it already holds the state, which a transfer-out

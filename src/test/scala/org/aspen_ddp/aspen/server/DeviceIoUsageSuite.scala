@@ -22,7 +22,6 @@ class DeviceIoUsageSuite extends AnyFunSuite with Matchers:
     "host/DeviceDiscovery.scala" -> 12,
     "host/DeviceShutdown.scala" -> 4,
     "host/JoinCeiling.scala" -> 3,
-    "host/StoreRebuilds.scala" -> 5,
     "host/StoreTransfers.scala" -> 3,
     "host/StoreTransfersOut.scala" -> 4,
     "rebuild/RebuildingStore.scala" -> 10,

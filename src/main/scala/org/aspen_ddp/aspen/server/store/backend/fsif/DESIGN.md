@@ -640,7 +640,7 @@ step in `FsifRecovery.recover` (the numbered step comments) and the `StoreLost` 
 
 All of these are thrown from `FsifBackend`'s constructor through `FsifBackend.open`. The host reaction is the same
 for each: `StoreLoader.handleBackendOpened` logs, leaves the store offline, moves the copy to `lost/`
-(`StoreRebuilds.moveToLost`), and calls `DeviceReconciler.checkStorageDevice`. A copy in `lost/` is acted on as
+(`StoreRebuilds.moveToLostOnLane`), and calls `DeviceReconciler.checkStorageDevice`. A copy in `lost/` is acted on as
 described in 4.5. A plain `IOException` from the open is not a loss (4.6). Every absence below is a known one: the
 directory and file tests are `server.FileStat`'s, so a stat that fails is such an `IOException`, never L0 or a
 missing index or journal.
@@ -693,7 +693,7 @@ but fail-stops no store. L13-L17 would fire together if an error classifier miss
 JDK that words it differently from `FsifIo.isOutOfSpace`'s strings), which turns every full device into a
 correlated loss.
 
-**Host routes for `BackendFailed` and other failed-backend checks.** Each of these moves the copy to `lost/` once it is closed (`StoreRebuilds.moveToLost`):
+**Host routes for `BackendFailed` and other failed-backend checks.** Each of these moves the copy to `lost/` once it is closed (`StoreRebuilds.moveToLostOnLane`):
 
 - **Served store** (`StoreRebuilds.handleBackendFailed`, then `backendFailed`). The store is unloaded, moved to `lost/` when its close ends, and left
   offline, and the device is checked. Its CRL entries stay live in the device CRL (`closeUnloaded(dropDurably =

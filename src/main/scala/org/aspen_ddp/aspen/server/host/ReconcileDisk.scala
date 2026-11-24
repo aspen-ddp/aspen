@@ -19,9 +19,10 @@ object ReconcileDisk:
    *  record names another path at the apply (or that gained or lost its record) is skipped that round
    *  (DeviceReconciler.reconcileStores), never acted on from these values. `listing`: the device's copies with their
    *  phase parameters (CopyLayout.list), for HostCopies.reread and its rebuild-finish check. `stats`: the stats of
-   *  every recorded path and of every copy the listing found outside pending-delete/ */
+   *  every recorded path and of every copy the listing found outside pending-delete/. `staging`: the directories under
+   *  `rebuilding/` (RebuildBookkeepingDisk.listStaging), for StoreRebuilds.sweepUnlistedStaging */
   final case class ReconcileDiskInputs(recorded: Map[StoreId, os.Path], listing: Try[CopyLayout.Listing],
-                                       stats: Map[os.Path, PathStats]):
+                                       stats: Map[os.Path, PathStats], staging: Try[List[os.Path]] = Try(Nil)):
     /** Whether `storeId`'s record names, at the apply, the path it named when these were gathered (`now`, None for no
      *  record): the stats are its copy's */
     def current(storeId: StoreId, now: Option[os.Path]): Boolean = recorded.get(storeId) == now
@@ -32,7 +33,8 @@ object ReconcileDisk:
     val listed = listing.toOption.toList.flatMap(_.copies).filter(_.phase != Phase.Retired).map(_.path)
     val stats = (recorded.values ++ listed).toSet.iterator.map: p =>
       p -> PathStats(FileStat.existence(p), FileStat.existence(p / StoreConfig.configFilename))
-    ReconcileDiskInputs(recorded, listing, stats.toMap)
+    val staging = Try(RebuildBookkeepingDisk.listStaging(devicePath))
+    ReconcileDiskInputs(recorded, listing, stats.toMap, staging)
 
   /** The device's (currentUsage, totalSize) in bytes, as the file system holding `configFile` reports them */
   def usage(configFile: os.Path): (Long, Long) =

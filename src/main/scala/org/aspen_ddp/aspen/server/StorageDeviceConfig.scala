@@ -13,6 +13,9 @@ aspen-system-id: 00000000-0000-0000-0000-000000000000
 # crl-max-file-size-mb: 512    # Size of each. Default capacity / 2048 (4 KiB multiple), at least 64 MiB
 # crl-max-streams: 20          # Most streams the CRL may grow to
 # crl-min-free-percent: 5      # Free space the CRL leaves on the device when growing
+# Optional FSIF device journal sizing (<device>/fsif-journal). Applies only when the journal is created:
+# fsif-journal-files: 4        # Files in the journal ring. Default 4, minimum 3
+# fsif-journal-file-size-mb: 256  # Size of each, 1 to 1024. Default 256
 */
 
 /** The CRL sizing keys are optional: a missing one takes the default `CrlSizingDefaults.resolve` computes when a CRL
@@ -25,7 +28,9 @@ case class StorageDeviceConfig(storageDeviceId: StorageDeviceId,
                                crlNumStreams: Option[Int] = None,
                                crlFileSizeMb: Option[Int] = None,
                                crlMaxStreams: Option[Int] = None,
-                               crlMinFreePercent: Option[Int] = None):
+                               crlMinFreePercent: Option[Int] = None,
+                               fsifJournalFiles: Option[Int] = None,
+                               fsifJournalFileSizeMb: Option[Int] = None):
   def yamlConfig: String =
     def key(name: String, v: Option[Int]): String = v.fold("")(n => s"$name: $n\n")
     s"""storage-device-id: ${storageDeviceId.uuid}
@@ -34,7 +39,9 @@ case class StorageDeviceConfig(storageDeviceId: StorageDeviceId,
       key("crl-num-streams", crlNumStreams) +
       key("crl-max-file-size-mb", crlFileSizeMb) +
       key("crl-max-streams", crlMaxStreams) +
-      key("crl-min-free-percent", crlMinFreePercent)
+      key("crl-min-free-percent", crlMinFreePercent) +
+      key("fsif-journal-files", fsifJournalFiles) +
+      key("fsif-journal-file-size-mb", fsifJournalFileSizeMb)
 
 
 object StorageDeviceConfig extends YObject[StorageDeviceConfig]:
@@ -47,9 +54,11 @@ object StorageDeviceConfig extends YObject[StorageDeviceConfig]:
   val crlFileSizeMb: Optional[Int]               = Optional("crl-max-file-size-mb", YInt)
   val crlMaxStreams: Optional[Int]               = Optional("crl-max-streams", YInt)
   val crlMinFreePercent: Optional[Int]           = Optional("crl-min-free-percent", YInt)
+  val fsifJournalFiles: Optional[Int]            = Optional("fsif-journal-files", YInt)
+  val fsifJournalFileSizeMb: Optional[Int]       = Optional("fsif-journal-file-size-mb", YInt)
 
   val attrs: List[Attr] = storageDeviceId :: aspenSystemId :: crlNumStreams :: crlFileSizeMb :: crlMaxStreams ::
-    crlMinFreePercent :: Nil
+    crlMinFreePercent :: fsifJournalFiles :: fsifJournalFileSizeMb :: Nil
 
   def create(o: Object): StorageDeviceConfig = StorageDeviceConfig(
     storageDeviceId.get(o),
@@ -57,7 +66,9 @@ object StorageDeviceConfig extends YObject[StorageDeviceConfig]:
     crlNumStreams.get(o),
     crlFileSizeMb.get(o),
     crlMaxStreams.get(o),
-    crlMinFreePercent.get(o)
+    crlMinFreePercent.get(o),
+    fsifJournalFiles.get(o),
+    fsifJournalFileSizeMb.get(o)
   )
 
   def loadStorageDeviceConfig(file: os.Path): StorageDeviceConfig =

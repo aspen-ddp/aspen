@@ -44,6 +44,20 @@ class StorageDeviceConfigSuite extends AnyFunSuite with Matchers:
     finally
       os.remove(f)
 
+  test("StorageDeviceConfig round-trips the two new keys"):
+    val sized = sample.copy(fsifJournalFiles = Some(5), fsifJournalFileSizeMb = Some(64))
+    val f = os.temp(prefix = "aspen-storage-device-fj", suffix = ".yaml")
+    try
+      os.write.over(f, sized.yamlConfig)
+      sized.yamlConfig should include("fsif-journal-files: 5")
+      sized.yamlConfig should include("fsif-journal-file-size-mb: 64")
+      StorageDeviceConfig.loadStorageDeviceConfig(f) should be(sized)
+      os.write.over(f, sample.yamlConfig)
+      val cfg = StorageDeviceConfig.loadStorageDeviceConfig(f)
+      (cfg.fsifJournalFiles, cfg.fsifJournalFileSizeMb) should be((None, None))
+    finally
+      os.remove(f)
+
   test("doc-comment example config parses correctly"):
     val docExampleYaml = """storage-device-id: 00000000-0000-0000-0000-000000000000
 aspen-system-id: 00000000-0000-0000-0000-000000000000

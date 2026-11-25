@@ -308,8 +308,12 @@ class FsifBackend(val storeId: StoreId,
 
   // Attach (spec 4.2), now that every field is set (the journal may call `owner` at once): index s+1 naming the
   // journal, the attachment and the tail serial, forced; index s emptied; then the attachment. Compaction then resumes
-  // without waiting for the first operation.
+  // without waiting for the first operation. An undetached index naming this journal passed openDirectory only
+  // because its attachment needs no replay (a frozen close's, or a failed open's): it is released first, which
+  // returns the reservations of operations that close abandoned (Ruling R13(a)).
   try
+    if !opened.meta.detached && opened.meta.journalId == journalId then
+      journal.release(opened.meta.attachment)
     withFile(activeIndex): f =>
       f.truncate(0)
       f.write(0, IndexFile.encode(currentSeq, IndexMeta(journalId, attachment, attachCovered, detached = false), index))
@@ -447,12 +451,12 @@ class FsifBackend(val storeId: StoreId,
 
   override def commit(state: CommitState, transactionId: TransactionId): Unit =
     val id = state.objectId
-    post(admitted(appendBound(state.data.size)): release =>
+    post(admitted(admissionBound(state)): release =>
       update(state, repairing = false,
         timed("fsif commit", r => handler.foreach(_.complete(Commit(storeId, id, transactionId, r)))), release))
 
   override def repair(state: CommitState, complete: Promise[Unit]): Unit =
-    post(admitted(appendBound(state.data.size)): release =>
+    post(admitted(admissionBound(state)): release =>
       // A foreign occupant of the slot fails the repair with RepairSlotOccupied, naming it, so the repairer can drop it
       var occupiedBy = Option.empty[ObjectId]
       val generic = promiseReply(complete, s"repair of ${state.objectId}")
@@ -461,6 +465,13 @@ class FsifBackend(val storeId: StoreId,
           complete.tryFailure(new RepairSlotOccupied(state.objectId, occupiedBy.get))
         case r => generic(r)
       update(state, repairing = true, reply, release, occupant => occupiedBy = Some(occupant)))
+
+  /** A commit's or repair's reservation. An oversized slice replies SliceTooLarge without appending (`update`), so it
+    * reserves no more than the largest slice: a bound for its own size might never fit and would hold it, and every
+    * operation behind it, forever (Ruling R13(b))
+    */
+  private def admissionBound(state: CommitState): Long =
+    appendBound(math.min(state.data.size, layout.segmentPayloadSize))
 
   override def repairDelete(objectId: ObjectId, storePointer: Array[Byte], complete: Promise[Unit]): Unit =
     post(admitted(MappingAppendSize): release =>
@@ -1115,6 +1126,11 @@ class FsifBackend(val storeId: StoreId,
       if !st.dead && st.writing == 0 && st.applied > st.forced then
         requeueWritten(st)
         requeued = true
+      else if !st.dead && st.writing > 0 then
+        // Its written run is queued again once the write in flight completes (inPlaceDone); until then no force may
+        // count it as forced, since a force issued meanwhile would succeed without the dropped bytes
+        for i <- st.forced until st.applied do
+          dropUnforced(st.deltas(i))
     compaction.dataLost()
     if rebuildMaps.nonEmpty then
       rebuildLost = true

@@ -10,8 +10,8 @@ import java.util.UUID
 object FsifRecovery:
   final class StoreLost(msg: String) extends org.aspen_ddp.aspen.server.store.backend.BackendStateLost(msg)
 
-  /** A store directory ready to attach: `activeIndex` holds index `seq` */
-  final case class Opened(index: IndexMap, seq: Long, activeIndex: String, slotCount: Int)
+  /** A store directory ready to attach: `activeIndex` holds index `seq`, with `meta` */
+  final case class Opened(index: IndexMap, seq: Long, activeIndex: String, slotCount: Int, meta: IndexMeta)
 
   val DataFile = "data"
   val IndexFiles: Vector[String] = Vector("index.a", "index.b")
@@ -216,4 +216,4 @@ object FsifRecovery:
       throw new IOException(s"$indexName (seq $seq) is attached to journal $journalId (attachment " +
         s"${meta.attachment}) but was not replayed at device load")
     val slotCount = checkedSlotCount(layout, index, forcedDataSize(files))
-    Opened(index, seq, indexName, slotCount)
+    Opened(index, seq, indexName, slotCount, meta)

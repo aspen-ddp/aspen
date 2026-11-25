@@ -944,6 +944,38 @@ class FsifBackendSuite extends FileBasedTests:
     h.reopen()
     h.readData(p).toList shouldBe bytes(20, 2).toList
 
+  test("Ruling R13(a): a reopen releases the reservations a frozen close abandoned"):
+    val h = new Harness
+    val p = ptr(1, oid(1))
+    h.commitOk(alloc(p, bytes(20, 1), 1))
+    h.quiesce()
+    h.await(h.backend.checkpointNow()) // every record covered: the attachment needs no replay
+    val full = new AtomicBoolean(true)
+    h.files.failWhile(Fault.OutOfSpace, _ == FsifRecovery.DataFile)(full.get)
+    val held = h.issueCommit(overwrite(p, bytes(600, 2), 2)) // copy-on-write: reserved, then held by ENOSPC
+    h.backend.isWriteFrozen shouldBe true
+    h.await(h.backend.close()) // abandons it, its reservation still charged
+    held.isCompleted shouldBe false
+    h.backend.detachedForTest shouldBe false
+    val att = h.backend.attachmentId
+    h.shared.journal.needsReplay(att) shouldBe false
+    h.shared.journal.reservedForTest should be > 0L
+    full.set(false)
+    h.reopen() // the same journal: no device load
+    h.shared.journal.reservedForTest shouldBe 0L
+    h.readData(p).toList shouldBe bytes(20, 1).toList
+
+  test("Ruling R13(b): an oversized commit on a tiny ring replies SliceTooLarge and a following commit succeeds"):
+    val h = new Harness(sharedWith = Some(new SharedJournal(rng(5), tinyRing)))
+    val p = ptr(1, oid(1))
+    h.commitOk(alloc(p, bytes(20, 1), 1))
+    // Its appendBound exceeds a whole journal file, so a reservation for its own size could never be granted
+    val huge = bytes(2 * tinyRing.fileSize.toInt, 2)
+    h.commit(overwrite(p, huge, 2)) shouldBe Right(CommitError.SliceTooLarge)
+    h.repair(overwrite(p, huge, 2)).isFailure shouldBe true
+    h.commitOk(overwrite(p, bytes(20, 3), 3))
+    h.readData(p).toList shouldBe bytes(20, 3).toList
+
 object FsifBackendSuite:
   /** The device journal's writes as IoKind.Journal tasks on `io` */
   def journalOn(io: ExecutionContext): Runnable => Unit =

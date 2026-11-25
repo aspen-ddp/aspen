@@ -81,7 +81,8 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
   private var salt = 0L
   private var nextSerial = start.map(_.nextSerial).getOrElse(0L)
   private var tail = nextSerial - 1
-  private val attachments = mutable.HashMap[UUID, Att]()
+  /** In attach order, so owners are notified in an order independent of the (random) attachment ids */
+  private val attachments = mutable.LinkedHashMap[UUID, Att]()
   private val queue = mutable.ArrayDeque[Pending]()
   private var inFlight = false
   private var failure: Option[Throwable] = None
@@ -112,6 +113,9 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
     attachments.get(attachment).exists(a => !a.released && (a.serials.nonEmpty || a.queued > 0))
 
   def failed: Option[Throwable] = lock.synchronized(failure)
+
+  /** Bytes reserved by every attachment, charged as tryReserve charges them */
+  private[fsif] def reservedForTest: Long = lock.synchronized(reservedTotal)
 
   def tryReserve(attachment: UUID, bytes: Long): Boolean =
     require(bytes >= 0, s"negative reservation $bytes")

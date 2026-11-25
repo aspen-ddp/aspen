@@ -362,6 +362,33 @@ class FsifFaultSuite extends FileBasedTests:
     h.crash()
     h.readData(p) shouldBe v2.toList
 
+  test("ENOSPC on a data force while the slot's next in-place write is in flight: the next force does not count the " +
+    "slot's earlier dropped writes as forced"):
+    import FsifCheckpointSuite.{HoldEc, oneShot}
+    val h = new Harness(mkIo = () => new HoldEc)
+    val ec = h.io.asInstanceOf[HoldEc]
+    val p = ptr(1, oid(1))
+    val v1 = bytes(100, 1)
+    h.commitOk(alloc(p, v1, 1))
+    h.quiesce()
+    h.commitOk(writeRange(p, v1, 10, bytes(8, 2), 2)) // A: written in place, not yet forced
+    val v2 = patched(v1, 10, bytes(8, 2))
+    ec.hold = oneShot(isInPlace)
+    h.commitOk(writeRange(p, v2, 60, bytes(8, 3), 3)) // B: its in-place write is in flight
+    val v3 = patched(v2, 60, bytes(8, 3))
+    ec.heldCount shouldBe 1
+    // The checkpoint's force drops A's write; the next force succeeds before B's write completes
+    h.files.failNext(Fault.OutOfSpace, isData, Set(FaultOp.Force))
+    val cp = h.backend.checkpointNow()
+    h.files.faultCount(FsifRecovery.DataFile, FaultOp.Force) shouldBe 1
+    ec.release()
+    h.await(cp)
+    h.quiesce()
+    h.readData(p) shouldBe v3.toList
+    h.fatals.isEmpty shouldBe true
+    h.crash()
+    h.readData(p) shouldBe v3.toList
+
   test("ENOSPC on a copy-on-write's data force re-issues the segment and another object's unforced in-place write"):
     val h = new Harness
     val p = ptr(1, oid(1))
@@ -794,6 +821,116 @@ class FsifFaultSuite extends FileBasedTests:
     held.isCompleted shouldBe false
     ec.release() // the batch is written; the closed store's reply goes nowhere it could matter
     h.fatals.size shouldBe 1
+
+  test("a journal write failure fail-stops every attached store, each through its own onFatal"):
+    val shared = new SharedJournal(rng(3))
+    val n = 3
+    val serials = Vector.fill(n)(new ManualEc)
+    val fatals = Vector.fill(n)(new ConcurrentLinkedQueue[Throwable]())
+    val recs = Vector.fill(n)(new Recorder)
+    val ps = (0 until n).map(i => ptr(1, oid(i + 1)))
+    val bs = (0 until n).map: i =>
+      shared.initialize(i, layout)
+      val b = shared.open(i, layout, InlineEc, FsifTuning(cowThreshold = 256), t => fatals(i).add(t),
+        new ManualScheduler, serialEc = Some(serials(i)), storeId = StoreId(poolId, i.toByte))
+      b.setCompletionHandler(recs(i))
+      b
+    var txn = 0
+    def commit(i: Int, cs: CommitState): Future[CommitResult] =
+      txn += 1
+      val tx = TransactionId(new UUID(3, txn))
+      val f = recs(i).expectCommit(cs.objectId, tx)
+      bs(i).commit(cs, tx)
+      f
+    def runAll(): Unit = while serials.exists(_.pending > 0) do serials.foreach(_.runAll())
+    val allocs = (0 until n).map(i => commit(i, alloc(ps(i), bytes(30, i), 1)))
+    runAll()
+    allocs.foreach(f => Await.result(f, Timeout) shouldBe Left(()))
+    shared.machine.failNext(Fault.IoError, isJournal, Set(FaultOp.Write))
+    val failing = commit(0, overwrite(ps(0), bytes(30, 9), 2))
+    serials(0).runAll() // store 0's append: the journal's write fails, and every owner is told
+    Await.result(failing, Timeout) shouldBe Right(CommitError.IOFailure)
+    shared.journal.failed.isDefined shouldBe true
+    fatals(0).size shouldBe 1
+    // Each other store fail-stops on its own serial executor, once that runs
+    for i <- 1 until n do
+      fatals(i).isEmpty shouldBe true
+      bs(i).hasFailed shouldBe false
+      serials(i).runAll()
+      fatals(i).size shouldBe 1
+      bs(i).hasFailed shouldBe true
+    for i <- 0 until n do
+      val f = commit(i, overwrite(ps(i), bytes(30, 10), 3))
+      val r = recs(i).expectRead(ps(i).id)
+      bs(i).read(ps(i))
+      runAll()
+      Await.result(f, Timeout) shouldBe Right(CommitError.IOFailure)
+      Await.result(r, Timeout) shouldBe Right(ReadError.CorruptedObject)
+    val closed = bs.map(_.close())
+    runAll()
+    closed.foreach(c => Await.result(c, Timeout))
+    bs.foreach(_.detachedForTest shouldBe false)
+    fatals.foreach(_.size shouldBe 1)
+
+  test("a clean close leaves a detached index and the directory reopens under another journal id with nothing to " +
+    "replay"):
+    val h = new Harness
+    val p = ptr(1, oid(1))
+    h.commitOk(alloc(p, bytes(30, 1), 1))
+    h.commitOk(overwrite(p, bytes(30, 2), 2))
+    h.await(h.backend.close())
+    h.backend.detachedForTest shouldBe true
+    FsifRecovery.newestIndex(h.files, layout)._3.detached shouldBe true
+    val target = DeviceJournalRecovery.Target(h.shared.path(0), h.files, layout)
+    // A device load of the old journal leaves it alone
+    DeviceJournalRecovery.recover(h.shared.journalFiles, h.shared.sizing, Seq(target)).outcomes(target.key) shouldBe
+      DeviceJournalRecovery.Outcome.NotAttached
+    // Moved to a device whose journal has another id: its load has nothing to replay, and the open attaches there
+    val otherSizing = JournalSizing(new UUID(0x77, 0x77), 3, 256 * 1024)
+    val otherFiles = new PrefixedFsifFiles(h.shared.machine, "fj2/")
+    val loaded = DeviceJournalRecovery.recover(otherFiles, otherSizing, Seq(target))
+    loaded.outcomes(target.key) shouldBe DeviceJournalRecovery.Outcome.NotAttached
+    val other = new FsifDeviceJournal(otherFiles, otherSizing, loaded.start, r => r.run(), forceAfterWrite = true)
+    h.backend = new FsifBackend(storeId, h.shared.path(0), layout, h.files, InlineEc, other,
+      FsifTuning(cowThreshold = 256), t => h.fatals.add(t), new ManualScheduler)
+    h.backend.setCompletionHandler(h.rec)
+    FsifRecovery.newestIndex(h.files, layout)._3.journalId shouldBe otherSizing.journalId
+    h.readData(p) shouldBe bytes(30, 2).toList
+    h.commitOk(overwrite(p, bytes(30, 3), 3))
+    h.readData(p) shouldBe bytes(30, 3).toList
+    h.fatals.isEmpty shouldBe true
+
+  test("a frozen close does not detach, and the next device-load replay restores its acknowledged writes"):
+    val h = new Harness
+    val p = ptr(1, oid(1))
+    val v1 = bytes(60, 1)
+    h.commitOk(alloc(p, v1, 1))
+    h.quiesce()
+    val slot = h.slotOf(1)
+    val full = new AtomicBoolean(true)
+    h.files.failWhile(Fault.OutOfSpace, isData)(full.get)
+    h.commitOk(writeRange(p, v1, 5, bytes(6, 9), 2)) // journaled and acknowledged; its in-place write is held
+    val v2 = patched(v1, 5, bytes(6, 9))
+    h.backend.isWriteFrozen shouldBe true
+    awaitNoRetry(h, h.backend.close())
+    h.backend.detachedForTest shouldBe false
+    FsifRecovery.newestIndex(h.files, layout)._3.detached shouldBe false
+    def onDisk: List[Byte] =
+      val at = (layout.slotOffset(slot) + SegmentHeader.Size).toInt
+      h.contents(FsifRecovery.DataFile).slice(at, at + v2.length).toList
+    onDisk shouldBe v1.toList // the acknowledged write lives only in the journal
+    full.set(false)
+    // The device load (DeviceJournalRecovery over the device's stores) replays it into the directory
+    h.shared.reload()
+    h.shared.journal
+    h.shared.lastRecovery.get.outcomes(h.shared.path(0)) match
+      case DeviceJournalRecovery.Outcome.Replayed(records) => records should be > 0
+      case o => fail(s"expected a replay, got $o")
+    FsifRecovery.newestIndex(h.files, layout)._3.detached shouldBe true
+    onDisk shouldBe v2.toList
+    h.reopen()
+    h.readData(p) shouldBe v2.toList
+    h.fatals.isEmpty shouldBe true
 
   test("EDQUOT (disk quota exceeded) counts as out of space"):
     FsifIo.isOutOfSpace(new IOException("Disk quota exceeded")) shouldBe true

@@ -20,7 +20,7 @@ import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitStat
   Read, UpdateForm}
 
 class FsifCompactionSuite extends FileBasedTests:
-  import FsifBackendSuite.{InlineEc, ShuffleEc, isKind}
+  import FsifBackendSuite.{InlineEc, ShuffleEc, isKind, journalOn}
   import FsifCheckpointSuite.{HoldEc, oneShot}
   import FsifBackend.IoKind
 
@@ -93,11 +93,14 @@ class FsifCompactionSuite extends FileBasedTests:
             case Some(q) => q.dequeue().success(r.result)
             case None => unexpected.add(r)
 
-  /** A backend over SimulatedFsifFiles; `mkIo` gives every incarnation a fresh io EC */
+  /** A backend on a SharedJournal; `mkIo` gives every incarnation a fresh io EC, on which the device journal's writes
+    * run too (IoKind.Journal tasks)
+    */
   private final class Harness(seed: Int = 0, mkIo: () => ExecutionContext = () => InlineEc,
                               tuning: FsifTuning = FsifTuning(cowThreshold = 256)):
-    var files = new SimulatedFsifFiles(rng(seed))
-    FsifRecovery.initialize(files, layout)
+    val shared = new SharedJournal(rng(seed))
+    shared.initialize(0, layout)
+    def files: SharedJournal.StoreFiles = shared.storeFiles(0)
     val fatals = new ConcurrentLinkedQueue[Throwable]()
     var io: ExecutionContext = mkIo()
     var rec = new Recorder
@@ -105,12 +108,13 @@ class FsifCompactionSuite extends FileBasedTests:
     private var txn = 0
 
     private def open(): FsifBackend =
-      val b = new FsifBackend(storeId, tdir / "fsif", layout, files, io, tuning, t => fatals.add(t))
+      shared.run = journalOn(io)
+      val b = shared.open(0, layout, io, tuning, t => fatals.add(t), storeId = storeId)
       b.setCompletionHandler(rec)
       b
 
     def crash(): Unit =
-      files = files.crash()
+      shared.crash()
       io = mkIo()
       rec = new Recorder
       fatals.clear()
@@ -445,7 +449,7 @@ class FsifCompactionSuite extends FileBasedTests:
         val stats = h.backend.compactionStats
         if h.fatals.isEmpty then
           if stats.mapped > 0 then completed += 1
-          if cpAt >= 0 then h.backend.journalSeq shouldBe 1
+          if cpAt >= 0 then h.backend.indexSeq shouldBe 2 // the attach index is seq 1
           h.assertDense(0 until n)
         else if stats.started > stats.mapped + stats.cancelled then
           midMove += 1

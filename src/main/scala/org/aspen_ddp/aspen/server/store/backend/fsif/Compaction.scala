@@ -45,6 +45,9 @@ import org.aspen_ddp.aspen.common.objects.ObjectId
   * A move write or force, or a truncation, that hits ENOSPC is held through `host.hold` and re-issued by the retry
   * round; once the store unfreezes, `drive` resumes a paused move where it stands. Every step re-runs from its start.
   *
+  * A move starts only once the device journal reserves room for its Map (`journalHasRoomForMove`), so that Map is
+  * never held; the reservation goes back once the Map is written or the move ends without one.
+  *
   * Moves run concurrently with checkpoints. Deltas to t keep being applied to t in place, so a checkpoint's wait
   * for journal-s Deltas is unaffected; the Deltas that kill(t) cancels are cancelled by Map(X, f) in the same serial
   * task, which the checkpoint's Barrier makes durable before index s+1 (taken with X -> t) is written; and f was
@@ -79,7 +82,7 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout,
       move.foreach(finishIfDone)
     else if !host.frozen then
       move.foreach(m => pump(m))
-      if truncate() && move.isEmpty && !backingOff && !host.closing && host.journalHasRoomForMove then
+      if truncate() && move.isEmpty && !backingOff && !host.closing then
         start()
 
   /** X's occupant is about to change (copy-on-write, delete, re-allocation, rebuild): a move of X that has not yet
@@ -146,7 +149,7 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout,
     val t = host.used.length() - 1
     val f = host.used.nextClearBit(0)
     if t > 0 && f < t then
-      host.movable(t).foreach: (x, id) =>
+      host.movable(t).filter(_ => host.journalHasRoomForMove).foreach: (x, id) =>
         host.used.set(f)
         val m = new Move(x, id, t, f)
         move = Some(m)
@@ -304,6 +307,7 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout,
       if !host.fatal then
         host.used.clear(m.to)
       move = None
+      host.moveEnded() // no Map will be appended: its journal reservation goes back
       host.released(m) // a held write or force of a cancelled move is moot
 
 private[fsif] object Compaction:
@@ -331,8 +335,12 @@ private[fsif] object Compaction:
     def closing: Boolean
     /** Writes are frozen by ENOSPC: start nothing new */
     def frozen: Boolean
-    /** The active journal has room for one more move's Mapping under the hard limit, and nothing is held by it */
+    /** Nothing waits for journal room and the device journal reserves room for one Mapping, held by the move until
+      * its Map is written (`commitMove`) or it ends without one (`moveEnded`)
+      */
     def journalHasRoomForMove: Boolean
+    /** A move that reserved journal room ends without appending its Map */
+    def moveEnded(): Unit
     /** Forces `data` (one force at a time); `done` runs once a force issued after the call completes */
     def forceData(kind: FsifBackend.IoKind)(done: Try[Unit] => Unit): Unit
     /** Bumped by every data force that fails with ENOSPC */
@@ -341,8 +349,8 @@ private[fsif] object Compaction:
     def hold(key: AnyRef, kind: String, retry: () => Unit, abort: () => Unit): Unit
     /** The held operation `key` succeeded or became moot; no effect if it is not held */
     def released(key: AnyRef): Unit
-    /** Maps X to `to`, kills `from` and appends Map(X, to) in this serial task; frees `from` once it is durable,
-      * then calls `done`
+    /** Maps X to `to`, kills `from` and appends Map(X, to) in this serial task; frees `from` once it is durable and
+      * returns the move's journal reservation, then calls `done`
       */
     def commitMove(x: Int, id: ObjectId, from: Int, to: Int)(done: Try[Unit] => Unit): Unit
 

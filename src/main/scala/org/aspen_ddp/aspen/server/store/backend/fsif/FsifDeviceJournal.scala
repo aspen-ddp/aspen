@@ -104,6 +104,13 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
 
   def tailSerial: Long = lock.synchronized(tail)
 
+  /** The attachment is unreleased and holds records above its covered serial in this journal's lifetime, written or
+    * still queued. False for one this journal never saw or has released: an index naming such an attachment, written
+    * by an open of this lifetime that failed after its attach index was durable, needs no replay
+    */
+  def needsReplay(attachment: UUID): Boolean = lock.synchronized:
+    attachments.get(attachment).exists(a => !a.released && (a.serials.nonEmpty || a.queued > 0))
+
   def failed: Option[Throwable] = lock.synchronized(failure)
 
   def tryReserve(attachment: UUID, bytes: Long): Boolean =

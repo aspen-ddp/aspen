@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.{CommitState, UpdateForm}
-import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifFile, FsifFiles, FsifLayout, FsifRecovery,
+import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifFile, FsifJournalBridge, FsifFiles, FsifLayout, FsifRecovery,
   FsifTuning, NioFsifFiles}
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
@@ -146,7 +146,8 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
       val dataEc = io.dataEc
       val serial = Some(io.serialEc)
       val gate = closeGate
-      val b = new FsifBackend(storeId, path, layout, new FullableFiles(path), dataEc, FsifTuning(),
+      val journal = FsifJournalBridge.journalFor(io, path, layout)
+      val b = new FsifBackend(storeId, path, layout, new FullableFiles(path), dataEc, journal, FsifTuning(),
           onFatal, org.aspen_ddp.aspen.server.store.backend.SharedRetryScheduler, serial):
         override def hasFailed: Boolean = super.hasFailed || FsifSeams.this.reportFailed
         override def close(): Future[Unit] = gate match
@@ -297,7 +298,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     host.testingOnlyHandleEvents()
     val storeDir = writeConfigOnly(deviceDir)
     os.write(storeDir / FsifRecovery.DataFile, Array.fill[Byte](10)(1))
-    os.write(storeDir / FsifRecovery.JournalFiles(0), Array.fill[Byte](10)(2))
+    os.write(storeDir / FsifRecovery.IndexFiles(0), Array.fill[Byte](10)(2))
     load(host)
 
     Future.successful:
@@ -314,7 +315,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).map: _ =>
       os.remove(storeDir / FsifRecovery.IndexFiles(0))
       load(host)
       host.getStoreIds should not contain storeId
@@ -327,7 +328,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).map: _ =>
       fsif(host).outOfSpaceOpens = 2
       load(host)
       host.getStoreIds should not contain storeId
@@ -363,7 +364,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).map: _ =>
       fsif(host).outOfSpaceOpens = Int.MaxValue
       load(host)
       val retriedAt = (1 to 100).filter: scan =>
@@ -438,7 +439,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).flatMap: _ =>
       load(host)
       host.getStoreIds should contain(storeId)
       // The close's final I/O fails: the backend reports failed by the time its close completes
@@ -454,18 +455,19 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         os.exists(Backend.crlSaveFile(storeDir)) should be(false)
         CopyFixtures.phaseOf(deviceDir, storeId).exists(_.isInstanceOf[Phase.Outbound]) should be(false)
 
-  atest("closing an FSIF store frozen by a full device completes without space returning, and it loads again"):
+  atest("closing an FSIF store frozen by a full device completes without space returning, and it stays attached"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).flatMap: _ =>
       load(host)
       host.getStoreIds should contain(storeId)
       val backend = fsif(host).lastBackend.get
       fsif(host).deviceFull = true
-      // A repair allocates an unmapped ext; its journal batch hits ENOSPC and freezes the store
+      // A repair allocates an unmapped ext; the device journal (preallocated) takes it, and its in-place write hits
+      // ENOSPC and freezes the store
       val id = ObjectId(new UUID(1, 2))
       val ptr = DataObjectPointer(id, storeId.poolId, java.nio.ByteBuffer.allocate(4).putInt(0).array())
       val md = Metadata(ObjectRevision(TransactionId(new UUID(3, 4))), ObjectRefcount(1, 1), HLCTimestamp(1))
@@ -477,13 +479,15 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.testingOnlyHandleEvents()
       closed.map: _ =>
         backend.isWriteFrozen should be(true)
-        repaired.isCompleted should be(false) // abandoned, never acknowledged
+        backend.detachedForTest should be(false) // a frozen close leaves its records for the next device load
         host.getStoreIds should not contain storeId
         CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) should be(false)
         os.exists(Backend.crlSaveFile(storeDir)) should be(false)
         fsif(host).deviceFull = false
+        // Until the device reloads and replays them, an open of the copy is an I/O error (a load retry), never a loss
         load(host)
-        host.getStoreIds should contain(storeId)
+        host.getStoreIds should not contain storeId
+        CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) should be(false)
 
   atest("an FSIF store's recovery runs as a device lane job and its outcome is served by an event"):
     val hostRoot = newHostDir()
@@ -491,7 +495,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).map: _ =>
       // The load's config read, and the open after it, wait on the device's lane, not in the load that started it
       holdDevice(host, deviceDir)
       load(host)
@@ -509,7 +513,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).flatMap: _ =>
       val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
       fsif(host).openQueue = Some(queued)
       load(host)
@@ -536,7 +540,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).flatMap: _ =>
       val queued = holdOpens(host)
       // The unserved backend's close is held, so the retry is seen waiting for it
       val gate = Promise[Unit]()
@@ -589,7 +593,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).flatMap: _ =>
       // Read by the LoadStore, after the open: unparsable, so the load is retried, the file never replaced
       val file = storeDir / StoreIncarnationFile.FileName
       val original = os.read(file)
@@ -634,7 +638,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).flatMap: _ =>
       val file = storeDir / StoreIncarnationFile.FileName
       os.write.over(file, "not a uuid")
       val gate = Promise[Unit]()
@@ -671,7 +675,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).map: _ =>
       val queued = holdOpens(host)
       load(host)
       queued.size should be(1)
@@ -693,7 +697,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       val host = newSeamHost(hostRoot)
       host.testingOnlyHandleEvents()
       val storeDir = writeFsifStoreConfig(deviceDir)
-      FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+      Future(FsifBackend.initializeStore(storeDir, layout)).map: _ =>
         fail(fsif(host))
         load(host)
         host.getStoreIds should not contain storeId
@@ -722,7 +726,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).map: _ =>
       fsif(host).failedOpens = 1
       load(host)
       fsif(host).opens should be(1)
@@ -755,7 +759,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).map: _ =>
       fsif(host).failedOpens = 1
       load(host)
       host.control.devices.devices(deviceA).reconciledEntries = Some(Map())
@@ -792,7 +796,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
     val storeDir = writeFsifStoreConfig(deviceDir)
     DeviceMarkers.writeShutdownState(deviceDir, HostId.BootstrapHostId)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).map: _ =>
       val lookup = Promise[StorageDeviceState]()
       val host = newSeamHost(hostRoot, _.heldLookups = Map(deviceA -> lookup))
       host.testingOnlyHandleEvents()
@@ -827,7 +831,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     os.makeDir.all(CrashRecoveryLog.deviceCrlDir(deviceDir))
     val storeDir = writeFsifStoreConfig(deviceDir)
     DeviceMarkers.writeShutdownState(deviceDir, HostId.BootstrapHostId)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).flatMap: _ =>
       // Left in outbound/ by an abandoned transfer out: bringIntoService reinstates it (T7)
       CopyFixtures.markCopy(deviceDir, storeId, Phase.Outbound(""))
       val live = CopyFixtures.livePathOf(deviceDir, storeId)
@@ -856,7 +860,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
   private def reinstateAbandoned(host: Host, deviceDir: os.Path, storeDir: os.Path,
                                  queued: java.util.concurrent.ConcurrentLinkedQueue[Runnable]): Future[Unit] =
     given ExecutionContext = executionContext
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).flatMap: _ =>
       CopyFixtures.markCopy(deviceDir, storeId, Phase.Outbound(""))
       load(host) // skipped in outbound/: offline
       host.control.router.silentStores should contain(storeId)
@@ -1137,7 +1141,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+    Future(FsifBackend.initializeStore(storeDir, layout)).flatMap: _ =>
       val retries = 10000
       fsif(host).outOfSpaceOpens = retries
       // Each load is an open that takes over the wait entry, as a retry's does, without the scans of backoff between

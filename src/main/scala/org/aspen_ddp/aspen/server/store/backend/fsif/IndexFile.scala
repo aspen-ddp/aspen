@@ -23,7 +23,7 @@ object IndexMap:
 final case class IndexMeta(journalId: UUID, attachment: UUID, covered: Long, detached: Boolean)
 
 object IndexMeta:
-  /** Attached to no journal: a fresh store, or one written by the per-store-journal backend */
+  /** Attached to no journal: a fresh store */
   val None: IndexMeta = IndexMeta(new UUID(0, 0), new UUID(0, 0), -1L, detached = true)
 
 /** magic "FSIFINDX"(8) seq(8) journalId(16) attachment(16) covered(8) detached(1, 0 or 1), then
@@ -35,9 +35,6 @@ object IndexFile:
   private val EntrySize = 20
 
   private[fsif] def sizeFor(segmentCount: Int): Long = 16L + MetaSize + segmentCount.toLong * EntrySize + 4
-
-  /** An index attached to no journal (IndexMeta.None) */
-  def encode(seq: Long, map: IndexMap): Array[Byte] = encode(seq, IndexMeta.None, map)
 
   def encode(seq: Long, meta: IndexMeta, map: IndexMap): Array[Byte] =
     val n = map.slots.length

@@ -20,7 +20,7 @@ import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitStat
   Read, UpdateForm}
 
 class FsifCheckpointSuite extends FileBasedTests:
-  import FsifBackendSuite.{InlineEc, ShuffleEc, isKind}
+  import FsifBackendSuite.{InlineEc, ShuffleEc, isKind, journalOn}
   import FsifCheckpointSuite.*
 
   private val layout = FsifLayout(1024, 64)
@@ -91,11 +91,16 @@ class FsifCheckpointSuite extends FileBasedTests:
             case Some(q) => q.dequeue().success(r.result)
             case None => unexpected.add(r)
 
-  /** A backend over SimulatedFsifFiles; `mkIo` gives every incarnation a fresh io EC */
+  /** Store `idx` on a SharedJournal (a fresh one unless `sharedWith`); `mkIo` gives every incarnation a fresh io EC,
+    * on which the device journal's writes run too when this harness builds it (IoKind.Journal tasks)
+    */
   private final class Harness(seed: Int = 0, mkIo: () => ExecutionContext = () => InlineEc,
-                              tuning: FsifTuning = FsifTuning(cowThreshold = 256)):
-    var files = new SimulatedFsifFiles(rng(seed))
-    FsifRecovery.initialize(files, layout)
+                              tuning: FsifTuning = FsifTuning(cowThreshold = 256),
+                              sharedWith: Option[SharedJournal] = None, idx: Int = 0,
+                              sizing: JournalSizing = SharedJournal.TestSizing):
+    val shared: SharedJournal = sharedWith.getOrElse(new SharedJournal(rng(seed), sizing))
+    shared.initialize(idx, layout)
+    def files: SharedJournal.StoreFiles = shared.storeFiles(idx)
     val fatals = new ConcurrentLinkedQueue[Throwable]()
     var io: ExecutionContext = mkIo()
     var rec = new Recorder
@@ -103,19 +108,29 @@ class FsifCheckpointSuite extends FileBasedTests:
     private var txn = 0
 
     private def open(): FsifBackend =
-      val b = new FsifBackend(storeId, tdir / "fsif", layout, files, io, tuning, t => fatals.add(t))
+      shared.run = journalOn(io)
+      val b = shared.open(idx, layout, io, tuning, t => fatals.add(t), storeId = StoreId(poolId, idx.toByte))
       b.setCompletionHandler(rec)
       b
 
+    /** The whole machine crashes (every store on `shared`); this harness reopens its store */
     def crash(): Unit =
-      files = files.crash()
+      shared.crash()
+      reopen()
+
+    /** After another harness on `shared` crashed the machine */
+    def reopen(): Unit =
       io = mkIo()
       rec = new Recorder
       backend = open()
 
-    def pump(): Unit = io match
-      case m: ShuffleEc => m.runAll()
-      case _ => ()
+    /** Harnesses on the same SharedJournal whose io may hold this one's journal writes, pumped with it */
+    var peers: Seq[Harness] = Nil
+
+    private def shuffle: Seq[ShuffleEc] = (this +: peers).map(_.io).collect { case m: ShuffleEc => m }
+
+    def pump(): Unit =
+      while shuffle.exists(_.pending > 0) do shuffle.foreach(_.runAll())
 
     def await[A](f: Future[A]): A =
       pump()
@@ -153,32 +168,33 @@ class FsifCheckpointSuite extends FileBasedTests:
 
     def indexSeq(name: String): Option[Long] = IndexFile.decode(contents(name), layout.segmentCount).map(_._1)
 
-    def journalSeqOf(name: String): Option[Long] = JournalFormat.decodeHeader(contents(name)).map(_._1)
+    def meta(name: String): Option[IndexMeta] = IndexFile.decode(contents(name), layout.segmentCount).map(_._2)
 
-  test("checkpointNow advances journalSeq, empties the old journal and index, and keeps every object"):
+  test("checkpointNow advances indexSeq, empties the old index, and keeps every object"):
     val h = new Harness
     val ps = (0 until 5).map(x => ptr(x, oid(x + 1)))
     val vs = mutable.ArrayBuffer.tabulate(5)(i => bytes(50 + i * 100, i)) // 450 bytes goes copy-on-write
     for i <- 0 until 5 do h.commitOk(alloc(ps(i), vs(i), 1))
     h.commitOk(writeRange(ps(0), vs(0), 3, bytes(4, 9), 2))
     vs(0) = patched(vs(0), 3, bytes(4, 9))
-    h.backend.journalSeq shouldBe 0
-    h.await(h.backend.checkpointNow())
-    h.backend.journalSeq shouldBe 1
-    h.size("journal.a") shouldBe 0
+    // initialize wrote index.a (seq 0), the attach index.b (seq 1)
+    h.backend.indexSeq shouldBe 1
     h.size("index.a") shouldBe 0
-    h.size("journal.b") shouldBe JournalFormat.HeaderSize
-    h.journalSeqOf("journal.b") shouldBe Some(1)
-    h.indexSeq("index.b") shouldBe Some(1)
+    h.await(h.backend.checkpointNow())
+    h.backend.indexSeq shouldBe 2
+    h.size("index.b") shouldBe 0
+    h.indexSeq("index.a") shouldBe Some(2)
+    val m = h.meta("index.a").get
+    (m.journalId, m.attachment, m.detached) shouldBe ((h.shared.sizing.journalId, h.backend.attachmentId, false))
+    m.covered shouldBe h.shared.journal.tailSerial
     for i <- 0 until 5 do h.readData(ps(i)) shouldBe vs(i).toList
-    // Later commits go to journal.b
+    // Later commits are above the covered serial
     h.commitOk(writeRange(ps(1), vs(1), 7, bytes(3, 4), 3))
     vs(1) = patched(vs(1), 7, bytes(3, 4))
-    h.size("journal.b") should be > JournalFormat.HeaderSize.toLong
-    h.size("journal.a") shouldBe 0
+    h.shared.journal.tailSerial should be > m.covered
     h.quiesce()
     h.crash()
-    h.backend.journalSeq shouldBe 1
+    h.backend.indexSeq shouldBe 4 // device-load replay wrote seq 3, the attach seq 4
     for i <- 0 until 5 do h.readData(ps(i)) shouldBe vs(i).toList
 
   test("two back-to-back checkpoints (a to b to a) read back correctly after a crash"):
@@ -191,20 +207,18 @@ class FsifCheckpointSuite extends FileBasedTests:
     vs(2) = patched(vs(2), 11, bytes(9, 3))
     h.commitOk(delete(ps(3), 3))
     h.await(h.backend.checkpointNow())
-    h.backend.journalSeq shouldBe 2
-    h.size("journal.b") shouldBe 0
-    h.size("index.b") shouldBe 0
-    h.journalSeqOf("journal.a") shouldBe Some(2)
-    h.indexSeq("index.a") shouldBe Some(2)
+    h.backend.indexSeq shouldBe 3
+    h.size("index.a") shouldBe 0
+    h.indexSeq("index.b") shouldBe Some(3)
     h.commitOk(append(ps(0), vs(0), bytes(30, 5), 4))
     vs(0) = vs(0) ++ bytes(30, 5)
     h.crash()
-    h.backend.journalSeq shouldBe 2
+    h.backend.indexSeq shouldBe 5
     for i <- 0 until 3 do h.readData(ps(i)) shouldBe vs(i).toList
     h.read(ps(3)) shouldBe Right(ReadError.ObjectNotFound)
 
-  test("with journalBound = 4096, 200 small writes trigger a checkpoint on their own"):
-    val h = new Harness(tuning = FsifTuning(cowThreshold = 256, journalBound = 4096))
+  test("with a small device journal, 200 small writes trigger checkpoints on their own (journal pressure)"):
+    val h = new Harness(sizing = JournalSizing(new UUID(3, 3), 3, 16 * 1024))
     val p = ptr(9, oid(9))
     var v = bytes(200, 1)
     h.commitOk(alloc(p, v, 1))
@@ -213,7 +227,7 @@ class FsifCheckpointSuite extends FileBasedTests:
       h.commitOk(writeRange(p, v, (i * 13) % 190, patch, i + 2))
       v = patched(v, (i * 13) % 190, patch)
     h.quiesce()
-    h.backend.journalSeq should be >= 1L
+    h.backend.indexSeq should be >= 10L // 3 files of 3 batches each: the ring wrapped many times
     h.readData(p) shouldBe v.toList
     h.crash()
     h.readData(p) shouldBe v.toList
@@ -222,8 +236,8 @@ class FsifCheckpointSuite extends FileBasedTests:
     val h = new Harness
     h.await(h.backend.rebuildWrite(ptr(3, oid(3)), ObjectType.Data, md(1), DataBuffer(bytes(70, 3))))
     h.await(h.backend.rebuildFlush())
-    h.backend.journalSeq shouldBe 1
-    h.indexSeq("index.b") shouldBe Some(1)
+    h.backend.indexSeq shouldBe 2
+    h.indexSeq("index.a") shouldBe Some(2)
     h.crash()
     h.readData(ptr(3, oid(3))) shouldBe bytes(70, 3).toList
 
@@ -243,38 +257,43 @@ class FsifCheckpointSuite extends FileBasedTests:
     h.await(cp)
     h.await(again)
     h.await(q)
-    h.backend.journalSeq shouldBe 1
+    h.backend.indexSeq shouldBe 2
 
-  test("Ruling 19: a commit arriving while journal s is still being forced is not acknowledged before it"):
-    for crashBeforeRelease <- List(false, true) do
-      withClue(s"crashBeforeRelease=$crashBeforeRelease"):
-        val h = new Harness(mkIo = () => new HoldEc)
-        val ec = h.io.asInstanceOf[HoldEc]
-        val p = ptr(1, oid(1))
-        val v1 = bytes(100, 1)
-        h.commitOk(alloc(p, v1, 1))
-        h.quiesce()
-        ec.hold = oneShot(isKind(FsifBackend.IoKind.Journal))
-        val fa = h.issueCommit(writeRange(p, v1, 10, bytes(8, 2), 2)) // its batch is held
-        val v2 = patched(v1, 10, bytes(8, 2))
-        ec.heldCount shouldBe 1
-        val cp = h.backend.checkpointNow()
-        val fb = h.issueCommit(writeRange(p, v2, 10, bytes(8, 3), 3))
-        val v3 = patched(v2, 10, bytes(8, 3))
-        fa.isCompleted shouldBe false
-        fb.isCompleted shouldBe false
-        cp.isCompleted shouldBe false
-        if crashBeforeRelease then
-          h.crash()
-          h.readData(p) shouldBe v1.toList
-        else
-          ec.release()
-          h.await(fa) shouldBe Left(())
-          h.await(fb) shouldBe Left(())
-          h.await(cp)
-          h.readData(p) shouldBe v3.toList
-          h.crash()
-          h.readData(p) shouldBe v3.toList
+  test("Ruling R8: a commit made while a checkpoint drains shares no batch with the snapshot's last append"):
+    // Store y's batch is in flight; store x's delete (A, the snapshot's last append) queues behind it; x's checkpoint
+    // snapshots; x's commit b follows. Were b in A's batch S, index s+1 would cover it unapplied, and a crash before
+    // b's in-place write would lose it.
+    val shared = new SharedJournal(rng(3))
+    val ec = new HoldEc
+    val x = new Harness(mkIo = () => ec, sharedWith = Some(shared), idx = 0)
+    val y = new Harness(mkIo = () => ec, sharedWith = Some(shared), idx = 1)
+    val p = ptr(1, oid(1))
+    val q = ptr(2, oid(2))
+    val v1 = bytes(100, 1)
+    x.commitOk(alloc(p, v1, 1))
+    x.commitOk(alloc(q, bytes(30, 2), 1))
+    y.commitOk(alloc(ptr(5, oid(5)), bytes(30, 5), 1))
+    x.quiesce()
+    ec.hold = r => isKind(FsifBackend.IoKind.InPlace)(r) || isKind(FsifBackend.IoKind.Journal)(r)
+    val fy = y.issueCommit(writeRange(ptr(5, oid(5)), bytes(30, 5), 0, bytes(4, 6), 2)) // in flight, held
+    ec.heldCount shouldBe 1
+    val fa = x.issueCommit(delete(q, 2)) // A: queued behind y's batch
+    val cp = x.backend.checkpointNow()
+    val fb = x.issueCommit(writeRange(p, v1, 10, bytes(8, 3), 3)) // b
+    val v2 = patched(v1, 10, bytes(8, 3))
+    // Journal writes run; in-place writes stay held, so b is never applied before the crash
+    ec.hold = isKind(FsifBackend.IoKind.InPlace)
+    ec.release(isKind(FsifBackend.IoKind.Journal))
+    y.await(fy) shouldBe Left(())
+    x.await(fa) shouldBe Left(())
+    x.await(fb) shouldBe Left(())
+    x.await(cp)
+    x.backend.indexSeq shouldBe 2
+    shared.crash()
+    x.reopen()
+    y.reopen()
+    x.readData(p) shouldBe v2.toList
+    x.read(q) shouldBe Right(ReadError.ObjectNotFound)
 
   test("a journal-s Delta cancelled by a later delete holds the checkpoint until that delete is durable"):
     for crashBeforeRelease <- List(false, true) do
@@ -310,35 +329,44 @@ class FsifCheckpointSuite extends FileBasedTests:
           h.read(p) shouldBe Right(ReadError.ObjectNotFound)
 
   test("a crash at any file op during a checkpoint with commits in flight keeps every acknowledged write"):
+    // Two stores on one machine and one device journal; the checkpoint runs on store 0 while both commit.
     // Coverage: seeds whose crash cut the checkpoint short, and seeds whose checkpoint completed first
     var cutShort = 0
     var completed = 0
     for seed <- 0 until 50 do
       withClue(s"seed=$seed"):
         val r = rng(seed + 5000)
-        val h = new Harness(seed, mkIo = () => new ShuffleEc(r))
+        val shared = new SharedJournal(rng(seed))
+        val hs = Vector.tabulate(2)(i => new Harness(seed, mkIo = () => new ShuffleEc(r), sharedWith = Some(shared),
+          idx = i))
+        hs(0).peers = Seq(hs(1))
+        hs(1).peers = Seq(hs(0))
         val n = 6
         val ps = (0 until n).map(x => ptr(x, oid(x + 1)))
-        // Per ext, every issued version in order (None = deleted), with whether it was acknowledged
-        val hist = Array.fill(n)(mutable.ArrayBuffer[(Option[Array[Byte]], () => Boolean)]())
+        // Per store and ext, every issued version in order (None = deleted), with whether it was acknowledged
+        val hist = Array.fill(2, n)(mutable.ArrayBuffer[(Option[Array[Byte]], () => Boolean)]())
         var rev = 1
-        for x <- 0 until n do
-          val v = bytes(20 + r.nextInt(400), x)
-          h.commitOk(alloc(ps(x), v, rev))
-          hist(x) += ((Some(v), () => true))
-        h.quiesce()
-        val io = h.io.asInstanceOf[ShuffleEc]
+        for s <- 0 until 2; x <- 0 until n do
+          val v = bytes(20 + r.nextInt(400), x + s)
+          hs(s).commitOk(alloc(ps(x), v, rev))
+          hist(s)(x) += ((Some(v), () => true))
+        hs.foreach(_.quiesce())
+        val ios = hs.map(_.io.asInstanceOf[ShuffleEc])
+        def runAll(): Unit =
+          while ios.exists(_.pending > 0) do ios.foreach(_.runAll())
+        val startSeq = hs(0).backend.indexSeq
         val opCount = 14
         val cpAt = r.nextInt(opCount)
         for i <- 0 until opCount do
           if i == cpAt then
-            // Counted from the checkpoint's start: the crash lands inside it or just after it (a dozen or more ops plus
-            // those of the commits in flight)
-            h.files.crashAfterOps(r.nextInt(70))
-            h.backend.checkpointNow()
+            // Counted from the checkpoint's start: the crash lands inside it or just after it (a few ops plus those of
+            // the commits in flight)
+            shared.machine.crashAfterOps(r.nextInt(50))
+            hs(0).backend.checkpointNow()
+          val s = r.nextInt(2)
           val x = r.nextInt(n)
           rev += 1
-          val (cs, next) = hist(x).last._1 match
+          val (cs, next) = hist(s)(x).last._1 match
             case None =>
               val v = bytes(r.nextInt(600), rev)
               (alloc(ps(x), v, rev), Some(v))
@@ -356,20 +384,22 @@ class FsifCheckpointSuite extends FileBasedTests:
                 case _ =>
                   val v = bytes(r.nextInt(900), rev) // over 256 bytes goes copy-on-write
                   (overwrite(ps(x), v, rev), Some(v))
-          val f = h.issueCommit(cs)
-          hist(x) += ((next, () => acked(f)))
-          for _ <- 0 until r.nextInt(6) do io.runOne()
-        io.runAll()
-        if h.fatals.isEmpty then h.backend.journalSeq shouldBe 1
-        // The I/O stop was armed as the checkpoint started, so a stop before seq 1 is durable landed inside it
-        if h.backend.journalSeq == 1 then completed += 1
-        else if !h.fatals.isEmpty then cutShort += 1
-        h.crash()
-        for x <- 0 until n do
-          withClue(s"ext=$x"):
-            val k = hist(x).lastIndexWhere(_._2())
-            val allowed = hist(x).drop(k).map(_._1.map(_.toList)).toList
-            val got = h.read(ps(x)) match
+          val f = hs(s).issueCommit(cs)
+          hist(s)(x) += ((next, () => acked(f)))
+          for _ <- 0 until r.nextInt(6) do ios(r.nextInt(2)).runOne()
+        runAll()
+        val done = hs(0).backend.indexSeq == startSeq + 1
+        if hs(0).fatals.isEmpty then done shouldBe true
+        // The I/O stop was armed as the checkpoint started, so a stop before its index is durable landed inside it
+        if done then completed += 1
+        else if !hs(0).fatals.isEmpty then cutShort += 1
+        shared.crash()
+        hs.foreach(_.reopen())
+        for s <- 0 until 2; x <- 0 until n do
+          withClue(s"store=$s ext=$x"):
+            val k = hist(s)(x).lastIndexWhere(_._2())
+            val allowed = hist(s)(x).drop(k).map(_._1.map(_.toList)).toList
+            val got = hs(s).read(ps(x)) match
               case Left(rs) => Some(rs.data.getByteArray.toList)
               case Right(ReadError.ObjectNotFound) => None
               case Right(e) => fail(s"read failed: $e")

@@ -36,12 +36,14 @@ import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitStat
   * on a ManualScheduler, so a seed's run is reproducible.
   */
 class FsifModelSuite extends FileBasedTests:
-  import FsifBackendSuite.ShuffleEc
+  import FsifBackendSuite.{ShuffleEc, journalOn}
   import FsifFaultSuite.ManualScheduler
   import FsifModelSuite.*
 
   private val layout = FsifLayout(1024, 16)
-  private val tuning = FsifTuning(cowThreshold = 256, journalBound = 4096, unappliedBound = 4096)
+  private val tuning = FsifTuning(cowThreshold = 256, unappliedBound = 4096)
+  /** A small device journal: its pressure starts checkpoints, as a small journalBound did */
+  private val sizing = JournalSizing(new UUID(9, 9), 3, 16 * 1024)
   private val poolId = PoolId(new UUID(7, 7))
   private val storeId = StoreId(poolId, 0)
   private val Exts = 16
@@ -137,8 +139,9 @@ class FsifModelSuite extends FileBasedTests:
     private val scrambled = splitMix(seed.toLong)
     private val rnd = new Random(scrambled)
     private val ioRnd = new Random(splitMix(scrambled ^ 0x10))
-    var files = new SimulatedFsifFiles(new Random(splitMix(scrambled ^ 0x20)))
-    FsifRecovery.initialize(files, layout)
+    var shared = new SharedJournal(new Random(splitMix(scrambled ^ 0x20)), sizing)
+    shared.initialize(0, layout)
+    def files: SharedJournal.StoreFiles = shared.storeFiles(0)
 
     val log = mutable.ArrayBuffer[String]()
     private val history = Array.fill(Exts)(mutable.ArrayBuffer(new Entry(None, "initial", baseline = true)))
@@ -190,12 +193,14 @@ class FsifModelSuite extends FileBasedTests:
       window = None
       val h = new Handler(x => history(x).size, () => fired)
       handler = h
-      val b = new FsifBackend(storeId, tdir / "fsif", layout, new ProbeFiles(files, onCrashIo), io, tuning,
-        t => fatals += t, sched)
+      shared.run = journalOn(io)
+      shared.wrapJournal = f => new ProbeFiles(f, onCrashIo)
+      val b = shared.open(0, layout, io, tuning, t => fatals += t, sched, wrap = f => new ProbeFiles(f, onCrashIo),
+        storeId = storeId)
       b.setCompletionHandler(h)
       backend = b
       opened = true
-      startSeq = b.journalSeq
+      startSeq = b.indexSeq
       b
 
     private def onCrashIo(): Unit =
@@ -428,29 +433,23 @@ class FsifModelSuite extends FileBasedTests:
       checkReads()
       checkErrors()
       pendingReads.clear()
-      checkpoints += backend.journalSeq - startSeq
+      checkpoints += backend.indexSeq - startSeq
       moves += backend.compactionStats.mapped
       for x <- 0 until Exts do
         ackedCommits += history(x).drop(1).count(_.acked)
         unackedAtCrash += history(x).count(!_.acked)
       // Rules (and so faults) live only in the incarnation's files, which this crash replaces
       cov.dataForceFaults += files.faultCount(FsifRecovery.DataFile, FaultOp.Force)
-      files = files.crash()
+      shared.crash()
       recover()
       verifyRecovered()
 
-    /** Both journals hold a header, with consecutive seqs: the crash hit a checkpoint after its journal switch, so
-      * recovery has an interrupted checkpoint to finish
+    /** The newest index is attached and not detached: the device load replays the store's records into it (the
+      * device-journal counterpart of finishing an interrupted checkpoint)
       */
     private def midCheckpointImage: Boolean =
-      val seqs = FsifRecovery.JournalFiles.flatMap: name =>
-        if !files.exists(name) then
-          None
-        else
-          val f = files.open(name)
-          try JournalFormat.decodeHeader(f.read(0, f.size.toInt)).map(_._1)
-          finally f.close()
-      seqs.size == 2 && math.abs(seqs(0) - seqs(1)) == 1
+      try !FsifRecovery.newestIndex(files, layout)._3.detached
+      catch case _: FsifRecovery.StoreLost => false
 
     /** The seqs of the valid index files in the image */
     private def indexSeqs: Vector[Long] =
@@ -480,11 +479,12 @@ class FsifModelSuite extends FileBasedTests:
         if !interruptRecovery then
           None
         else
-          val ref = files.snapshot()
+          val ref = shared.snapshot()
           val ec = new ShuffleEc(new Random(splitMix(scrambled ^ op)))
           val h = new Handler(_ => 0, () => false)
-          val b = new FsifBackend(storeId, tdir / "ref", layout, ref, ec, tuning, _ => (), new ManualScheduler)
-          val recoveryOps = ref.opCount.toInt
+          ref.run = journalOn(ec)
+          val b = ref.open(0, layout, ec, tuning, _ => (), new ManualScheduler, storeId = storeId)
+          val recoveryOps = ref.machine.opCount.toInt
           b.setCompletionHandler(h)
           Some(((0 until Exts).map(x => stateOf(b, h, ec, x)), recoveryOps))
       reference.foreach: (_, recoveryOps) =>
@@ -507,7 +507,7 @@ class FsifModelSuite extends FileBasedTests:
               note(s"recovery cut off after $n of $recoveryOps ops (mid-checkpoint image: $midCheckpoint)")
             case NonFatal(t) =>
               fail(s"recovery cut off after $n ops threw $t (a crash during recovery must stay recoverable)", t)
-          files = files.crash()
+          shared.crash()
           countIndexes()
           depth += 1
           again = depth < 3 && rnd.nextInt(3) == 0
@@ -544,7 +544,7 @@ class FsifModelSuite extends FileBasedTests:
       val flag = new AtomicBoolean(true)
       val (fileName, file) = rnd.nextInt(5) match
         case 0 => ("all", (_: String) => true)
-        case 1 => ("journals", (n: String) => n.startsWith("journal"))
+        case 1 => ("indexes", (n: String) => n.startsWith("index")) // the device journal never runs out of space
         case 2 | 3 => ("data", (n: String) => n == FsifRecovery.DataFile)
         case _ => ("indexes", (n: String) => n.startsWith("index"))
       // ENOSPC on a data force drops every write since the last good force (the simulator discards them), so it is

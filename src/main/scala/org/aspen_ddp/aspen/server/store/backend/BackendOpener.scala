@@ -1,9 +1,9 @@
 package org.aspen_ddp.aspen.server.store.backend
 
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.StoreConfig
+import org.aspen_ddp.aspen.server.{FileStat, StoreConfig}
 import org.aspen_ddp.aspen.server.host.{DeviceIo, JobKind}
-import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifLayout}
+import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifJournalBridge, FsifLayout, FsifRecovery}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -42,13 +42,17 @@ class DefaultBackendOpener(ec: ExecutionContext) extends BackendOpener:
     .future
 
   /** Opens an existing FSIF store (FsifBackend.open: a missing or blank store is lost), its I/O on the device's data
-   *  pool and its serial drains on the device's serial pool */
+   *  pool and its serial drains on the device's serial pool, against the device's journal (for now the temporary
+   *  FsifJournalBridge; Tasks 9-10 give DeviceIo the journal) */
   def openFsifBackend(storeId: StoreId,
                       storePath: os.Path,
                       layout: FsifLayout,
                       onFatal: Throwable => Unit,
                       io: DeviceIo): Backend =
-    FsifBackend.open(storeId, storePath, layout, io.dataEc, onFatal, serialEc = Some(io.serialEc),
+    if !FileStat.isDir(storePath) then
+      throw new FsifRecovery.StoreLost(s"FSIF store $storeId: its directory $storePath is missing")
+    val journal = FsifJournalBridge.journalFor(io, storePath, layout)
+    FsifBackend.open(storeId, storePath, layout, io.dataEc, journal, onFatal, serialEc = Some(io.serialEc),
       readGate = Some(io))
 
 object DefaultBackendOpener:

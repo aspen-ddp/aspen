@@ -102,7 +102,10 @@ object DeviceJournalFormat:
       val id = getId(bb)
       if id != journalId then None else Some(FileHeader(id, bb.getLong(), bb.getLong(), bb.getLong()))
 
-  def taggedRecordSize(r: JournalRecord): Int = JournalFormat.recordSize(r) + 16
+  /** Bytes the attachment id adds to each record */
+  val AttachmentTagSize = 16
+
+  def taggedRecordSize(r: JournalRecord): Int = JournalFormat.recordSize(r) + AttachmentTagSize
 
   private def unpadded(records: Seq[TaggedRecord]): Int =
     4 + 8 + 4 + records.map(t => taggedRecordSize(t.record)).sum + 4

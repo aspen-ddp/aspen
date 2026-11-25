@@ -22,7 +22,6 @@ import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitStat
 
 class FsifBackendSuite extends FileBasedTests:
   import FsifBackendSuite.*
-  import JournalWriterSuite.ManualEc
 
   private val layout = FsifLayout(1024, 64)
   private val poolId = PoolId(new UUID(7, 7))
@@ -56,6 +55,10 @@ class FsifBackendSuite extends FileBasedTests:
     System.arraycopy(patch, 0, data, off, patch.length)
     CommitState(p, md(rev), ObjectType.Data, DataBuffer(data),
       form = UpdateForm.Ranges(old.length, List((off, patch.length))))
+  private def patched(old: Array[Byte], off: Int, patch: Array[Byte]): Array[Byte] =
+    val data = old.clone()
+    System.arraycopy(patch, 0, data, off, patch.length)
+    data
   private def delete(p: ObjectPointer, rev: Int): CommitState =
     CommitState(p, md(rev, 0), ObjectType.Data, DataBuffer())
 
@@ -88,30 +91,39 @@ class FsifBackendSuite extends FileBasedTests:
             case Some(q) => q.dequeue().success(r.result)
             case None => unexpected.add(r)
 
-  /** A backend over SimulatedFsifFiles. `mkIo` gives a fresh io EC for every incarnation, so tasks queued by a
-    * crashed incarnation are dropped with it.
+  /** Store `idx` on a SharedJournal (a fresh one unless `sharedWith`). `mkIo` gives a fresh io EC for every
+    * incarnation, so tasks queued by a crashed incarnation are dropped with it; the device journal's writes run on it
+    * too, as IoKind.Journal tasks (SharedJournal.run).
     */
   private final class Harness(seed: Int = 0, val lay: FsifLayout = layout,
                               mkIo: () => ExecutionContext = () => InlineEc,
                               tuning: FsifTuning = FsifTuning(cowThreshold = 256),
                               wrap: FsifFiles => FsifFiles = f => f,
-                              gate: Option[org.aspen_ddp.aspen.server.host.DeviceIo] = None):
-    var files = new SimulatedFsifFiles(rng(seed))
-    FsifRecovery.initialize(files, lay)
+                              gate: Option[org.aspen_ddp.aspen.server.host.DeviceIo] = None,
+                              sharedWith: Option[SharedJournal] = None, idx: Int = 0):
+    val shared: SharedJournal = sharedWith.getOrElse(new SharedJournal(rng(seed)))
+    shared.initialize(idx, lay)
+    def files: SharedJournal.StoreFiles = shared.storeFiles(idx)
     val fatals = new ConcurrentLinkedQueue[Throwable]()
     var io: ExecutionContext = mkIo()
     var rec = new Recorder
     var backend: FsifBackend = open()
     private var txn = 0
 
-    private def open(): FsifBackend =
-      val b = new FsifBackend(storeId, tdir / "fsif", lay, wrap(files), io, tuning, t => fatals.add(t),
-        readGate = gate)
+    def open(): FsifBackend =
+      shared.run = journalOn(io)
+      val b = shared.open(idx, lay, io, tuning, t => fatals.add(t), readGate = gate, wrap = wrap,
+        storeId = StoreId(poolId, idx.toByte))
       b.setCompletionHandler(rec)
       b
 
+    /** The whole machine crashes (every store on `shared`); this harness reopens its store */
     def crash(): Unit =
-      files = files.crash()
+      shared.crash()
+      reopen()
+
+    /** After another harness on `shared` crashed the machine */
+    def reopen(): Unit =
       io = mkIo()
       rec = new Recorder
       backend = open()
@@ -408,7 +420,7 @@ class FsifBackendSuite extends FileBasedTests:
     h.await(f1) shouldBe Left(())
     h.await(f2) shouldBe Left(())
     h.quiesce()
-    def journalSize = h.files.open("journal.a").size
+    def journalSize = h.shared.journal.tailSerial
     val before = journalSize
     h.commitOk(delete(p, 4))
     h.commitOk(delete(ptr(30, oid(30)), 1))
@@ -734,7 +746,8 @@ class FsifBackendSuite extends FileBasedTests:
 
   test("a store on the shared io pool drains its serial work on fsif-serial threads, apart from the io"):
     val layout = FsifLayout(1024, 64)
-    val b = FsifBackend.create(StoreId(poolId, 0), tdir / "shared", layout, FsifBackend.sharedIo, _ => ())
+    val b = FsifBackend.create(StoreId(poolId, 0), tdir / "shared", layout, FsifBackend.sharedIo,
+      SharedJournal.nio(tdir / "fj"), _ => ())
     val thread = Promise[String]()
     b.setCompletionHandler(_ => thread.trySuccess(Thread.currentThread.getName))
     b.commit(alloc(ptr(1, oid(1)), bytes(40, 1), 1), TransactionId(new UUID(1, 1)))
@@ -745,7 +758,7 @@ class FsifBackendSuite extends FileBasedTests:
     val h = new Harness
     val p = ptr(1, oid(1))
     h.commitOk(alloc(p, bytes(20, 1), 1))
-    h.files.failNext(Fault.IoError, _ == "journal.a", Set(FaultOp.Force))
+    h.shared.machine.failNext(Fault.IoError, _.startsWith("fj/"), Set(FaultOp.Force))
     h.commit(overwrite(p, bytes(20, 2), 2)) shouldBe Right(CommitError.IOFailure)
     h.fatals.size shouldBe 1
     h.read(p) shouldBe Right(ReadError.CorruptedObject)
@@ -756,7 +769,156 @@ class FsifBackendSuite extends FileBasedTests:
     h.crash()
     h.readData(p).toList shouldBe bytes(20, 1).toList
 
+  // ---- The shared device journal ----
+
+  test("two stores sharing one journal both survive a crash with every acknowledged write"):
+    for seed <- 0 until 20 do
+      withClue(s"seed=$seed"):
+        val order = rng(seed + 6000)
+        val shared = new SharedJournal(rng(seed))
+        val hs = Vector.tabulate(2)(i => new Harness(seed, mkIo = () => new ShuffleEc(order), sharedWith = Some(shared),
+          idx = i))
+        val objs = (0 until 2).map: i =>
+          List((1, 700), (2, 30), (3, 30), (4, 700), (5, 30)).map((x, n) => (ptr(x, oid(10 * i + x)), bytes(n, 10 * i + x)))
+        val fs = (0 until 2).map(i => objs(i).map((p, d) => hs(i).issueCommit(alloc(p, d, 1))))
+        val ios = hs.map(_.io.asInstanceOf[ShuffleEc])
+        for _ <- 0 until order.nextInt(60) do ios(order.nextInt(2)).runOne()
+        val acked = fs.map(_.map(_.value.exists(_.toOption.contains(Left(())))))
+        shared.crash()
+        hs.foreach(_.reopen())
+        for i <- 0 until 2; ((p, d), a) <- objs(i).zip(acked(i)) do
+          hs(i).read(p) match
+            case Left(rs) => rs.data.getByteArray.toList shouldBe d.toList
+            case Right(err) =>
+              a shouldBe false
+              err shouldBe ReadError.ObjectNotFound
+        hs.foreach(_.rec.unexpected.isEmpty shouldBe true)
+
+  /** A small ring: 3 files of 3 small batches each */
+  private val tinyRing = JournalSizing(new UUID(8, 8), 3, 16 * 1024)
+
+  /** Store y fills the ring with commits whose in-place writes `gate` holds, so its checkpoint cannot pass Applying
+    * and its records keep the ring pinned; returns y's commits that wait for room
+    */
+  private def fillRing(y: Harness): List[Future[CommitResult]] =
+    val p = ptr(1, oid(100))
+    var v = bytes(40, 100)
+    y.commitOk(alloc(p, v, 1))
+    val waiting = mutable.ListBuffer[Future[CommitResult]]()
+    var i = 0
+    while waiting.isEmpty && i < 100 do
+      val patch = bytes(4, i)
+      val f = y.issueCommit(writeRange(p, v, i % 30, patch, i + 2))
+      System.arraycopy(patch, 0, v, i % 30, patch.length)
+      if !f.isCompleted then waiting += f
+      i += 1
+    waiting.nonEmpty shouldBe true
+    waiting.toList
+
+  test("a commit held for journal room has mutated nothing: a read during the hold sees the old state"):
+    val shared = new SharedJournal(rng(1), tinyRing)
+    val x = new Harness(sharedWith = Some(shared), idx = 0)
+    val gate = new GateEc(isInPlace)
+    val y = new Harness(mkIo = () => gate, sharedWith = Some(shared), idx = 1)
+    val p = ptr(5, oid(5))
+    val v1 = bytes(60, 1)
+    x.commitOk(alloc(p, v1, 1))
+    x.quiesce()
+    x.await(x.backend.checkpointNow()) // x pins nothing
+    val yWaiting = fillRing(y)
+    val v2 = bytes(60, 2)
+    val held = x.issueCommit(overwrite(p, v2, 2))
+    held.isCompleted shouldBe false
+    x.await(x.backend.capState)._1 shouldBe 1
+    x.readData(p).toList shouldBe v1.toList
+    x.await(x.backend.mapping(5))._1 shouldBe 0
+    // y's in-place writes land, its checkpoint covers its records, and the room returns
+    gate.release()
+    x.await(held) shouldBe Left(())
+    yWaiting.foreach(f => y.await(f) shouldBe Left(()))
+    x.readData(p).toList shouldBe v2.toList
+    shared.crash()
+    x.reopen()
+    y.reopen()
+    x.readData(p).toList shouldBe v2.toList
+
+  test("checkpoint completes while another store's appends fill the ring"):
+    // The journal's writes are held while x's checkpoint drains and y's commits take every reservation left: x's
+    // appends were admitted, so they are written and its Barrier completes (no checkpoint waits for a held operation)
+    val shared = new SharedJournal(rng(2), tinyRing)
+    val jm = new ManualEc
+    shared.run = jm.execute
+    shared.journal // built now, its writes on jm
+    val x = new Harness(sharedWith = Some(shared), idx = 0)
+    val y = new Harness(sharedWith = Some(shared), idx = 1)
+    def drive[A](f: Future[A]): A =
+      var n = 0
+      while !f.isCompleted && n < 10000 do
+        jm.runAll()
+        n += 1
+      Await.result(f, Timeout)
+    val p = ptr(1, oid(1))
+    val v1 = bytes(40, 1)
+    val fa = x.issueCommit(alloc(p, v1, 1))
+    drive(fa) shouldBe Left(())
+    val v2 = patched(v1, 4, bytes(4, 2))
+    val f1 = x.issueCommit(writeRange(p, v1, 4, bytes(4, 2), 2)) // queued: the journal's writes wait on jm
+    val cp = x.backend.checkpointNow() // snapshot with f1's append last
+    val v3 = patched(v2, 8, bytes(4, 3))
+    val f2 = x.issueCommit(writeRange(p, v2, 8, bytes(4, 3), 3)) // waits for the drain
+    val q = ptr(2, oid(2))
+    val ys = (0 until 30).map(i => y.issueCommit(if i == 0 then alloc(q, bytes(30, 9), 1)
+      else writeRange(q, bytes(30, 9), 0, bytes(2, i), i + 1)))
+    y.await(y.backend.capState)._1 should be > 0 // y holds some: no room left
+    drive(cp)
+    drive(f1) shouldBe Left(())
+    drive(f2) shouldBe Left(())
+    ys.foreach(f => drive(f) shouldBe Left(()))
+    x.readData(p).toList shouldBe v3.toList
+    shared.run = r => r.run()
+    shared.crash()
+    x.reopen()
+    y.reopen()
+    x.readData(p).toList shouldBe v3.toList
+
+  test("an open that fails after its attach index is durable leaves a directory the next open accepts"):
+    val h = new Harness
+    val p = ptr(1, oid(1))
+    h.commitOk(alloc(p, bytes(20, 1), 1))
+    h.await(h.backend.close()) // detached
+    // The next open writes its attach index into index.b, then fails emptying index.a
+    h.files.failNext(Fault.IoError, _ == "index.a", Set(FaultOp.Truncate))
+    an[java.io.IOException] should be thrownBy h.open()
+    FsifRecovery.newestIndex(h.files, h.lay)._3.detached shouldBe false
+    // That attachment never attached, so it needs no replay: a reopen is accepted
+    h.reopen()
+    h.readData(p).toList shouldBe bytes(20, 1).toList
+    h.commitOk(overwrite(p, bytes(20, 2), 2))
+    // An index whose attachment holds records in the journal is not: it would need a replay
+    an[java.io.IOException] should be thrownBy h.open()
+    h.crash()
+    h.readData(p).toList shouldBe bytes(20, 2).toList
+
+  test("a clean close detaches: its index covers every append and its attachment is released"):
+    val h = new Harness
+    val p = ptr(1, oid(1))
+    h.commitOk(alloc(p, bytes(20, 1), 1))
+    h.commitOk(overwrite(p, bytes(20, 2), 2))
+    val att = h.backend.attachmentId
+    h.shared.journal.needsReplay(att) shouldBe true
+    h.await(h.backend.close())
+    h.backend.detachedForTest shouldBe true
+    h.shared.journal.needsReplay(att) shouldBe false
+    val meta = FsifRecovery.newestIndex(h.files, h.lay)._3
+    meta shouldBe IndexMeta(h.shared.sizing.journalId, att, h.shared.journal.tailSerial, detached = true)
+    h.reopen()
+    h.readData(p).toList shouldBe bytes(20, 2).toList
+
 object FsifBackendSuite:
+  /** The device journal's writes as IoKind.Journal tasks on `io` */
+  def journalOn(io: ExecutionContext): Runnable => Unit =
+    r => io.execute(new FsifBackend.IoTask(FsifBackend.IoKind.Journal, () => r.run()))
+
   object InlineEc extends ExecutionContext:
     def execute(r: Runnable): Unit = r.run()
     def reportFailure(t: Throwable): Unit = throw t

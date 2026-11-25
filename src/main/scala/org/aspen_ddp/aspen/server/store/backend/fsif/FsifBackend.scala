@@ -37,15 +37,20 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit,
   *    `data` is forced; only then is `Mapping(X, f, id)` appended (durable-before-map). Operations on X that arrive
   *    meanwhile wait until that Mapping is appended, then target f.
   *
-  * Checkpoints (s to s+1, one at a time; started when the active journal exceeds max(indexFileSize / 2,
-  * journalBound), by `rebuildFlush`, or by `checkpointNow`), each step re-runnable from its start:
-  *  1. Snapshot the map as of the last record appended to journal s; later records are buffered. Once every
-  *     journal-s batch is durable, header s+1 is written and forced into the other journal file, and only then does a
-  *     new writer take the buffered records (DESIGN.md 3.7: no record of s+1 is durable unless all of s is).
-  *  2. Wait until every journal-s Delta is forced in place (a data force covering its write has succeeded) or
-  *     cancelled, and until everything appended so far (which includes any record that cancelled one) is durable.
-  *  3. Write index s+1 into the other index file and force it.
-  *  4. Empty journal s and index s, forcing each.
+  * Every journal record goes to the device journal (FsifDeviceJournal, spec 4.3) under this open's attachment, a fresh
+  * UUID: the constructor writes index s+1 naming the journal, the attachment and the journal's tail serial (the
+  * attach index), then attaches. A commit completes once its batch is durable in the device journal.
+  *
+  * Checkpoints (s to s+1, one at a time; started when the journal asks (pressure), when an operation waits for journal
+  * room while records are uncovered, by `rebuildFlush`, by `close` (the detach), or by `checkpointNow`), each step
+  * re-runnable from its start (DESIGN.md 2.7, Ruling R8):
+  *  1. Draining: the map as of the last record appended is index s+1's content. Appends made meanwhile wait in order
+  *     until that last append is durable, its batch serial `S`, so every later record has a serial above S.
+  *  2. Applying: every Delta appended before the snapshot is forced in place (a data force covering its write has
+  *     succeeded) or cancelled. Barrier: everything appended so far (which includes any record that cancelled one) is
+  *     durable.
+  *  3. Index s+1, covering S (detached for a close), is written into the other index file and forced; index s is
+  *     emptied. The journal is then told S is covered (or, for a detach, that the attachment is released).
   *
   * Tail compaction (Compaction.scala): after every serial task, free tail slots are truncated away and, if no move
   * is outstanding, the occupant of the highest used slot is moved into the lowest free slot below it.
@@ -60,15 +65,16 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit,
   * Backpressure: a commit that arrives while unapplied Delta bytes exceed `tuning.unappliedBound` is acknowledged only
   * once they no longer do.
   *
-  * Journal hard limit: a commit, repair or repairDelete whose records could take the active journal past
-  * `tuning.journalHardLimit` is held before it runs, neither completed nor failed, until a checkpoint switches
-  * journals, frozen or not. So no journal grows past what recovery can load (`journalLengthBound`).
+  * Journal room: a commit, repair, repairDelete or rebuildFlush chunk reserves room for what it may append in the device
+  * journal before it runs (`admitted`); one that does not fit is held, neither completed nor failed, until the
+  * journal reports room. So every issued append fits and is written (DESIGN.md 2.9).
   */
 class FsifBackend(val storeId: StoreId,
                   val path: os.Path,
                   layout: FsifLayout,
                   rawFiles: FsifFiles,
                   io: ExecutionContext,
+                  journal: FsifDeviceJournal,
                   tuning: FsifTuning = FsifTuning(),
                   onFatal: Throwable => Unit = _ => (),
                   scheduler: RetryScheduler = SharedRetryScheduler,
@@ -86,18 +92,32 @@ class FsifBackend(val storeId: StoreId,
     * hung device's fsyncs cannot starve every store's serial work), else on `io` itself (tests: one deterministic EC)
     */
   private val serial = new SerialExecutor(serialEc.getOrElse(if io eq FsifBackend.sharedIo then sharedSerial else io))
-  private val recovered = FsifRecovery.recover(rawFiles, layout)
+  private val journalId = journal.sizing.journalId
+  private val opened =
+    FsifRecovery.openDirectory(rawFiles, layout, journalId, a => !journal.needsReplay(a))
+  if !fitsJournal(layout, journal.sizing) then
+    throw new IOException(s"FSIF store $storeId: a commit of a ${layout.segmentPayloadSize}-byte slice needs " +
+      s"${appendBound(layout.segmentPayloadSize) + MappingAppendSize} bytes of a device journal file, which holds " +
+      s"${journal.sizing.fileSize - DeviceJournalFormat.HeaderSize} (file size ${journal.sizing.fileSize})")
+  /** This open's attachment to the device journal (spec 4.2): records are matched to this directory only by it */
+  private val attachment = UUID.randomUUID()
+  /** The attach index's covered serial: no record of this attachment is at or below it */
+  private val attachCovered = journal.tailSerial
   /** Every file of the store is opened and sized through this, so estimateSize does no I/O (SizeTrackedFiles) */
   private val files = new SizeTrackedFiles(rawFiles)
   private val dataFile = files.open(FsifRecovery.DataFile)
-  /** The journal the current writer appends to: its handle and name follow a checkpoint's journal switch */
-  @volatile private var journalFile: FsifFile = files.open(recovered.activeJournal)
-  @volatile private var activeJournal: String = recovered.activeJournal
-  private var journal = newJournal(journalFile, recovered.journalLength, recovered.nextBatch, recovered.salt)
+
+  /** Callbacks from the device journal, which makes them on its caller's thread: each is posted to `serial` */
+  private val owner: FsifDeviceJournal.Owner = new FsifDeviceJournal.Owner:
+    def complete(task: Runnable): Unit = serial.execute(task)
+    /** The epilogue's releaseCapHeld admits held operations */
+    def roomAvailable(): Unit = post(())
+    def checkpointRequested(): Unit = post { checkpointAsked = true }
+    def journalFailed(t: Throwable): Unit = post(failStop(t))
 
   // ---- State, owned by serial ----
-  private val index: IndexMap = recovered.index
-  @volatile private var slotTotal: Int = recovered.slotCount
+  private val index: IndexMap = opened.index
+  @volatile private var slotTotal: Int = opened.slotCount
   /** Slots that are mapped, reserved (copy-on-write or rebuild targets) or waiting for the slot-freeing rule */
   private val used = new java.util.BitSet
   index.slots.foreach(s => if s >= 0 then used.set(s))
@@ -123,7 +143,7 @@ class FsifBackend(val storeId: StoreId,
   private val tailCows = mutable.TreeSet[Int]()
   private val awaitingTail = mutable.ArrayBuffer[(Int, () => Unit)]()
   /** The pending Map(X, -1) of each X unmapped by a delete whose record is not yet durable */
-  private val unmapping = mutable.HashMap[Int, Future[Unit]]()
+  private val unmapping = mutable.HashMap[Int, Future[Long]]()
   /** Rebuild writes whose Mapping is appended by the next rebuildFlush: ext -> (slot, id) */
   private val rebuildMaps = mutable.LinkedHashMap[Int, (Int, ObjectId)]()
   /** Runs rebuildWrite / rebuildFlush one at a time, in call order */
@@ -185,53 +205,60 @@ class FsifBackend(val storeId: StoreId,
   @volatile private var rebuildLost = false
 
   // ---- Checkpoint state, owned by serial ----
-  /** The index file holding index `currentSeq` */
-  private var activeIndex: String = recovered.activeIndex
-  @volatile private var currentSeq: Long = recovered.seq
-  /** The journal seq that new records go to: `currentSeq`, or `currentSeq + 1` once a checkpoint has taken its
-    * snapshot (the records may still be buffered in `switchBuffer`)
+  /** The index file holding index `currentSeq`: the attach index, written at the end of the constructor */
+  private var activeIndex: String = FsifRecovery.IndexFiles.find(_ != opened.activeIndex).get
+  @volatile private var currentSeq: Long = opened.seq + 1
+  /** The checkpoint epoch new Deltas belong to: `currentSeq`, or `currentSeq + 1` once a checkpoint has taken its
+    * snapshot
     */
-  private var appendSeq: Long = recovered.seq
+  private var appendSeq: Long = currentSeq
   private var checkpoint: Option[Checkpoint] = None
-  /** Records appended while a checkpoint switches journals (DESIGN.md 3.7), released into the new writer in order */
-  private val switchBuffer = mutable.ArrayBuffer[(List[JournalRecord], Promise[Unit])]()
-  /** The Future of the most recent append. Batches complete in order, so it completing means every earlier append
-    * (to the same writer) is durable.
+  /** Appends made while a checkpoint drains (Ruling R8): held in order until the snapshot's last append is durable,
+    * so none of them shares its batch and every one has a serial above the covered serial S. Each belongs to an
+    * admitted operation holding its reservation.
     */
-  private var lastAppend: Future[Unit] = Future.unit
-  /** Journal seq -> Deltas appended to that journal and neither applied in place nor cancelled */
+  private val drainBuffer = mutable.ArrayBuffer[(List[JournalRecord], Promise[Long])]()
+  /** The Future of the most recent append, completing with its batch serial. One attachment's appends complete in
+    * order, so it completing means every earlier append is durable.
+    */
+  private var lastAppend: Future[Long] = Future.successful(attachCovered)
+  /** `lastAppend` when the latest checkpoint took its snapshot: an append since is not covered by it */
+  private var snapshotTail: Future[Long] = lastAppend
+  /** Checkpoint epoch -> Deltas appended in that epoch and neither applied in place nor cancelled */
   private val unappliedBySeq = mutable.HashMap[Long, Int]()
-  /** Clamped to half the hard limit, so a checkpoint starts well before the limit holds anything (an index near
-    * MaxSegmentCount alone would put max(indexFileSize / 2, journalBound) near 1 GiB)
-    */
-  private val checkpointThreshold: Long =
-    math.min(math.max(IndexFile.sizeFor(layout.segmentCount) / 2, tuning.journalBound), tuning.journalHardLimit / 2)
-  /** Encoded bytes of the records in `switchBuffer`, each entry counted as its own batch */
-  private var switchBytes = 0L
+  /** The journal asked for a checkpoint (Owner.checkpointRequested) and none has started since */
+  private var checkpointAsked = false
+  /** A close's checkpoint wrote a detached index and released the attachment: nothing more is written */
+  @volatile private var detached = false
 
-  // ---- Journal hard limit, owned by serial ----
+  // ---- Journal room, owned by serial ----
   //
-  // The active journal never grows past tuning.journalHardLimit (journalLengthBound), so recovery can always load it.
-  // Every commit, repair, repairDelete and rebuildFlush append is admitted (`admitted`) before it touches any state,
-  // with an upper bound on the journal bytes it can append. One that could take the active journal past the limit is
-  // held in `capHeld`, in arrival order, neither completed nor failed, and a checkpoint is started so the journals
-  // switch (`maybeCheckpoint`). Held operations have mutated nothing and appended nothing, so no checkpoint step ever
-  // waits for one (rebuildFlush's chunks are the one exception, safe for the reasons given there). A copy-on-write's Mapping and a compaction move's Mapping are never held: the first is covered by
-  // its admitted commit's bound, the second by `MappingAppendSize` of headroom that every admission leaves free (one
-  // move at a time, started only while that headroom is free: `journalHasRoomForMove`).
-  /** Operations held by the hard limit, in arrival order. None of them has run. */
+  // Every commit, repair, repairDelete and rebuildFlush chunk reserves an upper bound on what it may append in the
+  // device journal (`admitted`, FsifDeviceJournal.tryReserve) before it touches any state. One that does not fit is
+  // held in `capHeld`, in arrival order, neither completed nor failed; the journal asks for checkpoints and reports
+  // room (Owner.roomAvailable). Held operations have mutated nothing and appended nothing, so no checkpoint step ever
+  // waits for one (rebuildFlush's chunks are the one exception, safe for the reasons given there). An admitted
+  // operation's appends therefore always fit, and every checkpoint's Barrier completes. A copy-on-write's Mapping is
+  // covered by its commit's reservation; a compaction move reserves one Mapping itself (`journalHasRoomForMove`).
+  /** Operations waiting for journal room, in arrival order. None of them has run. */
   private val capHeld = mutable.ArrayDeque[CapHeld]()
-  /** Sum of the bounds of admitted operations that have not yet replied. Each appends at most its bound, so the
-    * active journal can reach at most activeJournalLength + capOutstanding (+ one compaction Mapping).
-    */
+  /** Sum of the bounds reserved by admitted operations that have not yet replied */
   private var capOutstanding = 0L
+  /** Mappings per rebuildFlush append: RebuildMappingsPerAppend, or fewer so one append's reservation fits a journal
+    * file (a batch adds 20 bytes of framing to its records)
+    */
+  private val rebuildMappingsPerAppend: Int =
+    val room = journal.sizing.fileSize - DeviceJournalFormat.HeaderSize - 20
+    math.max(1L, math.min(RebuildMappingsPerAppend.toLong, room / MappingAppendSize)).toInt
 
   @volatile private var handler: Option[CompletionHandler] = None
 
   private val compaction = new Compaction(new Compaction.Host:
     def fatal: Boolean = FsifBackend.this.fatal.isDefined
     def frozen: Boolean = FsifBackend.this.frozen
-    def journalHasRoomForMove: Boolean = capHeld.isEmpty && journalHasRoom(0)
+    def journalHasRoomForMove: Boolean =
+      capHeld.isEmpty && journal.tryReserve(attachment, MappingAppendSize)
+    def moveEnded(): Unit = journal.unreserve(attachment, MappingAppendSize)
     def hold(key: AnyRef, kind: String, retry: () => Unit, abort: () => Unit): Unit =
       FsifBackend.this.hold(key, kind, retry, abort)
     def released(key: AnyRef): Unit = FsifBackend.this.released(key)
@@ -274,11 +301,27 @@ class FsifBackend(val storeId: StoreId,
       assign(x, to, id)
       val dead = kill(from)
       onDurable(appendRecords(List(JournalRecord.Mapping(x, to, id)))): r =>
+        journal.unreserve(attachment, MappingAppendSize) // its Mapping is written
         if r.isSuccess then unmapDurable(dead)
         done(r)
   , layout, tuning.moveRetryDelays)
 
-  // Compaction resumes after recovery without waiting for the first operation
+  // Attach (spec 4.2), now that every field is set (the journal may call `owner` at once): index s+1 naming the
+  // journal, the attachment and the tail serial, forced; index s emptied; then the attachment. Compaction then resumes
+  // without waiting for the first operation.
+  try
+    withFile(activeIndex): f =>
+      f.truncate(0)
+      f.write(0, IndexFile.encode(currentSeq, IndexMeta(journalId, attachment, attachCovered, detached = false), index))
+      f.force()
+    withFile(opened.activeIndex): f =>
+      f.truncate(0)
+      f.force()
+    journal.attach(attachment, path, owner)
+  catch
+    case NonFatal(t) =>
+      Try(dataFile.close())
+      throw t
   post(())
 
   // ---- Backend interface ----
@@ -300,7 +343,7 @@ class FsifBackend(val storeId: StoreId,
   private[fsif] def checkpointRunning: Boolean = checkpoint.isDefined
   private[fsif] def moveRunning: Boolean = !compaction.idle
 
-  /** Test hook: (operations held by the journal hard limit, bytes the admitted ones may still append) */
+  /** Test hook: (operations waiting for journal room, bytes the admitted ones have reserved) */
   private[fsif] def capState: Future[(Int, Long)] =
     val p = Promise[(Int, Long)]()
     post(p.success((capHeld.size, capOutstanding)))
@@ -327,8 +370,14 @@ class FsifBackend(val storeId: StoreId,
     post(p.success((index.slots(x), index.ids(x))))
     p.future
 
-  /** Sequence of the newest durable index; the active journal holds the records made after it */
-  def journalSeq: Long = currentSeq
+  /** Sequence of the newest durable index */
+  def indexSeq: Long = currentSeq
+
+  /** The attachment this open appends under */
+  private[fsif] def attachmentId: UUID = attachment
+
+  /** Test hook: a close wrote a detached index and released the attachment */
+  private[aspen] def detachedForTest: Boolean = detached
 
   /** Test hook: starts a checkpoint, or returns the running one's Future */
   private[fsif] def checkpointNow(): Future[Unit] =
@@ -336,31 +385,52 @@ class FsifBackend(val storeId: StoreId,
     post(p.completeWith(startCheckpoint()))
     p.future
 
-  /** Completes once nothing is outstanding (as `quiesce`), then closes the files. A store frozen by ENOSPC (or that
-    * freezes while closing) does not wait for space (DESIGN.md 2.10): its held I/O is abandoned exactly as a
-    * crash would abandon it, and the close waits only for io already in flight. That is safe: held commits were never
-    * acknowledged (Tx keeps their data in the CRL), acknowledged Deltas are durable in the journal and replay at
-    * recovery, and a held checkpoint, copy-on-write or move step re-runs or is moot at recovery. Abandoned commits,
-    * repairs and repairDeletes never complete: after a close the host no longer routes this store's completions, and
-    * a late one could reach a store reloaded under the same id.
+  /** Completes once nothing is outstanding (as `quiesce`), then detaches (spec 4.6), then closes the files. The detach
+    * is a checkpoint covering every append whose index is marked detached, after which the attachment is released:
+    * the directory then holds its whole state and needs nothing from the journal. A store frozen by ENOSPC (or that
+    * freezes while closing) does not wait for space (DESIGN.md 2.10) and does not detach: its held I/O is abandoned
+    * exactly as a crash would abandon it, and the close waits only for io already in flight. That is safe: held
+    * commits were never acknowledged (Tx keeps their data in the CRL), acknowledged Deltas are durable in the journal
+    * and replay at the next device load, and a held checkpoint, copy-on-write or move step re-runs or is moot then. A
+    * failed store does not detach either. Abandoned commits, repairs and repairDeletes never complete: after a close
+    * the host no longer routes this store's completions, and a late one could reach a store reloaded under the same id.
     */
   override def close(): Future[Unit] =
-    val p = Promise[Unit]()
+    val quiesced = Promise[Unit]()
     post {
       closing = true
       if frozen && fatal.isEmpty then
         abandonHeld()
-      quiescers += p
+      quiescers += quiesced
     }
-    // The channel closes run on `io` (the device's data pool in production), never on the serial thread that
+    val detachDone = quiesced.future.flatMap(_ => onSerialDetach())(using ExecutionContext.parasitic)
+    // The channel close runs on `io` (the device's data pool in production), never on the serial thread that
     // completed the quiesce
-    p.future.transform { _ =>
-      Try {
-        dataFile.close()
-        journalFile.close()
-        checkpoint.flatMap(_.oldFile).foreach(_.close())
-      }
+    detachDone.transform { r =>
+      r.failed.foreach(t => logger.warn(s"FSIF store $storeId: closing without a detach: $t"))
+      Try(dataFile.close())
     }(using io)
+
+  /** A close's detach, run on serial once quiesced: a checkpoint covering every append whose index is detached, then
+    * the release (`finish`). None when failed, frozen or abandoned: the attachment stays live, its records in the
+    * journal for the next device load
+    */
+  private def detach(): Future[Unit] =
+    if fatal.isDefined || frozen || abandoned || detached then
+      Future.unit
+    else
+      checkpoint match
+        case Some(cp) if cp.phase != CheckpointPhase.Finishing && (cp.oldTail eq lastAppend) =>
+          cp.detach = true
+          cp.done.future
+        case Some(cp) => cp.done.future.transformWith(_ => onSerialDetach())(using ExecutionContext.parasitic)
+        case None => startCheckpoint(detach = true)
+
+  /** `detach` in a guarded serial task, so its checkpoint advances in the epilogue */
+  private def onSerialDetach(): Future[Unit] =
+    val d = Promise[Unit]()
+    post(d.completeWith(detach()))
+    d.future
 
   /** The sum of the store's files' sizes, tracked in memory (SizeTrackedFiles): it runs on the store's executor, which
     * never does device I/O */
@@ -496,16 +566,16 @@ class FsifBackend(val storeId: StoreId,
           if maps.isEmpty then
             appended.success(())
           else
-            // In chunks, each admitted under the journal's hard limit; they land in order, so the last one durable
+            // In chunks, each admitted for journal room; they land in order, so the last one durable
             // means all are. The one exception to "a held operation has mutated nothing": the assigns above run
             // before the chunks are admitted. That is safe: the store is not live, data was forced before any assign
             // (durable-before-map holds for any index snapshot), no Delta's cancellation depends on these Mappings,
             // and a checkpoint's Barrier waits only on real appends.
             val chunks = maps.map { case (x, (slot, id)) => JournalRecord.Mapping(x, slot, id) }
-              .grouped(RebuildMappingsPerAppend).toList
+              .grouped(rebuildMappingsPerAppend).toList
             val done = chunks.map: records =>
               val p = Promise[Unit]()
-              admitted(JournalFormat.BatchOverhead + records.size.toLong * JournalFormat.MappingRecordSize): release =>
+              admitted(records.size.toLong * MappingAppendSize): release =>
                 if fatal.isDefined then
                   release()
                   p.tryFailure(new IOException(s"FSIF store $storeId has failed", fatal.get))
@@ -618,8 +688,8 @@ class FsifBackend(val storeId: StoreId,
     case Right(err) => p.tryFailure(new FsifBackend.OperationFailed(s"$what on store $storeId failed: $err"))
   }
 
-  private def onDurable(f: Future[Unit])(body: Try[Unit] => Unit): Unit =
-    f.onComplete(r => guarded(body(r)))(using ExecutionContext.parasitic)
+  private def onDurable(f: Future[?])(body: Try[Unit] => Unit): Unit =
+    f.onComplete(r => guarded(body(r.map(_ => ()))))(using ExecutionContext.parasitic)
 
   private def checkQuiesce(): Unit =
     if quiescers.nonEmpty && idle then
@@ -627,8 +697,8 @@ class FsifBackend(val storeId: StoreId,
       quiescers.clear()
       ps.foreach(_.trySuccess(()))
 
-  /** After a fatal error, held work no longer counts, but io still in flight does (including the journal's, which
-    * failAll does not wait for), so `close` never closes a file under it. After an abandoning close only io in
+  /** After a fatal error, held work no longer counts, but io still in flight does, so `close` never closes a file
+    * under it (the device journal's writes touch none of the store's files). After an abandoning close only io in
     * flight counts.
     */
   private def idle: Boolean =
@@ -636,13 +706,14 @@ class FsifBackend(val storeId: StoreId,
       !ioInFlight
     else
       gated.isEmpty && writesInFlight == 0 && readsInFlight == 0 && checkpoint.isEmpty && compaction.idle &&
-        !journal.busy && !dataForceInFlight && cowIo == 0 &&
-        (fatal.isDefined || (!frozen && throttled.isEmpty && journal.idle && unappliedCount == 0 && capHeld.isEmpty))
+        !dataForceInFlight && cowIo == 0 &&
+        (fatal.isDefined ||
+          (!frozen && throttled.isEmpty && lastAppend.isCompleted && unappliedCount == 0 && capHeld.isEmpty))
 
   /** An io task of this store may still touch its files */
   private def ioInFlight: Boolean =
     writesInFlight > 0 || readsInFlight > 0 || cowIo > 0 || compactionIo > 0 || dataForceInFlight ||
-      checkpoint.exists(_.ioInFlight) || journal.busy
+      checkpoint.exists(_.ioInFlight)
 
   /** A close of a frozen store (DESIGN.md 2.10) abandons everything held. Called on serial once both hold. */
   private def abandonHeld(): Unit =
@@ -653,36 +724,23 @@ class FsifBackend(val storeId: StoreId,
       heldOps.clear()
       retryingOps.clear()
       capHeld.clear()
-      journal.abandon()
+      // Appends waiting for a drain never issue, and the checkpoint never finishes: close waits for neither
+      drainBuffer.clear()
+      checkpoint.foreach(_.done.tryFailure(outOfSpace()))
       val waiters = freezeWaiters.toList
       freezeWaiters.clear()
       waiters.foreach(_.tryFailure(outOfSpace()))
   // ---- Failure handling ----
   //
-  // Out of space freezes writes. Every I/O source (journal write/force/truncate, copy-on-write write/force, in-place
+  // Out of space freezes writes. Every I/O source (copy-on-write write/force, in-place
   // write, checkpoint step, compaction write/force and truncation) that fails with ENOSPC calls `hold` with a key, a
   // `retry` that re-issues exactly the failed I/O (each such step is re-runnable from its start) and an `abort` for
   // fail-stop. Nothing held completes, with an error or otherwise. While any operation is held the store is frozen:
   // in-place writes, checkpoint steps, compaction moves and truncation start nothing new (their own held retries
-  // excepted), commits are still accepted (their journal batches buffer behind a held one), and reads go on,
+  // excepted), commits are still accepted and journaled, and reads go on,
   // overlaying pending Deltas. Every `tuning.enospcRetry` a retry round re-issues every held operation; one that
   // succeeds calls `released`, one that hits ENOSPC again is held again. When none is held or retrying, the store
   // unfreezes and the paused work resumes. Any other I/O error, including one during a retry, is fail-stop.
-
-  private def newJournal(f: FsifFile, start: Long, next: Long, salt: Long): JournalWriter =
-    var w: JournalWriter = null
-    // onSettled: an io task abandoned by failAll has ended; run the guarded epilogue so a quiesce or close waiting
-    // on `!journal.busy` completes
-    w = new JournalWriter(f, start, next, salt, io, serial, t => journalError(w, t), () => released(w),
-      () => post(()))
-    w
-
-  /** The writer has truncated back to its durable length and holds the failed batch and everything behind it */
-  private def journalError(w: JournalWriter, t: Throwable): Unit =
-    if fatal.isEmpty && FsifIo.isOutOfSpace(t) then
-      hold(w, "journal", () => w.retry(), () => ())
-    else
-      failStop(t)
 
   /** Holds an operation whose I/O hit ENOSPC, freezing the store; `retry` runs in the next retry round */
   private def hold(key: AnyRef, kind: String, retry: () => Unit, abort: () => Unit): Unit =
@@ -698,7 +756,7 @@ class FsifBackend(val storeId: StoreId,
         waiters.foreach(_.tryFailure(outOfSpace()))
       if closing then
         abandonHeld()
-        // Not every caller is guarded (the journal writer's completion is not): the waiting close re-checks idle
+        // Not every caller is guarded: the waiting close re-checks idle
         // in a guarded task's epilogue
         post(())
       else
@@ -713,7 +771,7 @@ class FsifBackend(val storeId: StoreId,
         logger.info(s"FSIF store $storeId: space is available again; writes resume")
         frozen = false
         // Paused in-place writes restart now; checkpoints, compaction and backpressure resume in a guarded task's
-        // epilogue (not every caller is guarded, e.g. the journal writer's completion)
+        // epilogue (not every caller is guarded)
         slotStates.values.toList.foreach(st => kick(st))
         post(())
 
@@ -740,24 +798,23 @@ class FsifBackend(val storeId: StoreId,
     freezeWaiters.filterInPlace(!_.isCompleted)
     freezeWaiters += p
 
-  /** Stops accepting writes: pending commits complete with IOFailure (through their failed journal futures and the
-    * held operations' aborts), later commits likewise, and reads with CorruptedObject. ENOSPC retries stop. Calls
-    * onFatal once.
+  /** Stops accepting writes: pending commits complete with IOFailure (appends waiting for a drain, held operations'
+    * aborts; appends already issued complete as the journal writes or fails them), later commits likewise, and reads
+    * with CorruptedObject. ENOSPC retries stop. Calls onFatal once. The attachment stays live (no detach): its
+    * records stay in the journal until the copy's move out of replay's scope releases it.
     */
   private def failStop(t: Throwable): Unit =
     if fatal.isEmpty then
       logger.error(s"FSIF store $storeId: fatal I/O error, failing the store: $t")
       fatal = Some(t)
       frozen = false
-      journal.failAll(t)
-      val buffered = switchBuffer.toList
-      switchBuffer.clear()
-      switchBytes = 0
+      val buffered = drainBuffer.toList
+      drainBuffer.clear()
       buffered.foreach((_, p) => p.tryFailure(t))
       // Each sees `fatal` and fails with IOFailure
       val capped = capHeld.toList
       capHeld.clear()
-      capped.foreach(startHeld)
+      capped.foreach(startHeld(_, reserved = false))
       val held = (heldOps.values ++ retryingOps.values).toList
       heldOps.clear()
       retryingOps.clear()
@@ -1081,90 +1138,92 @@ class FsifBackend(val storeId: StoreId,
 
   // ---- Journal appends and checkpoints ----
 
-  /** Every journal append goes through here. While a checkpoint switches journals, records wait in `switchBuffer`
-    * until the new journal's header is forced and the old writer is idle (DESIGN.md 3.7).
+  /** Every journal append goes through here, so one store's records reach the device journal in order (DESIGN.md
+    * 3.3). While a checkpoint drains, appends wait in `drainBuffer`, in order (Ruling R8).
     */
-  private def appendRecords(records: List[JournalRecord]): Future[Unit] =
+  private def appendRecords(records: List[JournalRecord]): Future[Long] =
     val f =
-      if checkpoint.exists(_.switching) then
-        val p = Promise[Unit]()
-        switchBuffer += ((records, p))
-        switchBytes += JournalFormat.BatchOverhead + records.iterator.map(JournalFormat.recordSize).sum
+      if checkpoint.exists(_.phase == CheckpointPhase.Draining) then
+        val p = Promise[Long]()
+        drainBuffer += ((records, p))
         p.future
       else
-        journal.append(records)
+        journal.append(attachment, records)
     lastAppend = f
     f
 
-  /** The trigger, run after every serial task (so after every commit and compaction completion): the active journal
-    * exceeds the threshold, or an operation is held by the hard limit and switching journals would make room (the
-    * active journal holds records). Never while frozen: the held operations wait for space like everything else.
+  /** The trigger, run after every serial task: the journal asked for one (its records pin the ring's oldest file), or
+    * an operation waits for journal room while records are uncovered. Never while frozen (the held operations wait for
+    * space like everything else) or closing (the detach covers everything).
     */
   private def maybeCheckpoint(): Unit =
-    if checkpoint.isEmpty && fatal.isEmpty && !frozen &&
-      (journal.length > checkpointThreshold || capHeld.nonEmpty && journal.length > JournalFormat.HeaderSize)
+    if checkpoint.isEmpty && fatal.isEmpty && !frozen && !closing &&
+      (checkpointAsked || capHeld.nonEmpty && (lastAppend ne snapshotTail))
     then
       startCheckpoint()
 
-  /** Length the active journal has, or will have once the switch in progress lands its buffered records */
-  private def activeJournalLength: Long =
-    if checkpoint.exists(_.switching) then JournalFormat.HeaderSize + switchBytes else journal.length
-
-  /** An operation that appends at most `bound` bytes keeps the active journal within the hard limit, counting what
-    * the admitted operations may still append and one compaction Mapping. An otherwise empty journal admits any one
-    * operation, so a bound above the limit cannot wait forever (journalLengthBound).
-    */
-  private def journalHasRoom(bound: Long): Boolean =
-    val length = activeJournalLength
-    (length <= JournalFormat.HeaderSize && capOutstanding == 0) ||
-      length + capOutstanding + MappingAppendSize + bound <= tuning.journalHardLimit
-
-  /** Runs `op` now if the journal has room for `bound` bytes and nothing is held before it, else holds it.
-    * `op` receives a release, which it calls once when it replies (or never appends): its bound stops counting.
+  /** Runs `op` now if the journal reserves `bound` bytes for it and nothing is held before it, else holds it until
+    * the journal reports room. `op` receives a release, which it calls once when it replies (its appends are then
+    * written) or never appends: the reservation goes back.
     */
   private def admitted(bound: Long)(op: (() => Unit) => Unit): Unit =
     val h = new CapHeld(bound, op)
-    if capHeld.isEmpty && (fatal.isDefined || journalHasRoom(bound)) then
-      startHeld(h)
+    if capHeld.isEmpty && fatal.isDefined then
+      startHeld(h, reserved = false)
+    else if capHeld.isEmpty && journal.tryReserve(attachment, bound) then
+      startHeld(h, reserved = true)
     else
       if capHeld.isEmpty then
-        logger.warn(s"FSIF store $storeId: journal $activeJournal is at its hard limit of " +
-          s"${tuning.journalHardLimit} bytes; holding writes until a checkpoint switches journals")
+        logger.warn(s"FSIF store $storeId: the device journal has no room for $bound bytes; holding writes until " +
+          "checkpoints free it")
       capHeld += h
       post(()) // the epilogue starts the checkpoint, also for a caller outside a guarded task (rebuildFlush)
 
-  private def startHeld(h: CapHeld): Unit =
-    capOutstanding += h.bound
+  private def startHeld(h: CapHeld, reserved: Boolean): Unit =
+    if reserved then
+      capOutstanding += h.bound
     var released = false
     h.op { () =>
       if !released then
         released = true
-        capOutstanding -= h.bound
+        if reserved then
+          capOutstanding -= h.bound
+          journal.unreserve(attachment, h.bound)
     }
 
-  /** Run after every serial task: admits held operations, in order, while the journal has room */
+  /** Run after every serial task: admits held operations, in order, while the journal reserves room for them */
   private def releaseCapHeld(): Unit =
-    while capHeld.nonEmpty && !abandoned && (fatal.isDefined || journalHasRoom(capHeld.head.bound)) do
-      startHeld(capHeld.removeHead())
+    var more = true
+    while more && capHeld.nonEmpty && !abandoned do
+      if fatal.isDefined then
+        startHeld(capHeld.removeHead(), reserved = false)
+      else if journal.tryReserve(attachment, capHeld.head.bound) then
+        startHeld(capHeld.removeHead(), reserved = true)
+      else
+        more = false
 
-  /** Step 1 begins: the map as of the last record appended to journal s is index s+1's content, and every later
-    * record belongs to journal s+1 (buffered until that journal exists)
+  /** Step 1 begins: the map as of the last record appended is index s+1's content; later appends wait until that
+    * last one is durable. `detach`: the index is written detached and the attachment released (a close).
     */
-  private def startCheckpoint(): Future[Unit] =
+  private def startCheckpoint(detach: Boolean = false): Future[Unit] =
     checkpoint match
       case Some(cp) => cp.done.future
       case None =>
         fatal match
           case Some(t) => Future.failed(new IOException(s"FSIF store $storeId has failed", t))
+          case None if detached => Future.failed(new IOException(s"FSIF store $storeId is closed"))
           case None =>
             val cp = new Checkpoint(currentSeq + 1, index.copy(), lastAppend)
+            cp.detach = detach
             checkpoint = Some(cp)
+            checkpointAsked = false
             appendSeq = cp.seq
+            snapshotTail = lastAppend
             wake(cp.oldTail)
             cp.done.future
 
   /** Re-runs advanceCheckpoint once `f` completes */
-  private def wake(f: Future[Unit]): Unit = f.onComplete(_ => post(()))(using ExecutionContext.parasitic)
+  private def wake(f: Future[?]): Unit = f.onComplete(_ => post(()))(using ExecutionContext.parasitic)
 
   /** Moves the running checkpoint forward as far as its conditions allow. Called after every serial task. */
   private def advanceCheckpoint(): Unit =
@@ -1172,84 +1231,68 @@ class FsifBackend(val storeId: StoreId,
       if fatal.isDefined then
         if !cp.ioInFlight then
           abandon(cp)
-      else if frozen then
-        () // paused where it stands; a held step of its own is retried by the retry round
+      else if abandoned then
+        () // a frozen close: the checkpoint never finishes
       else
-        cp.phase match
-          case CheckpointPhase.Draining =>
-            // Every journal-s batch is durable
-            if cp.oldTail.isCompleted && journal.idle then
-              writeNextHeader(cp)
-          case CheckpointPhase.Applying =>
-            // Step 2: every journal-s Delta is forced in place (maybeForceData forces the written ones) or
-            // cancelled. A cancelled one's slot may still be
-            // mapped in the snapshot, so the record that cancelled it (appended to s+1 by now) must be durable too:
-            // wait for everything appended so far.
-            if !unappliedBySeq.keysIterator.exists(_ < cp.seq) then
-              cp.phase = CheckpointPhase.Barrier
-              cp.barrier = lastAppend
-              if cp.barrier.isCompleted then finish(cp) else wake(cp.barrier)
-          case CheckpointPhase.Barrier =>
-            if cp.barrier.isCompleted then
-              finish(cp)
-          case CheckpointPhase.Header | CheckpointPhase.Finishing => ()
+        if cp.phase == CheckpointPhase.Draining then
+          // No I/O, so it runs while frozen too: commits made meanwhile are not held behind it
+          cp.oldTail.value.foreach:
+            case Failure(t) =>
+              failStop(t)
+              if !cp.ioInFlight then abandon(cp)
+            case Success(serial) =>
+              cp.covered = serial
+              cp.phase = CheckpointPhase.Applying
+              val buffered = drainBuffer.toList
+              drainBuffer.clear()
+              buffered.foreach((records, p) => p.completeWith(journal.append(attachment, records)))
+        if fatal.isEmpty && !frozen then
+          cp.phase match
+            case CheckpointPhase.Applying =>
+              // Every Delta of the snapshot's epoch is forced in place (maybeForceData forces the written ones) or
+              // cancelled. A cancelled one's slot may still be mapped in the snapshot, so the record that cancelled it
+              // (appended after the snapshot) must be durable too: wait for everything appended so far.
+              if !unappliedBySeq.keysIterator.exists(_ < cp.seq) then
+                cp.phase = CheckpointPhase.Barrier
+                cp.barrier = lastAppend
+                if cp.barrier.isCompleted then finish(cp) else wake(cp.barrier)
+            case CheckpointPhase.Barrier =>
+              if cp.barrier.isCompleted then
+                finish(cp)
+            case CheckpointPhase.Draining | CheckpointPhase.Finishing => ()
 
-  /** Rest of step 1: header s+1 into the other journal file, forced; only then the new writer, which receives the
-    * buffered records in order
-    */
-  private def writeNextHeader(cp: Checkpoint): Unit =
-    cp.phase = CheckpointPhase.Header
-    val name = FsifRecovery.JournalFiles.find(_ != activeJournal).get
-    checkpointIo[(FsifFile, Long)](cp, (f, _) => f.close()) {
-      val f = files.open(name)
-      try (f, FsifRecovery.writeJournalHeader(f, cp.seq))
-      catch
-        case NonFatal(t) =>
-          f.close()
-          throw t
-    } { (f, salt) =>
-      cp.oldFile = Some(journalFile)
-      journalFile = f
-      activeJournal = name
-      journal = newJournal(f, JournalFormat.HeaderSize, 0, salt)
-      cp.phase = CheckpointPhase.Applying
-      val buffered = switchBuffer.toList
-      switchBuffer.clear()
-      switchBytes = 0
-      buffered.foreach((records, p) => p.completeWith(journal.append(records)))
-    }
-
-  /** Steps 3 (index s+1 into the other index file) and 4 (empty journal s and index s). Each is idempotent, so the
-    * whole sequence can be re-run from its start. Step 2's force of `data` is already done: a journal-s Delta counts
-    * as applied only once a data force covering its in-place write has succeeded.
+  /** Step 3: index s+1 (covering S, detached for a close) into the other index file, forced, then index s emptied.
+    * Idempotent, so it can be re-run from its start. Step 2's force of `data` is already done: a Delta counts as
+    * applied only once a data force covering its in-place write has succeeded. Then the journal is told: S is covered,
+    * or the attachment is released.
     */
   private def finish(cp: Checkpoint): Unit =
     cp.phase = CheckpointPhase.Finishing
     val oldIndex = activeIndex
     val newIndex = FsifRecovery.IndexFiles.find(_ != oldIndex).get
-    val oldJournal = cp.oldFile.get
+    val meta = IndexMeta(journalId, attachment, cp.covered, detached = cp.detach)
     checkpointIo(cp) {
       withFile(newIndex): f =>
         f.truncate(0)
-        f.write(0, IndexFile.encode(cp.seq, cp.snapshot))
+        f.write(0, IndexFile.encode(cp.seq, meta, cp.snapshot))
         f.force()
-      oldJournal.truncate(0)
-      oldJournal.force()
       withFile(oldIndex): f =>
         f.truncate(0)
         f.force()
     } { _ =>
-      cp.oldFile = None
-      oldJournal.close()
       activeIndex = newIndex
       currentSeq = cp.seq
       checkpoint = None
+      if cp.detach then
+        detached = true
+        journal.release(attachment)
+      else
+        journal.covered(attachment, cp.covered)
       cp.done.success(())
     }
 
   private def abandon(cp: Checkpoint): Unit =
     checkpoint = None
-    cp.oldFile.foreach(f => Try(f.close()))
     cp.done.tryFailure(new IOException(s"FSIF store $storeId has failed", fatal.orNull))
 
   private def withFile(name: String)(f: FsifFile => Unit): Unit =
@@ -1259,9 +1302,9 @@ class FsifBackend(val storeId: StoreId,
 
   /** Runs one checkpoint step on io, then `next` on serial. ENOSPC holds the step, which the retry round re-runs
     * from its start; any other failure is fail-stop (DESIGN.md 2.11). A success that arrives after a fatal error is
-    * handed to `discard`.
+    * discarded.
     */
-  private def checkpointIo[A](cp: Checkpoint, discard: A => Unit = (_: A) => ())(work: => A)(next: A => Unit): Unit =
+  private def checkpointIo[A](cp: Checkpoint)(work: => A)(next: A => Unit): Unit =
     val step = () => work
     def run(): Unit =
       cp.ioInFlight = true
@@ -1276,7 +1319,7 @@ class FsifBackend(val storeId: StoreId,
             failStop(t)
           case Success(a) =>
             released(cp)
-            if fatal.isDefined || abandoned then discard(a) else next(a)
+            if fatal.isEmpty && !abandoned then next(a)
       try
         io.execute(new IoTask(IoKind.Checkpoint, () => {
           val r = Try(step())
@@ -1288,7 +1331,7 @@ class FsifBackend(val storeId: StoreId,
 
   // ---- Commit and repair ----
 
-  /** `release` is called with the first reply: the journal hard limit stops counting the commit's bound */
+  /** `release` is called with the first reply: the commit's journal reservation goes back */
   private def update(state: CommitState, repairing: Boolean, reply0: Reply, release: () => Unit,
                      onForeignOccupant: ObjectId => Unit = _ => ()): Unit =
     var replied = false
@@ -1653,22 +1696,21 @@ class FsifBackend(val storeId: StoreId,
 object FsifBackend:
   private val Zero = ObjectId(new UUID(0, 0))
 
-  /** Draining: buffering, waiting for journal s to be durable. Header: buffering, header s+1 being written.
-    * Applying: waiting for journal-s Deltas. Barrier: waiting for the records appended so far. Finishing: io for
-    * steps 2-4.
+  /** Draining: later appends buffered, waiting for the snapshot's last append. Applying: waiting for the snapshot
+    * epoch's Deltas. Barrier: waiting for the records appended so far. Finishing: the index io.
     */
   private enum CheckpointPhase:
-    case Draining, Header, Applying, Barrier, Finishing
+    case Draining, Applying, Barrier, Finishing
 
-  /** A checkpoint from seq - 1 to seq. `oldTail` is the last append to journal seq - 1. */
-  private final class Checkpoint(val seq: Long, val snapshot: IndexMap, val oldTail: Future[Unit]):
+  /** A checkpoint from index seq - 1 to seq. `oldTail` is the snapshot's last append; `covered` its batch serial S */
+  private final class Checkpoint(val seq: Long, val snapshot: IndexMap, val oldTail: Future[Long]):
     val done: Promise[Unit] = Promise()
     var phase: CheckpointPhase = CheckpointPhase.Draining
     var ioInFlight = false
-    var barrier: Future[Unit] = Future.unit
-    /** Journal s's handle once the writer has switched, until step 4 has emptied it */
-    var oldFile: Option[FsifFile] = None
-    def switching: Boolean = phase == CheckpointPhase.Draining || phase == CheckpointPhase.Header
+    var barrier: Future[Long] = Future.successful(0L)
+    var covered = -1L
+    /** A close's: the index is written detached and the attachment released */
+    var detach = false
 
   /** How a finished disk read ends: completed, issued again at once (the slot moved or the read raced a write), or
     * failed without evidence of damage (retried after a delay)
@@ -1681,29 +1723,31 @@ object FsifBackend:
   /** An operation held by ENOSPC: `retry` re-issues its I/O, `abort` ends it on fail-stop */
   private final class HeldOp(val retry: () => Unit, val abort: () => Unit)
 
-  /** An operation admitted only once the journal has room for `bound` bytes; `op` is given its release */
+  /** An operation admitted only once the device journal reserves `bound` bytes; `op` is given its release */
   private final class CapHeld(val bound: Long, val op: (() => Unit) => Unit)
 
-  /** Journal bytes of one Mapping appended as its own batch */
-  val MappingAppendSize: Long = JournalFormat.BatchOverhead + JournalFormat.MappingRecordSize
+  /** Device journal bytes (DeviceJournalFormat.taggedRecordSize) of one Mapping: a compaction move's or a
+    * repairDelete's reservation
+    */
+  val MappingAppendSize: Long = DeviceJournalFormat.AttachmentTagSize + JournalFormat.MappingRecordSize
 
-  /** Upper bound on the journal bytes one commit or repair of a `sliceSize`-byte slice appends, whatever path it
-    * takes: a batch of Mapping plus a Delta whose ranges never encode larger than the whole slice (`rangesOf`). A
-    * delete or copy-on-write appends less.
+  /** Upper bound on the device journal bytes (tagged records) one commit or repair of a `sliceSize`-byte slice appends,
+    * whatever path it takes: a Mapping plus a Delta whose ranges never encode larger than the whole slice (`rangesOf`).
+    * A delete or copy-on-write appends less.
     */
   def appendBound(sliceSize: Int): Long =
-    JournalFormat.BatchOverhead + JournalFormat.MappingRecordSize + JournalFormat.DeltaRecordOverhead +
+    2L * DeviceJournalFormat.AttachmentTagSize + JournalFormat.MappingRecordSize + JournalFormat.DeltaRecordOverhead +
       JournalFormat.RangeOverhead + sliceSize.toLong
 
-  /** No active journal the backend writes is longer: admission keeps it within the hard limit, except that an
-    * otherwise empty journal admits any one operation, and a compaction Mapping (never held) may follow. Below
-    * FsifRecovery.MaxLoadSize for every layout (FsifLayout.MaxSegmentPayloadSize).
+  /** A store's largest commit plus a compaction Mapping fits one file of the journal (Global Constraints): checked at
+    * create (IllegalArgumentException) and open (IOException)
     */
-  def journalLengthBound(layout: FsifLayout, tuning: FsifTuning): Long =
-    math.max(tuning.journalHardLimit,
-      JournalFormat.HeaderSize + appendBound(layout.segmentPayloadSize) + MappingAppendSize)
+  def fitsJournal(layout: FsifLayout, sizing: JournalSizing): Boolean =
+    appendBound(layout.segmentPayloadSize) + MappingAppendSize <= sizing.fileSize - DeviceJournalFormat.HeaderSize
 
-  /** rebuildFlush appends its Mappings in batches of at most this many (about 116 KiB) */
+  /** rebuildFlush appends its Mappings in appends of at most this many (about 180 KiB), fewer when a journal file
+    * holds less (`rebuildMappingsPerAppend`)
+    */
   val RebuildMappingsPerAppend = 4096
 
   /** Hold key of the in-place Deltas re-queued by a data force that failed with ENOSPC */
@@ -1716,6 +1760,7 @@ object FsifBackend:
   final class OperationFailed(msg: String) extends Exception(msg)
 
   private[fsif] enum IoKind:
+    /** Journal: the device journal's writes, when a test runs them on `io` */
     case Read, InPlace, Cow, Journal, Checkpoint, MoveRead, MoveWrite, MoveForce, DataForce, RebuildWrite
 
   /** Test counters: moves started, moves whose Map(X, f) is durable, and moves cancelled */
@@ -1765,11 +1810,13 @@ object FsifBackend:
     os.makeDir.all(path)
     FsifRecovery.initialize(new NioFsifFiles(path), layout)
 
-  /** Initializes a new store in place and opens it. Tests only: the host creates stores through StoreCreation */
+  /** Initializes a new store in place and opens it against `journal`. Tests only: the host creates stores through
+    * StoreCreation
+    */
   private[aspen] def create(storeId: StoreId, path: os.Path, layout: FsifLayout, io: ExecutionContext,
-                            onFatal: Throwable => Unit): FsifBackend =
+                            journal: FsifDeviceJournal, onFatal: Throwable => Unit): FsifBackend =
     initializeStore(path, layout)
-    new FsifBackend(storeId, path, layout, new NioFsifFiles(path), io, FsifTuning(), onFatal)
+    new FsifBackend(storeId, path, layout, new NioFsifFiles(path), io, journal, FsifTuning(), onFatal)
 
   /** Opens the existing store in `path`. Never creates: a store directory exists only once its store was created
     * (StoreCreation), so a missing directory, or one whose FSIF files are all absent or empty (FsifRecovery.isBlank),
@@ -1777,9 +1824,12 @@ object FsifBackend:
     * absence is: a stat that fails throws its IOException (server.FileStat), an I/O error the host's load retries.
     *
     * @throws FsifRecovery.StoreLost if the store's acknowledged state cannot be recovered
-    * @throws java.io.IOException    on an I/O error, including running out of space (FsifIo.isOutOfSpace)
+    * @throws java.io.IOException    on an I/O error, including running out of space (FsifIo.isOutOfSpace); when the
+    *                                 layout does not fit `journal`'s file size; or when the newest index is attached
+    *                                 to `journal` and still needs a replay
+    *                                 (load retries, never a loss)
     */
-  def open(storeId: StoreId, path: os.Path, layout: FsifLayout, io: ExecutionContext,
+  def open(storeId: StoreId, path: os.Path, layout: FsifLayout, io: ExecutionContext, journal: FsifDeviceJournal,
            onFatal: Throwable => Unit, tuning: FsifTuning = FsifTuning(),
            serialEc: Option[ExecutionContext] = None, readGate: Option[DeviceIo] = None): FsifBackend =
     if !FileStat.isDir(path) then
@@ -1787,5 +1837,5 @@ object FsifBackend:
     val files = new NioFsifFiles(path)
     if FsifRecovery.isBlank(files) then
       throw new FsifRecovery.StoreLost(s"FSIF store $storeId at $path has no FSIF data: its files are absent or empty")
-    new FsifBackend(storeId, path, layout, files, io, tuning, onFatal, serialEc = serialEc,
+    new FsifBackend(storeId, path, layout, files, io, journal, tuning, onFatal, serialEc = serialEc,
       readGate = readGate)

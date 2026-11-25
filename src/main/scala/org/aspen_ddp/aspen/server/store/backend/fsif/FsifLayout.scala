@@ -19,10 +19,9 @@ object FsifLayout:
     */
   val MaxSegmentCount: Int = ((FsifRecovery.MaxLoadSize - IndexFile.sizeFor(0)) / 20).toInt
 
-  /** The largest payload one commit's records can carry in an otherwise empty journal, plus a compaction Mapping,
-    * without the journal passing FsifRecovery.MaxLoadSize (FsifBackend.journalLengthBound). About 2 GiB, so it
-    * excludes only payloads no JVM array could hold with their header anyway.
+  /** The largest payload whose commit (FsifBackend.appendBound) plus a compaction Mapping keeps the sum an Int, with
+    * room for a batch's framing. A store's layout must also fit its device journal's file size
+    * (FsifBackend.fitsJournal), which is far smaller.
     */
   val MaxSegmentPayloadSize: Int =
-    (FsifRecovery.MaxLoadSize - JournalFormat.HeaderSize - FsifBackend.appendBound(0) -
-      FsifBackend.MappingAppendSize).toInt
+    (Int.MaxValue - 16L - FsifBackend.appendBound(0) - FsifBackend.MappingAppendSize).toInt

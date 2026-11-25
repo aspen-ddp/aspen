@@ -19,10 +19,10 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, Completion, CompletionHandler,
-  Read, RetryScheduler, UpdateForm}
+  Read, RetryScheduler, SharedRetryScheduler, UpdateForm}
 
 class FsifFaultSuite extends FileBasedTests:
-  import FsifBackendSuite.{GateEc, InlineEc, ShuffleEc, isInPlace, isKind}
+  import FsifBackendSuite.{GateEc, InlineEc, ShuffleEc, isInPlace, isKind, journalOn}
   import FsifFaultSuite.*
 
   private val layout = FsifLayout(1024, 64)
@@ -99,9 +99,10 @@ class FsifFaultSuite extends FileBasedTests:
     */
   private final class Harness(seed: Int = 0, mkIo: () => ExecutionContext = () => InlineEc,
                               tuning: FsifTuning = FsifTuning(cowThreshold = 256, enospcRetry = 10.millis),
-                              manual: Boolean = true):
-    var files = new SimulatedFsifFiles(rng(seed))
-    FsifRecovery.initialize(files, layout)
+                              manual: Boolean = true, sizing: JournalSizing = SharedJournal.TestSizing):
+    val shared = new SharedJournal(rng(seed), sizing)
+    shared.initialize(0, layout)
+    def files: SharedJournal.StoreFiles = shared.storeFiles(0)
     var fatals = new ConcurrentLinkedQueue[Throwable]()
     var io: ExecutionContext = mkIo()
     var sched: Option[ManualScheduler] = None
@@ -112,14 +113,17 @@ class FsifFaultSuite extends FileBasedTests:
     private def open(): FsifBackend =
       sched = if manual then Some(new ManualScheduler) else None
       val fs = fatals
-      val b = sched match
-        case Some(s) => new FsifBackend(storeId, tdir / "fsif", layout, files, io, tuning, t => fs.add(t), s)
-        case None => new FsifBackend(storeId, tdir / "fsif", layout, files, io, tuning, t => fs.add(t))
+      shared.run = journalOn(io)
+      val b = shared.open(0, layout, io, tuning, t => fs.add(t), sched.getOrElse(SharedRetryScheduler),
+        storeId = storeId)
       b.setCompletionHandler(rec)
       b
 
-    /** A new incarnation on the same files, as after a clean close (nothing is dropped). Rules stay in force. */
+    /** A new incarnation on the same files after a device reload (nothing is dropped, and the device-load replay
+      * restores what a close without a detach left in the journal). Rules stay in force.
+      */
     def reopen(): Unit =
+      shared.reload()
       io = mkIo()
       rec = new Recorder
       fatals = new ConcurrentLinkedQueue[Throwable]()
@@ -127,7 +131,7 @@ class FsifFaultSuite extends FileBasedTests:
 
     /** Faults are not carried over: the new instance starts without rules */
     def crash(): Unit =
-      files = files.crash()
+      shared.crash()
       io = mkIo()
       rec = new Recorder
       fatals = new ConcurrentLinkedQueue[Throwable]()
@@ -199,32 +203,10 @@ class FsifFaultSuite extends FileBasedTests:
   private def guardedF[A](body: => Future[A]): Try[A] =
     Try(Await.result(Future.delegate(body)(using ExecutionContext.global), Timeout))
 
-  private def isJournal(name: String): Boolean = name.startsWith("journal")
+  /** The device journal's files on the machine (SimulatedFsifFiles names) */
+  private def isJournal(name: String): Boolean = name.startsWith("fj/")
 
   // ---- The brief's four tests (the production timer, retrying every 10 ms) ----
-
-  test("ENOSPC on the journal holds the commit and freezes writes; reads still work; clearing it completes the commit"):
-    val h = new Harness(manual = false)
-    val p1 = ptr(1, oid(1))
-    h.commitOk(alloc(p1, bytes(40, 1), 1))
-    val full = new AtomicBoolean(true)
-    h.files.failWhile(Fault.OutOfSpace, isJournal)(full.get)
-    val p2 = ptr(2, oid(2))
-    val f = h.issueCommit(alloc(p2, bytes(60, 2), 1))
-    f.isCompleted shouldBe false
-    h.backend.isWriteFrozen shouldBe true
-    h.readData(p1) shouldBe bytes(40, 1).toList
-    // A backend commit is a decided transaction, so a read may already return it (it overlays pending Deltas)
-    h.readData(p2) shouldBe bytes(60, 2).toList
-    f.isCompleted shouldBe false
-    full.set(false)
-    h.await(f) shouldBe Left(())
-    h.backend.isWriteFrozen shouldBe false
-    h.quiesce()
-    h.fatals.isEmpty shouldBe true
-    h.crash()
-    h.readData(p1) shouldBe bytes(40, 1).toList
-    h.readData(p2) shouldBe bytes(60, 2).toList
 
   test("ENOSPC on data with acknowledged deltas pending: reads overlay them and the writes land once it clears"):
     val h = new Harness(manual = false)
@@ -258,7 +240,7 @@ class FsifFaultSuite extends FileBasedTests:
     val h = new Harness(manual = false)
     val p = ptr(1, oid(1))
     h.commitOk(alloc(p, bytes(20, 1), 1))
-    h.files.failNext(Fault.IoError, isJournal, Set(FaultOp.Force))
+    h.shared.machine.failNext(Fault.IoError, isJournal, Set(FaultOp.Force))
     h.await(h.issueCommit(overwrite(p, bytes(20, 2), 2))) shouldBe Right(CommitError.IOFailure)
     h.fatals.size shouldBe 1
     h.backend.isWriteFrozen shouldBe false
@@ -297,12 +279,12 @@ class FsifFaultSuite extends FileBasedTests:
     for i <- 0 until 4 do h.commitOk(alloc(ps(i), vs(i), 1))
     h.quiesce()
     val full = new AtomicBoolean(true)
-    h.files.failWhile(Fault.OutOfSpace, _ == "index.b")(full.get)
+    h.files.failWhile(Fault.OutOfSpace, _ == "index.a")(full.get) // the attach index is index.b
     val cp = h.backend.checkpointNow()
     cp.isCompleted shouldBe false
     h.backend.isWriteFrozen shouldBe true
     for i <- 0 until 4 do h.readData(ps(i)) shouldBe vs(i).toList
-    // A commit while frozen is accepted; journal.b has space, so it may be acknowledged
+    // A commit while frozen is accepted; the device journal has space, so it may be acknowledged
     val fc = h.issueCommit(writeRange(ps(0), vs(0), 5, bytes(6, 9), 2))
     vs(0) = patched(vs(0), 5, bytes(6, 9))
     for _ <- 0 until 3 do h.tick()
@@ -313,8 +295,8 @@ class FsifFaultSuite extends FileBasedTests:
     h.await(cp)
     h.backend.isWriteFrozen shouldBe false
     h.await(fc) shouldBe Left(())
-    h.backend.journalSeq shouldBe 1
-    h.indexSeq("index.b") shouldBe Some(1)
+    h.backend.indexSeq shouldBe 2
+    h.indexSeq("index.a") shouldBe Some(2)
     h.quiesce()
     h.fatals.isEmpty shouldBe true
     h.crash()
@@ -372,8 +354,8 @@ class FsifFaultSuite extends FileBasedTests:
     cp.isCompleted shouldBe false
     h.backend.isWriteFrozen shouldBe true
     h.readData(p) shouldBe v2.toList
-    h.await(cp) // the fault is spent: the retry rewrites the Delta, forces it, and only then empties journal 0
-    h.backend.journalSeq shouldBe 1
+    h.await(cp) // the fault is spent: the retry rewrites the Delta, forces it, and only then writes the index
+    h.backend.indexSeq shouldBe 2
     h.backend.isWriteFrozen shouldBe false
     h.quiesce()
     h.fatals.isEmpty shouldBe true
@@ -443,7 +425,8 @@ class FsifFaultSuite extends FileBasedTests:
     h.readData(ptr(1, oid(1))) shouldBe bytes(30, 1).toList
 
   test("a crash while frozen recovers the acknowledged state; held commits are old or new, never torn"):
-    val cases = List[String => Boolean](_ => true, isJournal, _ == FsifRecovery.DataFile)
+    // The device journal never runs out of space (preallocated), so the store's own files are the cases
+    val cases = List[String => Boolean](_ => true, _.startsWith("index"), _ == FsifRecovery.DataFile)
     for (files, c) <- cases.zipWithIndex do
       withClue(s"case=$c"):
         val h = new Harness(c)
@@ -492,7 +475,7 @@ class FsifFaultSuite extends FileBasedTests:
         h.fatals.isEmpty shouldBe true
 
   test("an I/O error during a retry while frozen is fail-stop and calls onFatal once"):
-    for source <- List("journal", "data") do
+    for source <- List("data") do
       withClue(source):
         val h = new Harness
         val p = ptr(1, oid(1))
@@ -500,7 +483,7 @@ class FsifFaultSuite extends FileBasedTests:
         h.commitOk(alloc(p, v1, 1))
         h.quiesce()
         val full = new AtomicBoolean(true)
-        val file: String => Boolean = if source == "journal" then isJournal else _ == FsifRecovery.DataFile
+        val file: String => Boolean = _ == FsifRecovery.DataFile
         h.files.failWhile(Fault.OutOfSpace, file)(full.get)
         val f = h.issueCommit(writeRange(p, v1, 4, bytes(4, 2), 2))
         h.backend.isWriteFrozen shouldBe true
@@ -510,10 +493,7 @@ class FsifFaultSuite extends FileBasedTests:
         h.tick()
         h.fatals.size shouldBe 1
         h.backend.isWriteFrozen shouldBe false
-        if source == "journal" then
-          h.await(f) shouldBe Right(CommitError.IOFailure)
-        else
-          h.await(f) shouldBe Left(()) // it was durable in the journal before the in-place write failed
+        h.await(f) shouldBe Left(()) // it was durable in the journal before the in-place write failed
         h.read(p) shouldBe Right(ReadError.CorruptedObject)
         h.await(h.issueCommit(overwrite(p, bytes(20, 3), 3))) shouldBe Right(CommitError.IOFailure)
         for _ <- 0 until 3 do h.tick()
@@ -692,9 +672,9 @@ class FsifFaultSuite extends FileBasedTests:
     locally:
       val h = new Harness
       val full = new AtomicBoolean(true)
-      h.files.failWhile(Fault.OutOfSpace, isJournal)(full.get)
+      h.files.failWhile(Fault.OutOfSpace, _.startsWith("index"))(full.get)
       h.await(h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1))))
-      val r = guardedF(h.backend.rebuildFlush()) // its Mappings' batch is held: frozen
+      val r = guardedF(h.backend.rebuildFlush()) // its checkpoint's index write is held: frozen
       r.isFailure shouldBe true
       FsifIo.isOutOfSpace(r.failed.get) shouldBe true
       h.backend.isWriteFrozen shouldBe true
@@ -704,7 +684,7 @@ class FsifFaultSuite extends FileBasedTests:
       val again = guardedF(h.backend.rebuildFlush())
       again.isFailure shouldBe true
       FsifIo.isOutOfSpace(again.failed.get) shouldBe true
-      // Once space returns, the held Mapping lands and a flush succeeds
+      // Once space returns, the held checkpoint completes and a flush succeeds
       full.set(false)
       h.quiesce()
       h.backend.isWriteFrozen shouldBe false
@@ -738,7 +718,7 @@ class FsifFaultSuite extends FileBasedTests:
     Await.result(f, Timeout)
 
   test("close of a frozen store completes without space returning, and a reopen recovers the acknowledged state"):
-    for (files, c) <- List[String => Boolean](_ => true, isJournal, isData).zipWithIndex do
+    for (files, c) <- List[String => Boolean](_ => true, _.startsWith("index"), isData).zipWithIndex do
       withClue(s"case=$c"):
         val h = new Harness(c)
         val ps = (0 until 4).map(x => ptr(x, oid(x + 1)))
@@ -793,7 +773,8 @@ class FsifFaultSuite extends FileBasedTests:
     h.crash()
     h.readData(p) shouldBe v1.toList
 
-  test("close after a fail-stop completes once the journal batch that was in flight settles"):
+  test("close after a fail-stop completes without waiting for a device journal batch in flight"):
+    // The device journal's writes touch none of the store's files, so a close after a fail-stop need not wait for them
     import FsifCheckpointSuite.{HoldEc, oneShot}
     val h = new Harness(mkIo = () => new HoldEc)
     val ec = h.io.asInstanceOf[HoldEc]
@@ -808,12 +789,10 @@ class FsifFaultSuite extends FileBasedTests:
     h.files.failNext(Fault.IoError, _ == FsifRecovery.DataFile)
     val cow = h.issueCommit(overwrite(p2, bytes(600, 3), 2)) // copy-on-write: a data I/O error, fail-stop
     h.await(cow) shouldBe Right(CommitError.IOFailure)
-    h.await(held) shouldBe Right(CommitError.IOFailure)
     h.fatals.size shouldBe 1
-    val closed = h.backend.close()
-    closed.isCompleted shouldBe false // the journal's io still runs on its file
-    ec.release()
-    Await.result(closed, Timeout)
+    Await.result(h.backend.close(), Timeout)
+    held.isCompleted shouldBe false
+    ec.release() // the batch is written; the closed store's reply goes nowhere it could matter
     h.fatals.size shouldBe 1
 
   test("EDQUOT (disk quota exceeded) counts as out of space"):
@@ -822,230 +801,26 @@ class FsifFaultSuite extends FileBasedTests:
     FsifIo.isOutOfSpace(new IOException("DISK QUOTA EXCEEDED")) shouldBe true
     FsifIo.isOutOfSpace(new IOException("Input/output error")) shouldBe false
 
-  // ---- Journal hard limit ----
-
-  private def journalSizes(h: Harness): List[Long] = FsifRecovery.JournalFiles.toList.map(h.files.size)
-
-  test("with data writes frozen, commits past journalHardLimit are held, not failed, and complete once it clears"):
-    val limit = 2048L
-    val h = new Harness(tuning = FsifTuning(cowThreshold = 256, enospcRetry = retry, journalHardLimit = limit))
-    val bound = FsifBackend.journalLengthBound(layout, FsifTuning(journalHardLimit = limit))
-    val ps = (1 to 3).map(x => ptr(x, oid(x)))
-    var v1 = bytes(100, 1)
-    val v2 = bytes(50, 2)
-    h.commitOk(alloc(ps(0), v1, 1))
-    h.commitOk(alloc(ps(1), v2, 1))
-    h.commitOk(alloc(ps(2), bytes(30, 3), 1))
-    h.quiesce()
-    val full = new AtomicBoolean(true)
-    h.files.failWhile(Fault.OutOfSpace, isData)(full.get)
-    // Journaled 8-byte write ranges are acknowledged (their bytes are in the journal) until the limit is reached
-    val writes = mutable.ArrayBuffer[(Future[CommitResult], Array[Byte])]()
-    for rev <- 2 until 40 do
-      val next = patched(v1, rev % 90, bytes(8, rev))
-      writes += ((h.issueCommit(writeRange(ps(0), v1, rev % 90, bytes(8, rev), rev)), next))
-      v1 = next
-    h.backend.isWriteFrozen shouldBe true
-    val ackedWrites = writes.takeWhile((f, _) => acked(f))
-    ackedWrites.size should be > 0
-    ackedWrites.size should be < writes.size
-    // Held in order: nothing after the first held commit is acknowledged
-    writes.drop(ackedWrites.size).foreach((f, _) => f.isCompleted shouldBe false)
-    // A delete and a copy-on-write overwrite are held behind them too
-    val del = h.issueCommit(delete(ps(1), 2))
-    val v3 = bytes(400, 4)
-    val cow = h.issueCommit(overwrite(ps(2), v3, 2))
-    for _ <- 0 until 5 do h.tick()
-    del.isCompleted shouldBe false
-    cow.isCompleted shouldBe false
-    writes.drop(ackedWrites.size).foreach((f, _) => f.isCompleted shouldBe false)
-    val (held, _) = h.await(h.backend.capState)
-    held shouldBe (writes.size - ackedWrites.size + 2)
-    h.backend.journalSeq shouldBe 0 // frozen: no checkpoint has run
-    all(journalSizes(h)) should be <= limit
-    // Reads still work, and see only what was admitted
-    h.readData(ps(0)) shouldBe ackedWrites.last._2.toList
-    h.readData(ps(1)) shouldBe v2.toList
-    h.fatals.isEmpty shouldBe true
-
-    full.set(false)
-    for (f, _) <- writes do h.await(f) shouldBe Left(())
-    h.await(del) shouldBe Left(())
-    h.await(cow) shouldBe Left(())
-    h.quiesce()
-    h.backend.isWriteFrozen shouldBe false
-    h.backend.journalSeq should be >= 1L
-    h.await(h.backend.capState) shouldBe ((0, 0L))
-    all(journalSizes(h)) should be <= bound
-    h.fatals.isEmpty shouldBe true
-    h.readData(ps(0)) shouldBe v1.toList
-    h.readOpt(ps(1)) shouldBe None
-    h.readData(ps(2)) shouldBe v3.toList
-    h.crash()
-    h.readData(ps(0)) shouldBe v1.toList
-    h.readOpt(ps(1)) shouldBe None
-    h.readData(ps(2)) shouldBe v3.toList
-
-  test("a crash while commits are held by journalHardLimit keeps every acknowledged write"):
-    val limit = 1500L
-    val h = new Harness(tuning = FsifTuning(cowThreshold = 256, enospcRetry = retry, journalHardLimit = limit))
-    val p = ptr(1, oid(1))
-    var v = bytes(200, 1)
-    h.commitOk(alloc(p, v, 1))
-    h.quiesce()
-    h.files.failWhile(Fault.OutOfSpace, isData)(true)
-    val writes = (2 until 30).map: rev =>
-      val next = patched(v, rev * 5, bytes(4, rev))
-      val f = h.issueCommit(writeRange(p, v, rev * 5, bytes(4, rev), rev))
-      v = next
-      (f, next)
-    val ackedWrites = writes.takeWhile((f, _) => acked(f))
-    ackedWrites.size should be > 0
-    ackedWrites.size should be < writes.size
-    all(journalSizes(h)) should be <= limit
-    h.crash()
-    // Every acknowledged write survives; a held one never reached the journal
-    h.readData(p) shouldBe ackedWrites.last._2.toList
-    h.fatals.isEmpty shouldBe true
-
-  test("commits past journalHardLimit are held while not frozen too, until a checkpoint switches journals"):
-    val gate = new GateEc(isKind(FsifBackend.IoKind.Checkpoint))
-    val limit = 1500L
-    val h = new Harness(mkIo = () => gate,
-      tuning = FsifTuning(cowThreshold = 256, enospcRetry = retry, journalHardLimit = limit))
-    val p = ptr(1, oid(1))
-    var v = bytes(200, 1)
-    h.commitOk(alloc(p, v, 1))
-    val writes = (2 until 40).map: rev =>
-      val next = patched(v, rev * 4, bytes(4, rev))
-      val f = h.issueCommit(writeRange(p, v, rev * 4, bytes(4, rev), rev))
-      v = next
-      (f, next)
-    // The limit started a checkpoint, whose header write is gated: commits fill the next journal's switch buffer up
-    // to the limit, then are held
-    h.backend.isWriteFrozen shouldBe false
-    h.backend.checkpointRunning shouldBe true
-    gate.heldCount should be > 0
-    val (held, _) = h.await(h.backend.capState)
-    held should be > 0
-    writes.takeRight(held).foreach((f, _) => f.isCompleted shouldBe false)
-    all(journalSizes(h)) should be <= limit
-    gate.release()
-    for (f, _) <- writes do h.await(f) shouldBe Left(())
-    h.quiesce()
-    h.backend.journalSeq should be >= 1L
-    h.await(h.backend.capState) shouldBe ((0, 0L))
-    all(journalSizes(h)) should be <= limit
-    h.readData(p) shouldBe v.toList
-    h.crash()
-    h.readData(p) shouldBe v.toList
-    h.fatals.isEmpty shouldBe true
-
-  test("a fail-stop fails the commits held by journalHardLimit with IOFailure"):
-    val limit = 1500L
-    val h = new Harness(tuning = FsifTuning(cowThreshold = 256, enospcRetry = retry, journalHardLimit = limit))
-    val p = ptr(1, oid(1))
-    var v = bytes(200, 1)
-    h.commitOk(alloc(p, v, 1))
-    h.quiesce()
-    val full = new AtomicBoolean(true)
-    h.files.failWhile(Fault.OutOfSpace, isData)(full.get)
-    val writes = (2 until 30).map: rev =>
-      val f = h.issueCommit(writeRange(p, v, rev * 5, bytes(4, rev), rev))
-      v = patched(v, rev * 5, bytes(4, rev))
-      f
-    val held = writes.dropWhile(acked)
-    held.size should be > 0
-    // The held retry of the in-place write now fails with an I/O error: fail-stop
-    full.set(false)
-    h.files.failWhile(Fault.IoError, isData)(true)
-    h.tick()
-    h.fatals.size shouldBe 1
-    for f <- held do h.await(f) shouldBe Right(CommitError.IOFailure)
-    h.await(h.backend.capState) shouldBe ((0, 0L))
-
   test("a write range whose spans would encode larger than the slice is journaled as the whole slice"):
     val h = new Harness
     val p = ptr(1, oid(1))
     val v = bytes(800, 1)
     h.commitOk(alloc(p, v, 1))
     h.quiesce()
-    val before = h.files.size(FsifRecovery.JournalFiles(0))
     // 400 one-byte spans: 400 * (8 + 1) bytes as ranges, 8 + 800 as the whole slice
     val spans = (0 until 400).map(i => (i * 2, 1)).toList
     val next = Array.tabulate[Byte](800)(j => if j % 2 == 0 then (v(j) + 1).toByte else v(j))
     h.commitOk(CommitState(p, md(2), ObjectType.Data, DataBuffer(next), form = UpdateForm.Ranges(800, spans)))
-    h.files.size(FsifRecovery.JournalFiles(0)) - before shouldBe
-      JournalFormat.BatchOverhead + JournalFormat.DeltaRecordOverhead + JournalFormat.RangeOverhead + 800
+    val mine = DeviceJournalScan.scan(h.shared.journalFiles, h.shared.sizing) match
+      case Scan.Valid(bs, _) => bs.flatMap(_.records).filter(_.attachment == h.backend.attachmentId).map(_.record)
+      case other => fail(other.toString)
+    mine.last match
+      case JournalRecord.Delta(_, _, _, ranges) => ranges.map(r => (r.offset, r.bytes.toList)) shouldBe
+        List((0, next.toList))
+      case other => fail(other.toString)
     h.readData(p) shouldBe next.toList
     h.crash()
     h.readData(p) shouldBe next.toList
-
-  test("random ENOSPC windows under a small journalHardLimit: the journal stays bounded and every commit lands"):
-    var heldSeeds = 0
-    for seed <- 0 until 20 do
-      withClue(s"seed=$seed"):
-        val r = rng(seed + 7000)
-        val limit = 700L + r.nextInt(1500)
-        val tuning = FsifTuning(cowThreshold = 256, journalBound = 4096, enospcRetry = retry, journalHardLimit = limit)
-        val bound = FsifBackend.journalLengthBound(layout, tuning)
-        val h = new Harness(seed, mkIo = () => new ShuffleEc(r), tuning = tuning)
-        val io = h.io.asInstanceOf[ShuffleEc]
-        val n = 6
-        val ps = (0 until n).map(x => ptr(x, oid(x + 1)))
-        val last = Array.fill[Option[Array[Byte]]](n)(None)
-        val commits = mutable.ArrayBuffer[Future[CommitResult]]()
-        val windows = mutable.ArrayBuffer[AtomicBoolean]()
-        var sawHeld = false
-        var rev = 1
-        for i <- 0 until 80 do
-          r.nextInt(12) match
-            case 0 =>
-              val w = new AtomicBoolean(true)
-              windows += w
-              val name = if r.nextInt(3) == 0 then FsifRecovery.JournalFiles(r.nextInt(2)) else FsifRecovery.DataFile
-              h.files.failWhile(Fault.OutOfSpace, _ == name)(w.get)
-            case 1 if windows.nonEmpty =>
-              windows.remove(r.nextInt(windows.size)).set(false)
-            case 2 =>
-              h.tick()
-            case _ =>
-              val x = r.nextInt(n)
-              rev += 1
-              val (cs, next) = last(x) match
-                case None =>
-                  val v = bytes(r.nextInt(500), rev)
-                  (alloc(ps(x), v, rev), Some(v))
-                case Some(old) =>
-                  r.nextInt(4) match
-                    case 0 if old.length > 0 =>
-                      val off = r.nextInt(old.length)
-                      val patch = bytes(1 + r.nextInt(math.min(16, old.length - off)), rev)
-                      (writeRange(ps(x), old, off, patch, rev), Some(patched(old, off, patch)))
-                    case 1 =>
-                      (delete(ps(x), rev), None)
-                    case _ =>
-                      val v = bytes(r.nextInt(500), rev) // over 256 bytes goes copy-on-write
-                      (overwrite(ps(x), v, rev), Some(v))
-              commits += h.issueCommit(cs)
-              last(x) = next
-          for _ <- 0 until r.nextInt(8) do io.runOne()
-          all(journalSizes(h)) should be <= bound
-          if i % 8 == 0 && h.await(h.backend.capState)._1 > 0 then sawHeld = true
-        if sawHeld then heldSeeds += 1
-        windows.foreach(_.set(false))
-        h.quiesce()
-        h.fatals.isEmpty shouldBe true
-        h.await(h.backend.capState) shouldBe ((0, 0L))
-        for (f, i) <- commits.zipWithIndex do
-          withClue(s"commit=$i"):
-            f.value.map(_.get) shouldBe Some(Left(()))
-        all(journalSizes(h)) should be <= bound
-        h.crash()
-        for x <- 0 until n do withClue(s"ext=$x after crash"):
-          h.readOpt(ps(x)) shouldBe last(x).map(_.toList)
-    info(s"seeds that held commits at the journal hard limit: $heldSeeds")
-    heldSeeds should be >= 5
 
   // ---- Seeded ----
 
@@ -1055,8 +830,9 @@ class FsifFaultSuite extends FileBasedTests:
     for seed <- 0 until 30 do
       withClue(s"seed=$seed"):
         val r = rng(seed + 9000)
+        // A small device journal, so its pressure starts checkpoints
         val h = new Harness(seed, mkIo = () => new ShuffleEc(r),
-          tuning = FsifTuning(cowThreshold = 256, journalBound = 4096, enospcRetry = retry))
+          tuning = FsifTuning(cowThreshold = 256, enospcRetry = retry), sizing = JournalSizing(new UUID(4, 4), 3, 16 * 1024))
         val io = h.io.asInstanceOf[ShuffleEc]
         val n = 8
         val ps = (0 until n).map(x => ptr(x, oid(x + 1)))
@@ -1069,7 +845,7 @@ class FsifFaultSuite extends FileBasedTests:
           last(x) = Some(v)
         h.quiesce()
         // data is the busiest file (in-place writes, copy-on-write, moves, checkpoint forces, truncation)
-        val names = Vector.fill(4)(FsifRecovery.DataFile) ++ Vector("journal.a", "journal.b", "index.a", "index.b")
+        val names = Vector.fill(4)(FsifRecovery.DataFile) ++ Vector("index.a", "index.b")
         val windows = mutable.ArrayBuffer[AtomicBoolean]()
         var sawFrozen = false
         for i <- 0 until 60 do
@@ -1133,7 +909,7 @@ class FsifFaultSuite extends FileBasedTests:
           h.readOpt(ps(x)) shouldBe last(x).map(_.toList)
     info(s"seeds that froze: $froze; seeds holding each kind of I/O: ${kinds.toList.sorted}")
     froze should be >= 20
-    for k <- List("journal", "in-place", "copy-on-write", "checkpoint") do
+    for k <- List("in-place", "copy-on-write", "checkpoint") do
       withClue(k)(kinds(k) should be >= 3)
     withClue("move")(kinds("move-write") + kinds("move-force") should be >= 1)
 

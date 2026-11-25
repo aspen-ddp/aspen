@@ -12,7 +12,6 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.aspen_ddp.aspen.common.objects.ObjectId
 
 class FsifDeviceJournalSuite extends AnyFunSuite:
-  import JournalWriterSuite.ManualEc
 
   private val sizing = JournalSizing(new UUID(5, 6), 3, 64 * 1024)
   /** Blocks (batches of one small append) per file */
@@ -341,3 +340,22 @@ class FsifDeviceJournalSuite extends AnyFunSuite:
               assert(s < bs.size)
               assert(bs(s.toInt).records.map(_.record) == records.toVector)
           case other => fail(other.toString)
+
+  test("needsReplay holds while an unreleased attachment has records above its covered serial"):
+    val io = new ManualEc
+    val files = newFiles()
+    val j = new FsifDeviceJournal(files, sizing, None, io.execute, forceAfterWrite = true)
+    val (a, never) = (UUID.randomUUID(), UUID.randomUUID())
+    j.attach(a, dir / "a", new TestOwner)
+    assert(!j.needsReplay(a) && !j.needsReplay(never))
+    val f = j.append(a, List(rec(1)))
+    assert(j.needsReplay(a)) // queued, not yet written
+    io.runAll()
+    assert(j.needsReplay(a))
+    j.covered(a, value(f))
+    assert(!j.needsReplay(a))
+    j.append(a, List(rec(2)))
+    io.runAll()
+    assert(j.needsReplay(a))
+    j.release(a)
+    assert(!j.needsReplay(a))

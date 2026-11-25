@@ -94,8 +94,7 @@ private final class NioFsifFile(channel: FileChannel) extends FsifFile:
  *  every size is maintained by the handles `open` returns, which are the only writers of these files while the
  *  backend is open: a write raises it to the end of what was written, a truncate sets it. A mutation that throws may
  *  have gone part way, so the handle's size is read back (a stat, on the failing I/O thread; rare). The counter is
- *  shared by every handle of a name, so a checkpoint's second journal handle and the old journal's truncate update
- *  it too. */
+ *  shared by every handle of a name, so every index handle a checkpoint opens updates it too. */
 private[fsif] final class SizeTrackedFiles(under: FsifFiles) extends FsifFiles:
   private val sizes: Map[String, AtomicLong] =
     FsifRecovery.AllFiles.map(n => n -> new AtomicLong(under.size(n))).toMap

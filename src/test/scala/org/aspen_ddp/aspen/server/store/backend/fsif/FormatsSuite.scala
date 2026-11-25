@@ -79,7 +79,7 @@ class FormatsSuite extends FileBasedTests:
 
   test("index round trip and copy"):
     val m = sampleMap(64, 1)
-    val enc = IndexFile.encode(123456789012L, m)
+    val enc = IndexFile.encode(123456789012L, IndexMeta.None, m)
     enc.length shouldBe 8 + 8 + 41 + 64 * 20 + 4
     val (seq, meta, d) = IndexFile.decode(enc, 64).get
     seq shouldBe 123456789012L
@@ -111,7 +111,7 @@ class FormatsSuite extends FileBasedTests:
     IndexFile.decode(bad, 16) shouldBe None
 
   test("index decode rejects malformed input"):
-    val enc = IndexFile.encode(1L, sampleMap(16, 2))
+    val enc = IndexFile.encode(1L, IndexMeta.None, sampleMap(16, 2))
     IndexFile.decode(enc.take(enc.length - 1), 16) shouldBe None
     IndexFile.decode(enc :+ 0.toByte, 16) shouldBe None
     IndexFile.decode(enc, 17) shouldBe None
@@ -126,4 +126,4 @@ class FormatsSuite extends FileBasedTests:
   test("index decode rejects slot below -1 even with valid crc"):
     val m = IndexMap.empty(4)
     m.slots(2) = -2
-    IndexFile.decode(IndexFile.encode(1L, m), 4) shouldBe None
+    IndexFile.decode(IndexFile.encode(1L, IndexMeta.None, m), 4) shouldBe None

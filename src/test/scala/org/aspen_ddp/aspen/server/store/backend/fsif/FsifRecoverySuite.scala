@@ -490,6 +490,11 @@ class FsifRecoverySuite extends FileBasedTests:
     val (name, seq, _, map) = FsifRecovery.newestIndex(files, layout)
     writeIndex(files, otherIndex(name), seq + 1, IndexMeta(J, Att, covered, detached = false), map)
 
+  /** A fresh store's index.a (seq 0) rewritten in place as attached to `journalId`, so a first replay writes index.b */
+  private def attachInPlace(files: FsifFiles, journalId: UUID = J): Unit =
+    writeIndex(files, "index.a", 0, IndexMeta(journalId, Att, -1, detached = false),
+      IndexMap.empty(layout.segmentCount))
+
   private def open(files: FsifFiles, expected: Map[Int, Seg]): Opened =
     val o = FsifRecovery.openDirectory(files, layout, J)
     checkObjects(files, o.index, expected)
@@ -546,9 +551,39 @@ class FsifRecoverySuite extends FileBasedTests:
         (name, seq, meta) shouldBe ("index.a", 2L, IndexMeta(J, Att, 8, detached = true))
     open(files, Map()).slotCount shouldBe 0
 
+  test("replayDirectory is a no-op when the newest index is already detached"):
+    val files = fresh()
+    attach(files)
+    val (recs, expected) = threeObjectRecords()
+    FsifRecovery.replayDirectory(files, layout, recs, J, 5)
+    val before = FsifRecovery.newestIndex(files, layout)
+    val dataSize = files.open("data").size
+    val (more, _) = alloc(20, 3, oid(20), bytes(10, 1), 9)
+    FsifRecovery.replayDirectory(files, layout, more.toVector, J, 9)
+    val after = FsifRecovery.newestIndex(files, layout)
+    (after._1, after._2, after._3) shouldBe (before._1, before._2, before._3)
+    files.open("data").size shouldBe dataSize
+    open(files, expected)
+    // IndexMeta.None is detached too
+    val blank = fresh(2)
+    FsifRecovery.replayDirectory(blank, layout, more.toVector, J, 9)
+    FsifRecovery.newestIndex(blank, layout)._2 shouldBe 0
+    blank.open("data").size shouldBe 0
+
+  test("replayDirectory refuses an undetached index of another journal with an IOException"):
+    val files = fresh()
+    val (name, seq, _, map) = FsifRecovery.newestIndex(files, layout)
+    writeIndex(files, otherIndex(name), seq + 1, IndexMeta(new UUID(5, 5), Att, 0, detached = false), map)
+    val (recs, _) = threeObjectRecords()
+    val e = the[IOException] thrownBy FsifRecovery.replayDirectory(files, layout, recs, J, 5)
+    e.getMessage should include(new UUID(5, 5).toString)
+    FsifRecovery.newestIndex(files, layout)._2 shouldBe seq + 1
+    files.open("data").size shouldBe 0
+
   test("a torn index s+1 is ignored and replay starts from index s"):
     val files = fresh()
     val (recs, first) = threeObjectRecords()
+    attachInPlace(files)
     FsifRecovery.replayDirectory(files, layout, recs, J, 3) // index.b seq 1
     attach(files, covered = 3) // index.a seq 2
     val torn = IndexFile.encode(3, IndexMeta(J, Att, 99, detached = true), mapOf(first))
@@ -636,6 +671,7 @@ class FsifRecoverySuite extends FileBasedTests:
   test("initialize on a replayed directory empties the old index first and leaves an empty store"):
     val files = fresh()
     val (recs, _) = threeObjectRecords()
+    attachInPlace(files)
     FsifRecovery.replayDirectory(files, layout, recs, J, 3) // the store's index is now index.b
     attach(files, covered = 3) // and index.a again
     var ops = List[String]()
@@ -656,6 +692,7 @@ class FsifRecoverySuite extends FileBasedTests:
   test("openDirectory accepts an index naming another journal"):
     val files = fresh()
     val (recs, expected) = threeObjectRecords()
+    attachInPlace(files, new UUID(5, 5))
     FsifRecovery.replayDirectory(files, layout, recs, new UUID(5, 5), 3)
     // Attached elsewhere and shipped (or moved) without a detach: nothing of it is in J
     val (name, seq, _, map) = FsifRecovery.newestIndex(files, layout)
@@ -711,6 +748,7 @@ class FsifRecoverySuite extends FileBasedTests:
             segs += ext -> s2
           case _ =>
       batch.toVector
+    attachInPlace(files)
     FsifRecovery.replayDirectory(files, layout, randomOps(1 + rnd.nextInt(8)), J, 10)
     attach(files, covered = 10)
     // The older index.b: valid, emptied or torn; the newest (index.a) is what replay starts from

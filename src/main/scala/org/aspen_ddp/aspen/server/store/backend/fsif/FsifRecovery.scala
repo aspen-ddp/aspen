@@ -208,7 +208,9 @@ object FsifRecovery:
 
   /** Device-load replay of one directory: `records` are its attachment's records above its index's covered serial,
     * in journal order. The caller runs it only for a directory whose newest index names `journalId` and is not
-    * detached.
+    * detached. As a guard, a newest index that is already detached makes it a no-op (a rerun after the detached
+    * index became durable), and an undetached one naming another journal throws an IOException (a caller bug: no
+    * record of this journal belongs to it).
     *
     *  1. Load the newest valid index s (L1).
     *  2. Replay the records from it and validate before writing anything (L7-L10, `replayChecked`).
@@ -225,16 +227,21 @@ object FsifRecovery:
   def replayDirectory(files: FsifFiles, layout: FsifLayout, records: Vector[JournalRecord], journalId: UUID,
                       tailSerial: Long): Unit =
     val (indexName, s, meta, start) = newestIndex(files, layout)
-    val result = replayChecked(files, layout, start, records)
-    val dataSize = applyDeltas(files, layout, result.apply)
-    checkedSlotCount(layout, result.index, dataSize)
-    val otherIndex = IndexFiles.find(_ != indexName).get
-    withFile(files, otherIndex): f =>
-      f.truncate(0)
-      f.write(0, IndexFile.encode(s + 1, IndexMeta(journalId, meta.attachment, tailSerial, detached = true),
-        result.index))
-      f.force()
-    truncateToZero(files, indexName)
+    if meta.detached then
+      ()
+    else if meta.journalId != journalId then
+      throw new IOException(s"$indexName (seq $s) is attached to journal ${meta.journalId}, not $journalId")
+    else
+      val result = replayChecked(files, layout, start, records)
+      val dataSize = applyDeltas(files, layout, result.apply)
+      checkedSlotCount(layout, result.index, dataSize)
+      val otherIndex = IndexFiles.find(_ != indexName).get
+      withFile(files, otherIndex): f =>
+        f.truncate(0)
+        f.write(0, IndexFile.encode(s + 1, IndexMeta(journalId, meta.attachment, tailSerial, detached = true),
+          result.index))
+        f.force()
+      truncateToZero(files, indexName)
 
   /** Store open against the device journal `journalId`: loads the newest valid index (L1) and runs the checks that
     * need no journal (L11, L12) against data's forced size. The index must be detached or name another journal (a

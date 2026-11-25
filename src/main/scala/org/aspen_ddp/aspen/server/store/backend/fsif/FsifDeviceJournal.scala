@@ -49,8 +49,9 @@ import scala.util.control.NonFatal
   *
   * '''Pressure.''' When no file after the current one is free and the current file is at least 3/4 full, when a
   * reservation was refused and has not had its room yet, or when the next batch waits for a file, each owner whose
-  * oldest needed serial lies in the oldest pinned file gets `checkpointRequested`, once per oldest needed serial.
-  * A refused attachment gets `roomAvailable` once the room covers the charge it was refused.
+  * oldest needed serial lies in the oldest pinned file gets `checkpointRequested`, once per oldest needed serial and
+  * again after each `covered` (a finished checkpoint that left it pinning). A refused attachment gets
+  * `roomAvailable` once the room covers the charge it was refused.
   *
   * '''Failure.''' A failed write (or a `run` that throws) fails the journal: `failed` becomes Some, every pending
   * append fails with it, each unreleased attachment's owner gets `journalFailed` once, and later appends and
@@ -171,6 +172,8 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
             a.serials.removeHead()
           if a.head != wasHead && wasHead == minNeeded then
             recomputeMinNeeded()
+          // A checkpoint finished: one that left its owner still pinning (its snapshot predated head) is asked again
+          a.requestedFor = NoSerial
           (nextWrite(), roomNotes() ++ pressureNotes())
     notes.foreach(_())
     write.foreach(submit)

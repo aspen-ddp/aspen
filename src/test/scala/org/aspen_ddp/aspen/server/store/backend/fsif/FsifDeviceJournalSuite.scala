@@ -176,6 +176,29 @@ class FsifDeviceJournalSuite extends AnyFunSuite:
     value(j.append(b, List(rec(7778))))
     assert(oa.checkpoints == 1)
 
+  test("a checkpoint covering below its owner's oldest needed serial is followed by another request"):
+    val files = newFiles()
+    val j = direct(files)
+    val (a, b) = (UUID.randomUUID(), UUID.randomUUID())
+    val (oa, ob) = (new TestOwner, new TestOwner)
+    j.attach(a, dir / "a", oa)
+    j.attach(b, dir / "b", ob)
+    value(j.append(a, List(rec(0)))) // serial 0, file 0
+    val sa = value(j.append(a, List(rec(1)))) // serial 1, file 0: a's head stays here after covering 0
+    for i <- 2 until perFile do
+      j.covered(b, value(j.append(b, List(rec(i)))))
+    for i <- 0 until perFile + (perFile * 3 + 3) / 4 do // into file 2 past 3/4
+      value(j.append(b, List(rec(i))))
+    assert(oa.checkpoints == 1)
+    // A checkpoint whose snapshot predated the request covers only serial 0: a still pins file 0 at serial 1
+    j.covered(a, sa - 1)
+    assert(oa.checkpoints == 2)
+    // Covering below its head again (nothing changes) still asks again
+    j.covered(a, sa - 1)
+    assert(oa.checkpoints == 3)
+    j.covered(a, sa)
+    assert(oa.checkpoints == 3 && ob.checkpoints == 0)
+
   test("a refused reservation asks the owners pinning the oldest file to checkpoint"):
     val files = newFiles()
     val j = direct(files)

@@ -244,12 +244,16 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
                       logger.info(s"Keeping $copy: the state of store $storeId could not be read. Error: $t")
 
   /** Deletes the pending-delete copy `copy` on `local` as a `Delete` job on its lane (rename-first, CopyDisk.delete).
-   *  The copy has no record (P3): `deleting` marks it busy until the job's result returns */
+   *  The copy has no record (P3): `deleting` marks it busy until the job's result returns. Once it is gone, on a
+   *  device still loaded, its FSIF journal attachments are released (CopyMoves.releaseJournal) */
   private def deleteRetired(local: LocalStorageDeviceState, copy: os.Path, why: String): Unit =
     if !deleting.contains(copy) then
       deleting += copy
       val job = local.io.submit(JobKind.Delete, None)(CopyDisk.delete(local.devicePath, copy, why))
-      ctx.onControl("copy release: delete", job)(_ => deleting -= copy)
+      ctx.onControl("copy release: delete", job): result =>
+        deleting -= copy
+        if result == Success(true) && ctx.devices.isLoaded(local) then
+          CopyLayout.parseName(copy.last).foreach((storeId, copyId) => ctx.moves.releaseJournal(local, storeId, copyId))
 
   /** Deletes a copy that never was its store's owner copy and holds nothing its source lacks, so it needs no retiring:
    *  the copy a transfer delivered onto a device that turned out to be tombstoned (TransferOutcome.SourceRestored:
@@ -264,8 +268,8 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
    *  deleted, nor reported discarded), the copy claimed DiskJob(Delete) meanwhile (a copy busy with another job is
    *  kept, logged, as a failed delete keeps it). `discarded` runs with the device, on the control thread, once the
    *  copy is deleted, for the copy registry, provided the device is still the loaded one and the copy's record still
-   *  at the deleted path. A device not loaded, or a copy with no record (no copy of the store there), discards
-   *  nothing */
+   *  at the deleted path, its FSIF journal attachments released first (CopyMoves.releaseJournal). A device not
+   *  loaded, or a copy with no record (no copy of the store there), discards nothing */
   def discard(storeId: StoreId, deviceId: StorageDeviceId, reason: String)
              (discarded: LocalStorageDeviceState => Unit): Unit =
     ctx.devices.devices.get(deviceId) match
@@ -274,7 +278,8 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
         // since unloaded. Log rather than assume.
         logger.warn(s"Cannot discard the copy of store $storeId on unloaded device $deviceId")
       case Some(sds) =>
-        ctx.copyRegistry.pathOf(sds, storeId).foreach: storePath =>
+        ctx.copyRegistry.copiesOf(sds).flatMap(_.copies.get(storeId)).foreach: record =>
+          val storePath = CopyLayout.path(sds.devicePath, storeId, record.copyId, record.phase)
           if !ctx.copyRegistry.diskJob(sds, storeId, JobKind.Delete) then
             logger.warn(s"Not discarding the copy of store $storeId at $storePath yet: it is busy")
           else
@@ -285,6 +290,8 @@ class StoreCopies(ctx: DeviceControl) extends Logging:
             ctx.onControl("copy discard", job): result =>
               ctx.copyRegistry.diskJobEnded(sds, storeId)
               if result == Success(CopyDisk.Discarded.Deleted) && stillAt(sds, storeId, storePath) then
+                // Gone: out of the FSIF journal's replay scope
+                ctx.moves.releaseJournal(sds, storeId, record.copyId)
                 discarded(sds)
 
 object StoreCopies:

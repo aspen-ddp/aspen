@@ -92,6 +92,29 @@ object TransferDisk extends Logging:
                    s"Error: $t")
       MoveResult.NotMoved(t)
 
+  /** T6's disk steps for a transfer out's closed copy at `from`: the detach check (spec 4.6), then the move to `target`
+   *  in `to` (CopyDisk.relocate). Every close but a fail-stopped or frozen one detaches its FSIF store, so a copy
+   *  shipped holds its whole state; one whose newest index is still attached (FsifJournalDisk.undetachedAt: a close
+   *  that could not detach) holds acknowledged writes only this device's journal can replay, and is refused, logged
+   *  at error: NotMoved, so nothing ships (the receiver's retransmit asks again). A read that fails is NotMoved too:
+   *  it says nothing of the index. Any other copy moves as CopyDisk.relocate moves it */
+  def moveOutbound(from: os.Path, target: os.Path, to: Phase, syncDirectory: os.Path => Unit,
+                   rename: (os.Path, os.Path) => Unit): MoveResult =
+    val attached =
+      try Right(FsifJournalDisk.undetachedAt(from))
+      catch case NonFatal(t) => Left(t)
+    attached match
+      case Right(false) => CopyDisk.relocate(from, target, to, syncDirectory, rename)
+      case Right(true) =>
+        val t = new java.io.IOException(s"the FSIF copy at $from is still attached to its device's journal: its " +
+                                        "close did not detach it")
+        logger.error(s"Refusing to ship the copy at $from: $t. It stays where it is")
+        MoveResult.NotMoved(t)
+      case Left(t) =>
+        logger.error(s"Refusing to ship the copy at $from: whether it is detached from its device's FSIF journal " +
+                     s"cannot be read. It stays where it is. Error: $t")
+        MoveResult.NotMoved(t)
+
   /** What a transfer out's extraction of a closed store found at its copy (inspectSaveFile) */
   enum SaveFileState:
     /** No directory: nothing to extract */

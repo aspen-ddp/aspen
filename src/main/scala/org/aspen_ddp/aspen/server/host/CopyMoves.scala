@@ -95,7 +95,8 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
 
   /** Moves the copy of `storeId` on the attached `sds` to `to` (the copy keeps its copyId, P4) as one `Move` job on
    *  the device's lane (CopyDisk.relocate; with `writeArrival`, TransferDisk.bringArrivedLive: the copy's arrival
-   *  written durably first, T9), its result given to `andThen` on the control thread. A copy that is opening, served or
+   *  written durably first, T9; into outbound/, TransferDisk.moveOutbound: an undetached FSIF copy refused first), its
+   *  result given to `andThen` on the control thread. A copy that is opening, served or
    *  closing is never moved (no move of an installed store's directory): refused, NotMoved, and logged at error as the
    *  caller's bug, as is a copy with no record; one already busy with a disk job is refused at info (`movable`). A copy
    *  already unsynced stays unsynced after the move, whose syncs force only the directories naming it, until a resync
@@ -105,7 +106,8 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
    *  move (recordMove). Otherwise, or for a cancelled job, it records nothing and gives `andThen` NotMoved; a rename
    *  that landed unforced on a device unloaded meanwhile is held for its next attach (HostCopies.unsynced), as
    *  moveUnattachedOnLane holds one. A job that never returns (a hung device) leaves the copy busy and `andThen`
-   *  waiting */
+   *  waiting. A durable move to Lost or Retired that leaves the copy synced releases its FSIF journal attachments
+   *  (releaseJournal); an unsynced one releases them once its resync forces it */
   def moveOnLane(site: String, sds: LocalStorageDeviceState, storeId: StoreId, to: Phase, writeArrival: Boolean = false)
                 (andThen: MoveResult => Unit): Unit =
     movable(site, sds, storeId) match
@@ -118,11 +120,14 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
           val target = CopyLayout.path(sds.devicePath, storeId, r.copyId, to)
           val sync = syncDirectory
           val renameCopy = rename
-          val job =
-            if writeArrival then
+          val job = to match
+            case _ if writeArrival =>
               sds.io.submit(JobKind.Move, Some(storeId))(
                 TransferDisk.bringArrivedLive(from, target, to, sync, renameCopy))
-            else
+            case Phase.Outbound(_) =>
+              // A transfer out's (the only move into outbound/): its detach check first, in the same job
+              sds.io.submit(JobKind.Move, Some(storeId))(TransferDisk.moveOutbound(from, target, to, sync, renameCopy))
+            case _ =>
               sds.io.submit(JobKind.Move, Some(storeId))(CopyDisk.relocate(from, target, to, sync, renameCopy))
           ctx.onControl(s"copy move ($site)", job): done =>
             val result = done match
@@ -140,6 +145,10 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
               // Recorded under the mark (a retry beneath it retargeted, HostCopies.moved), then the mark cleared
               recordMove(site, sds, storeId, r.copyId, from, target, to, result)
               ctx.copyRegistry.diskJobEnded(sds, storeId)
+              // Out of the FSIF journal's replay scope once durable; a copy still unsynced keeps its pin (resync)
+              if result == MoveResult.Durable && CopyMoves.outOfReplayScope(to) &&
+                 !ctx.copyRegistry.isUnsynced(sds, storeId) then
+                releaseJournal(sds, storeId, r.copyId)
               andThen(result)
             else
               ctx.copyRegistry.diskJobEnded(sds, storeId)
@@ -262,12 +271,28 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
             claimed.foreach: (storeId, path, _) =>
               outcomes.get(path) match
                 case Some(None) if registry.pathOf(local, storeId).contains(path) =>
+                  val record = registry.copiesOf(local).flatMap(_.copies.get(storeId))
                   unforced -= path
                   registry.synced(path)
+                  // A move out of the FSIF journal's replay scope that landed unforced is durable now
+                  record.filter(r => CopyMoves.outOfReplayScope(r.phase))
+                    .foreach(r => releaseJournal(local, storeId, r.copyId))
                 case Some(Some(t)) =>
                   logger.warn(s"Failed to force $path again. Its copy stays unsynced and unloaded. Error: $t")
                 case _ => ()
           andThen
+
+  /** Spec 4.5: the copy `copyId` of `storeId` on the attached `sds` is durably out of the FSIF device journal's replay
+   *  scope (its move to lost/ or pending-delete/ durable, or its rename-first delete done): every attachment of its
+   *  directory is released, so an attachment its fail-stopped or frozen close left live (4.6) pins the ring no more.
+   *  Until then a crash could reload the copy from where it was, and the next device load's replay must find its
+   *  records. An attachment names the copy's path at its open; a copy is never moved while its backend is open (P5),
+   *  but one closed without a detach may have moved between phases since, so the copy's path in every phase is
+   *  released: they all name this one copy (its copy id, P4), never another's directory. Runs on the control thread
+   *  where the result is applied; no disk I/O. A device with no journal open releases nothing */
+  private[host] def releaseJournal(sds: LocalStorageDeviceState, storeId: StoreId, copyId: UUID): Unit =
+    sds.io.fsifJournal.get.foreach: journal =>
+      CopyMoves.AllPhases.foreach(p => journal.releaseDirectory(CopyLayout.path(sds.devicePath, storeId, copyId, p)))
 
   private def logMove(site: String, from: os.Path, target: os.Path, result: MoveResult): Unit =
     result match
@@ -282,3 +307,12 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
    *  held for the resync */
   private[host] def heldUnforced(from: os.Path, target: os.Path): Unit =
     unforced += target -> List(target / os.up, from / os.up).distinct
+
+object CopyMoves:
+  /** Whether a copy in `phase` is out of the FSIF device journal's replay scope (spec 4.7: the device load replays
+   *  into every phase but these) */
+  def outOfReplayScope(phase: Phase): Boolean = phase == Phase.Lost || phase == Phase.Retired
+
+  /** One phase per phase directory (a phase's parameter never changes its path, CopyLayout.path) */
+  private val AllPhases: List[Phase] = List(Phase.Live, Phase.Arrived(""), Phase.Outbound(""), Phase.Rebuilt(""),
+    Phase.Parked, Phase.Lost, Phase.Retired)

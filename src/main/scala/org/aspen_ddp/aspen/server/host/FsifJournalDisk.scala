@@ -321,6 +321,12 @@ object FsifJournalDisk extends Logging:
                                 s"unknown, so its device is left for the next scan")
         None
 
+  /** Whether the directory `dir` is an FSIF directory (`layoutOf`, as a device load with a journal decides it) whose
+   *  newest valid index is undetached (`undetached`): a transfer out's detach check (TransferDisk.moveOutbound). A
+   *  directory with no FSIF config and no FSIF index file is not. Throws where layoutOf or the read does */
+  def undetachedAt(dir: os.Path): Boolean =
+    layoutOf(dir, journal = true).exists(layout => undetached(Dir(dir, None, layout)))
+
   /** Whether `d`'s newest valid index is undetached. One with no valid index says nothing (its own open finds it
    *  lost): false. A read that fails throws */
   private def undetached(d: Dir): Boolean =

@@ -17,7 +17,7 @@ object FsifLayout:
   /** The most segments whose index file (IndexFile.sizeFor) stays below 2 GiB, so recovery can read it whole into
     * one array: sizeFor(n) <= Int.MaxValue - 16
     */
-  val MaxSegmentCount: Int = ((FsifRecovery.MaxLoadSize - 20) / 20).toInt
+  val MaxSegmentCount: Int = ((FsifRecovery.MaxLoadSize - IndexFile.sizeFor(0)) / 20).toInt
 
   /** The largest payload one commit's records can carry in an otherwise empty journal, plus a compaction Mapping,
     * without the journal passing FsifRecovery.MaxLoadSize (FsifBackend.journalLengthBound). About 2 GiB, so it

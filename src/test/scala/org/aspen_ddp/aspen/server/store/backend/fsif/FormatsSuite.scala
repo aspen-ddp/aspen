@@ -80,14 +80,35 @@ class FormatsSuite extends FileBasedTests:
   test("index round trip and copy"):
     val m = sampleMap(64, 1)
     val enc = IndexFile.encode(123456789012L, m)
-    enc.length shouldBe 8 + 8 + 64 * 20 + 4
-    val (seq, d) = IndexFile.decode(enc, 64).get
+    enc.length shouldBe 8 + 8 + 41 + 64 * 20 + 4
+    val (seq, meta, d) = IndexFile.decode(enc, 64).get
     seq shouldBe 123456789012L
+    meta shouldBe IndexMeta.None
     same(d, m)
     val c = m.copy()
     same(c, m)
     c.slots(0) = -7
     same(m, sampleMap(64, 1))
+
+  test("index v2 round-trips its meta"):
+    val m = sampleMap(16, 3)
+    IndexMeta.None shouldBe IndexMeta(new UUID(0, 0), new UUID(0, 0), -1L, detached = true)
+    for meta <- Seq(IndexMeta(new UUID(1, 2), new UUID(3, 4), 987654321L, detached = false),
+                    IndexMeta(new UUID(-5, 6), new UUID(7, -8), -1L, detached = true),
+                    IndexMeta.None) do
+      val enc = IndexFile.encode(42L, meta, m)
+      enc.length.toLong shouldBe IndexFile.sizeFor(16)
+      val (seq, dm, d) = IndexFile.decode(enc, 16).get
+      seq shouldBe 42L
+      dm shouldBe meta
+      same(d, m)
+    // A detached byte other than 0 or 1 is not an index this code wrote, even with a valid CRC
+    val bad = IndexFile.encode(1L, IndexMeta.None, m)
+    bad(8 + 8 + 40) = 2
+    val c = new java.util.zip.CRC32
+    c.update(bad, 0, bad.length - 4)
+    java.nio.ByteBuffer.wrap(bad).putInt(bad.length - 4, c.getValue.toInt)
+    IndexFile.decode(bad, 16) shouldBe None
 
   test("index decode rejects malformed input"):
     val enc = IndexFile.encode(1L, sampleMap(16, 2))

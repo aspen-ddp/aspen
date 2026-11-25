@@ -55,10 +55,13 @@ import scala.util.control.NonFatal
   *
   * '''Failure.''' A failed write (or a `run` that throws) fails the journal: `failed` becomes Some, every pending
   * append fails with it, each unreleased attachment's owner gets `journalFailed` once, and later appends and
-  * reservations fail at once.
+  * reservations fail at once. `whenFailed` completes with the failure after every owner's `journalFailed` has been
+  * called, so a device-level reaction runs after each store's own fail-stop was asked for.
+  *
+  * '''Close.''' `onClosed` runs once, after the files are closed (the device's journal lock is released there).
   */
 final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start: Option[Tail],
-                              run: Runnable => Unit, forceAfterWrite: Boolean):
+                              run: Runnable => Unit, forceAfterWrite: Boolean, onClosed: () => Unit = () => ()):
   import FsifDeviceJournal.*
 
   private val lock = new Object
@@ -86,7 +89,9 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
   private val queue = mutable.ArrayDeque[Pending]()
   private var inFlight = false
   private var failure: Option[Throwable] = None
+  private val failedPromise = Promise[Throwable]()
   private var closed = false
+  private var handlesClosed = false
   /** Minimum oldest needed serial over unreleased attachments; NoSerial for none */
   private var minNeeded = NoSerial
   private var reservedTotal = 0L
@@ -113,6 +118,9 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
     attachments.get(attachment).exists(a => !a.released && (a.serials.nonEmpty || a.queued > 0))
 
   def failed: Option[Throwable] = lock.synchronized(failure)
+
+  /** Completes with the journal's failure once every live owner has had `journalFailed`; never if it does not fail */
+  def whenFailed: Future[Throwable] = failedPromise.future
 
   /** Bytes reserved by every attachment, charged as tryReserve charges them */
   private[fsif] def reservedForTest: Long = lock.synchronized(reservedTotal)
@@ -365,28 +373,37 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
     next.foreach(submit)
 
   private def fail(t: Throwable, inFlightPending: List[Pending]): Unit =
-    val (pending, owners, closeNow) = lock.synchronized:
+    val (pending, owners, closeNow, first) = lock.synchronized:
       inFlight = false
       if failure.isDefined then
-        (inFlightPending, Nil, closed)
+        (inFlightPending, Nil, closed, false)
       else
         failure = Some(t)
         val ps = inFlightPending ++ queue
         queue.clear()
         refused.clear()
         val os = attachments.valuesIterator.filter(!_.released).map(_.owner).toList.distinct
-        (ps, os, closed)
+        (ps, os, closed, true)
     pending.foreach(p => p.att.owner.complete(() => p.promise.failure(t)))
     owners.foreach(_.journalFailed(t))
+    if first then
+      failedPromise.trySuccess(t)
     if closeNow then
       closeHandles()
 
   private def closeHandles(): Unit =
+    val firstClose = lock.synchronized:
+      val f = !handlesClosed
+      handlesClosed = true
+      f
     for i <- 0 until count do
       if handles(i) != null then
         try handles(i).close()
         catch case NonFatal(_) => ()
         handles(i) = null
+    if firstClose then
+      try onClosed()
+      catch case NonFatal(_) => ()
 
 object FsifDeviceJournal:
   trait Owner:

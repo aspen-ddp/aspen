@@ -20,8 +20,8 @@ enum JobKind:
     RebuildBookkeeping
   /** Device discovery's own jobs (DeviceDiscovery), used by nothing else: the listing of storage-devices/ on the host
    *  root's lane, a path's probe, and a load's sweep and P2. A load's device CRL open (DeviceCrlDisk.open) is
-   *  `CrlOpen`, used by discovery only */
-  case DeviceListing, DeviceProbe, LoadSweep, LoadDuplicates,
+   *  `CrlOpen`, used by discovery only; its FSIF device journal open (FsifJournalDisk.openAtLoad) is `FsifJournalOpen` */
+  case DeviceListing, DeviceProbe, LoadSweep, LoadDuplicates, FsifJournalOpen,
     /** Ownership resolution's reads (DeviceStateDisk.storesIn, ownershipUnchanged) */
     DeviceOwnership,
     /** Adoption's reads and moves, and bringIntoService's steps (DeviceStateDisk) */
@@ -50,9 +50,10 @@ trait DeviceIo:
   /** The device's FSIF journal thread (FsifDeviceJournal's `run`): one thread, each write of the journal one task on
    *  it, in order. A task counts toward `idle` as a pool task does, and the thread stops at `close` */
   def journalRun: Runnable => Unit
-  /** The device's open FSIF journal, None while none is open. Set by the device load or the lazy create ahead of the
-   *  first FSIF store create (for now the temporary FsifJournalBridge, which also fills it at the first FSIF open);
-   *  cleared and closed at the device's unload */
+  /** The device's open FSIF journal, None while none is open. Set by the device load (FsifJournalDisk.openAtLoad,
+   *  applied by DeviceDiscovery) or the lazy creation ahead of the first FSIF store on a device without one
+   *  (FsifJournalDisk.ensure); cleared at the device's unload, wherever its CRL is shut, and closed with the CRL
+   *  (DeviceShutdown.shutDownCrl) */
   def fsifJournal: AtomicReference[Option[FsifDeviceJournal]]
   def observer: DeviceIoObserver
   /** The device's health probe (HealthProbe): armed while a storage device is loaded at this path, disarmed at its

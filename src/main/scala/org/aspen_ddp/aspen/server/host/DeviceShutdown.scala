@@ -8,6 +8,7 @@ import org.aspen_ddp.aspen.common.util.runSequentially
 import org.aspen_ddp.aspen.server.Host.StoreFailedOnClose
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.ShutdownOutcome
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.store.backend.fsif.FsifDeviceJournal
 import scribe.Logging
 
 import java.util.concurrent.Executors
@@ -303,11 +304,34 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  Rebuilds and transfers on the device are not cancelled: their CRL calls and store loads now fail, and a restart
    *  resumes them from what they left on disk, as after a crash. */
   def crlFailed(local: LocalStorageDeviceState, cause: Throwable): Unit =
+    takeFailedOutOfService(local, cause, "CRL",
+      "None of its stores can vote: unloading the device until the host restarts")
+
+  /** Takes a loaded device whose FSIF device journal has failed (FsifDeviceJournal.whenFailed, spec 4.8, J4) out of
+   *  service exactly as crlFailed does, once each of its FSIF stores has been asked to fail-stop (each takes its own
+   *  route: its copy moved to lost/ when its close ends, which the unload waits for). Not reloaded before the host
+   *  restarts, whose device load recovers the journal as after a crash: until then every FSIF open on the device would
+   *  fail against the failed journal. Ignored unless `local` is still the device loaded */
+  def fsifJournalFailed(local: LocalStorageDeviceState, cause: Throwable): Unit =
+    takeFailedOutOfService(local, cause, "FSIF device journal",
+      "Its FSIF stores fail-stop: unloading the device until the host restarts")
+
+  /** Watches the FSIF journal in `local`'s slot, if it is not watched yet, so its failure takes the device out of
+   *  service (fsifJournalFailed). Called where a journal may have appeared in the slot: the device's load, an open of
+   *  a store on it (the lazy creation, FsifJournalDisk.ensure, fills the slot on the lane), and each device check */
+  def watchFsifJournal(local: LocalStorageDeviceState): Unit =
+    local.io.fsifJournal.get.foreach: journal =>
+      if !local.watchedFsifJournal.exists(_ eq journal) then
+        local.watchedFsifJournal = Some(journal)
+        journal.whenFailed.foreach(t => fsifJournalFailed(local, t))
+
+  /** crlFailed's sequence, for the device's `what` that failed */
+  private def takeFailedOutOfService(local: LocalStorageDeviceState, cause: Throwable, what: String,
+                                     consequence: String): Unit =
     val deviceId = local.storageDeviceId
     if ctx.devices.isLoaded(local) && !relinquishingDevices.contains(deviceId) then
       relinquishingDevices += deviceId
-      logger.error(s"The CRL of storage device $deviceId at ${local.devicePath} has failed. None of its stores can " +
-                   s"vote: unloading the device until the host restarts", cause)
+      logger.error(s"The $what of storage device $deviceId at ${local.devicePath} has failed. $consequence", cause)
       ctx.discovery.disown(local.devicePath)
       val closed =
         try
@@ -315,13 +339,13 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
             ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now)))
         catch case t: Throwable => Future.failed(t)
       closed.transformWith: result =>
-        result.failed.foreach(t => logger.error(s"Failed to close the stores of storage device $deviceId, whose CRL " +
-                                                s"has failed. Unloading it anyway: $t"))
+        result.failed.foreach(t => logger.error(s"Failed to close the stores of storage device $deviceId, whose " +
+                                                s"$what has failed. Unloading it anyway: $t"))
         unloadOnceClosed(local)
       .onComplete: result =>
         relinquishingDevices -= deviceId
         if result.toOption.contains(true) then
-          logger.info(s"Storage device $deviceId, whose CRL has failed, is unloaded")
+          logger.info(s"Storage device $deviceId, whose $what has failed, is unloaded")
 
   /** Closes every store open on a relinquished device, one at a time, until none is left: one loaded meanwhile is
    *  closed by another round. `onClosed` runs for each once it is offline. */
@@ -392,7 +416,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
       sds.unloaded = true
       // No new probe attempt; one stuck in flight stays, for a reload of the path to inherit
       sds.io.probe.disarm()
-      shutDownCrl(sds.devicePath, sds.crl)
+      shutDownCrl(sds.devicePath, sds.crl, takeFsifJournal(sds.io))
       // Its last tree entry's stores, and the copies it holds: an unload before its first reconcile lists those
       ctx.copyRegistry.detach(storageDeviceId,
         sds.reconciledEntries.map(_.keySet).getOrElse(Set()) ++ sds.copies.copies.keySet)
@@ -400,10 +424,19 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
     ctx.discovery.forgetDevice(storageDeviceId)
     ctx.publishView()
 
+  /** Empties `io`'s FSIF journal slot, returning the journal it held, for shutDownCrl to close: cleared on the
+   *  control thread at the unload, before any later load of the path can fill the slot again */
+  private[host] def takeFsifJournal(io: DeviceIo): Option[FsifDeviceJournal] = io.fsifJournal.getAndSet(None)
+
   /** Shuts `crl`, the CRL of the device at `devicePath`, down on DeviceShutdown.CrlShutdownEc, since the shutdown
-   *  blocks. Until it ends the path is in closingCrls, so the device is not loaded again over files still open. */
-  private[host] def shutDownCrl(devicePath: os.Path, crl: CrashRecoveryLog): Unit =
-    val closed = Future(crl.shutdown())(using DeviceShutdown.CrlShutdownEc)
+   *  blocks, and then closes `journal`, the device's FSIF journal taken from its slot (takeFsifJournal), releasing its
+   *  lock. Until both end the path is in closingCrls, so the device is not loaded again over files still open. */
+  private[host] def shutDownCrl(devicePath: os.Path, crl: CrashRecoveryLog,
+                                journal: Option[FsifDeviceJournal]): Unit =
+    def shutDown(): Unit =
+      try crl.shutdown()
+      finally journal.foreach(_.close())
+    val closed = Future(shutDown())(using DeviceShutdown.CrlShutdownEc)
     ctx.devices.closingCrls += devicePath -> closed
     closed.onComplete: result =>
       result.failed.foreach(t => logger.error(s"Failed to shut down the CRL of the device at $devicePath: $t"))

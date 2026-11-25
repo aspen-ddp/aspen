@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.StoreIncarnationFile
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.{CommitState, UpdateForm}
-import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifFile, FsifJournalBridge, FsifFiles, FsifLayout, FsifRecovery,
+import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifFile, FsifFiles, FsifLayout, FsifRecovery,
   FsifTuning, NioFsifFiles}
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
@@ -54,6 +54,9 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
   @volatile var closeGate: Option[Future[Unit]] = None
   /** Closes started on backends opened under a closeGate */
   @volatile var gatedCloses: Int = 0
+  /** The newest index of each FSIF directory as its open found it, before the backend attached, most recent first */
+  @volatile var indexesAtOpen: List[(os.Path, org.aspen_ddp.aspen.server.store.backend.fsif.IndexMeta,
+    org.aspen_ddp.aspen.server.store.backend.fsif.IndexMap)] = Nil
 
   override def open(storeCfg: StoreConfig, storePath: os.Path, onFatal: Throwable => Unit,
                     io: DeviceIo): Future[Backend] =
@@ -140,13 +143,15 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
       failedOpens -= 1
       throw new IOException("injected open failure")
     onFatals = onFatal :: onFatals
+    scala.util.Try(FsifRecovery.newestIndex(new NioFsifFiles(path), layout)).foreach: (_, _, meta, map) =>
+      indexesAtOpen = (path, meta, map) :: indexesAtOpen
     if !os.isDir(path) || FsifRecovery.isBlank(new NioFsifFiles(path)) then
       super.openFsifBackend(storeId, path, layout, onFatal, io) // StoreLost
     else
       val dataEc = io.dataEc
       val serial = Some(io.serialEc)
       val gate = closeGate
-      val journal = FsifJournalBridge.journalFor(io, path, layout)
+      val journal = org.aspen_ddp.aspen.server.host.FsifJournalDisk.forOpen(io)
       val b = new FsifBackend(storeId, path, layout, new FullableFiles(path), dataEc, journal, FsifTuning(),
           onFatal, org.aspen_ddp.aspen.server.store.backend.SharedRetryScheduler, serial):
         override def hasFailed: Boolean = super.hasFailed || FsifSeams.this.reportFailed
@@ -488,6 +493,39 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
         load(host)
         host.getStoreIds should not contain storeId
         CopyFixtures.phaseOf(deviceDir, storeId).contains(Phase.Lost) should be(false)
+
+  atest("a host restart replays acknowledged FSIF writes before the stores open"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    load(host)
+    val servedFirst = host.getStoreIds.contains(storeId)
+    val backend = fsif(host).lastBackend.get
+    val id = ObjectId(new UUID(5, 6))
+    val ptr = DataObjectPointer(id, storeId.poolId, java.nio.ByteBuffer.allocate(4).putInt(0).array())
+    val md = Metadata(ObjectRevision(TransactionId(new UUID(7, 8))), ObjectRefcount(1, 1), HLCTimestamp(1))
+    val acknowledged = Promise[Unit]()
+    backend.repair(CommitState(ptr, md, ObjectType.Data, DataBuffer(Array[Byte](4, 5, 6)), form = UpdateForm.Full),
+      acknowledged)
+    acknowledged.future.map: _ =>
+      // kill -9: nothing is closed or detached. Only the journal's lock goes with the process, so its files close
+      loadedDevices(host)(deviceA).io.fsifJournal.get.foreach(_.close())
+      val (_, _, metaBefore, mapBefore) = FsifRecovery.newestIndex(new NioFsifFiles(storeDir), layout)
+      val restarted = newSeamHost(hostRoot)
+      restarted.testingOnlyHandleEvents()
+      val atOpen = fsif(restarted).indexesAtOpen.filter(_._1 == storeDir)
+      servedFirst should be(true)
+      // The write was only in the device journal: the index still attached, its mapping absent
+      metaBefore.detached should be(false)
+      mapBefore.ids.contains(id) should be(false)
+      // The device load replayed it before the store's open, which found the index detached and mapping it
+      atOpen.size should be(1)
+      atOpen.head._2.detached should be(true)
+      atOpen.head._3.ids.contains(id) should be(true)
+      restarted.getStoreIds should contain(storeId)
 
   atest("an FSIF store's recovery runs as a device lane job and its outcome is served by an event"):
     val hostRoot = newHostDir()

@@ -44,9 +44,10 @@ class BackendOpenerSuite extends FileBasedTests:
       io.close()
 
   /** The device config a create reads from the device directory (`tdir`, the parent of its creating/) */
-  private def writeDeviceConfig(): Unit =
+  private def writeDeviceConfig(fileSizeMb: Int = 4): Unit =
     os.write.over(tdir / StorageDeviceConfig.configFilename,
-      StorageDeviceConfig(StorageDeviceId(new UUID(9, 4)), new UUID(9, 5)).yamlConfig)
+      StorageDeviceConfig(StorageDeviceId(new UUID(9, 4)), new UUID(9, 5), fsifJournalFiles = Some(3),
+        fsifJournalFileSizeMb = Some(fileSizeMb)).yamlConfig)
 
   test("opening an FSIF store with no journal open fails with an IOException, not BackendStateLost"):
     withIo: io =>
@@ -61,12 +62,23 @@ class BackendOpenerSuite extends FileBasedTests:
       e should not be a[BackendStateLost]
       io.fsifJournal.get should be(None)
 
-  test("Review Focus 3: an FSIF create whose slice cannot fit a journal file fails with nothing at the path; an open of such a store fails with an IOException naming both sizes"):
+  test("an FSIF open on a device without a journal directory creates the journal first, sized by the device config"):
     withIo: io =>
       writeDeviceConfig()
-      val fileSize = 64L * 1024
-      DeviceJournalFiles.create(tdir / DeviceJournalFiles.DirName, JournalSizing(new UUID(9, 6), 3, fileSize))
-      val slice = 128 * 1024
+      val cfg = StoreConfig(storeId, StoreConfig.Fsif(1024, 64), None, Replication(3, 2))
+      val path = tdir / "fsif"
+      // As a transfer in leaves it: a detached store on a device loaded Absent
+      DefaultBackendOpener.createStore(cfg, path, tdir / StoreCreation.CreatingDirectory)
+      val backend = Await.result(opener.open(cfg, path, _ => (), io), Timeout)
+      io.fsifJournal.get.map(_.sizing.fileSize) should be(Some(4L << 20))
+      DeviceJournalFiles.readSizing(tdir / DeviceJournalFiles.DirName).files should be(3)
+      Await.result(backend.close(), Timeout)
+
+  test("Review Focus 3: an FSIF create whose slice cannot fit a journal file fails with nothing at the path; an open of such a store fails with an IOException naming both sizes"):
+    withIo: io =>
+      writeDeviceConfig(fileSizeMb = 1)
+      val fileSize = 1L << 20
+      val slice = 2 << 20
       val cfg = StoreConfig(storeId, StoreConfig.Fsif(slice, 4), None, Replication(3, 2))
       val path = tdir / "big"
       val e = intercept[Throwable](
@@ -97,6 +109,7 @@ class BackendOpenerSuite extends FileBasedTests:
 
   test("an FSIF open runs on the device lane and its I/O on the device data pool"):
     withIo: io =>
+      writeDeviceConfig()
       val cfg = StoreConfig(storeId, StoreConfig.Fsif(1024, 64), None, Replication(3, 2))
       val path = tdir / "fsif"
       DefaultBackendOpener.createStore(cfg, path, tdir / StoreCreation.CreatingDirectory)

@@ -183,6 +183,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   private def reconcileDeviceState(local: LocalStorageDeviceState,
                                    remote: StorageDeviceState)(ended: () => Unit): Unit =
     local.reconciledEntries = Some(remote.stores)
+    // A journal the lazy creation made for a rebuild's staging store is watched here at the latest
+    ctx.shutdown.watchFsifJournal(local)
     val shuttingDown = remote.status == StorageDeviceState.DeviceStatus.ShuttingDown ||
       remote.status == StorageDeviceState.DeviceStatus.Shutdown || ctx.shutdown.isShuttingDown(local.storageDeviceId)
     if remote.isFailed || remote.hostId != ctx.hostId || shuttingDown then

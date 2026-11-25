@@ -379,6 +379,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     // again
     var installing = false
     val registered = ctx.devices.isLoaded(sds)
+    // An FSIF open (or create) may have made the device's journal (FsifJournalDisk.ensure): its failure is watched
+    if registered then
+      ctx.shutdown.watchFsifJournal(sds)
     // The open's copy, unless served below: Opening -> Idle, or AwaitingRetry where a retry was recorded
     def openEnded(): Unit = ctx.copyRegistry.openEnded("open ended", sds, storeId)
     // A create renames its finished copy into the store's path before the open (StoreCreation), so the record its open

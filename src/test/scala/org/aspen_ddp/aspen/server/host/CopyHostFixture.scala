@@ -32,7 +32,7 @@ trait CopyHostFixture extends ControlFixture:
   protected val s = storeId
   protected val ida = Replication(3, 2)
 
-  /** The default opener, whose RocksDB backends report hasFailed while `failing` is set, close only once `closeGate`
+  /** The default opener (FSIF stores open through it unchanged), whose RocksDB backends report hasFailed while `failing` is set, close only once `closeGate`
    *  (if set when the close is asked) completes, and whose opens fail with BackendStateLost while `stateLost` is set */
   protected class TestOpener extends DefaultBackendOpener(executionContext):
     @volatile var failing = false
@@ -53,6 +53,9 @@ trait CopyHostFixture extends ControlFixture:
             case Some(gate) => gate.flatMap(_ => super.close())(using executionContext)).future
       if stateLost then
         Future.failed(new BackendStateLost("injected: acknowledged state lost"))
+      else if storeCfg.backend.isInstanceOf[StoreConfig.Fsif] then
+        // FSIF copies open as the host's own opener opens them, against the device's journal
+        super.open(storeCfg, storePath, onFatal, io)
       else
         // An open held by `openGate` completes once it does
         openGate match

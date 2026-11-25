@@ -519,6 +519,12 @@ trait ControlFixture:
       os.makeDir.all(hostDir)
     hostDir
 
+  /** The FSIF device journal sizing every test device config sets (the production default is 4 files of 256 MiB):
+   *  small, yet each file holds the largest commit of every FSIF layout the tests create
+   *  (FsifBackend.fitsJournal) */
+  protected val TestJournalFiles = 3
+  protected val TestJournalFileSizeMb = 4
+
   /** Creates `<hostRoot>/storage-devices/<name>` with a device config naming `deviceId`. */
   protected def writeDevice(hostRoot: os.Path,
                             name: String,
@@ -537,7 +543,8 @@ trait ControlFixture:
                                   sysId: UUID = systemId,
                                   owner: Option[HostId] = Some(HostId.BootstrapHostId)): Unit =
     os.write.over(deviceDir / StorageDeviceConfig.configFilename,
-      StorageDeviceConfig(deviceId, sysId, crlFileSizeMb = Some(1)).yamlConfig)
+      StorageDeviceConfig(deviceId, sysId, crlFileSizeMb = Some(1), fsifJournalFiles = Some(TestJournalFiles),
+        fsifJournalFileSizeMb = Some(TestJournalFileSizeMb)).yamlConfig)
     owner.foreach(DeviceMarkers.writeOwningHost(deviceDir, _))
 
   /** A store directory for `storeId` holding only its config, as every real store directory holds one. The recording
@@ -752,7 +759,7 @@ trait ControlFixture:
     // Discovery's own job kinds and results only (JobKind.DeviceListing etc., DeviceJobDone.discovery): other
     // subsystems' jobs and results keep their place on the FIFO
     val kinds = Set[JobKind](JobKind.DeviceListing, JobKind.DeviceProbe, JobKind.LoadSweep, JobKind.CrlOpen,
-      JobKind.LoadDuplicates, JobKind.DeviceOwnership, JobKind.Adoption)
+      JobKind.FsifJournalOpen, JobKind.LoadDuplicates, JobKind.DeviceOwnership, JobKind.Adoption)
     def isDiscovery(task: Runnable): Boolean = task match
       case t: LockstepThreading.DeviceTask => kinds.contains(t.kind)
       case t: Host.EventTask => t.event match

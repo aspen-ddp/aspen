@@ -4,6 +4,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{DeviceMarkers, FileStat, StorageDeviceConfig}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.store.backend.StoreCreation
+import org.aspen_ddp.aspen.server.store.backend.fsif.DeviceJournalFiles
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
 
@@ -50,8 +51,9 @@ object DiscoveryDisk extends Logging:
 
   /** The scratch areas of a device being loaded, which nothing can be using yet: the transfer staging directory (a
    *  copy that had finished arriving was already moved to its final path), `creating/` (a complete store was already
-   *  renamed out of it, StoreCreation), `deleting/` (an interrupted delete, CopyDisk.delete) and `crl.creating` (an
-   *  unfinished replacement of a lost CRL, which holds no entry). A removal that fails is logged and left */
+   *  renamed out of it, StoreCreation), `deleting/` (an interrupted delete, CopyDisk.delete), `crl.creating` (an
+   *  unfinished replacement of a lost CRL, which holds no entry) and `fsif-journal.creating` (an FSIF device journal
+   *  never renamed into place, FsifJournalDisk). A removal that fails is logged and left */
   def sweepAtLoad(devicePath: os.Path): Unit =
     def remove(dir: os.Path, what: String): Unit =
       try os.remove.all(dir)
@@ -60,6 +62,7 @@ object DiscoveryDisk extends Logging:
     remove(devicePath / StoreCreation.CreatingDirectory, "stale store-creation directory")
     CopyDisk.sweepDeleting(devicePath)
     remove(CrashRecoveryLog.replacementCrlDir(devicePath), "the unfinished replacement CRL directory")
+    remove(devicePath / DeviceJournalFiles.CreatingName, "the unfinished FSIF device journal directory")
 
   /** A load's first job (DeviceDiscovery.loadOwnedDevice): sweepAtLoad, then the device's listing (P6: a failed one
    *  leaves the device unloaded for the next scan) */

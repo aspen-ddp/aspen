@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
 import org.aspen_ddp.aspen.server.{Host, StorageDeviceConfig, StorageDeviceManager}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlConfigInvalid, CrlSizingMismatch}
+import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifDeviceJournal, JournalSizingMismatch}
 import scribe.Logging
 
 import scala.concurrent.{Future, Promise}
@@ -758,6 +759,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *     read, leaves the device unloaded, nothing on it moved, for the next scan).
    *  2. The device CRL's open (DeviceCrlDisk.open: recovery, and a lost CRL's moves and replacement, one CrlOpen
    *     job), before any store is offered, so each store recovers from it. Its result is applied by openCrl.
+   *  2b. The FSIF device journal's open (FsifJournalDisk.openAtLoad: recovery and replay into every FSIF directory,
+   *     a copy's own replay loss, and a lost journal's moves and replacement, one FsifJournalOpen job), so every FSIF
+   *     store opens detached. Its result is applied by openFsifJournal, which sets `io.fsifJournal`.
    *  3. P2 (DiscoveryDisk.retireDuplicates), over a fresh listing: a lost CRL's open moved copies to lost/ since the
    *     first one. Then, on the control thread, its copies are registered (HostCopies.attach) and its Live copies
    *     offered to tryLoadStore, and only then is the device registered, so a throw anywhere leaves it unregistered
@@ -802,7 +806,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     val earlierUnforced = ctx.moves.unforcedUnder(storageDevicePath)
     val sync = ctx.moves.syncDirectory
     val rename = ctx.moves.rename
-    def shutDown(crl: CrashRecoveryLog): Unit = ctx.shutdown.shutDownCrl(storageDevicePath, crl)
+    def shutDown(crl: CrashRecoveryLog): Unit = ctx.shutdown.shutDownCrl(storageDevicePath, crl, None)
     submitFor(storageDevicePath, b, JobKind.CrlOpen, "device CRL open")(
       DeviceCrlDisk.open(storageDevicePath, sdCfg, listing, factory, transientIsLost, earlierUnforced, sync, rename))(
       _.foreach(_.openedCrl.foreach(shutDown))):
@@ -824,10 +828,72 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
           shutDown(crl)
           end(storageDevicePath, b)
         else
-          try attachOpened(storageDevicePath, b, sdCfgPath, sdCfg, crl, trigger)
+          try openFsifJournal(storageDevicePath, b, sdCfgPath, sdCfg, crl, trigger)
           catch case t: Throwable =>
             shutDown(crl)
             throw t
+
+  /** Step 2b of loadOwnedDevice, mirroring openCrl: the FSIF device journal's open, one FsifJournalOpen job on the
+   *  device's lane (FsifJournalDisk.openAtLoad), and the decisions on its result once submitFor's recheck has passed.
+   *  Failed: its unforced moves held for the attach as P2's are, the device left unloaded and its CRL shut. Lost: its
+   *  forced copies done with (CopyMoves.forcedUnattached). Opened or Lost: the journal set in `io.fsifJournal`, then
+   *  P2 and the attach; Absent sets nothing. A result for a path no longer held, listed or on the same DeviceIo, or a
+   *  device loaded from elsewhere meanwhile, shuts the CRL and closes the journal it opened, as an unload does */
+  private def openFsifJournal(storageDevicePath: os.Path,
+                              b: Busy,
+                              sdCfgPath: os.Path,
+                              sdCfg: StorageDeviceConfig,
+                              crl: CrashRecoveryLog,
+                              trigger: DeviceDiscovery.Trigger): Unit =
+    val io = b.io
+    val earlierUnforced = ctx.moves.unforcedUnder(storageDevicePath)
+    val sync = ctx.moves.syncDirectory
+    val rename = ctx.moves.rename
+    def shutDown(journal: Option[FsifDeviceJournal]): Unit = ctx.shutdown.shutDownCrl(storageDevicePath, crl, journal)
+    submitFor(storageDevicePath, b, JobKind.FsifJournalOpen, "device FSIF journal open")(
+      FsifJournalDisk.openAtLoad(io, storageDevicePath, sdCfg, earlierUnforced, sync, rename))(
+      result => shutDown(result.toOption.flatMap(_.openedJournal))):
+      case FsifJournalOpenResult.Failed(t, how, unsynced) =>
+        unsynced.foreach: (from, to) =>
+          ctx.moves.heldUnforced(from, to)
+          ctx.copyRegistry.unsynced(FsifJournalDisk.LostSite, to)
+        fsifJournalOpenFailed(storageDevicePath, t, how)
+        shutDown(None)
+        end(storageDevicePath, b)
+        warnOnce(storageDevicePath, s"Failed to load storage device found at path $storageDevicePath. Error: $t")
+      case opened =>
+        val journal = opened.openedJournal
+        opened match
+          case FsifJournalOpenResult.Lost(_, _, forced) => ctx.moves.forcedUnattached(forced)
+          case _ => ()
+        if alreadyLoaded(storageDevicePath, sdCfg) then
+          shutDown(journal)
+          end(storageDevicePath, b)
+        else
+          journal.foreach(j => io.fsifJournal.set(Some(j)))
+          try attachOpened(storageDevicePath, b, sdCfgPath, sdCfg, crl, trigger)
+          catch case t: Throwable =>
+            shutDown(ctx.shutdown.takeFsifJournal(io))
+            throw t
+
+  /** The log of an FSIF journal open that failed (FsifJournalOpenResult.Failed), beside submitFor's warning. A
+   *  sizing mismatch is a refusal, logged once at error until an operator repairs the directory; a locked journal is
+   *  in use, not lost; a transient failure is retried at the next scan */
+  private def fsifJournalOpenFailed(devicePath: os.Path, t: Throwable, how: CrlOpenFailure): Unit =
+    how match
+      case CrlOpenFailure.Refused =>
+        t match
+          case _: JournalSizingMismatch =>
+            if !reportedDirs.contains(devicePath) then
+              reportedDirs += devicePath
+              logger.error(s"Refusing to load storage device $devicePath: its FSIF device journal does not match the " +
+                           s"sizing it was created with. Its FSIF copies are not declared lost. Restore the journal's " +
+                           s"files and sizing file, then the next scan loads it: $t")
+          case _ => ()
+      case CrlOpenFailure.Transient =>
+        logger.error(s"Failed to open the FSIF device journal of storage device $devicePath. Retrying on the next " +
+                     s"scan: $t")
+      case CrlOpenFailure.AfterLost | CrlOpenFailure.Undecided => ()
 
   /** The count and log of a CRL open that failed (CrlOpenResult.Failed). A CRL another writer holds open (CrlLocked)
    *  is in use, not lost: its count is reset, and the next scan retries. A sizing mismatch and a config that cannot
@@ -886,7 +952,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       // Not the registry of a device with this id loaded from another directory meanwhile
       if !devices.contains(sds.storageDeviceId) then
         ctx.copyRegistry.detach(sds.storageDeviceId, Set())
-      ctx.shutdown.shutDownCrl(storageDevicePath, crl)
+      ctx.shutdown.shutDownCrl(storageDevicePath, crl, ctx.shutdown.takeFsifJournal(b.io))
     val sync = ctx.moves.syncDirectory
     val rename = ctx.moves.rename
     submitFor(storageDevicePath, b, JobKind.LoadDuplicates, "device load P2")(
@@ -923,6 +989,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
         // On the control context. Ignored unless sds is still the device loaded (DeviceShutdown.crlFailed), so
         // registered only once it is: a failure meanwhile is acted on now
         crl.failed.foreach(t => ctx.shutdown.crlFailed(sds, t))
+        // Likewise its FSIF journal's failure (R16): the device taken out of service as for a failed CRL
+        ctx.shutdown.watchFsifJournal(sds)
         announceOnLoad.get(storageDevicePath).foreach: stores =>
           announceOnLoad -= storageDevicePath
           stores.toList.sortBy(s => (s.poolId.uuid, s.poolIndex)).foreach(ctx.gossipStoreOnline)

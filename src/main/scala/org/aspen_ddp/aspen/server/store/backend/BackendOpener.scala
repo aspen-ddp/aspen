@@ -3,8 +3,7 @@ package org.aspen_ddp.aspen.server.store.backend
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{FileStat, StorageDeviceConfig, StoreConfig}
 import org.aspen_ddp.aspen.server.host.{DeviceIo, FsifJournalDisk, JobKind}
-import org.aspen_ddp.aspen.server.store.backend.fsif.{DeviceJournalFormat, FsifBackend, FsifJournalBridge, FsifLayout,
-  FsifRecovery}
+import org.aspen_ddp.aspen.server.store.backend.fsif.{DeviceJournalFormat, FsifBackend, FsifLayout, FsifRecovery}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -60,9 +59,9 @@ class DefaultBackendOpener(ec: ExecutionContext) extends BackendOpener:
 
   /** Opens an existing FSIF store (FsifBackend.open: a missing or blank store is lost), its I/O on the device's data
    *  pool and its serial drains on the device's serial pool, against the device's journal, `io.fsifJournal`. A journal
-   *  absent or failed is an IOException (a load retry), never a lost store; so is a layout whose largest commit cannot
-   *  fit one journal file. While the slot is empty the temporary FsifJournalBridge fills it first (Task 10: the device
-   *  load's job). */
+   *  failed, or a journal directory present while none is open (the device load opens it), is an IOException (a load
+   *  retry), never a lost store; so is a layout whose largest commit cannot fit one journal file. A device without a
+   *  journal directory (loaded Absent: its FSIF copies arrived detached) gets one first (FsifJournalDisk.forOpen). */
   def openFsifBackend(storeId: StoreId,
                       storePath: os.Path,
                       layout: FsifLayout,
@@ -70,10 +69,7 @@ class DefaultBackendOpener(ec: ExecutionContext) extends BackendOpener:
                       io: DeviceIo): Backend =
     if !FileStat.isDir(storePath) then
       throw new FsifRecovery.StoreLost(s"FSIF store $storeId: its directory $storePath is missing")
-    if io.fsifJournal.get.isEmpty then
-      FsifJournalBridge.fill(io, io.path, FsifJournalBridge.sizingFor(layout))
-    FsifJournalBridge.throwIfLost(io, storePath)
-    val journal = FsifJournalBridge.usable(io)
+    val journal = FsifJournalDisk.forOpen(io)
     FsifBackend.open(storeId, storePath, layout, io.dataEc, journal, onFatal, serialEc = Some(io.serialEc),
       readGate = Some(io))
 

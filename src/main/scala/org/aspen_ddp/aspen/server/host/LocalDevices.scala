@@ -41,6 +41,9 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
    *  DeviceReconciler.pollUsage); None until its first measurement is applied. Set on the control thread only */
   var usage: Option[(Long, Long)] = None
 
+  /** The FSIF journal whose failure DeviceShutdown.watchFsifJournal watches for this device. Control thread only */
+  var watchedFsifJournal: Option[org.aspen_ddp.aspen.server.store.backend.fsif.FsifDeviceJournal] = None
+
   /** The device's current health (DeviceHealthJudge), Initial at load. Written on the control thread only;
    *  @volatile because the health publish reads it on the client context */
   @volatile var health: DeviceHealth = DeviceHealth.Initial

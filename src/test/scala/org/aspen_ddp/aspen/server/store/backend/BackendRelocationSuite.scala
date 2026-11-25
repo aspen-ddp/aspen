@@ -9,7 +9,8 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.objects.ReadError
 import org.aspen_ddp.aspen.common.transaction.TransactionId
-import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
+import org.aspen_ddp.aspen.server.{DurableFiles, StorageDeviceConfig, StoreConfig}
 
 import java.nio.ByteBuffer
 import java.util.UUID
@@ -38,6 +39,10 @@ class BackendRelocationSuite extends FileBasedTests:
 
   private def open(cfg: StoreConfig, path: os.Path): (Backend, Completions) =
     val opener = new DefaultBackendOpener(ExecutionContext.global)
+    // The device config an FSIF open's lazy journal creation sizes the device's journal by
+    os.write.over(path / os.up / StorageDeviceConfig.configFilename,
+      StorageDeviceConfig(StorageDeviceId(new UUID(9, 4)), new UUID(9, 5), fsifJournalFiles = Some(3),
+        fsifJournalFileSizeMb = Some(1)).yamlConfig)
     val backend = Await.result(opener.open(cfg, path, _ => (), org.aspen_ddp.aspen.server.TestDeviceIo.of(path / os.up)), Timeout)
     val c = new Completions
     backend.setCompletionHandler(c)

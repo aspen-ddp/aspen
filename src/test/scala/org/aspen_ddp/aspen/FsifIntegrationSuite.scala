@@ -190,7 +190,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
 
   /** Crash-only restart: the host is dropped, never shut down, and a new one starts from the same directories.
     *
-    * The old backends are quiesced and their file handles closed first. That is the in-process stand-in for the
+    * The old backends are quiesced and their file handles closed first, then the device journals. That is the in-process stand-in for the
     * process being gone, so it cannot write behind the new host's recovery; FSIF's close writes nothing (no
     * checkpoint, no marker), and the Host close path, which writes CRL save files and markers, is never run.
     * `whileDown` runs on the directories with no host running.
@@ -200,6 +200,8 @@ class FsifIntegrationSuite extends IntegrationTestSuite with ControlFixture:
       _ <- waitForTransactionsToComplete()
       _ <- Future.sequence(FsifTestHost.fsifBackends(host).map(_.close()))
     yield
+      // The process's FSIF device journals go with it: their files closed, the journal lock released
+      host.control.deviceIos.all.values.foreach(_.fsifJournal.get.foreach(_.close()))
       whileDown()
       host = newFsifHost()
       net.poolHosts += poolId -> host

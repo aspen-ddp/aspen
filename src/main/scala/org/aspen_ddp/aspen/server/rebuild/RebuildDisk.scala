@@ -74,9 +74,14 @@ object RebuildDisk extends Logging:
                       s"from the beginning: $t")
           None
 
-  /** Removes the staging directory `staging`, whole, if it is there. Throws on a failed stat or removal */
-  def cleanup(staging: os.Path): Unit =
+  /** Removes the staging directory `staging`, whole, if it is there, and forces its parent (when there), so it is
+   *  durably absent; then `released(staging)` (the device journal's releaseDirectory, spec 4.5: a staging store closed
+   *  without a detach pins the ring until then), in this job, so no later job on the lane opens a store there first.
+   *  Throws on a failed stat, removal or force, releasing nothing */
+  def cleanup(staging: os.Path, released: os.Path => Unit): Unit =
     if FileStat.exists(staging) then os.remove.all(staging)
+    if FileStat.isDir(staging / os.up) then DurableFiles.syncDirectory(staging / os.up)
+    released(staging)
 
   /** finish's disk work once the staging backend is closed: the completion files, the checkpoint's removal, and the
    *  rename of `staging` into `rebuilt/` under a fresh copy id, which it returns.

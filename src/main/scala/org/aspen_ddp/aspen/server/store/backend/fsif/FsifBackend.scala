@@ -383,6 +383,8 @@ class FsifBackend(val storeId: StoreId,
   /** Test hook: a close wrote a detached index and released the attachment */
   private[aspen] def detachedForTest: Boolean = detached
 
+  override def closedAttached: Boolean = !detached
+
   /** Test hook: fail-stops the store as a fatal I/O error does (onFatal, no detach) */
   private[aspen] def failStopForTest(t: Throwable): Unit = post(failStop(t))
 

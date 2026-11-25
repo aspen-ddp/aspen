@@ -28,12 +28,13 @@ object RebuildBookkeepingDisk extends Logging:
     val root = stagingRoot(devicePath)
     if FileStat.isDir(root) then os.list(root).filter(FileStat.isDir(_)).toList else Nil
 
-  /** Removes each staging directory of `dirs` whole. Each one's outcome: None once removed, or the failure (the next
-   *  sweep tries again) */
-  def removeStaging(dirs: List[os.Path]): List[(os.Path, Option[Throwable])] =
+  /** Removes each staging directory of `dirs` whole, durably (RebuildDisk.cleanup: its parent forced, then
+   *  `released`, the device journal's releaseDirectory, in this job). Each one's outcome: None once removed, or the
+   *  failure (the next sweep tries again) */
+  def removeStaging(dirs: List[os.Path], released: os.Path => Unit): List[(os.Path, Option[Throwable])] =
     dirs.map: dir =>
       try
-        os.remove.all(dir)
+        RebuildDisk.cleanup(dir, released)
         dir -> None
       catch case NonFatal(t) => dir -> Some(t)
 

@@ -657,7 +657,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               logger.info(s"Deleting the staging copy at $dir: its store is no longer being rebuilt on " +
                           s"device ${local.storageDeviceId}")
             stagingSweeps += devicePath
-            val job = local.io.submit(JobKind.RebuildBookkeeping, None)(RebuildBookkeepingDisk.removeStaging(doomed))
+            val job = local.io.submit(JobKind.RebuildBookkeeping, None)(RebuildBookkeepingDisk.removeStaging(doomed,
+              dir => local.io.fsifJournal.get.foreach(_.releaseDirectory(dir))))
             ctx.onControl("rebuild staging sweep", job): result =>
               stagingSweeps -= devicePath
               result match

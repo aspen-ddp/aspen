@@ -278,16 +278,33 @@ class RebuildingStore(client: AspenClient,
       catch
         case err: Throwable => Future.failed(err)
 
+    // A staging store closed still attached to the device journal (an FSIF store that fail-stopped or froze, spec
+    // 4.6) is discarded, so its attachment is released and pins the ring no more: the next pass starts over. Kept, a
+    // resumed pass's open would refuse it (its attachment needs a replay, an IOException) until the device reloads
     f.onComplete: outcome =>
-      closeBackend().onComplete(_ => completionPromise.tryComplete(outcome))
+      closeBackend()
+        .flatMap: _ =>
+          if closedAttached then
+            logger.warn(s"Rebuild of $storeId: the staging store closed without detaching from its device journal. " +
+                        "Discarding it, so the next pass starts over")
+            cleanupStaging()
+          else
+            Future.unit
+        .onComplete(_ => completionPromise.tryComplete(outcome))
 
   /** One device job on `io`; its Future completes on the device's thread */
   private def staging[T](job: => T): Future[T] = io.submit(JobKind.Staging, Some(storeId))(job).future
 
+  /** The device journal's release of a staging directory durably removed (RebuildDisk.cleanup) */
+  private def released(dir: os.Path): Unit = io.fsifJournal.get.foreach(_.releaseDirectory(dir))
+
   /** Removes the staging directory, best effort: a failure is logged, and the Future succeeds either way */
   private def cleanupStaging(): Future[Unit] =
-    staging(RebuildDisk.cleanup(stagingPath)).recover:
+    staging(RebuildDisk.cleanup(stagingPath, released)).recover:
       case t => logger.warn(s"Rebuild of $storeId: failed to remove $stagingPath: $t")
+
+  /** Set once a staging backend's close left it attached to the device journal (Backend.closedAttached) */
+  @volatile private var closedAttached = false
 
   /** Idempotent: finish() closes on the happy path, start()'s onComplete closes on every path. */
   private def closeBackend(): Future[Unit] =
@@ -301,6 +318,9 @@ class RebuildingStore(client: AspenClient,
     else
       b.close().recover:
         case t => logger.warn(s"Rebuild of $storeId: backend close failed: $t")
+      .map: _ =>
+        if b.closedAttached then
+          closedAttached = true
 
   /** When the current pass began, on this host's wall clock (inheritedVotesAfter) */
   @volatile private var passStartMillis: Long = System.currentTimeMillis()
@@ -371,7 +391,7 @@ class RebuildingStore(client: AspenClient,
    *  device's `creating/`, then renamed to the staging path), after discarding whatever a pass that never
    *  checkpointed left there: without a checkpoint none of it is used. */
   private def createStaging(cfg: StoreConfig): Future[Unit] =
-    staging(RebuildDisk.cleanup(stagingPath)).flatMap: _ =>
+    staging(RebuildDisk.cleanup(stagingPath, released)).flatMap: _ =>
       backends.create(cfg, stagingPath, devicePath / StoreCreation.CreatingDirectory, io)
 
   /** Opens the staging store through the BackendOpener, which decides where the open runs: created just before on
@@ -750,3 +770,8 @@ class RebuildingStore(client: AspenClient,
     // An abort latched while the backend closed (a fail-stop of the staging store's last I/O, a cancel)
     // means the staging copy must not become the live store: the pass fails with the checkpoint left in place
     synchronized(abortCause).foreach(cause => throw cause)
+    // Nor one its close left attached to the device journal: renamed into rebuilt/, its directory would need records
+    // the journal releases only with that path (start's discard releases it)
+    if closedAttached then
+      throw new java.io.IOException(s"Rebuild of $storeId: the staging store closed without detaching from its " +
+                                    "device journal")

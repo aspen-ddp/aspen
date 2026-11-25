@@ -182,6 +182,58 @@ class FsifJournalReleaseSuite extends IntegrationTestSuite with CopyHostFixture:
         appends += 1
     refused
 
+  /** A probe attachment at `at` holding one record above its covered serial, as a store closed without a detach
+   *  leaves its attachment: needsReplay until released */
+  private def pinningProbe(journal: FsifDeviceJournal, at: os.Path): UUID =
+    val probe = UUID.randomUUID()
+    journal.attach(probe, at, new FsifDeviceJournal.Owner:
+      def complete(task: Runnable): Unit = task.run()
+      def roomAvailable(): Unit = ()
+      def checkpointRequested(): Unit = ()
+      def journalFailed(t: Throwable): Unit = ())
+    Await.result(journal.append(probe, List(JournalRecord.Mapping(0, 0, ObjectId(new UUID(8, 8))))),
+      Duration(10, SECONDS))
+    probe
+
+  atest("a released pending-delete copy's delete releases its attachments"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    journal(dev)
+    val retired = CopyFixtures.placeCopy(dev, s, Phase.Retired)
+    val host = newHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val local = loadedDevices(host)(deviceA)
+    val journalNow = local.io.fsifJournal.get.get
+    // Attached where the copy was served from, before its moves
+    val probe = pinningProbe(journalNow, CopyLayout.path(dev, s, CopyFixtures.copyIdOf(retired), Phase.Live))
+    val pinnedBefore = journalNow.needsReplay(probe)
+    host.control.copies.release(local, deviceState(deviceA, active(s)))
+    pump(host, !os.exists(retired) && host.control.copies.deletesRunning.isEmpty).map: _ =>
+      pinnedBefore should be(true)
+      os.exists(retired) should be(false)
+      journalNow.needsReplay(probe) should be(false)
+
+  atest("a discarded copy's delete releases its attachments"):
+    given ExecutionContext = executionContext
+    val (hostRoot, dev) = device()
+    journal(dev)
+    val rebuilt = CopyFixtures.placeCopy(dev, s, Phase.Rebuilt("ep"))
+    val host = newHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val journalNow = loadedDevices(host)(deviceA).io.fsifJournal.get.get
+    val probe = pinningProbe(journalNow, rebuilt)
+    val pinnedBefore = journalNow.needsReplay(probe)
+    @volatile var discarded = false
+    // As its callers do: the deleted copy's record is forgotten
+    host.control.copies.discard(s, deviceA, "test"): sds =>
+      host.control.copyRegistry.removed("test", sds, s)
+      discarded = true
+    pump(host, discarded).map: _ =>
+      pinnedBefore should be(true)
+      discarded should be(true)
+      os.exists(rebuilt) should be(false)
+      journalNow.needsReplay(probe) should be(false)
+
   /** `copy`'s newest index made seq `seq` with `meta`, as an open's attach index (or a detach) leaves it */
   private def writeIndex(copy: os.Path, seq: Long, meta: IndexMeta): Unit =
     os.write.over(copy / FsifRecovery.IndexFiles((seq % 2).toInt), IndexFile.encode(seq, meta,

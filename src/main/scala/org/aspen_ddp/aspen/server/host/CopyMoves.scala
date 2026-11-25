@@ -292,7 +292,8 @@ final class CopyMoves(ctx: DeviceControl) extends Logging:
    *  where the result is applied; no disk I/O. A device with no journal open releases nothing */
   private[host] def releaseJournal(sds: LocalStorageDeviceState, storeId: StoreId, copyId: UUID): Unit =
     sds.io.fsifJournal.get.foreach: journal =>
-      CopyMoves.AllPhases.foreach(p => journal.releaseDirectory(CopyLayout.path(sds.devicePath, storeId, copyId, p)))
+      CopyLayout.phaseDirectories.foreach((_, p) =>
+        journal.releaseDirectory(CopyLayout.path(sds.devicePath, storeId, copyId, p)))
 
   private def logMove(site: String, from: os.Path, target: os.Path, result: MoveResult): Unit =
     result match
@@ -312,7 +313,3 @@ object CopyMoves:
   /** Whether a copy in `phase` is out of the FSIF device journal's replay scope (spec 4.7: the device load replays
    *  into every phase but these) */
   def outOfReplayScope(phase: Phase): Boolean = phase == Phase.Lost || phase == Phase.Retired
-
-  /** One phase per phase directory (a phase's parameter never changes its path, CopyLayout.path) */
-  private val AllPhases: List[Phase] = List(Phase.Live, Phase.Arrived(""), Phase.Outbound(""), Phase.Rebuilt(""),
-    Phase.Parked, Phase.Lost, Phase.Retired)

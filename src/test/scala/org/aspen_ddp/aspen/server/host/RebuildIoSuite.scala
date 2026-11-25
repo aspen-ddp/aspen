@@ -538,6 +538,6 @@ class RebuildIoSuite extends IntegrationTestSuite with ControlFixture:
     RebuildBookkeepingDisk.dropStagingCheckpoint(staging) should be(RebuildBookkeepingDisk.CheckpointDrop.Dropped)
     os.exists(staging) should be(false)
     RebuildBookkeepingDisk.dropStagingCheckpoint(staging) should be(RebuildBookkeepingDisk.CheckpointDrop.NoStaging)
-    RebuildBookkeepingDisk.removeStaging(List(writeCheckpoint(dev, sB))).map(_._2) should be(List(None))
+    RebuildBookkeepingDisk.removeStaging(List(writeCheckpoint(dev, sB)), _ => ()).map(_._2) should be(List(None))
     RebuildBookkeepingDisk.listStaging(dev) should be(Nil)
 

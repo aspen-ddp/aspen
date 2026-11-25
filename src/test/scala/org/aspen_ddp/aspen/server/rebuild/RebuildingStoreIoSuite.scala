@@ -7,8 +7,13 @@ import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
-import org.aspen_ddp.aspen.server.host.{CopyFixtures, DeviceIo, JobKind, LockstepDeviceIo, LockstepThreading}
+import org.aspen_ddp.aspen.server.host.{CopyFixtures, DeviceIo, JobKind, LockstepDeviceIo, LockstepThreading,
+  RebuildBookkeepingDisk}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, DefaultBackendOpener, MapBackend}
+import org.aspen_ddp.aspen.server.store.backend.fsif.{DeviceJournalFiles, FsifDeviceJournal, JournalRecord,
+  JournalSizing, NioFsifFiles}
+
+import java.util.UUID
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.{FiniteDuration, MILLISECONDS, SECONDS}
@@ -163,3 +168,69 @@ class RebuildingStoreIoSuite extends IntegrationTestSuite:
     val at = rocks.indexWhere(_.contains("Await.result(fcommit"))
     rocks.take(at).reverse.find(_.trim.startsWith("def ")).map(_.trim) should
       be(Some("def bootstrapPut(key: Array[Byte], value: Array[Byte]): Unit = {"))
+
+  /** A journal of the device at `dev`, opened in `io`'s slot, its writes made in the caller */
+  private def openJournal(dev: os.Path, io: DeviceIo): FsifDeviceJournal =
+    val dir = dev / DeviceJournalFiles.DirName
+    val sizing = JournalSizing(UUID.randomUUID(), 3, 64 * 1024)
+    DeviceJournalFiles.create(dir, sizing)
+    val journal = new FsifDeviceJournal(new NioFsifFiles(dir, dsync = true), sizing, None, r => r.run(),
+      forceAfterWrite = false)
+    io.fsifJournal.set(Some(journal))
+    journal
+
+  /** An attachment at `at` holding one record above its covered serial: needsReplay until released */
+  private def pinningProbe(journal: FsifDeviceJournal, at: os.Path): UUID =
+    val probe = UUID.randomUUID()
+    journal.attach(probe, at, new FsifDeviceJournal.Owner:
+      def complete(task: Runnable): Unit = task.run()
+      def roomAvailable(): Unit = ()
+      def checkpointRequested(): Unit = ()
+      def journalFailed(t: Throwable): Unit = ())
+    journal.append(probe, List(JournalRecord.Mapping(0, 0, ObjectId(new UUID(8, 8)))))
+    probe
+
+  atest("a staging store closed without a detach is discarded and its attachment released; a first pass's discard releases too"):
+    given ExecutionContext = executionContext
+    val dev = os.temp.dir(prefix = "rebuilding-store-io")
+    val threading = new LockstepThreading(executionContext)
+    val io = new LockstepDeviceIo(dev, threading, DeviceIo.Config())
+    val journal = openJournal(dev, io)
+    val stagingPath = RebuildBookkeepingDisk.stagingOf(dev, storeId)
+    // A staging directory an earlier attempt left, its store closed without a detach: the first pass discards it
+    os.makeDir.all(stagingPath)
+    val earlier = pinningProbe(journal, stagingPath)
+    val default = new DefaultBackendOpener(executionContext)
+    // Its staging store closes still attached, as a fail-stopped or frozen FSIF store does
+    val attachedOpener = new BackendOpener:
+      def create(cfg: StoreConfig, path: os.Path, creatingRoot: os.Path, io: DeviceIo): Future[Unit] =
+        default.create(cfg, path, creatingRoot, io)
+      def open(cfg: StoreConfig, path: os.Path, onFatal: Throwable => Unit, io: DeviceIo): Future[Backend] =
+        Future.successful(new MapBackend(cfg.storeId):
+          override def closedAttached: Boolean = true)
+    var current: Option[UUID] = None
+    var earlierPinnedAtOpen = true
+    var rebuild: RebuildingStore = null
+    val run = for
+      _ <- populate(2)
+      _ <- net.waitForTransactionsToComplete()
+      pinnedBefore = journal.needsReplay(earlier)
+      _ = rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, attachedOpener,
+                                        io, CopyFixtures.existingCopy(dev, storeId),
+                                        // The open's attachment (as the staging store's would be), then a failed pass
+                                        testingOnlyAfterQuery = () =>
+                                          earlierPinnedAtOpen = journal.needsReplay(earlier)
+                                          current = Some(pinningProbe(journal, stagingPath))
+                                          Future.failed(new java.io.IOException("injected pass failure")))
+      finished <- pumpUntil(threading, () => rebuild.complete.isCompleted)
+    yield
+      pinnedBefore should be(true)
+      finished should be(true)
+      rebuild.complete.value.exists(_.isFailure) should be(true)
+      earlierPinnedAtOpen should be(false)
+      current.exists(journal.needsReplay) should be(false)
+      current should be(defined)
+      os.exists(stagingPath) should be(false)
+    run.andThen: _ =>
+      journal.close()
+      io.close()

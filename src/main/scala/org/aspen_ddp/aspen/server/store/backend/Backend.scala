@@ -48,6 +48,10 @@ trait Backend extends Logging {
   /** Writes are held because the device is full; reads go on. Readable from any thread. */
   def isWriteFrozen: Boolean = false
 
+  /** Once closed: the close left the store attached to its device's journal (an FSIF store that fail-stopped or froze,
+   *  spec 4.6), so its directory still needs that journal's records until it is released. Readable from any thread */
+  def closedAttached: Boolean = false
+
   /** The device's backlog of outstanding backend reads is over its bound (DeviceIo.readsOverBound): the Frontend then
     * drops new client reads before they create any state. Readable from any thread. False for a backend with no device.
     */

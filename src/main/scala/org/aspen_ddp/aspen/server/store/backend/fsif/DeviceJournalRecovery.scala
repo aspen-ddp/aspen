@@ -33,11 +33,18 @@ object DeviceJournalRecovery:
   /** `start` is where the writer continues (FsifDeviceJournal's `start`): None for a ring with no valid header */
   final case class Result(start: Option[Tail], outcomes: Map[os.Path, Outcome])
 
-  /** @throws JournalCorrupt when the scan is Corrupt; IOExceptions propagate (transient: the device load retries) */
+  /** @throws JournalCorrupt when the scan is Corrupt, or Empty while an attached directory has a covered serial >= 0
+    *         (a batch was written, so a valid header must exist: every header rotted). Thrown before anything is
+    *         written. IOExceptions propagate (transient: the device load retries)
+    */
   def recover(journalFiles: FsifFiles, sizing: JournalSizing, targets: Seq[Target]): Result =
     require(targets.map(_.key).distinct.size == targets.size, "duplicate target keys")
     val (batches, start) = DeviceJournalScan.scan(journalFiles, sizing) match
-      case Scan.Empty => (Vector.empty, None)
+      case Scan.Empty =>
+        targets.find(t => coveredAttached(t, sizing.journalId)).foreach: t =>
+          throw new JournalCorrupt(s"device journal ${sizing.journalId} has no valid file header, but ${t.key} is " +
+            "attached to it with a covered serial >= 0")
+        (Vector.empty, None)
       case Scan.Valid(bs, tail) => (bs, Some(tail))
       case Scan.Corrupt(reason) =>
         throw new JournalCorrupt(s"device journal ${sizing.journalId} is corrupt: $reason")
@@ -47,6 +54,16 @@ object DeviceJournalRecovery:
     val outcomes = targets.map: t =>
       t.key -> recoverOne(t, byAttachment, sizing.journalId, tailSerial)
     Result(start, outcomes.toMap)
+
+  /** Attached to `journalId` (newest index undetached and naming it) with a covered serial >= 0. A directory attached
+    * to a ring never written has covered -1 (its attach index records tail serial -1). No valid index: false, left for
+    * recoverOne to declare Lost
+    */
+  private def coveredAttached(t: Target, journalId: UUID): Boolean =
+    try
+      val meta = FsifRecovery.newestIndex(t.files, t.layout)._3
+      !meta.detached && meta.journalId == journalId && meta.covered >= 0
+    catch case _: FsifRecovery.StoreLost => false
 
   private def recoverOne(t: Target, byAttachment: Map[UUID, Vector[(Long, JournalRecord)]], journalId: UUID,
                          tailSerial: Long): Outcome =

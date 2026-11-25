@@ -214,6 +214,33 @@ class DeviceJournalRecoverySuite extends AnyFunSuite with Matchers:
     r.outcomes shouldBe Map(key(0) -> Outcome.Replayed(0))
     metaOf(s) shouldBe IndexMeta(jid, new UUID(4, 0), -1, detached = true)
 
+  test("an empty ring with an attached directory whose covered serial is >= 0 throws JournalCorrupt and writes nothing"):
+    val sim = newMachine(11)
+    // A never-attached directory and one attached at -1 beside it: neither saves the ring
+    val s0 = storeFiles(sim, 0)
+    FsifRecovery.initialize(s0, layout)
+    val s1 = storeFiles(sim, 1)
+    FsifRecovery.initialize(s1, layout)
+    attachIndex(s1, new UUID(11, 1), -1)
+    val s2 = storeFiles(sim, 2)
+    FsifRecovery.initialize(s2, layout)
+    attachIndex(s2, new UUID(11, 2), 0) // batch 0 was written: its header rotted
+    val before = image(sim)
+    a[JournalCorrupt] should be thrownBy recover(sim, Seq(0, 1, 2))
+    image(sim) shouldBe before
+
+  test("an empty ring with only covered -1 attached directories replays each with nothing"):
+    val sim = newMachine(12)
+    for i <- 0 until 2 do
+      val s = storeFiles(sim, i)
+      FsifRecovery.initialize(s, layout)
+      attachIndex(s, new UUID(12, i), -1)
+    val r = recover(sim, Seq(0, 1))
+    r.start shouldBe None
+    r.outcomes shouldBe Map(key(0) -> Outcome.Replayed(0), key(1) -> Outcome.Replayed(0))
+    for i <- 0 until 2 do
+      metaOf(storeFiles(sim, i)) shouldBe IndexMeta(jid, new UUID(12, i), -1, detached = true)
+
   test("Review Focus 4: an idle directory whose covered serial is three laps behind is not Corrupt"):
     val sim = newMachine(5)
     val j = journal(sim)

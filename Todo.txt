@@ -3,6 +3,16 @@ TODO
 
 FSIF throughput after device I/O isolation (measured 2026-11-24, docs/host-threading-measurement.md "Device I/O
 isolation: before/after")
+  - Status: investigation and fix done (2026-11-24). The cause below is fixed by the FSIF device journal (one
+    preallocated journal per device, spec docs/superpowers/specs/2026-11-24-fsif-device-journal-design.md).
+    Microbenchmark (FsifDeviceBench, docs/host-threading-measurement.md "FSIF device journal"), mean ops/s over six
+    runs against the old tree's three: 1 thread 2231 vs 39, 2: 1532 vs 48, 4: 2638 vs 113, 8: 2409 vs 240, 16: 2246
+    vs 376, 24: 2644 vs 644. 1-2 threads collapse in some runs (288-578, reads queued behind the data pool), 4 never
+    below 2449. `DeviceIo.defaultDataThreads` is now 4 (was max(4, CPUs/2)).
+  - Remaining (the user runs it: needs root and TCMU): the fio procedure of docs/host-threading-measurement.md, both
+    trees back to back, alternating, three runs each, at the new default. Success: FSIF randrw and seqwrite
+    throughput and fsync latency no worse than the fd82a6f3 baseline (spec section 7 step 2). The caveats below
+    apply.
   - What degraded: FSIF needs many more I/O threads per device than before to reach the same throughput. Before
     (fd82a6f3), every FSIF store shared one host-wide `sharedIo` pool of max(4, CPUs) = 24 threads and a
     `sharedSerial` pool of max(2, CPUs) = 24 threads. After, each device has its own `dataEc` of
@@ -39,9 +49,9 @@ isolation: before/after")
         against 5 ms, but 16 concurrent ones degraded past 8 threads (each issues its own device flush).
     - This explains the measured numbers: the old 24 shared threads covered 16 stores; CPUs/2 = 12 does not, hence
       the remaining randrw fsync gap. Untested prediction: `--device-io-threads=24` closes it.
-    - Chosen direction: one journal per device, shared by its stores (device-level group commit), preallocated so a
-      force changes no metadata. Design in progress.
-  - Caveats before investigating:
+    - Chosen direction, now built: one journal per device, shared by its stores (device-level group commit),
+      preallocated so a force changes no metadata.
+  - Caveats for the fio re-measure:
     - Every number above was taken with vdisk-server's full piece scan on cached reads, which made each cache-hit read
       60-70 us slower on a fragmented block; it is fixed in dda89905.
       - That fix sped the baseline's RocksDB randrw by ~45%.
@@ -53,33 +63,3 @@ isolation: before/after")
       vdisk-server, which is what produced the remaining RocksDB no-fsync gap.
     - Avoid the TCMU 30 s SYNCHRONIZE CACHE timeout (ext4 goes read-only, on both trees) by laying out small files one
       at a time.
-  - Why thread count matters to FSIF: its file I/O is blocking (reads, writes and forces each hold a thread). The
-    queue depth a device sees is therefore bounded by its data threads, and 16 stores on one device share them, where
-    before they shared 24.
-  - Suspects to check:
-    - The single serial thread per device (`serialEc`). Before, serial drains had a 24-thread pool. Now all of a
-      device's stores' `SerialExecutor` drains share one thread, including compaction's inline truncate (Task 4
-      ruling: kept inline on serial). A drain that waits behind another store's truncate or force delays commits. Try
-      2-4 serial threads per device: per-store ordering lives in each `SerialExecutor`, not the pool.
-    - Forces: the longer randrw fsync suggests forces queue behind reads and writes on the same small pool. Look at
-      whether one store's force waits for unrelated data tasks; a separate small force pool per device is an option.
-    - The read gate (`DeviceIo.beginRead`/`endRead`, FsifBackend ~1584-1600) and the `DeviceIoObserver` bookkeeping
-      on every data task. The RocksDB root-cause work found no per-read cost from these, but FSIF tasks are smaller and
-      more numerous, so confirm with a profile.
-    - `SizeTrackedFiles` (estimateSize without I/O): check that its accounting adds no synchronization on the write
-      path.
-  - How to look:
-    - Use the measurement doc's capture-job.sh/analyze.py: thread dumps and BackendTiming's "store commit
-      (FsifBackend)" against "fsif commit". The gap is time spent outside FSIF.
-    - Add a per-device data-pool queue length and wait time; the observer's `inFlight` and `completed` give a start.
-    - Use JFR or async-profiler on the host under randrw at 4 and 12 threads. Compare thread states (blocked in
-      pread/pwrite/fdatasync against waiting for a pool slot).
-    - A microbenchmark of 16 FSIF stores' commits through one DeviceIo, at 4 and 24 threads and at 1 and 4 serial
-      threads, isolates the host from vdisk.
-  - Potential fixes, roughly cheapest first:
-    - Size the serial pool above 1.
-    - Scale a device's data threads with the number of stores on it, not CPUs. FSIF wants concurrency per device
-      queue, which depends on how many stores share the device.
-    - Group commit: batch forces per store, or per device across stores, so fewer threads sit in fdatasync.
-    - Asynchronous file I/O (io_uring, or AsynchronousFileChannel where it is truly async), so queue depth no longer
-      costs a thread per outstanding operation. This is the structural fix, and the larger change.

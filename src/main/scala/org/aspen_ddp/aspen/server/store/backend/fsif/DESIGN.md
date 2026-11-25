@@ -57,13 +57,15 @@ Terms used throughout:
   `ida.minSliceSizeFor(maxObjectSize)`. `segmentCount` is bounded by `FsifLayout.MaxSegmentCount`
   (`(MaxLoadSize - 20) / 20`), which keeps the index file within `FsifRecovery.MaxLoadSize` (`Int.MaxValue - 16`)
   so recovery can read it into a single array. `segmentPayloadSize` is bounded by
-  `FsifLayout.MaxSegmentPayloadSize` (about 2 GiB), so one commit's records always fit a loadable journal (2.9).
+  `FsifLayout.MaxSegmentPayloadSize` (about 2 GiB). A store's largest commit must also fit one device journal file
+  (`FsifBackend.fitsJournal`, 2.3).
 - `common/network/Codec.scala:decodeBackendConfig` and `src/main/protobuf/codec.proto`: `BACKEND_CONFIG_FSIF = 1`.
   `backendMaxSliceSize` carries the payload size and `fsifSegmentCount` (field 13) the count. A decoded FSIF config
   with either value `<= 0` is an `EncodingError`.
 - `StoreConfig.Fsif(segmentPayloadSize, segmentCount)` is the per-store config (`storage-engine: fsif`).
-- `FsifTuning` defaults: `cowThreshold = 64 KiB`, `journalBound = 64 MiB`, `unappliedBound = 64 MiB`,
-  `enospcRetry = 1 s`, `journalHardLimit = 1 GiB`. The host always uses the defaults.
+- `FsifTuning` defaults: `cowThreshold = 64 KiB`, `unappliedBound = 64 MiB`, `enospcRetry = 1 s`, plus the read and
+  move retry delays (2.6, 2.8). The host always uses the defaults. The device journal's sizing comes from the device
+  config (2.3).
 
 ### 2.2 storePointer contract
 
@@ -74,10 +76,11 @@ Anything else gives `CommitError.InvalidPointer` on commit and `ReadError.Object
 
 ### 2.3 Files and on-disk formats
 
-The store directory holds `data`, `index.a`, `index.b`, `journal.a` and `journal.b`, plus the
-generic files every store has: `aspen-store-config.yaml`, `crl_save.log`, and the files a copy's phase may add (`phase-param.<phase>`,
-`arrived-at`; the phase itself is the directory the copy is in). All
-integers are big-endian, and every CRC is CRC32.
+The store directory holds `data`, `index.a` and `index.b`, plus the generic files every store has:
+`aspen-store-config.yaml`, `crl_save.log`, and the files a copy's phase may add (`phase-param.<phase>`, `arrived-at`;
+the phase itself is the directory the copy is in). A store has no journal file of its own: its journal records go to
+its device's FSIF journal (below; design `docs/superpowers/specs/2026-11-24-fsif-device-journal-design.md`). Integers
+are big-endian. The index and segment CRCs are CRC32, the device journal's CRC32C.
 
 **Data file and segment.** `FsifLayout.stride = roundUp(61 + segmentPayloadSize, 4096)`. A segment is a 61-byte
 header followed by `sliceLength` slice bytes (`SegmentHeader.scala`):
@@ -91,47 +94,75 @@ header followed by `sliceLength` slice bytes (`SegmentHeader.scala`):
 | 25 | 32 | Metadata (revision, refcount, timestamp) |
 | 57 | 4 | CRC over header bytes 0..56 followed by the slice bytes |
 
-**Index file** (`IndexFile.scala`), `20 * segmentCount + 20` bytes:
+**Index file** (`IndexFile.scala`), `20 * segmentCount + 61` bytes:
 
 | Size | Field |
 |---|---|
 | 8 | magic `FSIFINDX` |
 | 8 | seq |
+| 16 | journal id: the device journal the index is attached to (zero for none) |
+| 16 | attachment id (4.2 of the spec; below) |
+| 8 | covered serial: the highest journal batch serial whose records for this attachment the index and forced data reflect |
+| 1 | detached (0 or 1): the directory needs nothing from that journal |
 | 20 per ext | slot (4, `-1` = unmapped) then the occupant's ObjectId (16, zero UUID when unmapped) |
 | 4 | CRC over every preceding byte |
 
-An index is valid only if its size is exact, the magic matches, the CRC matches, and no slot is below `-1`.
+An index is valid only if its size is exact, the magic matches, the CRC matches, the detached byte is 0 or 1, and no
+slot is below `-1`. `IndexMeta.None` (zero ids, covered -1, detached) is a fresh store's.
 
-**Journal** (`JournalFormat.scala`):
+**Records** (`JournalFormat.scala`), each tagged with its attachment id in the device journal:
 
-| Part | Layout | Size |
+| Record | Layout | Size |
 |---|---|---|
-| Header | magic `FSIFJRNL`(8), seq(8), salt(8), CRC(4) over the first 24 bytes | 28 |
-| Batch | len(4), batchNo(8), records..., crc(4) | 16 + records |
 | Record | len(4), type(1), payload; len counts type + payload | |
 | Mapping (type 1) | ext(4), slot(4), ObjectId msb(8), lsb(8) | 29 |
 | Delta (type 2) | ext(4), slot(4), SegmentHeader(61), rangeCount(4), then per range offset(4), length(4), bytes | 78 + Σ(8 + length) |
 
-- A batch's `len` counts `batchNo` plus the records. Its `crc` covers the salt (8 bytes, **not stored in the
-  batch**) followed by `len`, `batchNo` and the records. The salt is a fresh `SecureRandom` long, written into the
-  header each time the header is rewritten.
-- Batch numbers start at 0 in each journal and rise by one per batch.
-- Delta ranges hold absolute bytes of the new slice, never XOR deltas, so replaying a Delta twice is harmless.
-  Parsing rejects ranges that fall outside `sliceLength`, negative lengths, unknown types and trailing bytes.
-- **A header is rewritten** (`FsifRecovery.writeJournalHeader`) as truncate(0), force, write header, force. The
-  first force means an invalid header on a file longer than 28 bytes can never be a crash artifact.
+Delta ranges hold absolute bytes of the new slice, never XOR deltas, so replaying a Delta twice is harmless. Parsing
+rejects ranges that fall outside `sliceLength`, negative lengths, unknown types and trailing bytes.
 
-**Creation** (`FsifRecovery.initialize`, run by `server.store.backend.StoreCreation` in a scratch directory under
-the device's `creating/`): index.a emptied first if present, index.b and journal.b emptied if present, data emptied,
-journal.a given header seq 0, and index.a written last with seq 0 and an empty map. So a valid index implies the
-rest of the store exists. The scratch directory, config included, is forced and renamed to the store's path only once
-`initialize` has returned; a failure or crash before that leaves nothing at the path, and the scratch copy is
-discarded. A store path therefore never holds a partly initialized store, and `open` never initializes (2.13).
+**Device journal** (`<device>/fsif-journal/`; `DeviceJournalFormat`, `DeviceJournalFiles`, `DeviceJournalScan`):
+
+| Part | Layout |
+|---|---|
+| `sizing` | magic `FSIFDJSZ`(8), journal id(16), file count(4), file size(8), CRC(4); written durably once, at creation |
+| `<n>.fj`, `n < count` | exactly the file size each, zero-filled with real writes and forced at creation (never `fallocate`d) |
+| File header (first 4096 bytes) | magic `FSIFDJHD`(8), journal id(16), salt(8), first serial(8), oldest needed serial(8), CRC(4) |
+| Batch (at a 4096 boundary, zero-padded to one) | len(4), serial(8), record count(4), then per record attachment id(16) and a record, CRC(4) |
+| `lock` | `CrlLock`'s lock file, held while the journal is open |
+
+- A batch's `len` counts the serial through the last record. Its CRC covers the journal id and the file's salt
+  (neither stored in the batch), then `len` through the last record. The salt is a fresh `SecureRandom` long each time
+  the writer enters the file. So a stale batch of an earlier pass, or another journal's bytes, never passes as a batch.
+- Serials are device-wide, rising by one per batch across files and passes. A file with a valid header holds this
+  pass's batches `first`, `first + 1`, ... contiguously after its header, up to the next file's `first - 1`; only the
+  newest file may end in a torn tail. A file with an invalid header holds nothing.
+- Sizing: at least 3 files of 1 MiB to 1 GiB (a multiple of 4096), default 4 x 256 MiB
+  (`DeviceJournalFiles.sizingFor`; device config keys `fsif-journal-files`, `fsif-journal-file-size-mb`, read only when
+  a journal is created). A store whose largest commit plus one Mapping cannot fit one file less its header
+  (`FsifBackend.fitsJournal`) is refused at create (`IllegalArgumentException`) and at open (`IOException`).
+- **Creation is lazy and atomic** (`FsifJournalDisk.ensure`): just before the device's first FSIF store create (and,
+  on a device loaded without one, before an FSIF open, `forOpen`), in `fsif-journal.creating`, renamed into place
+  durably once every file is written and forced; the device load sweeps a leftover `fsif-journal.creating`.
+  RocksDB-only devices never get one. 4 x 256 MiB took 0.5 to 1.1 s to create on NVMe/ext4.
+
+**Creation of a store** (`FsifRecovery.initialize`, run by `server.store.backend.StoreCreation` in a scratch
+directory under the device's `creating/`): index.a emptied first if present, index.b emptied if present, data emptied,
+and index.a written last with seq 0, `IndexMeta.None` and an empty map. So a valid index implies the rest of the store
+exists. The scratch directory, config included, is forced and renamed to the store's path only once `initialize` has
+returned; a failure or crash before that leaves nothing at the path, and the scratch copy is discarded. A store path
+therefore never holds a partly initialized store, and `open` never initializes (2.13).
+
+**Attach and detach** (spec 4.2, 4.6). Each open is an attachment with a fresh UUID: before its first append the
+constructor writes index s+1 naming the journal, the attachment and the journal's tail serial (covered), undetached,
+forces it, empties index s, and attaches. Records reach a directory only by attachment id. A close detaches (2.7): its
+last checkpoint writes the index detached, and the journal releases the attachment. A directory whose newest index is
+detached needs nothing from any journal.
 
 ### 2.4 Threading model
 
-- **One `SerialExecutor` per backend** owns all mutable state: index map, slot states, journal writer,
-  checkpoint, compaction and freeze. Every interface method only posts to it (`FsifBackend.post`). Every posted
+- **One `SerialExecutor` per backend** owns all mutable state: index map, slot states, checkpoint and its drain
+  buffer, journal room (`capHeld`), compaction and freeze. Every interface method only posts to it (`FsifBackend.post`). Every posted
   task runs inside `guarded`, which catches internal errors (they fail-stop the store) and then runs the epilogue:
   `advanceCheckpoint`, `maybeCheckpoint`, `compaction.drive`, `releaseThrottled`, `maybeForceData`, and
   `checkQuiesce`. The executor is lock-free and has no thread of its own (`SerialExecutor.scala`). Each drain runs
@@ -141,8 +172,17 @@ discarded. A store path therefore never holds a partly initialized store, and `o
   Results are posted back to the serial executor. `FsifBackend.sharedIo`/`sharedSerial` (`fsif-io-N`,
   `fsif-serial-N`) remain for tests, which may also pass one deterministic EC for both. `close()` closes the channels
   on `io`.
+- **The device journal** (`FsifDeviceJournal`) is shared by every FSIF store of the device and safe to call from
+  any thread: one lock guards its state and is never held across I/O or a store callback. Each write (a file's
+  header when the writer enters it, then one batch) is one DSYNC write, one task on the device's journal thread
+  `dev-<label>-fjournal-0` (`DeviceIo.journalRun`, behind the device's gate and recorded in its observer as
+  `fsif-journal`, so hang detection sees a stuck journal write). One batch is in flight; appends made meanwhile, from
+  every store, form the next batch. Each append's Future completes on its store's serial executor
+  (`Owner.complete`), and `roomAvailable`, `checkpointRequested` and `journalFailed` are posted there too. The data
+  pool carries no journal writes. Tests give each machine one journal over `SimulatedFsifFiles` (`SharedJournal`),
+  its writes on a test EC.
 - **ENOSPC retries** are scheduled on `backend.SharedRetryScheduler` (one `backend-retry` thread, shared with RocksDB's read retry).
-- **Recovery runs synchronously in the constructor.** The host therefore runs the open or create as a job on
+- **The open's recovery (`openDirectory`) and attach index write run synchronously in the constructor.** The host therefore runs the open or create as a job on
   the device's management lane (`DeviceIo.submit(BackendOpen|BackendCreate, ...)`), never on its control thread:
   `DefaultBackendOpener.open` returns that job's Future, and `StoreLoader.startOpen`, called on the control thread,
   gets the outcome back as a posted `BackendOpened`.
@@ -182,8 +222,8 @@ repaired object is shown still live (repair-process 6.5; cross-document-review 2
   `Mapping(X, slot, id)` and a full Delta are appended in **one** call, so they go into one batch.
 - The header, including the CRC over the full new slice, is computed at commit time. Applying the Delta needs
   only the journaled bytes.
-- The commit completes when the batch is forced (`JournalWriter`: one batch in flight, later appends buffered
-  into the next batch, one write plus one force per batch). Only then is the `PendingDelta` marked `durable` and
+- The commit completes when its batch is durable in the device journal (one DSYNC write per batch, one batch in
+  flight per device, later appends of every store of the device batched into the next). Only then is the `PendingDelta` marked `durable` and
   eligible for its in-place write.
 
 **Copy-on-write** (`copyOnWrite`, `cowWritten`, `cowMap`).
@@ -233,25 +273,33 @@ one transient host condition must not produce it. A read failure does **not** fa
 
 ### 2.7 Checkpoints
 
-A checkpoint is triggered by `maybeCheckpoint` when the active journal exceeds
-`min(max(indexFileSize / 2, journalBound), journalHardLimit / 2)`, or when an operation is held by the journal hard limit and the active
-journal holds records (2.9). It can also be started by `rebuildFlush` or the test hook `checkpointNow`. Only one runs at a time, and none starts while frozen or failed. It moves from seq s to s+1
-(`startCheckpoint`, `advanceCheckpoint`, `writeNextHeader`, `finish`):
+A checkpoint writes an index covering the store's applied records, so the device journal can reuse the files holding
+them. `maybeCheckpoint` starts one when the journal asks (`Owner.checkpointRequested`: this store's oldest needed
+record pins the ring's oldest file under pressure, 2.9), or when an operation waits for journal room while the store
+has records no checkpoint covers. `rebuildFlush`, `close` (the detach) and the test hook `checkpointNow` start one too.
+Only one runs at a time, none starts while frozen or failed, and a closing store still checkpoints. It moves from seq
+s to s+1 (`startCheckpoint`, `advanceCheckpoint`, `finish`):
 
-1. **Draining.** Snapshot the index as of the last record appended to journal s. `appendSeq` becomes s+1, and new
-   records wait in `switchBuffer`.
-2. **Header.** Once the last journal-s append is durable and the writer is idle, write and force header s+1
-   (`writeJournalHeader`) into the other journal file. Only then does a new `JournalWriter` take the buffered
-   records, in order.
-3. **Applying.** Wait until no journal-s Delta is unapplied (`unappliedBySeq`). "Applied" means forced in place,
-   that is, covered by a successful data force, or cancelled.
-4. **Barrier.** Wait until everything appended so far is durable (`lastAppend`). A cancelled journal-s Delta may
-   still be mapped in the snapshot, and the record that cancelled it is in journal s+1.
-5. **Finishing.** Write index s+1 into the other index file and force it. Then truncate and force journal s, then
-   index s.
+1. **Draining.** Snapshot the index as of the last record appended (`oldTail`). `appendSeq` becomes s+1, and new
+   appends wait in order in `drainBuffer` until `oldTail` is durable; its batch serial is the covered serial `S`. The
+   buffered appends are then issued in order. The journal merges one attachment's queued appends into one batch, so
+   without the wait a post-snapshot record could share S's batch and be taken as covered (Ruling R8). Draining does
+   no I/O and runs while frozen.
+2. **Applying.** Wait until no epoch-s Delta is unapplied (`unappliedBySeq`). "Applied" means forced in place, that
+   is, covered by a successful data force, or cancelled.
+3. **Barrier.** Wait until everything appended so far is durable (`lastAppend`). A cancelled epoch-s Delta may still
+   be mapped in the snapshot, and the record that cancelled it came after the snapshot.
+4. **Finishing.** Write index s+1 (covered `S`, detached for a close) into the other index file and force it, then
+   truncate and force index s. Then tell the journal: `covered(attachment, S)`, or, for a detach, `release`.
 
 Each I/O step runs through `checkpointIo`. ENOSPC holds the step and re-runs it from its start. Any other
-failure is fail-stop. While frozen the checkpoint pauses where it stands.
+failure is fail-stop. While frozen the checkpoint pauses where it stands. A checkpoint needs no journal space.
+
+**Detach on close** (spec 4.6). Once quiesced, `close` runs a checkpoint with `detach` set (or marks a running one
+that covers every append), so the index it writes covers every append and is detached, and the attachment is
+released; only then are the files closed. A frozen, abandoned or failed store does not detach: it stays attached
+(`Backend.closedAttached`), its records stay in the ring for the next device load to replay, and the host releases the
+attachment once the copy is durably out of replay's scope (`server/host/CLAUDE.md`).
 
 ### 2.8 Tail compaction and truncation
 
@@ -284,63 +332,60 @@ client read of f then reports the damage (`CorruptedObject`), as a read of t wou
 delay that ends after close starts no move"). On ENOSPC, writes and forces into f are held and re-run. A data force failure re-queues every
 write into f that no good force has covered (`dataLost`).
 
-### 2.9 Backpressure and the journal hard limit
+### 2.9 Backpressure and journal room
 
 A commit that arrives while `unappliedBytes > unappliedBound` is journaled normally, but its successful reply is
 held in `throttled` until unapplied bytes drop to the bound or below (`ack`, `releaseThrottled`). Error replies
 are never held.
 
-**Journal hard limit** (`admitted`, `journalHasRoom`, `releaseCapHeld`). The active journal never grows past
-`journalHardLimit`, whether or not the store is frozen, so recovery can always load it (L2):
-- Every commit, repair, repairDelete and `rebuildFlush` chunk (at most `RebuildMappingsPerAppend` = 4096
-  Mappings) is admitted before it touches any state, with an upper bound on the bytes it can append:
-  `appendBound(sliceSize)` (a batch of a Mapping plus a one-range Delta of the whole slice), or one Mapping batch
-  (`MappingAppendSize`, 45 bytes) for a repairDelete. Copy-on-write and delete commits are covered by the same
-  bound.
-- It is admitted if nothing is held before it and `activeJournalLength + capOutstanding + MappingAppendSize +
-  bound <= journalHardLimit`. `activeJournalLength` is the writer's length (durable, in flight and buffered), or,
-  during a switch, the header plus the switch buffer. `capOutstanding` sums the bounds of admitted operations that
-  have not yet replied. An otherwise empty journal (header only, nothing outstanding) admits any one operation.
-- Otherwise it waits in `capHeld`, in arrival order, neither completed nor failed, and `maybeCheckpoint` starts a
-  checkpoint (never while frozen). Held operations are admitted once the switch makes room. Reads go on and do not
-  see them.
-- A copy-on-write's Mapping is covered by its commit's bound. A compaction move's Mapping is covered by the
-  `MappingAppendSize` headroom: one move at a time, started only while that headroom is free
-  (`journalHasRoomForMove`).
-- Fail-stop fails every held operation with `IOFailure`. A close of a frozen store abandons them as it abandons
-  held I/O (2.10).
+**Journal room** (`admitted`, `releaseCapHeld`; `FsifDeviceJournal.tryReserve`). Every append the store issues must
+fit the device journal without waiting, so that every checkpoint's Barrier completes:
+- Every commit, repair, repairDelete and `rebuildFlush` chunk reserves an upper bound on the bytes it can append before
+  it touches any state: `appendBound(min(sliceSize, segmentPayloadSize))` (a Mapping plus a one-range Delta of the whole
+  slice, each with its 16-byte attachment tag; Ruling R13(b): an oversized slice reserves the largest bound and replies
+  `SliceTooLarge`), or one Mapping (`MappingAppendSize`, 45 bytes) for a repairDelete. A `rebuildFlush` chunk is at
+  most `RebuildMappingsPerAppend` (4096) Mappings, fewer when that would not fit one journal file (Ruling R11).
+  Copy-on-write and delete commits are covered by the same bound. A compaction move reserves its own Mapping
+  (`journalHasRoomForMove`), one move at a time.
+- The journal charges a reservation of padded size `c` as `2c - 4096` against its room: what is left in the current
+  file plus every free file after it, less what is already reserved. That covers the unusable tail a batch may leave
+  in a file, so a reserved append is always written without waiting for a file to free. One larger than a file less
+  its header is refused for good; `fitsJournal` keeps every store's largest commit below that.
+- An operation is admitted if nothing is held before it and the reservation succeeds. Otherwise it waits in `capHeld`,
+  in arrival order, neither completed nor failed, and the epilogue starts a checkpoint if the store has uncovered
+  records. The journal calls `Owner.roomAvailable` once room covers a refused charge, and asks the stores pinning the
+  oldest file to checkpoint (pressure: no free file after the current one and the current one 3/4 full, a refused
+  reservation, or a batch waiting for a file). Reads go on and do not see held operations.
+- A reservation is returned when the operation replies (its appends are written) or if it never appends.
+- Fail-stop fails every held operation with `IOFailure`. A close of a frozen store abandons them as it abandons held
+  I/O (2.10); a later open of that directory releases the old attachment first, returning its reservations (Ruling
+  R13(a)).
 - **Exception: `rebuildFlush` chunks.** `rebuildFlush` calls `assign` for every buffered Mapping before its chunks
   are admitted, so a held chunk has mutated the index. This is safe: the rebuild store is not live; `data` is forced
   before any assign, so durable-before-map holds for any index snapshot; no Delta's cancellation depends on these
   Mappings; and Barrier waits only on real appends.
-- The checkpoint threshold is clamped to `journalHardLimit / 2` (2.7), so a checkpoint normally starts well before
-  the limit holds anything.
 
-So no journal the backend writes is longer than `journalLengthBound = max(journalHardLimit, 28 +
-appendBound(segmentPayloadSize) + 45)`, which `FsifLayout.MaxSegmentPayloadSize` keeps within
-`FsifRecovery.MaxLoadSize`. With the defaults it is 1 GiB.
-
-**Why the limit cannot deadlock a checkpoint.** A held operation has mutated nothing (no index, slot or pending
-Delta change; rebuild chunks excepted, as above) and appended nothing, and no admitted operation waits for one. Every checkpoint condition looks only
-at admitted records: Draining waits for `oldTail`, the last append to journal s; Applying waits for journal-s
-Deltas; Barrier waits for `lastAppend`, the last admitted append. Writing header s+1 is not an append. So the switch
-always proceeds, and afterwards the active journal holds only the header and the switch buffer, which was itself
-admitted under the limit. Admitted operations reply independently of held ones, so `capOutstanding` drains; the
-empty-journal rule then admits any head, however large. While frozen, nothing starts a checkpoint, so held
-operations wait for space exactly as held I/O does.
+**Why journal room cannot deadlock a checkpoint.** A held operation has mutated nothing (rebuild chunks excepted, as
+above) and appended nothing, and no admitted operation waits for one. Every checkpoint condition looks only at
+admitted records: Draining waits for `oldTail`, an admitted append, which fits and is written; the appends it buffers
+belong to admitted operations and are issued once it completes; Applying waits for epoch-s Deltas; Barrier waits for
+`lastAppend`, the last admitted append. Writing the index is not an append. So every checkpoint finishes and its
+`covered` lets the writer reuse the files it pinned. While frozen nothing starts a checkpoint, so a frozen store holds
+the ring (2.10), and every FSIF store of the device then waits for room as its commits fill it.
 
 ### 2.10 ENOSPC freeze
 
 `FsifIo.isOutOfSpace` matches "no space left", "disk full", "insufficient space", "disk quota exceeded" or
 "edquot" anywhere in the cause chain. Each I/O source that fails this way calls `hold(key, kind, retry, abort)`.
-The sources are: journal batch, in-place write, data force, checkpoint step, copy-on-write, move write or force,
-and truncate.
+The sources are: in-place write, data force, checkpoint step, copy-on-write, move write or force, and truncate. A
+device journal write is never one: it overwrites preallocated space, and any failure of it is J4 (4.1).
 
 While anything is held, the store is **frozen**:
 - In-place writes, checkpoints, compaction moves and truncation start nothing new, except their own held retries.
-- Commits are still accepted, and their batches buffer behind a held one. A commit whose bytes are not durable is
-  held, not failed, so `Tx` keeps its data in the CRL. Checkpoints do not start, so once the active journal reaches
-  `journalHardLimit` new commits are held before they run (2.9) until space returns.
+- Commits are still accepted and journaled. Checkpoints do not start, so the store's records pin the device journal's
+  ring; once it is full, new operations of every FSIF store on the device wait for room (2.9) until space returns.
+  Decided: no evacuation (spec 4.5); out of space is per file system, so the neighbours are almost always frozen too.
+  A held operation is never failed, so `Tx` keeps its data in the CRL.
 - Reads go on and overlay pending Deltas.
 - `retryRound` re-issues every held operation every `enospcRetry`. When the last one succeeds the store unfreezes
   and paused work resumes.
@@ -361,19 +406,23 @@ A data force failure that is **not** ENOSPC is fail-stop.
 **Closing a frozen store** (`close`, `abandonHeld`). Held I/O is abandoned exactly as a crash would
 abandon it, and the close waits only for I/O already in flight. Abandoned commits never complete. That is safe:
 - held commits were never acknowledged, and Tx keeps them in the CRL;
-- acknowledged Deltas are in the journal and replay at recovery;
+- acknowledged Deltas are in the device journal and replay at the next device load (the store does not detach);
 - held checkpoint, move and copy-on-write steps re-run, or are moot, at recovery.
 
 ### 2.11 Fail-stop
 
 `failStop(t)` runs at most once:
 - sets `fatal`;
-- fails every journal append (`JournalWriter.failAll`), every buffered switch record, every held operation's
-  abort, and every throttled reply, each with `IOFailure`;
+- fails every append waiting in `drainBuffer`, every operation waiting for journal room, every held operation's
+  abort, and every throttled reply, each with `IOFailure` (appends already issued complete as the journal writes or
+  fails them);
 - calls `onFatal` once.
 
 Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebuild entry points throw, and
-`hasFailed` is true. The full list of sources is in section 4.2.
+`hasFailed` is true. The attachment stays live (no detach): its records stay in the ring until the host releases it,
+once the copy's move to `lost/` is durable. A device journal write failure fails the journal: every pending append
+fails, and each unreleased attachment's owner gets `journalFailed`, which fail-stops its store (J4). The full list of
+sources is in section 4.2.
 
 ### 2.12 Rebuild entry points
 
@@ -407,13 +456,20 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
   | a create that left nothing at the path | leave offline, not retried here: its entry is still Initializing and the next device check creates it again |
   | any other failure (out of space, I/O, lock or resource error) | leave offline, its copy left where it is; it awaits a load retry (AwaitingRetry), offered every device scan with exponential backoff capped at `LoadRetryCap` (5 min) |
 
+- **The device journal** (`DefaultBackendOpener`). A create first makes sure the device has a journal
+  (`FsifJournalDisk.ensure`: created if absent, sized by the device config) and refuses a layout that does not fit it.
+  An open runs against `io.fsifJournal` (`FsifJournalDisk.forOpen`; a device loaded with no journal directory gets one
+  first, Ruling R17); a failed journal, or a journal directory present while none is open, is an `IOException`, a load
+  retry. The device load opens and replays the journal before any store opens (`FsifJournalOpen`, step 2b of
+  `DeviceDiscovery.loadOwnedDevice`; `server/host/CLAUDE.md`), so every store opens detached or attached to an
+  attachment that needs no replay (Ruling R12); any other undetached index naming the journal is an `IOException`.
 - **No create on open** (systemic-loss-protection 4.1, row D5; 2.3 creation). A missing
   store directory, or one whose FSIF files are all absent or empty (`FsifRecovery.isBlank`), is `StoreLost` (L0):
   creation is atomic, so such a directory lost its store. Every other directory is recovered. A stat that fails
   (`server.FileStat`) is an I/O error, retried, not an absence.
 - **onFatal** posts `BackendFailed`. The routes are listed in section 4.2.
 - **Frozen close.** `ShutdownStore` logs and closes without waiting for space.
-- **`estimateSize`** is the sum of the data, journal and index file sizes, kept in memory by `SizeTrackedFiles` (statted once at open, then updated by every write and truncate through its handles), so it does no I/O on the store's executor.
+- **`estimateSize`** is the sum of the data and index file sizes (the device journal is the device's), kept in memory by `SizeTrackedFiles` (statted once at open, then updated by every write and truncate through its handles), so it does no I/O on the store's executor.
 
 ---
 
@@ -428,11 +484,13 @@ under `src/test/scala/org/aspen_ddp/aspen/server/store/backend/fsif/` unless nam
   write.
 - **Where:**
   - `appendDelta`, `cowMap` and `deleteExt` reply only from `onDurable(appendRecords(...))`.
-  - `JournalWriter.completed` completes a batch's promises only after its write and force succeed.
+  - `FsifDeviceJournal.written` completes a batch's promises only after its DSYNC write (in tests, write and force)
+    returns.
   - The in-place write is never required for durability, because the journal holds the bytes.
   - `kick` writes only `durable` Deltas, so a slot is never changed ahead of its journal record.
-- **Tests:** `JournalWriterSuite` "every acknowledged record survives crash" and "random faults, retries and
-  crashes never lose an acknowledged record or corrupt the journal"; `FsifBackendSuite` "100 appends of 37 bytes
+- **Tests:** `FsifDeviceJournalSuite` "crash at every op of 20 appends and 2 file switches scans Valid and holds every
+  completed append"; `FsifBackendSuite` "two stores sharing one journal both survive a crash with every acknowledged
+  write" and "100 appends of 37 bytes
   read back byte-exactly, before and after a crash"; `FsifModelSuite`.
 
 ### 3.2 Durable-before-map
@@ -453,15 +511,15 @@ under `src/test/scala/org/aspen_ddp/aspen/server/store/backend/fsif/` unless nam
   journaled before a Mapping it logically follows would be dropped. One journaled after a later Mapping would land
   on the wrong incarnation.
 - **Where:**
-  - Everything goes through `appendRecords`, which preserves order across the checkpoint switch via
-    `switchBuffer`.
+  - Everything goes through `appendRecords`, which keeps order while a checkpoint drains (`drainBuffer`). The device
+    journal's queue is FIFO and each batch takes a prefix of it, so one attachment's records stay in append order.
   - `withExt` and `gated` hold every operation on X behind a copy-on-write until its Mapping is appended
     (`releaseExt`).
   - A journaled allocation that must wait for a tail copy-on-write gates X the same way (`journaled`,
     `afterTailCows`).
 - **Tests:** `FsifBackendSuite` "a small write right behind a copy-on-write survives a crash once acknowledged
   (Ruling 14)" and "two commits to one object issued back to back leave the second's data"; `FsifCheckpointSuite`
-  "Ruling 19: a commit arriving while journal s is still being forced is not acknowledged before it".
+  "Ruling R8: a commit made while a checkpoint drains shares no batch with the snapshot's last append".
 
 ### 3.4 Replay selection rule
 - **Rule:** `Replay.run` keeps `Delta(X, i)` at position p iff `finalSlot(X) == i` and p is after X's last Mapping
@@ -487,7 +545,7 @@ under `src/test/scala/org/aspen_ddp/aspen/server/store/backend/fsif/` unless nam
 ### 3.6 Lowest-free-slot allocation and the recovery bound
 - **Rule:** `allocateSlot` always returns `used.nextClearBit(0)`. Recovery rejects any kept Delta slot or final
   mapped slot above `max(D0 / stride, 1 + highest slot in index m) + (number of replayed Mappings with slot >= 0)`.
-  D0 is the forced data size before replay (`FsifRecovery.recover` step 2).
+  D0 is the forced data size before replay (`FsifRecovery.replayDirectory` step 2).
 - **Why:** a CRC-valid but bogus slot number must not make recovery grow `data` enormously. The bound holds
   because each Mapping can grow the slot count by at most one.
 - **Tail copy-on-write exception:** a copy-on-write that grew the slot count is invisible to every term of the
@@ -498,32 +556,44 @@ under `src/test/scala/org/aspen_ddp/aspen/server/store/backend/fsif/` unless nam
   store"; `FsifRecoverySuite` "a Mapping beyond the reachable slot bound -> StoreLost" and "a chain of allocations
   each taking the next new top slot is accepted".
 
-### 3.7 Checkpoint switch and Barrier
+### 3.7 Checkpoint Draining and Barrier
 - **Why:**
-  - Recovery replays journal s+1 only on top of a complete journal s. A durable s+1 record with an incomplete s
-    behind it would replay a suffix without its prefix.
-  - Index s+1 must not be written while it maps a slot whose cancelling record (in s+1) is not yet durable.
-    Otherwise a crash would pair index s+1 with a journal that lacks that record.
+  - Index s+1's covered serial S must not cover a record left out of the snapshot. Replay applies only records above
+    S, so such a record would be lost. The device journal batches one attachment's queued appends together, so a
+    record appended after the snapshot could share S's batch.
+  - Index s+1 must not be written while it maps a slot whose cancelling record (appended after the snapshot) is not
+    yet durable. Otherwise a crash would pair index s+1 with a journal that lacks that record.
+  - The ring must never reuse a file holding a record above a live attachment's covered serial.
 - **Where:**
-  - `advanceCheckpoint` `Draining` requires `oldTail.isCompleted && journal.idle` before `writeNextHeader`.
-  - The new writer exists only after header s+1 is forced.
-  - `Applying` requires `unappliedBySeq` to have no seq below s+1.
-  - `Barrier` waits for `lastAppend`.
-- **Tests:** `FsifCheckpointSuite` "Ruling 19: ...", "a journal-s Delta cancelled by a later delete holds the
-  checkpoint until that delete is durable", "a crash at any file op during a checkpoint with commits in flight
-  keeps every acknowledged write", and "two back-to-back checkpoints (a to b to a) read back correctly after a
-  crash".
+  - `appendRecords` holds every append in `drainBuffer` while a checkpoint is Draining; `advanceCheckpoint` issues
+    them, in order, only once `oldTail` has completed with S (Ruling R8).
+  - `Applying` requires `unappliedBySeq` to have no seq below s+1; `Barrier` waits for `lastAppend`.
+  - `finish` tells the journal `covered(attachment, S)` only after index s+1 is forced. `FsifDeviceJournal.nextWrite`
+    enters a file only when every unreleased attachment's oldest needed serial is above that file's last serial of its
+    previous pass (`freeRun`, `lastOf`, `minNeeded`).
+- **Tests:** `FsifCheckpointSuite` "Ruling R8: a commit made while a checkpoint drains shares no batch with the
+  snapshot's last append", "a journal-s Delta cancelled by a later delete holds the checkpoint until that delete is
+  durable", "a crash at any file op during a checkpoint with commits in flight keeps every acknowledged write" and
+  "two back-to-back checkpoints (a to b to a) read back correctly after a crash"; `FsifDeviceJournalSuite` "the writer
+  enters the next file only when no unreleased attachment needs it", "an idle attachment pins nothing" and "a released
+  attachment pins nothing".
 
 ### 3.8 Force coverage and fsyncgate
-- **Rule:** a Delta is resolved only by a successful data force that started after its write completed. The tag is
-  `nextForceId` at completion, `forcedUpTo(id)` resolves tags `<= id`, and forces are serialized.
+- **Rule:** a Delta is resolved only by a successful data force that started after its write completed, with no failed
+  data force since that write completed. The tag is `nextForceId` at completion, `forcedUpTo(id)` resolves tags
+  `<= id`, and forces are serialized. A failed force drops the tags of every written but unforced Delta (`dataLost`),
+  including a slot's whose next in-place write is still in flight, so no later force counts them.
 - **ENOSPC on a force:** every uncovered write is re-issued (2.10).
 - **Other force failures:** fail-stop.
 - **Why:** after a failed fsync the kernel may report later forces as successful although the pages never reached
-  disk. Emptying journal s on the strength of such a force would lose acknowledged Deltas.
+  disk. A checkpoint covering a record on the strength of such a force would lose an acknowledged Delta: its record is
+  never replayed again.
 - **Tests:** `FsifFaultSuite`:
   - "ENOSPC on the data force of a checkpoint's step 2 re-issues the in-place writes before the journal is
     emptied";
+  - "ENOSPC on a data force while the slot's next in-place write is in flight: the next force does not count the
+    slot's earlier dropped writes as forced" (the regression found by the three-store model: a force issued before
+    that write completed counted the dropped Deltas as forced);
   - "ENOSPC on a copy-on-write's data force re-issues the segment and another object's unforced in-place write";
   - "ENOSPC on a compaction move's data force re-issues its copy into f before Map(X, f)";
   - "after a data force fails with a rebuild write unmapped, that incarnation refuses further rebuild work".
@@ -532,21 +602,30 @@ under `src/test/scala/org/aspen_ddp/aspen/server/store/backend/fsif/` unless nam
   `dataForceFaults` coverage floor.
 
 ### 3.9 Torn tail versus corruption, with the salt
-- **Rule** (`JournalFormat.scan`):
-  - Batches are parsed in order while each is CRC-valid with the expected number.
-  - At the first invalid position, `findLater` checks **every** byte offset after it for a CRC-valid batch numbered
-    n+1, with no extent skip, because a rotted `len` could otherwise hide later batches.
-  - If one is found, the journal is `Corrupt`. Otherwise the remainder is a torn tail, which recovery truncates
-    away.
-  - A CRC-valid batch whose records do not parse is `Corrupt`.
-- **Why the salt:** batch CRCs include the per-header random salt, which is not stored in the batch. User data
-  inside a torn batch, such as a slice that happens to contain an encoded batch copied from another journal or
-  crafted by a client, cannot pass as a later batch, so it cannot make a torn tail look like corruption.
-- **Tests:** `JournalFormatSuite` "truncation at every offset inside the last batch", "flip in a middle batch is
-  corrupt, in the last batch is a torn tail", "torn batch embedding a later batch (different salt) in user data
-  stays a torn tail", "mid-journal batch with a rotted len (larger, in bounds) is corrupt", and "scan never throws
-  on random mutations"; `FsifRecoverySuite` "a torn tail is truncated to the valid length" and "corruption in the
-  middle of the active journal -> StoreLost".
+- **Rule** (`DeviceJournalScan.scan`, spec 4.7 step 1):
+  - Every file header is read; the valid ones are ordered by `first`. The needed range runs from the newest header's
+    oldest needed serial to the tail. Batches below it are not read; where one fails, the walk resumes at the later
+    4096 boundary holding the oldest needed serial (none there is corrupt).
+  - Every needed serial must be present, CRC-valid and in order in the file 4.1 assigns it to. A failed batch in a
+    file other than the newest is corrupt, as is an oldest needed serial below the oldest valid file's `first`.
+  - In the newest file, the first batch that fails or has the wrong serial ends the journal: a torn tail unless a
+    CRC-valid batch with the next serial exists at a later 4096 boundary of that file (`findLater`), which is
+    corrupt.
+  - A CRC-valid batch whose records do not parse is corrupt. No valid header at all is Empty, which is corrupt if any
+    attached directory has a covered serial >= 0 (`DeviceJournalRecovery.recover`).
+- **Why it holds:** one batch is in flight, so only the newest file's last batch can be torn. The writer rewrites a
+  file's header (fresh salt) with a DSYNC write before its first batch of the pass, and every batch CRC covers the
+  journal id and that salt, so an earlier pass's batches and another journal's bytes end the file instead of passing
+  as batches. A file being entered when a crash tore its header holds nothing needed, which the needed range decides.
+  After recovery the writer enters the next file before its first batch, so it never appends after a torn tail
+  (Ruling R4). User data inside a torn batch cannot pose as the next batch: it would need the salt.
+- **Tests:** `DeviceJournalScanSuite` (all of it, e.g. "torn last batch in the newest file is a torn tail", "a rotted
+  batch followed by a valid next batch is Corrupt", "a torn header rewrite of the file being entered is ignored", "a
+  rotted header of a file inside the needed range is Corrupt", "stale batches of an earlier pass (old salt) after the
+  current pass's last batch end the file, not Corrupt"); `DeviceJournalFormatSuite` "truncation at every byte of a
+  batch is Invalid, never Unparseable" and "a batch is Invalid under another salt or journal id";
+  `DeviceJournalRecoverySuite` "an empty ring with an attached directory whose covered serial is >= 0 throws
+  JournalCorrupt and writes nothing".
 
 ### 3.10 ObjectId checks against reused exts
 - **Why:** an ext is reused after deletion. A store that missed O's delete may later hold P at the same ext. A
@@ -562,25 +641,32 @@ under `src/test/scala/org/aspen_ddp/aspen/server/store/backend/fsif/` unless nam
   and "repair at an ext held by a different object fails naming the occupant, and succeeds once it is dropped".
 
 ### 3.11 Idempotent recovery
-- **Rule:** every step of `FsifRecovery.recover` falls into one of three kinds:
-  - it only reads (step 1: load, which forces each file before reading it; step 2: classify, replay and validate);
-  - it rewrites identical bytes (step 3: absolute Deltas, then force; step 4: torn-tail truncate);
-  - it moves the store to a state whose own recovery yields the same objects (step 5: finish the interrupted
-    checkpoint by writing index m+1 and emptying journal m and index m, or empty stale files).
+- **Rule:** recovery is split in two (`FsifRecovery`). At device load, `DeviceJournalRecovery.recover` scans the ring
+  without writing it, then runs `replayDirectory` for each directory whose newest index names this journal and is not
+  detached, with that attachment's records above its covered serial. Every step of `replayDirectory` is one of three
+  kinds:
+  - it only reads (step 1: load the newest index, forcing each index file before reading it; step 2: replay and
+    validate, L7-L10);
+  - it rewrites identical bytes (step 3: absolute Deltas, then force, then L11 and L12);
+  - it moves the directory to a state whose own recovery yields the same objects (step 4: index s+1 written
+    detached, covering the ring's tail, forced, then index s emptied).
 
-  A crash inside recovery followed by another recovery therefore yields the same state. Steps 1 and 5 decide on
-  whether files exist (`FsifFiles.exists`/`size`); `NioFsifFiles` answers them with `server.FileStat`, so a file is
-  absent only when known absent and a stat that fails throws an `IOException` out of the open (4.6). Read as an
-  absence, a failed stat of journal m+1 in step 1 would replay without it, and step 5, finding it again, would empty
-  it as stale.
-- **Tests:** `FsifRecoverySuite` "recover is idempotent across crashes inside recover (30 seeds)", which crashes at
-  every op k and then again at a random op; `FsifModelSuite` "crash during recovery"; `FsifRecoverySuite` "index s
-  valid, index s+1 torn, journals s and s+1 recover the union and finish the checkpoint".
+  Until step 4's index is valid every rerun sees the same inputs; once it is, the directory is detached, so a device
+  load no longer replays it, and data already holds every kept Delta. The writer starts only after every directory is
+  replayed, entering the next file, so the ring a rerun scans is unchanged. A crash inside the device load followed by
+  another load therefore yields the same state. At store open, `openDirectory` only reads (L1, L11, L12) and the
+  constructor's attach index is an ordinary index switch.
+- Steps decide on whether files exist (`FsifFiles.exists`/`size`); `NioFsifFiles` answers them with `server.FileStat`,
+  so a file is absent only when known absent and a stat that fails throws an `IOException` (4.6).
+- **Tests:** `FsifRecoverySuite` "replayDirectory is idempotent across crashes inside replayDirectory (30 seeds)" and
+  "a torn index s+1 is ignored and replay starts from index s"; `DeviceJournalRecoverySuite` "crash at every op of
+  recover, then recover again, yields the same objects (20 seeds)"; `FsifModelSuite` "crash during recovery" (its
+  `inReplay` floor).
 
 Validation order differs slightly from "validate everything before writing anything". The sliceLength,
 double-mapping and bound checks run before step 3. The "mapped slot past EOF" check and the slot-count overflow
 check run after step 3 has written and forced the kept Deltas, because applied Deltas extend the file. These are
-idempotent writes, so a rerun sees the same inputs, but a store declared lost by those two checks has already
+idempotent writes, so a rerun sees the same inputs, but a directory declared lost by those two checks has already
 been modified.
 
 ### 3.12 Testing approach
@@ -595,13 +681,18 @@ been modified.
   - faulted writes and truncates have no effect;
   - creating a file is durable, matching `NioFsifFiles.open`, which syncs the directory;
   - `failNext` / `failWhile` inject `OutOfSpace` or `IoError` by file and op.
+  Tests run the device journal over the same simulated machine (`SharedJournal`, `PrefixedFsifFiles`), with
+  `forceAfterWrite` standing in for DSYNC.
 - **crashAfterOps sweeps.** `crashAfterOps(n)` stops the simulated machine after n more ops, and `crash()` then
   yields the durable image. Sweeps cover:
   - every op of one move (`FsifCompactionSuite` "a crash at every file op of one move ...");
   - random points inside checkpoints and compactions with commits in flight (50 seeds each);
-  - every op inside recovery (`FsifRecoverySuite`).
+  - every op of 20 appends and two file switches of the device journal (`FsifDeviceJournalSuite`);
+  - every op inside device-load replay (`DeviceJournalRecoverySuite`, `FsifRecoverySuite`).
 - **Model-based suite** (`FsifModelSuite`):
-  - 400 random operations over 16 exts: allocate, small write, append, overwrite, delete, read, checkpoint,
+  - three stores sharing one device journal on one simulated machine, so every crash covers all of them and each
+    recovery is a device-load replay followed by each store's open;
+  - 400 random operations over 16 exts each: allocate, small write, append, overwrite, delete, read, checkpoint,
     compaction, ENOSPC windows and crashes;
   - checked against a per-ext history: after each crash, every ext must read as its last acknowledged state or a
     later issued one, other ObjectIds as `ObjectNotFound`, and nothing as `CorruptedObject` unless the store
@@ -609,13 +700,19 @@ been modified.
   - 30 seeds for "random operations match the model across crashes", and 30 for "crash during recovery";
   - coverage floors of at least 3 across the seeds for: crashes inside a checkpoint, inside a move and while
     frozen; mid-checkpoint images; later-index images; data-force faults; and, with interrupted recovery,
-    crashes inside recovery and inside recovery's checkpoint completion;
+    crashes inside recovery, inside recovery's index switch and inside device-load replay;
   - at least 1 stale-index image.
 - **Determinism.** io is a seeded `ShuffleEc` that runs on the test thread, and ENOSPC retries run on a
   `ManualScheduler`. The first two seeds of each model run are re-run and their digests compared.
 - **Host and integration:**
   - `src/test/scala/org/aspen_ddp/aspen/server/HostFsifLoadSuite.scala`: open off the event thread, StoreLost and
-    fail-stop marking, the out-of-space backoff, and frozen close;
+    fail-stop marking, the out-of-space backoff, frozen close, and the device journal's load paths (R19, R20, runtime
+    failure);
+  - `src/test/scala/org/aspen_ddp/aspen/server/host/FsifJournalLostSuite.scala`: the lost-journal path (J1, J2), a
+    failed move, a locked journal, the open's classification (R18);
+  - `src/test/scala/org/aspen_ddp/aspen/server/host/FsifJournalReleaseSuite.scala`: releases of attachments a close
+    left live (a durable move to lost/, deletes of pending-delete and discarded copies) and the refused undetached
+    transfer;
   - `DeviceShutdownSuite`: fail-stop during shutdown and transfer closes;
   - `DeviceAdoptionSuite`: CrlLost adoption, including a failed-on-close store;
   - `src/test/scala/org/aspen_ddp/aspen/FsifIntegrationSuite.scala`: a RARS pool through the client covering
@@ -634,37 +731,55 @@ away. This cannot be solved inside the backend: each store sees only its own fil
 "System-level protection against correlated 'lost store' declarations".
 
 Every case below runs without an operator. Code is named by class and method; a recovery check is located by its
-step in `FsifRecovery.recover` (the numbered step comments) and the `StoreLost` message it throws.
+step in `FsifRecovery.replayDirectory` (its numbered steps) and the `StoreLost` message it throws.
 
 ### 4.1 Detected by FSIF recovery (`FsifRecovery.StoreLost`)
 
-All of these are thrown from `FsifBackend`'s constructor through `FsifBackend.open`. The host reaction is the same
-for each: `StoreLoader.handleBackendOpened` logs, leaves the store offline, moves the copy to `lost/`
-(`StoreRebuilds.moveToLostOnLane`), and calls `DeviceReconciler.checkStorageDevice`. A copy in `lost/` is acted on as
-described in 4.5. A plain `IOException` from the open is not a loss (4.6). Every absence below is a known one: the
-directory and file tests are `server.FileStat`'s, so a stat that fails is such an `IOException`, never L0 or a
-missing index or journal.
+Recovery runs in two places (3.11). At a store open, `FsifBackend.open` and `FsifRecovery.openDirectory` throw from
+`FsifBackend`'s constructor: L0, L1, L11, L12 and J5. The host reaction is the same for each:
+`StoreLoader.handleBackendOpened` logs, leaves the store offline, moves the copy to `lost/`
+(`StoreRebuilds.moveToLostOnLane`), and calls `DeviceReconciler.checkStorageDevice`. At the device load,
+`FsifRecovery.replayDirectory` (inside `DeviceJournalRecovery.recover`, in the `FsifJournalOpen` job) finds L1 and
+L7-L12 for a directory, which is then lost alone (J3). A copy in `lost/` is acted on as described in 4.5. A plain
+`IOException` from either is not a loss (4.6). Every absence below is a known one: the directory and file tests are
+`server.FileStat`'s, so a stat that fails is such an `IOException`, never L0 or a missing index or journal.
 
-| # | Trigger | Where (`FsifRecovery.recover` unless noted) | Why it is believed to mean loss | What a false trigger from a systemic bug looks like |
+| # | Trigger | Where (`FsifRecovery` unless noted) | Why it is believed to mean loss | What a false trigger from a systemic bug looks like |
 |---|---|---|---|---|
-| L0 | The store directory is missing, or every FSIF file is absent or empty | `FsifBackend.open` | A store directory appears at its path only complete, by StoreCreation's rename, so its files were lost (an incomplete restore or mount, a wiped directory) | A code path that makes a store directory outside StoreCreation (a new create path, a test helper copied into production), or a transfer or rebuild that moves a directory before its files are written |
-| L1 | Neither index file is valid (size, magic, CRC, or a slot < -1) | step 1, "no valid index file" | `initialize` writes index.a last, before the store is renamed into place, and a checkpoint empties index s only after index s+1 is forced. So a store always has one valid index unless something damaged it | An index size or CRC computation that changes with the code: e.g. a change to `IndexFile.EntrySize` or `sizeFor`, or a `segmentCount` read differently from the pool config. Every store would fail on first open after the upgrade |
-| L2 | An index or journal file is larger than `MaxLoadSize` (`Int.MaxValue - 16`) bytes | `FsifRecovery.load`, "is too large to load" | Not reachable from a state the backend produced. The index is at most `IndexFile.sizeFor(MaxSegmentCount)`. The active journal is at most `journalLengthBound` (1 GiB by default), because operations past `journalHardLimit` are held, frozen or not (2.9); a stale journal is one that was active | A bug in admission: a write path that appends without being admitted or covered by headroom, an `appendBound` that undercounts (a new record type or field), or a writer whose batches outgrow their records. The journal would then grow past the limit only on stores that keep taking writes while checkpoints cannot finish, e.g. a long freeze |
-| L3 | A journal with a valid scan has seq > m + 1 | step 1, "has seq ... but the newest index has seq" | A journal s+1 header is written only while index s is the newest, so s+2 cannot exist | Seq arithmetic off by one in the checkpoint switch or in step 5's finish; a misread of the header seq |
-| L4 | A journal is `Scan.Corrupt` and is not a stale journal (a valid header with seq < m). Corrupt means: (a) invalid header on a file longer than 28 bytes; (b) a CRC-valid batch whose records do not parse (`JournalFormat.parseRecords` / `parseRecord`); (c) an invalid batch followed later by a CRC-valid batch numbered n+1 (`JournalFormat.findLater`) | step 1, "is corrupt"; `JournalFormat.scan` | (a) the header rewrite forces after truncate(0); (b) the batch CRC covers the records; (c) batches are written strictly in sequence, so only the last can be torn, and the salt keeps user data from posing as a batch | (b) is the most dangerous: any change to the record encoding (a new record type, a `SegmentHeader` layout or type-byte change, a stricter parse check) makes **every** CRC-valid journal "corrupt" after an upgrade. (c) would fire on every store if the writer reused batch numbers, or if a retry path re-sent a batch at a different offset without truncating first |
-| L5 | No journal has seq m | step 1, "no journal with seq" | Index m is written only after journal m's header is forced, and journal m is emptied only after index m+1 is forced | Step 5 or `finish` emptying the wrong journal; a journal naming scheme that changed |
-| L6 | Both journals have seq m | step 1, "both journals have seq" | The header rewrite always targets the non-active journal | A checkpoint that writes header s+1 into the active file |
-| L7 | A Mapping or Delta carries an ext outside `[0, segmentCount)` (`Replay.InvalidRecord`) | `Replay.checkExt` via `FsifRecovery.replay`, step 2, "invalid journal record" | Only a writer bug or corruption past the CRC produces one | A `segmentCount` that shrinks or is read from the wrong source at open: every store of the pool would fail on any record above the new count |
-| L8 | A kept Delta has sliceLength > segmentPayloadSize | step 2, "has slice length" | `update` rejects such slices with `SliceTooLarge` | A `segmentPayloadSize` computed differently after an upgrade (e.g. from `forObjectSize` instead of the stored config) |
-| L9 | After replay, two exts map to one slot | step 2, "is mapped by ext" | Allocation marks the slot used, and freeing waits for the unmap to be durable | A bug in `tryFree` or `assign` that frees or double-assigns a slot; replay selection or Mapping order changed |
-| L10 | A kept Delta's slot, or a final mapped slot, is above `max(D0/stride, startTop+1) + mappings` | step 2, `checkBound`, "beyond the reachable bound" | Lowest-free allocation makes each Mapping grow the slot count by at most one (3.6) | The highest-risk check. An allocator that skips a slot (e.g. a new reservation kind), a new write path that maps a slot not covered by `tailCows`, or a miscalculated bound would fire on every store after an upgrade, typically only on stores that had a crash with the right pattern in flight, which makes it look like scattered hardware loss |
-| L11 | After applying the kept Deltas and forcing, a mapped slot starts at or beyond the end of `data` | step 3, "beyond the data file" | A mapped slot was either written in place (forced before index m+1) or its Delta was replayed now | A truncation that is too aggressive (compaction's `used` missing a mapped slot) that became durable; a `stride` change |
-| L12 | The computed slot count exceeds `Int.MaxValue` | step 3, after L11, "slot count ... is too large" | Not reachable with a bounded data file | A `stride` computed as 0 or very small |
+| L0 | The store directory is missing, or every FSIF file is absent or empty | `FsifBackend.open`; `DefaultBackendOpener.openFsifBackend` | A store directory appears at its path only complete, by StoreCreation's rename, so its files were lost (an incomplete restore or mount, a wiped directory) | A code path that makes a store directory outside StoreCreation (a new create path, a test helper copied into production), or a transfer or rebuild that moves a directory before its files are written |
+| L1 | Neither index file is valid (size, magic, CRC, detached byte, or a slot < -1) | `newestIndex`, "no valid index file" (open and replay) | `initialize` writes index.a last, before the store is renamed into place, and every index switch empties index s only after index s+1 is forced. So a store always has one valid index unless something damaged it | An index size or CRC computation that changes with the code: e.g. a change to `IndexFile.EntrySize`, the meta fields or `sizeFor`, or a `segmentCount` read differently from the pool config. Every store would fail on first open after the upgrade |
+| L2 | An index file is larger than `MaxLoadSize` (`Int.MaxValue - 16`) bytes | `load`, "is too large to load" | Not reachable: the index is at most `IndexFile.sizeFor(MaxSegmentCount)` | A change to `sizeFor` or `MaxSegmentCount` |
+| L7 | A Mapping or Delta carries an ext outside `[0, segmentCount)` (`Replay.InvalidRecord`) | `Replay.checkExt` via `replay`, "invalid journal record" (replay) | Only a writer bug or corruption past the CRC produces one | A `segmentCount` that shrinks or is read from the wrong source at load: every store of the pool would fail on any record above the new count |
+| L8 | A kept Delta has sliceLength > segmentPayloadSize | `replayChecked`, "has slice length" (replay) | `update` rejects such slices with `SliceTooLarge` | A `segmentPayloadSize` computed differently after an upgrade (e.g. from `forObjectSize` instead of the stored config) |
+| L9 | After replay, two exts map to one slot | `replayChecked`, "is mapped by ext" (replay) | Allocation marks the slot used, and freeing waits for the unmap to be durable | A bug in `tryFree` or `assign` that frees or double-assigns a slot; replay selection or Mapping order changed |
+| L10 | A kept Delta's slot, or a final mapped slot, is above `max(D0/stride, startTop+1) + mappings` | `replayChecked`, `checkBound`, "beyond the reachable bound" (replay) | Lowest-free allocation makes each Mapping grow the slot count by at most one (3.6) | The highest-risk check. An allocator that skips a slot (e.g. a new reservation kind), a new write path that maps a slot not covered by `tailCows`, or a miscalculated bound would fire on every store after an upgrade, typically only on stores that had a crash with the right pattern in flight, which makes it look like scattered hardware loss |
+| L11 | A mapped slot starts at or beyond the end of `data` (after applying and forcing the kept Deltas, at replay) | `checkedSlotCount`, "beyond the data file" (open and replay) | A mapped slot was either written in place (forced before the index that maps it) or its Delta was replayed | A truncation that is too aggressive (compaction's `used` missing a mapped slot) that became durable; a `stride` change |
+| L12 | The computed slot count exceeds `Int.MaxValue` | `checkedSlotCount`, after L11, "slot count ... is too large" (open and replay) | Not reachable with a bounded data file | A `stride` computed as 0 or very small |
+
+L3-L6 (the per-store journals' seq rules and corruption) and L2's journal half went with those journals; their
+device-level counterparts are J1 and J2.
+
+**Device journal triggers** (spec section 5; `host/FsifJournalDisk.scala`, device load). J1 and J2 move every FSIF
+copy on the device to `lost/` and remove its FSIF staging directories (the lost-journal path, modelled on the lost
+CRL's; `server/host/CLAUDE.md`); RocksDB copies are untouched. J3 and J5 lose one copy (or staging directory).
+
+| # | Trigger | Where | What a false trigger from a systemic bug looks like |
+|---|---|---|---|
+| J1 | The ring is corrupt: a needed serial missing or out of order (a gap, a rotted header hiding batches, a failed batch before the newest file), a CRC-valid batch whose records do not parse, a valid batch after an invalid one in the newest file, or no valid header while an attached directory has covered >= 0; also any other non-transient failure of the recovery once the device holds FSIF directories, and a transient one on `FsifJournalOpenAttempts` scans in a row | `DeviceJournalScan.scan`, `DeviceJournalRecovery.recover` (`JournalCorrupt`); `FsifJournalDisk.open` | A change to the record or batch encoding, the CRC's inputs or the serial arithmetic: every device's FSIF copies after an upgrade, at once |
+| J2 | No journal directory on a device holding an FSIF directory whose newest index is undetached | `FsifJournalDisk.open` | A journal directory renamed by new code, or an index's detached flag or journal id read wrongly |
+| J3 | One directory's replay fails (L1, L7-L12) | `FsifJournalDisk.openPresent`, `moveLostAlone` | As for L1 and L7-L12, now found at device load |
+| J4 | A device journal write fails at runtime | `FsifDeviceJournal.fail` → each attached store's `journalFailed` (4.2, L13) | An error classifier or an I/O path bug that fails the device's journal: every FSIF store on the device fail-stops, and the device is taken out of service until the host restarts (`DeviceShutdown.fsifJournalFailed`) |
+| J5 | A newest index undetached but naming another journal (Rulings R6, R20) | `DeviceJournalRecovery` `ForeignUndetached` (device load); `openDirectory` (store open) | A transfer or move path that ships a directory without detaching it (every legitimate foreign index is detached: a close detaches, `TransferDisk.moveOutbound` refuses an undetached copy, a create writes `IndexMeta.None`), or a journal id read wrongly |
+
+Refusals, never a loss: a journal locked elsewhere (`JournalLocked`) or whose files do not match its sizing
+(`JournalSizingMismatch`), and a device config that cannot size a replacement, refuse the device (Failed, Refused)
+until fixed.
 
 Related, for staging only: `RebuildingStore.openStaging` (`rebuild/RebuildingStore.scala`) opens the rebuild's
 staging store through the host's `BackendOpener` and catches `BackendStateLost`, which `StoreLost` extends. It
-deletes the staging directory and its checkpoint (`cleanupStaging`), so the next pass starts over. The live store is already Rebuilding, so this costs only
-rebuild progress. A recovery bug of the L0-L12 kind would make every rebuild restart from scratch forever.
+deletes the staging directory and its checkpoint (`cleanupStaging`), so the next pass starts over. The live store is
+already Rebuilding, so this costs only rebuild progress. A recovery bug of the L0-L12 kind would make every rebuild
+restart from scratch forever. A staging store that closes attached (fail-stopped or frozen) is discarded the same way.
 
 ### 4.2 Detected at runtime by FSIF fail-stop (`onFatal`)
 
@@ -672,10 +787,10 @@ Every fail-stop calls `onFatal` once. The host's `onFatal` posts `BackendFailed`
 
 | # | Trigger | Where |
 |---|---|---|
-| L13 | A journal batch write or force fails with a non-ENOSPC error (including during an ENOSPC retry) | `FsifBackend.journalError` |
+| L13 | The device journal failed (a write failed, J4: every attached store), or the append a checkpoint drains behind failed | `FsifBackend.owner.journalFailed`; `advanceCheckpoint` (Draining) |
 | L14 | An in-place write fails with a non-ENOSPC error | `FsifBackend.inPlaceDone` |
 | L15 | A data force fails with a non-ENOSPC error | `FsifBackend.dataForceDone` |
-| L16 | A checkpoint step (open the other journal, header rewrite, index write, truncates) fails with a non-ENOSPC error | `FsifBackend.checkpointIo` |
+| L16 | A checkpoint step (index write, index truncate) fails with a non-ENOSPC error | `FsifBackend.checkpointIo` |
 | L17 | A copy-on-write segment write or force fails with a non-ENOSPC error | `FsifBackend.cowWritten` |
 | L18 | Compaction: a move write or force fails with a non-ENOSPC error; the truncate of free tail slots fails with a non-ENOSPC error. (A failed move read is not a trigger: it abandons the move, 2.8.) | `Compaction.written`, `forced`; the truncate (`Compaction.truncate`) fails through `FsifBackend.guarded` |
 | L19 | Any `NonFatal` exception escapes a serial task, checkpoint advance or compaction drive (an internal error), for example `allocateSlot`'s `IllegalStateException`, a rejected io task, or an NPE | `FsifBackend.guarded` |
@@ -691,7 +806,8 @@ failed client read is retried and only then returns `CorruptedObject`, and a fai
 the move and retries it after a backoff, so a host-wide EMFILE, ENOMEM or saturated io executor stalls compaction
 but fail-stops no store. L13-L17 would fire together if an error classifier misses ENOSPC (for example a filesystem or
 JDK that words it differently from `FsifIo.isOutOfSpace`'s strings), which turns every full device into a
-correlated loss.
+correlated loss. L13 fires on every FSIF store of a device at once (J4), and the device then stays out of service until
+the host restarts.
 
 **Host routes for `BackendFailed` and other failed-backend checks.** Each of these moves the copy to `lost/` once it is closed (`StoreRebuilds.moveToLostOnLane`):
 
@@ -726,12 +842,15 @@ counts as loss only at adoption (L21), where a copy in `outbound/` shows that a 
 
 ### 4.4 Count
 
-There are 23 automatic cases:
-- 13 found at FSIF open (L0 by `FsifBackend.open`, L1-L12 by recovery);
+There are 22 automatic cases:
+- 9 found by FSIF recovery (L0, L1, L2, L7-L12), at store open or device-load replay;
+- 3 more found at device load or store open (J1, J2, J5; J3 is L1/L7-L12 at device load, J4 is L13 at device scope);
 - 7 FSIF fail-stop sources (L13-L19), reaching `lost/` through the host routes listed in 4.2;
-- 3 generic host paths (L20-L22).
+- 3 generic host paths (L20-L22);
+- J1 and J2 each lose every FSIF copy on their device.
 
-In addition, the rebuild staging store is discarded on `StoreLost` (4.1, related).
+In addition, the rebuild staging store is discarded on `StoreLost`, on a replay failure, on a lost journal, and when
+it closes attached (4.1, related).
 
 ### 4.5 What happens after the move to `lost/`
 
@@ -761,8 +880,17 @@ These look like loss but never trigger a rebuild:
   retries. Only a non-ENOSPC error during a retry is fail-stop.
 - **A crash or failure during creation.** It happens in `creating/`, which the device's next load deletes; nothing
   reaches the store's path, so nothing is opened or moved to `lost/`.
-- **A torn journal tail.** It is truncated in recovery step 4.
-- **A journal with a stale seq** (< m), whether valid or corrupt with a valid header. It is ignored and emptied.
+- **A torn tail in the device journal's newest file.** The scan ends there, and the writer starts in the next file.
+- **Batches below the needed range, and invalid headers outside it** (an earlier pass, a torn header rewrite of the
+  file being entered). They are not read.
+- **A device with no journal and no FSIF directory attached to one.** Loaded Absent; nothing is created until an FSIF
+  store needs it.
+- **A journal locked elsewhere, one whose files do not match its sizing, or a device config that cannot size a
+  replacement.** The device is refused until fixed (Ruling R18); nothing is moved.
+- **An FSIF copy with an unreadable config that holds index files** (Ruling R19). The device stays unloaded for the
+  next scan.
+- **An undetached index naming this journal at a store open** that the running journal does not know as replay-free.
+  An `IOException`, a load retry (Ruling R12).
 - **One invalid index file** while the other is valid (a torn index s+1 falls back to index s).
 - **A CRC mismatch on a read.** `CorruptedObject` goes to the repair path. The store stays served.
 - **An `IOException` during open that is not out of space.** It is logged ("its backend failed to open"), and the
@@ -793,35 +921,36 @@ Tests for the automatic paths:
   rebuilt";
 - `FsifIntegrationSuite` "an FSIF store whose recovery finds it lost is rebuilt through the rebuild path".
 
-Tests for the non-cases: `FsifRecoverySuite` "a non-empty journal with seq < m is stale and ignored" and "an
-invalid header no longer than a header is an empty journal"; `FsifInitializationSuite` "a store holding objects is
+Tests for the non-cases: `DeviceJournalScanSuite` "torn last batch in the newest file is a torn tail", "a rotted
+batch below oldestNeeded is not read" and "a torn header rewrite of the file being entered is ignored";
+`FsifJournalLostSuite` "a locked journal refuses the device and moves nothing", "a journal open that fails before
+anything is decided never loses the journal, however many scans" and "Review Focus 2: a device whose FSIF copies all
+came from another host loads Absent"; `FsifRecoverySuite` "openDirectory refuses an undetached index of its own journal
+with an IOException"; `FsifInitializationSuite` "a store holding objects is
 recovered on open", "an initialized store is recovered as the empty store, not re-initialized" and "a directory with
 non-empty files and no valid index is lost and left untouched"; `StoreCreationSuite` (a failed create leaves nothing at
 the store path); `HostFsifLoadSuite` "an FSIF store whose files hold no valid index is marked for rebuild, not
 emptied", "a create that runs out of space leaves nothing at the store path, and the next device check serves it" and
 "a device load removes what a crashed create left in creating/, and never loads it". L0: `FsifInitializationSuite` "a
 missing directory is lost, ..." and "a directory whose FSIF files are all absent or empty is lost, ... (SL D5)";
-`HostFsifLoadSuite` "an FSIF store whose files are gone or empty is marked for rebuild, not served empty (SL D5)";
-`FsifFaultSuite` "with data writes frozen, commits past journalHardLimit are
-held, not failed, and complete once it clears" (L2 cannot be reached).
+`HostFsifLoadSuite` "an FSIF store whose files are gone or empty is marked for rebuild, not served empty (SL D5)".
 
 ---
 
 ## 5. Known limitations and open items
 
-- **Index and journal files are read whole during recovery.** `FsifRecovery.load` reads each into one array and
-  throws `StoreLost` above `MaxLoadSize` (`Int.MaxValue - 16`) bytes. Both stay below it by construction: the index
-  through `MaxSegmentCount`, the journal through `journalHardLimit` (2.9). The cost moves elsewhere: a store frozen
-  long enough to fill its journal to the limit (1 GiB) stops acknowledging commits until space returns, and
-  recovery of such a journal reads and replays up to 1 GiB.
-- **Bounds that keep a journal loadable.** `FsifLayout` rejects a `segmentPayloadSize` above
-  `MaxSegmentPayloadSize` (about 2 GiB), and a span list whose encoding would exceed the whole slice is journaled as
-  the whole slice (2.5).
-- **The hard limit counts conservatively.** An admitted operation's bound counts until it replies, even once its
-  records are in the journal, and a commit's bound assumes a Mapping plus the whole slice. Commits can therefore be
-  held while the journal is still well below the limit, most while a frozen journal batch keeps commits from
-  replying. Operations held only by outstanding copy-on-writes can make checkpoints run back to back without
-  admitting anything until those finish.
+- **Index files are read whole during recovery.** `FsifRecovery.load` reads each into one array and throws
+  `StoreLost` above `MaxLoadSize` (`Int.MaxValue - 16`) bytes; the index stays below it through `MaxSegmentCount`.
+  Device journal recovery reads the headers, then one file at a time (at most 1 GiB each).
+- **One frozen store holds its whole device.** A store frozen by ENOSPC cannot checkpoint, so its records pin the
+  ring, and once the ring is full every FSIF store on the device waits for room; reads go on. So does a fail-stopped
+  copy until its move to `lost/` is durable (`retryPendingLost`). Accepted: no evacuation (spec 4.5).
+- **Journal room counts conservatively.** A reservation is charged `2c - 4096` and counts until its operation
+  replies, even once its records are written, and a commit's bound assumes a Mapping plus the whole slice. Operations
+  can therefore wait while the ring is still well below full.
+- **A frozen or failed close leaves an attachment live until it is released** (a reopen of the same directory
+  releases it, Ruling R13(a); otherwise the host's move or delete does). A frozen FSIF staging store restarts its
+  rebuild from scratch.
 - **Truncate runs inline on the serial executor** (`Compaction.truncate`). It is the one blocking file call made
   there, so a hung device can stall that store's serial work during a truncate.
 - **A moving object's Map can livelock.** `Compaction.pump` appends `Map(X, f)` only if no write into f started

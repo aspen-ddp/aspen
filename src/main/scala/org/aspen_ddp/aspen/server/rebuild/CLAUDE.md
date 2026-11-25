@@ -155,6 +155,15 @@
   `StoreRebuildFactory.createRebuild`). A first pass (no checkpoint) discards whatever staging holds and creates a
   fresh staging store atomically (`BackendOpener.create`); a resume only opens it, and one whose backend is lost
   (missing or blank files included) is discarded, checkpoint and all, so the next pass starts over
+- FSIF staging and the device journal: a staging store attaches to its device's FSIF journal like any store, and the
+  device load replays into `rebuilding/` directories too. Every removal of a staging directory is durable and then
+  releases its journal attachments (`RebuildDisk.cleanup(staging, released)`: removed, parent forced, then
+  `releaseDirectory`, in the same `Staging` job; the staging sweep's `RebuildBookkeepingDisk.removeStaging` likewise),
+  so a staging store closed without a detach stops pinning the ring. A staging store whose close left it attached
+  (`Backend.closedAttached`: it fail-stopped or froze) is discarded at the pass's end and its rebuild starts over from
+  scratch (no resume: its open would refuse the attached index until the device reloads), and `finish` refuses to
+  rename one into `rebuilt/`. A lost device journal, or a staging directory whose own replay fails, removes it at
+  device load (`server/host/CLAUDE.md`)
 - A promoted bootstrap-pool store may hold stale copies of the bootstrap pool's own ErrorTree/UnackedCommits nodes
   (their writes are untracked, so the rebuild recorded no misses). Its first bootstrap tree sweep after promotion
   (within one scan floor) reconciles every node of both trees (`server/repair/CLAUDE.md`), closing the staleness window of rebuild-process 8.3

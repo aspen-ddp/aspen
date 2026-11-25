@@ -26,6 +26,7 @@
   fail startup naming both classes and jars
 - Periodic diagnostics: `AbortVoteReport` (`transaction/`) logs a host's abort votes by failed requirement once a
   second while they happen; `BackendTiming` (`store/backend/`) logs each host's write stages about once a second while
-  writes happen: the store's view of a commit, RocksDB's pool wait and write, and FSIF's io wait, journal write and
-  force, data force, copy-on-write and backpressure. `FinalizationStallReport` (`transaction/`) logs
+  writes happen: the store's view of a commit, RocksDB's pool wait and write, and FSIF's commit, journaled commit,
+  device journal write and batch (`fsif journal write`, `fsif journal batch (records)`: an append's wait from its
+  queueing to its batch's write, with the batch's record count), data force and backpressure. `FinalizationStallReport` (`transaction/`) logs
   `FINALIZATION STALLED` once a minute per store while committed transactions stay unfinalized past 60 s

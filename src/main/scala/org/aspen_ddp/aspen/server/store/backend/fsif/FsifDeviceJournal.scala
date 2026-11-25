@@ -8,6 +8,8 @@ import scala.collection.mutable
 import scala.concurrent.{Future, Promise}
 import scala.util.control.NonFatal
 
+import org.aspen_ddp.aspen.server.store.backend.BackendTiming
+
 /** The device journal's writer (spec 4.3, 4.5, 4.8): the only writer of the ring's files `<n>.fj` in `files`.
   *
   * '''Threads.''' Every public method may be called from any thread. One lock guards all state and is never held
@@ -171,7 +173,7 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
                 None, Nil)
             case Some(a) =>
               val p = Promise[Long]()
-              queue += Pending(a, records, bytes, p)
+              queue += Pending(a, records, bytes, p, System.nanoTime())
               a.queued += 1
               val w = nextWrite()
               // Waiting for a file: ask for checkpoints (rare)
@@ -342,8 +344,10 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
       handles(f) = files.open(DeviceJournalScan.fileName(f))
     handles(f)
 
-  /** The write task */
+  /** The write task. Records BackendTiming's `fsif journal write` (the task's writes) and `fsif journal batch
+    * (records)` (from the oldest append's queueing to the batch's write, sized by its record count) */
   private def write(w: Write): Unit =
+    val started = System.nanoTime()
     val error =
       try
         w.entry.foreach: (f, h) =>
@@ -358,7 +362,12 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
       catch case NonFatal(t) => Some(t)
     error match
       case Some(t) => fail(t, w.pending)
-      case None => written(w)
+      case None =>
+        val now = System.nanoTime()
+        BackendTiming.report.record("fsif journal write", now - started)
+        BackendTiming.report.record("fsif journal batch (records)", now - w.pending.iterator.map(_.queued).min,
+          w.pending.iterator.map(_.records.size.toLong).sum)
+        written(w)
 
   private def written(w: Write): Unit =
     val (next, notes, closeNow) = lock.synchronized:
@@ -431,7 +440,9 @@ object FsifDeviceJournal:
     /** Oldest needed serial; NoSerial when idle */
     def head: Long = if serials.isEmpty then NoSerial else serials.head
 
-  private final case class Pending(att: Att, records: List[JournalRecord], bytes: Long, promise: Promise[Long])
+  /** `queued`: System.nanoTime() at the append, for BackendTiming */
+  private final case class Pending(att: Att, records: List[JournalRecord], bytes: Long, promise: Promise[Long],
+                                   queued: Long)
 
   /** `entry`: the file entered and its new header, written before the batch */
   private final case class Write(entry: Option[(Int, FileHeader)], file: Int, position: Long, serial: Long,

@@ -1,8 +1,9 @@
 # FSIF device journal: one preallocated journal per storage device
 
-Status: design, 2026-11-24. Replaces each FSIF store's own `journal.a`/`journal.b` with one journal per storage
-device, shared by every FSIF store on it and preallocated so that a force changes no file metadata. Paths are
-relative to `src/main/scala/org/aspen_ddp/aspen/server/` unless they start with `src/`, `docs/` or `scripts/`.
+Status: built, 2026-11-24 (rulings and differences: section 10). Replaces each FSIF store's own
+`journal.a`/`journal.b` with one journal per storage device, shared by every FSIF store on it and preallocated so that
+a force changes no file metadata. Paths are relative to `src/main/scala/org/aspen_ddp/aspen/server/` unless they start
+with `src/`, `docs/` or `scripts/`.
 
 ## 1. Why
 
@@ -146,16 +147,21 @@ device's `DeviceIo` beside the data and serial pools. It is the only writer of t
 
 A store's checkpoint keeps its purpose (write an index that covers its applied records) but loses the journal
 switch:
-1. **Snapshot** the index as of the store's last appended record (the last append the backend issued; every issued
-   append was admitted, 4.5, so it will be written).
-2. **Barrier**: wait until that append is durable, and take its batch serial as `S`. Appends issued after the
-   snapshot have serials above `S` (one attachment's records keep their order), so they are not covered.
-3. **Applying**: wait until every Delta appended up to the snapshot is applied (forced in place) or cancelled, as
+1. **Snapshot and Draining**: snapshot the index as of the store's last appended record (the last append the backend
+   issued; every issued append was admitted, 4.5, so it will be written). Until that append is durable, its batch
+   serial taken as `S`, the store's new appends wait in order on its serial executor (a drain buffer), and are then
+   issued in order. The journal merges an attachment's queued appends into one batch, so an append issued right after
+   the snapshot could share `S`'s batch; holding it until `S` is durable gives every post-snapshot record a serial
+   above `S` (corrected by ruling R8; the original text said post-snapshot appends always have serials above `S`).
+2. **Applying**: wait until every Delta appended up to the snapshot is applied (forced in place) or cancelled, as
    today.
+3. **Barrier**: wait until everything appended so far is durable: a cancelled Delta may still be mapped in the
+   snapshot, and the record that cancelled it came after the snapshot.
 4. **Finishing**: write index s+1 with covered serial `S` and force it, then the old index file is emptied (as
    today).
 
-There is no header step and no `switchBuffer`: appends go on throughout. The trigger changes (4.5).
+There is no header step. Appends wait only while Draining, at most one batch per checkpoint. The trigger changes
+(4.5).
 
 ### 4.5 Space, reclaim and holding
 
@@ -328,10 +334,13 @@ L4-L6 (journal corruption, seq rules of the two per-store journals) disappear. L
 - **3.5 Slot-freeing**: "unmapping record durable" now means its batch is durable.
 - **3.6 Recovery bound**: computed per directory from its index and its own replayed Mappings.
 - **3.7 Checkpoint switch and Barrier**: the journal switch goes; what remains is that index s+1's covered serial S
-  never exceeds a record not yet applied or not yet durable (Applying and Barrier, 4.4), and that the ring never
+  never exceeds a record not yet applied or not yet durable, and that no record left out of the snapshot is at or
+  below S: S is the batch serial of the snapshot's last append, and later appends wait until that batch is durable
+  (Draining, ruling R8), so they land in later batches; Applying and Barrier cover the rest (4.4). The ring never
   reuses a file holding a record above a live attachment's covered serial (4.5). DESIGN 2.9's no-deadlock argument
   carries over because admission still happens before any mutation, now against device journal space (4.5): no
-  admitted operation waits for a held one, and every issued append fits, so every Barrier completes.
+  admitted operation waits for a held one, every issued append fits, and the appends Draining holds belong to admitted
+  operations and are issued once S is durable, so every Barrier completes.
 - **3.9 Torn tail versus corruption**: re-proved for the ring: per-pass salt and journal id in every batch CRC, a
   header rewritten before a file's first batch of a pass, one batch in flight.
 - **3.11 Idempotent recovery**: device-load replay is per directory today's steps 2-5, whose writes are idempotent,
@@ -363,3 +372,46 @@ L4-L6 (journal corruption, seq rules of the two per-store journals) disappear. L
 - How the journal thread is woken and how it batches (a queue drained per write is enough).
 - Test layout, as long as the crash sweeps (every op of a checkpoint, of a device-load replay, of the lost-journal
   path) and the model suite run against several stores sharing one simulated journal.
+
+## 10. As built
+
+Rulings (ledger `.superpowers/sdd/2026-11-24-fsif-device-journal/progress.md`) that changed the design above; the
+others (R5, R7, R9, R10, R14) only ordered the work. `store/backend/fsif/DESIGN.md` describes the code.
+
+- **R3**: a journal file is at most 1 GiB (`fsif-journal-file-size-mb` 1-1024), and recovery reads the headers first,
+  then one file at a time.
+- **R4**: the writer starts on a fresh ring in file 0 (first serial 0); after a replay it always enters the file
+  after the tail before its first batch, never appending after a possibly torn tail.
+- **R6**: device-load replay reports `ForeignUndetached` (newest index undetached but naming another journal), which
+  the device load treats as that copy's loss.
+- **R8**: a checkpoint holds the store's new appends in a drain buffer from its snapshot until the snapshot's last
+  append is durable (4.4, 6 3.7 corrected): one attachment's queued appends can share a batch.
+- **R11**: `rebuildFlush` appends at most as many Mappings at once as one reservation fits in a journal file.
+- **R12**: a store open accepts an undetached index naming this journal when the journal says its attachment needs no
+  replay (`FsifDeviceJournal.needsReplay` false: a failed open or a frozen close of this journal's lifetime); any
+  other is an `IOException`, a load retry.
+- **R13**: such an open releases that old attachment first, returning the reservations a frozen close abandoned; and
+  admission reserves `appendBound(min(size, segmentPayloadSize))`, so an oversized slice replies `SliceTooLarge`
+  instead of waiting forever.
+- **R15**: production sizing is 4 x 256 MiB; tests size their journals small through the device config keys.
+- **R16**: a journal write failure (J4), after each store's own fail-stop, takes the device out of service the way a
+  failed CRL does (`DeviceShutdown.fsifJournalFailed`): unloaded until the host restarts, not marked Failed.
+- **R17**: a store open on a device with no journal directory (loaded Absent, its FSIF copies transferred in or
+  otherwise detached) creates the journal (`FsifJournalDisk.forOpen`), as a create does.
+- **R18**: the device-load open classifies failures as `DeviceCrlDisk.open` does: Refused (locked, sizing mismatch, a
+  config that cannot size a replacement), Transient (counted by `FsifJournalOpenAttempts`), Undecided (before anything
+  was decided, or any failure on a device with no FSIF directory), and anything else the lost-journal path.
+- **R19**: a copy whose store config cannot be read but which holds FSIF index files leaves the device unloaded for
+  the next scan (Undecided); one with neither is not an FSIF directory.
+- **R20**: at store open, an undetached index naming another journal is that copy's loss (`StoreLost`), as at device
+  load (R6).
+
+Also differing from sections 4-7:
+- Checkpoints start on the journal's request (pressure) or when an operation waits for journal room while the store
+  has uncovered records; there is no "half the ring" size trigger. Pressure is: no free file after the current one
+  and the current one 3/4 full, a refused reservation, or a batch waiting for a file.
+- A reservation of `c` padded bytes is charged `2c - 4096`, covering the unusable tail its batch may leave in a file.
+- Batch and header CRCs are CRC32C. The journal thread is `dev-<label>-fjournal-0`.
+- A shipped copy's detach check is in the outbound move (`TransferDisk.moveOutbound`), not in `closedForTransfer`'s
+  extraction; an FSIF rebuild staging store that closes attached is discarded and its rebuild starts over.
+- Measured (7): `docs/host-threading-measurement.md`, "FSIF device journal".

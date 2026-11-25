@@ -134,11 +134,14 @@
   `DiscoveryIoSuite`'s result runs (`runInOrder`) work the same way; `runCopyJobs` runs its jobs anywhere (results at
   the tail) and applies results from the head only
 - Device load (`DeviceDiscovery.loadOwnedDevice`): one `Sweep` job (`DiscoveryDisk.sweepAtLoad`: transfer staging,
-  `creating/`, `deleting/`, `crl.creating`; then the listing, P6), one `CrlOpen` job for the device CRL's open
+  `creating/`, `deleting/`, `crl.creating`, `fsif-journal.creating`; then the listing, P6), one `CrlOpen` job for the device CRL's open
   (`DeviceCrlDisk.open`, below: recovery and the whole lost-CRL path, its result a `CrlOpenResult` Opened, Lost or
   Failed applied by `DeviceDiscovery.openCrl`: a Failed one's unsynced moves held as P2's are, the CrlOpenAttempts
   count kept, the device left unloaded; a Lost one's forced copies done with, `CopyMoves.forcedUnattached`; a result
-  for a device loaded from elsewhere meanwhile shuts its CRL), then one `Move` job for
+  for a device loaded from elsewhere meanwhile shuts its CRL), then (step 2b) one `FsifJournalOpen` job for the FSIF
+  device journal (`FsifJournalDisk.openAtLoad`, below: recovery, replay into every FSIF directory and the lost-journal
+  path, over a fresh listing; its `FsifJournalOpenResult` applied by `DeviceDiscovery.openFsifJournal` as `openCrl`
+  applies the CRL's, setting `io.fsifJournal` for Opened or Lost; a Failed one shuts the CRL too), then one `Move` job for
   P2 (`DiscoveryDisk.retireDuplicates`, moves through `CopyDisk.relocate`, an unforced one held by the apply with
   `CopyMoves.heldUnforced` and `HostCopies.unsynced`): a store with more than one copy directory outside
   `pending-delete/` (any phases) is logged
@@ -663,7 +666,9 @@
   executor (`StoreRouter.onStore`) and gets results back through a Future whose callbacks name the control context
 - Device I/O isolation (`DeviceIo`, `DeviceIos`; spec `docs/superpowers/specs/2026-11-23-device-io-isolation-design.md`):
   each device directory has a `DeviceIo`: a serial management lane (`submit(kind, store)`, one thread, cancellable
-  while queued), a data pool (`--device-io-threads`, default `DeviceIo.defaultDataThreads` = max(4, CPUs/2)) and a serial pool (`dataEc`, `serialEc`; their threads made on demand and timing out
+  while queued), a data pool (`--device-io-threads`, default `DeviceIo.defaultDataThreads`, 4, measured with the FSIF device journal), a serial pool and
+  a one-thread FSIF journal pool (`dataEc`, `serialEc`, `journalRun`, thread `dev-<label>-fjournal-0`, observed as
+  `fsif-journal`; the device's open journal is in `io.fsifJournal`; their threads made on demand and timing out
   after `DeviceIo.Config.poolKeepAliveMillis` idle, 30 s, so an idle device holds none, and only `close` stops them)
   and an observer of what it runs, all on daemon threads of that device, so a hung device stalls only its own work. `HostThreading.newDeviceIo(path)` builds it
   (`ThreadedDeviceIo` for StoreThreadPool and SingleThreadThreading, configured by `DeviceIo.Config`;
@@ -865,6 +870,52 @@ device (project 3's job), and a false Hung must never come from a merely busy de
   job for the scan that would be the third). Slowness never declares a CRL lost: the open has no timeout. Only a `ScanDevices` open counts
   (`checkForNewDevices(scan = true)`): host start, `CheckAllDevices` and nudges retry uncounted, so start-up's burst of
   opens cannot use up the allowance.
+- FSIF device journal (`<device>/fsif-journal`, one per device, shared by its FSIF stores; format and backend side
+  in `store/backend/fsif/DESIGN.md`, spec `docs/superpowers/specs/2026-11-24-fsif-device-journal-design.md`). All its
+  disk work is `FsifJournalDisk`'s, in lane jobs:
+  - Creation is lazy: an FSIF create first calls `FsifJournalDisk.ensure` (in its `BackendCreate` job), which creates
+    the journal (sized by the device config, `fsif-journal-files`/`fsif-journal-file-size-mb`, default 4 x 256 MiB) in
+    `fsif-journal.creating`, renames it into place durably and sets the slot. An FSIF open on a device with no journal
+    directory (loaded Absent: its FSIF copies arrived detached) creates it too (`forOpen`, Ruling R17). A journal
+    directory present while the slot is empty, or a failed journal, is an `IOException`: a load retry
+  - The load's open (`FsifJournalDisk.open`) serves the FSIF copies in every phase but Lost and Retired plus the FSIF
+    staging directories under `rebuilding/`, each FSIF by its store config. A copy whose config cannot be read but
+    which holds FSIF index files makes the job throw before deciding (Undecided: the device unloaded for the next
+    scan), journal or not (Ruling R19); one with neither is not FSIF. With no journal directory: Absent if every such
+    directory's newest index is detached, else (J2) the journal is lost. With one: `CrlLock`, the sizing, the ring's
+    recovery and the replay into every directory attached to it, each replayed directory left detached
+    (`DeviceJournalRecovery`)
+  - A directory whose own replay fails (L1, L7-L12), or whose undetached index names another journal (Ruling R20), is
+    lost alone (`moveLostAlone`): a copy moved to `lost/` through `CopyDisk.relocate`, a staging directory removed; a
+    move that fails or lands unforced is Failed(AfterLost), its unforced move held for the resync. A store open finds
+    the same foreign undetached index `StoreLost` (`FsifRecovery.openDirectory`)
+  - Classification mirrors `DeviceCrlDisk.open` (Ruling R18): a locked journal (`JournalLocked`), files not matching
+    the sizing (`JournalSizingMismatch`, logged once at error) and a config that cannot size a replacement are
+    Refused, nothing moved, each scan retrying; a failure before anything is decided (listing, stats, unreadable
+    configs), or any failure on a device with no FSIF directory, is Undecided; a transient one is Transient, counted
+    on device scans apart from the CRL's (`FsifJournalOpenAttempts` = 3, `transientJournalFailures`, reset on Refused,
+    AfterLost or success); anything else (a corrupt ring, `JournalCorrupt`, logged as such) loses the journal
+  - The lost journal (`replaceLost`, step for step the lost CRL's): every FSIF copy not in `lost/` decided, then moved
+    to `lost/` (`CopyDisk.relocate`; one that fails or lands unforced fails the job, nothing more done, the journal
+    untouched for the next scan); the phase directories forced, then each `lost/` copy with the directories an
+    earlier unforced move of it left; every FSIF staging directory removed; the old directory kept as
+    `fsif-journal.lost-<uuid>`; a fresh journal created and opened. RocksDB copies are untouched. The reconcile then
+    rebuilds each `lost/` copy, as for a lost CRL (`FsifJournalLostSuite`)
+  - A runtime journal failure (J4, Ruling R16): each attached store fail-stops through its own `onFatal` first, then
+    the journal's `whenFailed` takes the device out of service exactly as a failed CRL does
+    (`DeviceShutdown.fsifJournalFailed`, sharing `crlFailed`'s sequence: disowned, stores closed and gossiped offline,
+    each failed store's copy moved to `lost/` when its close ends, which `unloadOnceClosed` waits for; unloaded until
+    the host restarts, not marked Failed). `watchFsifJournal` watches the slot's journal from the device's load, each
+    store open and each device check (a lazily created journal appears there). Every unload empties the slot
+    (`takeFsifJournal`) and closes the journal with the CRL (`shutDownCrl`), releasing its lock
+  - Release hooks (spec 4.5): a close that does not detach (fail-stop, frozen) leaves its attachment live, pinning
+    the ring, until its copy is durably out of replay's scope. `CopyMoves.releaseJournal` (every phase path of the
+    copy id, `releaseDirectory`) runs when a move to Lost or Retired is durable and synced (`moveOnLane`), when an
+    unsynced one is forced by the resync, when a pending-delete copy's delete is done (`StoreCopies.deleteRetired`)
+    and when a copy is discarded (`StoreCopies.discard`); a rebuild staging directory's removal releases it once
+    durably absent (`RebuildDisk.cleanup`, the staging sweep's `removeStaging`). A transfer out's move into
+    `outbound/` checks the copy first (`TransferDisk.moveOutbound`): an undetached FSIF copy is refused, logged at
+    error, NotMoved, so nothing ships (`FsifJournalReleaseSuite`)
 - `Host.StoreFailStopped` (a store's CRL read failed other than by the CRL's death or shutdown, its recovery threw, or
   its Frontend fail-stopped, `server/store/CLAUDE.md`) is handled as a backend failure
   (`StoreRebuilds.handleFailStopped`), but only while that Store is still the one installed under its id: a late

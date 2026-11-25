@@ -99,7 +99,7 @@ improve, also add the busiest threads and where they spend their time as the nex
 
 The measurements are summarised under "Store commit delay" and "Adaptive store threading" in `Todo.txt`. The
 default is now a fixed pool of min(4, CPUs/4) store threads, stores spread over them by count; `--store-threads=<n>`
-sets the count. (Per-device I/O: `--device-io-threads=<n>` data threads per storage device, default max(4, CPUs/2), and
+sets the count. (Per-device I/O: `--device-io-threads=<n>` data threads per storage device, default 4 (was max(4, CPUs/2) before the FSIF device journal), and
 `--device-read-bound=<n>` outstanding backend reads before a device's stores drop new client reads, default 4096.) The adaptive policy (`StoreThreadPool.Adaptive`) is parked and can only be chosen in code: to measure
 it again, pass `adaptive = Some(StoreThreadPool.Adaptive())` where `Main.startHost` builds the pool. It packs stores
 onto threads by load and adds threads only when work waits for them. Warm the pool up before capturing, as its runs
@@ -255,3 +255,56 @@ only when it is clear of both.
   laying out small files one at a time.
 - The default stays max(4, CPUs/2); the user decided this on 2026-11-24. Remedies for the remaining gap are in
   `Backlog.txt` (bigger vdisk transactions, RocksDB ranged writes).
+
+## FSIF device journal (2026-11-24)
+
+The FSIF device journal (`docs/superpowers/specs/2026-11-24-fsif-device-journal-design.md`) replaced each FSIF
+store's own journal with one preallocated journal per device, written by one thread. Measured with the
+microbenchmark only; the fio runs (sections 1-5, which need root and TCMU) are still to do (`Todo.txt`).
+
+### What was run
+
+- `src/test/scala/org/aspen_ddp/aspen/bench/FsifDeviceBench.scala`: 16 FSIF stores (64 KiB slices, 2000 objects
+  each) on one `ThreadedDeviceIo`, one serial thread, driven like the vdisk randrw job: depth 8, each op a 50/50 mix of
+  a 512-byte ranged write committed on all 16 stores and a read on 10 of them; 10 s per run. The new tree creates the
+  journal with the production sizing (4 x 256 MiB) through `FsifJournalDisk.ensure`, as a device's first FSIF create
+  does.
+- `java -cp "$(sbt -batch 'export Test/fullClasspath' | tail -1)" org.aspen_ddp.aspen.bench.FsifDeviceBench
+  $PWD/target/fsifbench <threads> 1 16 8 10`, on NVMe/ext4 (`target/`, not tmpfs), 24 CPUs.
+- Baseline: the same benchmark (its pre-journal version) built from `7f75c2fd` in a separate worktree, run
+  alternating with the new tree, thread count by thread count, three rounds. The new tree also ran three rounds just
+  before (six runs each in all).
+- The machine was shared with other workloads (a browser, a torrent client): load average 3.1 at the start, 3.5 to
+  16.8 during the alternating rounds.
+
+### Results (ops/s; mean, range, every run)
+
+| Data threads | New tree (6 runs) | Runs | Baseline (3 runs) | Runs |
+|---|---|---|---|---|
+| 1 | 2231 (288-3705) | 3705, 2620, 510, 3648, 2614, 288 | 39 (32-51) | 51, 33, 32 |
+| 2 | 1532 (507-2566) | 1344, 2479, 578, 1719, 2566, 507 | 48 (39-63) | 63, 39, 41 |
+| 4 | 2638 (2449-3108) | 2553, 2474, 2449, 3108, 2577, 2666 | 113 (80-132) | 132, 80, 127 |
+| 8 | 2409 (1219-3858) | 1740, 2489, 2545, 3858, 1219, 2604 | 240 (178-271) | 271, 178, 270 |
+| 16 | 2246 (1670-2691) | 2318, 2358, 2691, 2634, 1804, 1670 | 376 (370-386) | 370, 386, 372 |
+| 24 | 2644 (2463-3145) | 2514, 2581, 2470, 2690, 3145, 2463 | 644 (480-748) | 480, 748, 704 |
+
+The baseline matches the investigation's numbers (49, 131, 374 at 12, 602, 767). The journal's creation (4 x 256 MiB
+zero-filled and forced) took 0.54-1.19 s.
+
+### Reading them
+
+- The success criterion (at least the old best, 767 ops/s, on 1-2 data threads) is met on average: 2231 at 1 thread
+  is about 3.5 times the old best on 24, and 57 times the old tree on 1. Write latency is 3.2-6.2 ms at every count
+  (one journal batch per transaction for the whole device), against 20-310 ms before.
+- On 1 and 2 threads some runs collapse (288-578 ops/s): their reads take 22-50 ms while commits stay at about 5 ms
+  (BackendTiming's `fsif journaled`). Reads, in-place writes and data forces share the data pool, and with one or two
+  threads a read queues behind them; it happened in the runs taken under the heaviest other load, so page-cache misses
+  are the likely cause (not confirmed). At 4 threads and above no run fell below 1219, and at 4 none below 2449.
+- Beyond 4 threads nothing improves: 4, 8, 16 and 24 are within each other's spread.
+
+### Default chosen
+
+- `--device-io-threads`: **4** per device (`DeviceIo.defaultDataThreads`), the smallest count within noise of the
+  best that never collapsed. Was max(4, CPUs/2), 12 on this host.
+- Still to do: the fio procedure above, both trees back to back (spec section 7 step 2), to confirm vdisk randrw and
+  seqwrite throughput and fsync latency at the new default.

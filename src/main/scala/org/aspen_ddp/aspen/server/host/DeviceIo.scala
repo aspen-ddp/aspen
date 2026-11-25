@@ -78,10 +78,12 @@ trait DeviceIo:
 object DeviceIo:
   object Cancelled extends Exception("device io job cancelled")
 
-  /** Data threads per device by default: half the CPUs, at least 4. Measured against the host-wide FSIF pool this
-   *  replaced (max(4, CPUs) shared threads): 4 per device lost 15 to 25 percent on a single busy device, CPUs/2 matched
-   *  or beat it (docs/host-threading-measurement.md, "Device I/O isolation"). */
-  def defaultDataThreads: Int = math.max(4, Runtime.getRuntime.availableProcessors / 2)
+  /** Data threads per device by default: 4. With the FSIF device journal the data pool carries no journal writes, only
+   *  reads, in-place writes, data forces and index writes. Measured with FsifDeviceBench (16 FSIF stores, depth 8, six
+   *  10 s runs each, 2026-11-24): mean ops/s 2231 at 1 thread, 1532 at 2, 2638 at 4, 2409 at 8, 2246 at 16, 2644 at
+   *  24; 1 and 2 threads fell to 288-578 in some runs as reads queued (25-50 ms), 4 never below 2449. The per-store
+   *  journals before it needed 24 threads for 767 (docs/host-threading-measurement.md, "FSIF device journal"). */
+  def defaultDataThreads: Int = 4
 
   /** `poolKeepAliveMillis`: how long an idle data or serial thread lives before it exits (a device with no backend
    *  work holds no pool thread). `probe`: the health probe's interval and hang threshold */

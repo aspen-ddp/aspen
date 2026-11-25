@@ -312,7 +312,7 @@
 
 #### Backends (`backend/`)
 - A backend's commit completion must mean durable: the CRL deletes a committed transaction's record once the backend
-  commit completes. RocksDB writes synced, FSIF completes at the journal force. `MapBackend` is memory only and gives
+  commit completes. RocksDB writes synced, FSIF completes once its batch's DSYNC write to the device journal returns. `MapBackend` is memory only and gives
   no durability (crash-recovery-log 3.4); it is for tests, and no opener constructs it
 - A read reports `CorruptedObject` only on evidence of damage, since a recovered commit vote's load failure
   fail-stops the store (systemic-loss D7). RocksDB (`RocksDBBackend.read`): a Corruption status or an undecodable
@@ -325,7 +325,10 @@
   fsif/DESIGN.md 2.8). Tests inject read failures
   by overriding `getValue` (RocksDB) or with `SimulatedFsifFiles.failReads` (FSIF)
 - Pluggable: RocksDB, in-memory Map, and FSIF (`backend/fsif`, a flat file of fixed-size segments located by a
-  4-byte storePointer, with a journal and checkpointed index; design in `backend/fsif/DESIGN.md`). FSIF freezes
+  4-byte storePointer, with a checkpointed index; its journal records go to one preallocated FSIF journal per device,
+  shared by the device's FSIF stores and written by one thread, so a device's commits share batches and their forces
+  change no metadata; a close detaches (its index then needs nothing from the journal); design in
+  `backend/fsif/DESIGN.md`). FSIF freezes
   writes on ENOSPC and keeps serving reads. A repair write never overwrites a different occupant of its slot: it
   fails with `backend.RepairSlotOccupied(objectId, occupant)`, which the repairer uses to drop a dead occupant
   (cross-document-review 2.4, repair and transactions). FSIF pools allocate through `FsifIndexAllocationStrategy`
@@ -342,7 +345,8 @@
   `server/host/CLAUDE.md`
 - Backend executors: every `BackendOpener.open`/`create` takes the device's `DeviceIo` and runs as a job on its
   management lane. An FSIF backend does its blocking I/O on that device's `dataEc` and drains its serial executor on
-  its `serialEc` (threads `dev-<label>-io-N` / `-serial-N`), so a hung device stalls only its own stores; its
+  its `serialEc` (threads `dev-<label>-io-N` / `-serial-N`), and its journal writes go to the device journal's thread
+  (`dev-<label>-fjournal-0`), so a hung device stalls only its own stores; its
   `close()` closes the channels on the data pool. Compaction's truncate of free tail slots still runs inline on the
   serial executor (a device thread, so contained to its device; making it asynchronous would race the slot
   allocator). RocksDB's foreground work (reads, the write-batch commit, iteration, close) runs on the device's `dataEc`
@@ -386,7 +390,7 @@
   (`dropForReadBound`). Counting: FSIF counts each disk read task from `io.execute` until the task has run (a rejected
   task is ended at once; a retry is a new task), RocksDB counts each `getValue` attempt until its Future completes. Every
   outcome ends the count; the Future always completes (a closed database fails it with `DBClosed`), and FSIF's close
-  waits for reads in flight. Limit: `--device-read-bound` (default 4096), threads `--device-io-threads` (default max(4, CPUs/2), `DeviceIo.defaultDataThreads`: measured, 4 lost 15 to 25 percent on one busy FSIF device against the old host-wide pool)
+  waits for reads in flight. Limit: `--device-read-bound` (default 4096), threads `--device-io-threads` (default 4, `DeviceIo.defaultDataThreads`: measured with the FSIF device journal, docs/host-threading-measurement.md "FSIF device journal")
 - Parked reads (client 1-RTT commit design section 5): a client read whose `Read.awaitCommit` names a transaction
   holding a write lock on the object's in-memory state (`lockedWriteTransactions`) is parked (`parkRead`, keyed by
   object and `readUUID`: a resent read replaces its entry) instead of answered: the client knows that transaction

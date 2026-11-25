@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.server.{DurableFiles, FileStat, StorageDeviceConfig, StoreConfig}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlLocked}
+import org.aspen_ddp.aspen.server.crl.CrlLocked
 import org.aspen_ddp.aspen.server.crl.simple.CrlLock
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.fsif.{DeviceJournalFiles, DeviceJournalRecovery, FsifDeviceJournal,
@@ -51,44 +51,48 @@ object FsifJournalDisk extends Logging:
    *  device's unload cleared it) is closed first, then the device's copies are listed afresh (a lost CRL's open may have
    *  moved some since the load's first listing) and the journal opened (`open`). A listing that fails is
    *  Failed(Undecided), nothing moved */
-  def openAtLoad(io: DeviceIo, devicePath: os.Path, cfg: StorageDeviceConfig, earlierUnforced: Map[os.Path, List[os.Path]],
-                 syncDirectory: os.Path => Unit, rename: (os.Path, os.Path) => Unit): FsifJournalOpenResult =
+  def openAtLoad(io: DeviceIo, devicePath: os.Path, cfg: StorageDeviceConfig, transientIsLost: Boolean,
+                 earlierUnforced: Map[os.Path, List[os.Path]], syncDirectory: os.Path => Unit,
+                 rename: (os.Path, os.Path) => Unit): FsifJournalOpenResult =
     io.fsifJournal.getAndSet(None).foreach: j =>
       logger.error(s"An FSIF journal of storage device $devicePath was opened after the device's unload. Closing it")
       j.close()
-    try open(devicePath, cfg, CopyLayoutDisk.list(devicePath), io.journalRun, earlierUnforced, syncDirectory, rename)
+    try
+      open(devicePath, cfg, CopyLayoutDisk.list(devicePath), io.journalRun, transientIsLost, earlierUnforced,
+        syncDirectory, rename)
     catch case t: Throwable => FsifJournalOpenResult.Failed(t, CrlOpenFailure.Undecided, Nil)
 
-  /** Opens the FSIF journal of the device at `devicePath`, whose copies `listing` names (spec 4.7).
+  /** Opens the FSIF journal of the device at `devicePath`, whose copies `listing` names (spec 4.7), classifying every
+   *  failure as DeviceCrlDisk.open does (Ruling R18).
    *
    *  The directories it serves are the FSIF copies in every phase but Lost and Retired, and the FSIF staging
-   *  directories under `rebuilding/` (a copy is FSIF by its config; one whose config cannot be read throws, leaving the
-   *  device unloaded, as DeviceCrlDisk.holdsOwnState does, and one whose config is absent or does not parse is no FSIF
-   *  directory here: its own open decides it). With no journal directory, a device whose every such directory's newest
-   *  index is detached is Absent; one with an undetached index (J2: it names the journal that is gone) has lost its
-   *  journal. Otherwise the journal is locked (CrlLock; held elsewhere is JournalLocked), its sizing read, the ring
-   *  recovered and replayed into every directory (DeviceJournalRecovery). A directory whose replay fails, or whose
-   *  undetached index names another journal (damage or a bug), is lost alone: a copy moved to lost/ (CopyDisk.relocate,
-   *  CopyMoves' seams), a staging directory removed. A corrupt ring (JournalCorrupt) or J2 is the lost journal path
-   *  (`replaceLost`). Never lost: a journal locked elsewhere, or whose files do not match its sizing
-   *  (JournalSizingMismatch), each Failed, Refused, nothing moved; a transient error (DeviceDiscovery.isTransient),
-   *  Failed, Transient, nothing moved; any other error, Failed, Undecided. `run` is the journal's writer thread
+   *  directories under `rebuilding/`, each FSIF by its config (`fsifDirectories`, Ruling R19). Deciding them reads the
+   *  journal directory's stat, the configs and, with no journal, the newest indexes; any failure there is
+   *  Failed(Undecided), nothing moved, whatever it is. With no journal directory, a device whose every such
+   *  directory's newest index is detached is Absent; one with an undetached index (J2: it names the journal that is
+   *  gone) has lost its journal. Otherwise the journal is locked (CrlLock), its sizing read, the ring recovered and
+   *  replayed into every directory (DeviceJournalRecovery). Those steps' failures: a journal locked elsewhere
+   *  (JournalLocked) or whose files do not match its sizing (JournalSizingMismatch) is Failed(Refused), never lost; on
+   *  a device holding no FSIF directory any failure is Failed(Undecided); a transient one (DeviceDiscovery.isTransient)
+   *  is Failed(Transient) unless `transientIsLost` (the caller's count of device scans in a row reached
+   *  FsifJournalOpenAttempts); anything else, a corrupt ring (JournalCorrupt) logged as such, loses the journal
+   *  (`replaceLost`). A directory whose replay fails, or whose undetached index names another journal (damage or a
+   *  bug), is lost alone: a copy moved to lost/ (CopyDisk.relocate, CopyMoves' seams), a staging directory removed; a
+   *  move that fails or lands unforced is Failed(AfterLost). `run` is the journal's writer thread
    *  (DeviceIo.journalRun). */
   def open(devicePath: os.Path,
            cfg: StorageDeviceConfig,
            listing: CopyLayout.Listing,
            run: Runnable => Unit,
+           transientIsLost: Boolean,
            earlierUnforced: Map[os.Path, List[os.Path]],
            syncDirectory: os.Path => Unit,
            rename: (os.Path, os.Path) => Unit): FsifJournalOpenResult =
     val dir = devicePath / DeviceJournalFiles.DirName
-    def failed(t: Throwable): FsifJournalOpenResult =
-      if DeviceDiscovery.isTransient(t) then FsifJournalOpenResult.Failed(t, CrlOpenFailure.Transient, Nil)
-      else FsifJournalOpenResult.Failed(t, CrlOpenFailure.Undecided, Nil)
     try
-      // A failed stat throws (FileStat): never a journal taken for absent that is there
+      // Decided before anything else: a failed stat throws (FileStat), never a journal taken for absent that is there
       val present = FileStat.exists(dir)
-      val dirs = fsifDirectories(devicePath, listing, strict = present)
+      val dirs = fsifDirectories(devicePath, listing, journal = present)
       if !present then
         val attached = dirs.filter(d => undetached(d))
         if attached.isEmpty then
@@ -98,39 +102,55 @@ object FsifJournalDisk extends Logging:
                        s"${attached.map(_.path).mkString(", ")}. Its FSIF copies must be rebuilt")
           replaceLost(devicePath, cfg, listing, dirs, run, earlierUnforced, syncDirectory, rename)
       else
-        val lock =
-          try CrlLock.acquire(dir)
-          catch case e: CrlLocked => throw new JournalLocked(s"the FSIF device journal $dir is open elsewhere: $e")
-        var keep = false
-        try
-          val sizing = DeviceJournalFiles.readSizing(dir)
-          val files = new NioFsifFiles(dir, dsync = true)
-          val recovered =
-            try DeviceJournalRecovery.recover(files, sizing,
-                  dirs.map(d => DeviceJournalRecovery.Target(d.path, new NioFsifFiles(d.path), d.layout)))
-            catch case e: JournalCorrupt =>
-              lock.release()
-              logger.error(s"The FSIF device journal of storage device $devicePath is corrupt. Its FSIF copies must be " +
-                           s"rebuilt: ${e.getMessage}")
-              return replaceLost(devicePath, cfg, listing, dirs, run, earlierUnforced, syncDirectory, rename)
-          val lost = dirs.flatMap: d =>
-            recovered.outcomes.get(d.path).collect:
-              case DeviceJournalRecovery.Outcome.Lost(e) => d -> e.getMessage
-              case DeviceJournalRecovery.Outcome.ForeignUndetached =>
-                d -> "its newest index is not detached and names another journal"
-          moveLostAlone(devicePath, lost, syncDirectory, rename) match
-            case Left(failure) => failure
-            case Right(moved) =>
-              val journal = new FsifDeviceJournal(files, sizing, recovered.start, run, forceAfterWrite = false,
-                onClosed = () => lock.release())
-              keep = true
-              FsifJournalOpenResult.Opened(journal, moved)
-        finally
-          if !keep then lock.release()
-    catch
-      case t @ (_: JournalLocked | _: JournalSizingMismatch) =>
-        FsifJournalOpenResult.Failed(t, CrlOpenFailure.Refused, Nil)
-      case t: Throwable => failed(t)
+        try openPresent(devicePath, dir, dirs, run, syncDirectory, rename)
+        catch
+          case t @ (_: JournalLocked | _: JournalSizingMismatch) =>
+            FsifJournalOpenResult.Failed(t, CrlOpenFailure.Refused, Nil)
+          case t: Throwable if dirs.isEmpty =>
+            FsifJournalOpenResult.Failed(t, CrlOpenFailure.Undecided, Nil)
+          case t: Throwable if DeviceDiscovery.isTransient(t) && !transientIsLost =>
+            FsifJournalOpenResult.Failed(t, CrlOpenFailure.Transient, Nil)
+          case t: Throwable =>
+            t match
+              case _: JournalCorrupt =>
+                logger.error(s"The FSIF device journal of storage device $devicePath is corrupt. Its FSIF copies must " +
+                             s"be rebuilt: ${t.getMessage}")
+              case _ =>
+                logger.error(s"Failed to recover the FSIF device journal of storage device $devicePath. Its FSIF " +
+                             s"copies must be rebuilt: $t")
+            replaceLost(devicePath, cfg, listing, dirs, run, earlierUnforced, syncDirectory, rename)
+    catch case t: Throwable => FsifJournalOpenResult.Failed(t, CrlOpenFailure.Undecided, Nil)
+
+  /** `open`'s steps over a journal directory that is there: lock, sizing, recovery and replay (whose failures `open`
+   *  classifies), then each directory whose own replay found it lost taken out alone. The lock is released unless the
+   *  journal opened holds it */
+  private def openPresent(devicePath: os.Path, dir: os.Path, dirs: List[Dir], run: Runnable => Unit,
+                          syncDirectory: os.Path => Unit,
+                          rename: (os.Path, os.Path) => Unit): FsifJournalOpenResult =
+    val lock =
+      try CrlLock.acquire(dir)
+      catch case e: CrlLocked => throw new JournalLocked(s"the FSIF device journal $dir is open elsewhere: $e")
+    var keep = false
+    try
+      val sizing = DeviceJournalFiles.readSizing(dir)
+      val files = new NioFsifFiles(dir, dsync = true)
+      val recovered = DeviceJournalRecovery.recover(files, sizing,
+        dirs.map(d => DeviceJournalRecovery.Target(d.path, new NioFsifFiles(d.path), d.layout)))
+      val lost = dirs.flatMap: d =>
+        recovered.outcomes.get(d.path).collect:
+          case DeviceJournalRecovery.Outcome.Lost(e) => d -> e.getMessage
+          case DeviceJournalRecovery.Outcome.ForeignUndetached =>
+            d -> "its newest index is not detached and names another journal"
+      // Decided: a failure from here on is AfterLost, never a lost journal
+      moveLostAlone(devicePath, lost, syncDirectory, rename) match
+        case Left(failure) => failure
+        case Right(moved) =>
+          val journal = new FsifDeviceJournal(files, sizing, recovered.start, run, forceAfterWrite = false,
+            onClosed = () => lock.release())
+          keep = true
+          FsifJournalOpenResult.Opened(journal, moved)
+    finally
+      if !keep then lock.release()
 
   /** The directories `lost` names, whose replay found them lost, each taken out alone: a copy moved to lost/, a
    *  staging directory removed (its rebuild starts over, as RebuildingStore.openStaging treats a lost staging store).
@@ -256,42 +276,50 @@ object FsifJournalDisk extends Logging:
       lock.release()
       throw t
 
-  /** The FSIF directories a device-load open serves. With `strict` (the device has a journal), a directory whose
-   *  config cannot be stat'd or read throws, leaving the device unloaded: one attached to the journal and left out
-   *  would lose its records, which the writer then overwrites. Without a journal there is nothing to replay: such a
-   *  directory is left out (logged), and, if attached to a journal that is gone, the next device load after it
-   *  reads cleanly finds it attached to another journal than the device's, a loss of that copy alone */
-  private def fsifDirectories(devicePath: os.Path, listing: CopyLayout.Listing, strict: Boolean): List[Dir] =
-    def layoutOf(dir: os.Path): Option[FsifLayout] =
-      try fsifLayout(dir)
-      catch case t: Throwable if !strict && NonFatal(t) =>
-        logger.warn(s"Cannot read the store config of $dir at the load of storage device $devicePath, which has no " +
-                    s"FSIF device journal: it is not considered for the journal: $t")
-        None
+  /** The FSIF directories a device-load open serves (Ruling R19). A directory is FSIF by its store config. One whose
+   *  config is absent, does not parse or cannot be read is no FSIF directory here only while it holds no FSIF index
+   *  file (index.a, index.b): its own open decides it. One holding an FSIF index file with an unusable config may be
+   *  attached to a journal holding its acknowledged writes, so its state is unknown: this throws, leaving the device
+   *  unloaded for the next scan, journal or not. A directory whose index files cannot even be stat'd (no search
+   *  permission) throws too on a device with a journal (`journal`), where leaving out an attached directory would let
+   *  its records be overwritten and its later open take it for replayed. On a device without one it is left out,
+   *  logged, so a RocksDB copy that cannot be read keeps its device loading (X-W18): an attached FSIF copy there needs
+   *  a journal that is already gone as well */
+  private def fsifDirectories(devicePath: os.Path, listing: CopyLayout.Listing, journal: Boolean): List[Dir] =
     val copies = listing.copies.filter(c => c.phase != Phase.Lost && c.phase != Phase.Retired).flatMap: c =>
-      layoutOf(c.path).map(Dir(c.path, Some(c.phase), _))
+      layoutOf(c.path, journal).map(Dir(c.path, Some(c.phase), _))
     val stagingRoot = devicePath / RebuildingStore.RebuildDirectory
     val staging =
       if !FileStat.isDir(stagingRoot) then Nil
       else
         os.list(stagingRoot).toList.sorted.filter(FileStat.isDir(_)).flatMap: d =>
-          layoutOf(d).map(Dir(d, None, _))
+          layoutOf(d, journal).map(Dir(d, None, _))
     copies ++ staging
 
-  /** The FSIF layout `dir`'s store config names. None for another backend, or a config absent or that does not parse
-   *  (its own open decides such a directory); a config that cannot be read, or a stat that fails, throws */
-  private def fsifLayout(dir: os.Path): Option[FsifLayout] =
+  /** `dir`'s FSIF layout, as fsifDirectories decides it */
+  private def layoutOf(dir: os.Path, journal: Boolean): Option[FsifLayout] =
     val cfgFile = dir / StoreConfig.configFilename
-    if !FileStat.exists(cfgFile) then
-      None
-    else
-      val cfg =
-        try Some(StoreConfig.loadStoreConfig(cfgFile))
-        catch
-          case t: Throwable if CrashRecoveryLog.isUnreadable(t) => throw t
-          case NonFatal(_) => None
-      cfg.map(_.backend).collect:
-        case b: StoreConfig.Fsif => FsifLayout(b.segmentPayloadSize, b.segmentCount)
+    val read: Either[Throwable, Option[StoreConfig]] =
+      try
+        if !FileStat.exists(cfgFile) then Right(None)
+        else Right(Some(StoreConfig.loadStoreConfig(cfgFile)))
+      catch case NonFatal(t) => Left(t)
+    read match
+      case Right(Some(cfg)) => cfg.backend match
+        case b: StoreConfig.Fsif => Some(FsifLayout(b.segmentPayloadSize, b.segmentCount))
+        case _ => None
+      case unusable =>
+        val indexes =
+          try FsifRecovery.IndexFiles.exists(n => FileStat.exists(dir / n))
+          catch case NonFatal(t) if !journal =>
+            logger.warn(s"Cannot read the directory $dir at the load of its device, which has no FSIF device " +
+                        s"journal: it is not considered for one: $t")
+            false
+        if indexes then
+          val why = unusable.left.toOption.fold("no store config")(t => s"a store config that cannot be used ($t)")
+          throw new IOException(s"$dir holds FSIF index files but $why: whether it is attached to a journal is " +
+                                s"unknown, so its device is left for the next scan")
+        None
 
   /** Whether `d`'s newest valid index is undetached. One with no valid index says nothing (its own open finds it
    *  lost): false. A read that fails throws */

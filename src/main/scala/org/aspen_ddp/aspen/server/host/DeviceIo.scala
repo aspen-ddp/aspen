@@ -1,13 +1,14 @@
 package org.aspen_ddp.aspen.server.host
 
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.{AtomicLong, LongAdder}
+import java.util.concurrent.atomic.{AtomicLong, AtomicReference, LongAdder}
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.jdk.CollectionConverters.*
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.server.store.backend.fsif.FsifDeviceJournal
 
 enum JobKind:
   case Scan, ReadConfig, Markers, CopyLayout, Move, Retire, Release, Delete, Sweep, SaveFile, CrlOpen, CrlCreate,
@@ -46,6 +47,13 @@ trait DeviceIo:
   def submit[T](kind: JobKind, store: Option[StoreId])(job: => T): JobHandle[T]
   def dataEc: ExecutionContext
   def serialEc: ExecutionContext
+  /** The device's FSIF journal thread (FsifDeviceJournal's `run`): one thread, each write of the journal one task on
+   *  it, in order. A task counts toward `idle` as a pool task does, and the thread stops at `close` */
+  def journalRun: Runnable => Unit
+  /** The device's open FSIF journal, None while none is open. Set by the device load or the lazy create ahead of the
+   *  first FSIF store create (for now the temporary FsifJournalBridge, which also fills it at the first FSIF open);
+   *  cleared and closed at the device's unload */
+  def fsifJournal: AtomicReference[Option[FsifDeviceJournal]]
   def observer: DeviceIoObserver
   /** The device's health probe (HealthProbe): armed while a storage device is loaded at this path, disarmed at its
    *  unload, `closeLane` and `close`; never armed for the host root. Its attempts are recorded in `observer` but are
@@ -59,11 +67,11 @@ trait DeviceIo:
    *  device loaded and no control step outstanding on it */
   def idle: Boolean
   /** Closes the management lane only (DeviceIos.forget): every lane job queued fails with `Cancelled`, and every later
-   *  submit at once. The data and serial pools keep running whatever is still executed on them (a rebuild's staging
+   *  submit at once. The data, serial and journal pools keep running whatever is still executed on them (a rebuild's staging
    *  backend, an FSIF serial executor, a late close that outlives its device's listing), on this device's threads,
    *  which time out once idle; so no backend task is ever rejected and no Future chained on one left incomplete */
   def closeLane(): Unit
-  /** Host shutdown (DeviceIos.closeAll): `closeLane`, and both pools stopped without waiting */
+  /** Host shutdown (DeviceIos.closeAll): `closeLane`, and every pool stopped without waiting */
   def close(): Unit
 
 object DeviceIo:

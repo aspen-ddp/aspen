@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.host
 
 import java.util.concurrent.{LinkedBlockingQueue, ThreadFactory, ThreadPoolExecutor, TimeUnit}
-import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong, AtomicReference}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
@@ -9,6 +9,7 @@ import scala.util.{Failure, Success, Try}
 import scribe.Logging
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.server.store.backend.fsif.FsifDeviceJournal
 
 /** `gate` runs before every task on every thread of this DeviceIo, the health probe's attempts included; hang tests
  *  pass a latch await. `clock` stamps the observer's entries and the probe's attempts, and `probeWrite` is the probe's
@@ -128,8 +129,9 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
         else false
 
   /** A pool of up to `n` threads, each timing out after `cfg.poolKeepAliveMillis` idle: a device with no backend
-   *  task holds no pool thread, and the pool never rejects a task until `close` */
-  private def pool(role: String, n: Int): (ThreadPoolExecutor, ExecutionContext) =
+   *  task holds no pool thread, and the pool never rejects a task until `close`. Each task passes the gate and is
+   *  recorded in the observer as `kind` */
+  private def pool(role: String, n: Int, kind: String): (ThreadPoolExecutor, ExecutionContext) =
     val exec = new ThreadPoolExecutor(n, n, cfg.poolKeepAliveMillis, TimeUnit.MILLISECONDS,
       new LinkedBlockingQueue[Runnable](), factory(role, false))
     exec.allowCoreThreadTimeOut(true)
@@ -138,7 +140,7 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
         poolTasks.incrementAndGet()
         try
           exec.execute: () =>
-            val token = observer.started(if role == "io" then "data" else "serial", None, 0L)
+            val token = observer.started(kind, None, 0L)
             var ok = false
             try
               gate()
@@ -153,11 +155,15 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
       def reportFailure(t: Throwable): Unit = logger.error(s"device io task failed: $t")
     (exec, ec)
 
-  private val (dataExec, dataEcImpl) = pool("io", cfg.dataThreads)
-  private val (serialExec, serialEcImpl) = pool("serial", cfg.serialThreads)
+  private val (dataExec, dataEcImpl) = pool("io", cfg.dataThreads, "data")
+  private val (serialExec, serialEcImpl) = pool("serial", cfg.serialThreads, "serial")
+  private val (journalExec, journalEc) = pool("fjournal", 1, "fsif-journal")
 
   def dataEc: ExecutionContext = dataEcImpl
   def serialEc: ExecutionContext = serialEcImpl
+  /** One thread, `dev-<label>-fjournal-0`, so the journal's writes run in order */
+  val journalRun: Runnable => Unit = r => journalEc.execute(r)
+  val fsifJournal: AtomicReference[Option[FsifDeviceJournal]] = new AtomicReference(None)
 
   private val reads = new AtomicLong(0)
   def beginRead(): Unit = reads.incrementAndGet()
@@ -167,15 +173,15 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
   /** Backend reads begun and not ended (beginRead, endRead): the backlog the read bound limits */
   private[aspen] def outstandingReads: Long = reads.get()
 
-  /** Data and serial tasks executed and not yet ended: queued or running on the pools */
+  /** Data, serial and journal tasks executed and not yet ended: queued or running on the pools */
   private[aspen] def poolTasksOutstanding: Int = poolTasks.get()
 
   def idle: Boolean = laneJobs.get() == 0 && poolIdle
 
-  /** Pool threads alive, data and serial: 0 once both pools have been idle past their keep-alive */
-  private[host] def poolThreads: Int = dataExec.getPoolSize + serialExec.getPoolSize
+  /** Pool threads alive, data, serial and journal: 0 once the pools have been idle past their keep-alive */
+  private[host] def poolThreads: Int = dataExec.getPoolSize + serialExec.getPoolSize + journalExec.getPoolSize
 
-  /** No data or serial task queued or running */
+  /** No data, serial or journal task queued or running */
   private[host] def poolIdle: Boolean = poolTasks.get() == 0
 
   /** Stops the lane without waiting: every lane job not yet started fails with `DeviceIo.Cancelled` now, even behind
@@ -189,9 +195,10 @@ class ThreadedDeviceIo(val path: os.Path, cfg: DeviceIo.Config, gate: () => Unit
     // Here, not only in the lane thread's finally, which a hung job never reaches. Each entry is polled by one party
     cancelQueued()
 
-  /** Host shutdown: `closeLane`, then both pools stopped without waiting, a running task interrupted and one not yet
-   *  started dropped */
+  /** Host shutdown: `closeLane`, then the pools (data, serial, journal) stopped without waiting, a running task
+   *  interrupted and one not yet started dropped */
   def close(): Unit =
     closeLane()
     dataExec.shutdownNow()
     serialExec.shutdownNow()
+    journalExec.shutdownNow()

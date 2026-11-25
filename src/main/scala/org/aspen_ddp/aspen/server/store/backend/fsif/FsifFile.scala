@@ -34,12 +34,17 @@ object FsifIo:
   /** Backend.isOutOfSpace */
   def isOutOfSpace(t: Throwable): Boolean = org.aspen_ddp.aspen.server.store.backend.Backend.isOutOfSpace(t)
 
-final class NioFsifFiles(dir: os.Path) extends FsifFiles:
+/** `dsync` opens every channel with DSYNC, so each write is durable when it returns (the device journal's files, whose
+ *  writer then never forces) */
+final class NioFsifFiles(dir: os.Path, dsync: Boolean = false) extends FsifFiles:
+
+  private val options =
+    val base = Seq(StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE)
+    if dsync then base :+ StandardOpenOption.DSYNC else base
 
   def open(name: String): FsifFile =
     val path = dir / name
-    val channel = FileChannel.open(path.toNIO,
-      StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE)
+    val channel = FileChannel.open(path.toNIO, options*)
     // Always, not only when this call creates the file: a crash between an earlier open's create and its sync
     // could otherwise leave the directory entry non-durable for good. open is rare, so this is cheap.
     try DurableFiles.syncDirectory(dir)

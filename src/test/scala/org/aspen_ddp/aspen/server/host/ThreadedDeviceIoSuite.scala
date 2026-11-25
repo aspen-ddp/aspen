@@ -257,3 +257,36 @@ class ThreadedDeviceIoSuite extends AnyFunSuite with Matchers:
       io.poolThreads should be(0)
       Await.result(Future(2)(using io.dataEc), wait) should be(2)
     finally io.close()
+
+  test("journal tasks run on one dev-<label>-fjournal thread, pass the gate, and show in observer.inFlight as fsif-journal"):
+    val gated = new java.util.concurrent.ConcurrentLinkedQueue[String]()
+    withIo(() => gated.add(Thread.currentThread.getName)) : io =>
+      io.fsifJournal.get should be(None)
+      val started = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      val names = new java.util.concurrent.ConcurrentLinkedQueue[String]()
+      val first = Promise[Unit]()
+      io.journalRun: () =>
+        names.add(Thread.currentThread.getName)
+        started.countDown()
+        release.await()
+        first.success(())
+      started.await()
+      io.observer.inFlight("fsif-journal")._1 should be(1)
+      io.idle should be(false)
+      val rest = (0 until 10).map: _ =>
+        val p = Promise[Unit]()
+        io.journalRun(() => { names.add(Thread.currentThread.getName); p.success(()) })
+        p.future
+      release.countDown()
+      Await.result(first.future, wait)
+      rest.foreach(f => Await.result(f, wait))
+      val all = names.toArray.map(_.toString).toSet
+      all.size should be(1)
+      all.head should startWith("dev-devX-fjournal")
+      gated.toArray.map(_.toString).count(_.startsWith("dev-devX-fjournal")) should be(11)
+      val deadline = System.nanoTime() + wait.toNanos
+      while !io.idle && System.nanoTime() < deadline do Thread.sleep(1)
+      io.idle should be(true)
+      io.observer.inFlight.contains("fsif-journal") should be(false)
+      io.observer.completed("fsif-journal") should be(11L)

@@ -146,6 +146,8 @@ object StoreRouterSuite:
     def setDeviceId(id: StorageDeviceId): Unit = under.setDeviceId(id)
     def dataEc: ExecutionContext = under.dataEc
     def serialEc: ExecutionContext = under.serialEc
+    def journalRun: Runnable => Unit = under.journalRun
+    def fsifJournal = under.fsifJournal
     def observer: DeviceIoObserver = under.observer
     def probe: HealthProbe = under.probe
     def beginRead(): Unit = under.beginRead()

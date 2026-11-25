@@ -1,14 +1,17 @@
 package org.aspen_ddp.aspen.server.host
 
+import java.util.concurrent.atomic.AtomicReference
+
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.server.store.backend.fsif.FsifDeviceJournal
 
 /** A device's lanes under LockstepThreading. Management-lane jobs (`submit`) wait on the threading's FIFO, in posting
  *  order with every other posted task, until a test drains it, or on the path's held side queue while a test holds
- *  the path. The data and serial pools run on real daemon threads (an internal `ThreadedDeviceIo` of the same path),
+ *  the path. The data, serial and journal pools run on real daemon threads (an internal `ThreadedDeviceIo` of the same path),
  *  as backend I/O already does in tests; its gate blocks while the path is held, so `hold` stalls them too and
  *  `release` frees them. The health probe (`probe`) runs there too, behind the same gate. `clock` and `probeWrite`
  *  pass to the internal ThreadedDeviceIo (test seams). */
@@ -24,6 +27,9 @@ final class LockstepDeviceIo(val path: os.Path, threading: LockstepThreading, cf
   def probe: HealthProbe = threaded.probe
   def dataEc: ExecutionContext = threaded.dataEc
   def serialEc: ExecutionContext = threaded.serialEc
+  /** The internal ThreadedDeviceIo's journal thread, behind the same gate */
+  def journalRun: Runnable => Unit = threaded.journalRun
+  def fsifJournal: AtomicReference[Option[FsifDeviceJournal]] = threaded.fsifJournal
   def beginRead(): Unit = threaded.beginRead()
   def endRead(): Unit = threaded.endRead()
   def readsOverBound: Boolean = threaded.readsOverBound

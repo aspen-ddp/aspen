@@ -1154,10 +1154,11 @@ class FsifBackend(val storeId: StoreId,
 
   /** The trigger, run after every serial task: the journal asked for one (its records pin the ring's oldest file), or
     * an operation waits for journal room while records are uncovered. Never while frozen (the held operations wait for
-    * space like everything else) or closing (the detach covers everything).
+    * space like everything else) or once detached. A closing store still checkpoints: its quiesce waits for its held
+    * operations, whose room may return only once it does, and its detach comes only after that quiesce.
     */
   private def maybeCheckpoint(): Unit =
-    if checkpoint.isEmpty && fatal.isEmpty && !frozen && !closing &&
+    if checkpoint.isEmpty && fatal.isEmpty && !frozen && !detached &&
       (checkpointAsked || capHeld.nonEmpty && (lastAppend ne snapshotTail))
     then
       startCheckpoint()

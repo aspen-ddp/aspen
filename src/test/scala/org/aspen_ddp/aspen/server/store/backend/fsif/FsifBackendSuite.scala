@@ -881,6 +881,36 @@ class FsifBackendSuite extends FileBasedTests:
     y.reopen()
     x.readData(p).toList shouldBe v3.toList
 
+  test("a close while the store's own records pin the ring and operations wait for room completes"):
+    // Room returns only once this store checkpoints, which it must still do while closing: the quiesce waits for its
+    // held operations, and the detach comes after the quiesce
+    val shared = new SharedJournal(rng(4), tinyRing)
+    val jm = new ManualEc
+    shared.run = jm.execute
+    shared.journal // built now, its writes on jm
+    val h = new Harness(sharedWith = Some(shared))
+    def drive[A](f: Future[A]): A =
+      var n = 0
+      while !f.isCompleted && n < 10000 do
+        jm.runAll()
+        n += 1
+      Await.result(f, Timeout)
+    val p = ptr(1, oid(1))
+    var v = bytes(40, 1)
+    drive(h.issueCommit(alloc(p, v, 1))) shouldBe Left(())
+    val fs = (0 until 40).map: i =>
+      val patch = bytes(4, i)
+      val f = h.issueCommit(writeRange(p, v, i % 30, patch, i + 2))
+      v = patched(v, i % 30, patch)
+      f
+    h.await(h.backend.capState)._1 should be > 0
+    val closed = h.backend.close()
+    drive(closed)
+    fs.foreach(f => drive(f) shouldBe Left(()))
+    h.backend.detachedForTest shouldBe true
+    h.reopen()
+    h.readData(p).toList shouldBe v.toList
+
   test("an open that fails after its attach index is durable leaves a directory the next open accepts"):
     val h = new Harness
     val p = ptr(1, oid(1))

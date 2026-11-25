@@ -303,18 +303,28 @@ class FsifRecoverySuite extends FileBasedTests:
     val e = the[IOException] thrownBy FsifRecovery.openDirectory(files, layout, J)
     e.getMessage should include("not replayed")
 
-  test("openDirectory accepts an index naming another journal"):
+  test("openDirectory accepts a detached index naming another journal"):
     val files = fresh()
     val (recs, expected) = threeObjectRecords()
     attachInPlace(files, new UUID(5, 5))
     FsifRecovery.replayDirectory(files, layout, recs, new UUID(5, 5), 3)
-    // Attached elsewhere and shipped (or moved) without a detach: nothing of it is in J
+    // Detached elsewhere and shipped (a transfer in): nothing of it is in J
     val (name, seq, _, map) = FsifRecovery.newestIndex(files, layout)
-    writeIndex(files, otherIndex(name), seq + 1, IndexMeta(new UUID(5, 5), new UUID(5, 6), 3, detached = false), map)
+    writeIndex(files, otherIndex(name), seq + 1, IndexMeta(new UUID(5, 5), new UUID(5, 6), 3, detached = true), map)
     val o = open(files, expected)
     o.seq shouldBe seq + 1
     o.activeIndex shouldBe otherIndex(name)
     o.slotCount shouldBe 3
+
+  test("openDirectory declares an undetached index of another journal lost"):
+    val files = fresh()
+    val (recs, _) = threeObjectRecords()
+    attachInPlace(files, new UUID(5, 5))
+    FsifRecovery.replayDirectory(files, layout, recs, new UUID(5, 5), 3)
+    // Attached elsewhere and never detached: its acknowledged writes are in a journal this device cannot replay
+    val (name, seq, _, map) = FsifRecovery.newestIndex(files, layout)
+    writeIndex(files, otherIndex(name), seq + 1, IndexMeta(new UUID(5, 5), new UUID(5, 6), 3, detached = false), map)
+    a[StoreLost] should be thrownBy FsifRecovery.openDirectory(files, layout, J)
 
   /** One attachment's records in the device journal after a durable earlier state: phase 1 records replayed into
     * index.b (seq 1), then the attach index (index.a, seq 2), then phase 2 records not yet replayed. Uses

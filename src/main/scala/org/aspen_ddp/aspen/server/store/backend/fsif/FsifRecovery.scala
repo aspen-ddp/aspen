@@ -202,16 +202,22 @@ object FsifRecovery:
       truncateToZero(files, indexName)
 
   /** Store open against the device journal `journalId`: loads the newest valid index (L1) and runs the checks that
-    * need no journal (L11, L12) against data's forced size. The index must be detached or name another journal (a
-    * transferred-in or newly created directory has no records here), or be attached to `journalId` under an
+    * need no journal (L11, L12) against data's forced size. The index must be detached (a transferred-in or newly
+    * created directory has no records here: a transfer detaches, a create writes IndexMeta.None), or be attached to
+    * `journalId` under an
     * attachment for which `replayFree` holds: one the running journal knows needs no replay (FsifDeviceJournal's
     * `needsReplay` is false: an earlier open of this lifetime wrote its attach index and failed before or without
     * appending). Any other undetached index naming `journalId` was not replayed at device load, which is a bug, not a
-    * loss: it throws an IOException so the load retries.
+    * loss: it throws an IOException so the load retries. An undetached index naming another journal (Ruling R20)
+    * holds records in a journal this device cannot replay: StoreLost, a loss of this copy alone, as the device load's
+    * ForeignUndetached is.
     */
   def openDirectory(files: FsifFiles, layout: FsifLayout, journalId: UUID,
                     replayFree: UUID => Boolean = _ => false): Opened =
     val (indexName, seq, meta, index) = newestIndex(files, layout)
+    if !meta.detached && meta.journalId != journalId then
+      throw new StoreLost(s"$indexName (seq $seq) is attached to journal ${meta.journalId}, not this device's " +
+        s"$journalId: its acknowledged writes in that journal cannot be replayed")
     if !meta.detached && meta.journalId == journalId && !replayFree(meta.attachment) then
       throw new IOException(s"$indexName (seq $seq) is attached to journal $journalId (attachment " +
         s"${meta.attachment}) but was not replayed at device load")

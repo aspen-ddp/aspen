@@ -440,3 +440,23 @@ class FsifJournalLostSuite extends IntegrationTestSuite with CopyHostFixture:
       host.shutdown()(using ExecutionContext.parasitic).transform: _ =>
         pool.shutdown()
         r
+
+  atest("R20: an FSIF copy left out of a journal-less load because it could not be read is lost at its open, never served"):
+    val (hostRoot, dev) = device()
+    // Attached to the device's journal, which is gone; no search permission at the load, so it is left out
+    val copy = fsifCopy(dev, s)
+    writeIndex(copy, attached(UUID.randomUUID(), covered = 4))
+    os.perms.set(copy, "rw-------")
+    val host =
+      try
+        val h = realHost(hostRoot, new TestOpener)
+        h.testingOnlyHandleEvents()
+        h
+      finally os.perms.set(copy, "rwx------")
+    val loadedFirst = loadedDevices(host).contains(deviceA)
+    given ExecutionContext = executionContext
+    // Its load retry opens it once it reads: an undetached index of another journal is that copy's loss
+    scans(host, 4)().map: _ =>
+      loadedFirst should be(true)
+      host.control.router.loaded.keySet should not contain s
+      CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Lost))

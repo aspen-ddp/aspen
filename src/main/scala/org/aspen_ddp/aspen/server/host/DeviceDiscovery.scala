@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
 import org.aspen_ddp.aspen.server.{Host, StorageDeviceConfig, StorageDeviceManager}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrlAdmission, CrlConfigInvalid, CrlSizingMismatch}
-import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifDeviceJournal, JournalSizingMismatch}
+import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifDeviceJournal, JournalLocked, JournalSizingMismatch}
 import scribe.Logging
 
 import scala.concurrent.{Future, Promise}
@@ -888,9 +888,11 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             throw t
 
   /** The count and log of an FSIF journal open that failed (FsifJournalOpenResult.Failed), as crlOpenFailed's for the
-   *  CRL. A locked journal is in use, not lost; a sizing mismatch is a refusal, logged once at error until an operator
-   *  repairs the directory; either resets the count, as does a lost journal's later failure (AfterLost). A transient
-   *  failure counts towards FsifJournalOpenAttempts only on a device scan */
+   *  CRL. A locked journal is in use, not lost: a refusal, logged as possibly transient (usually this host's own
+   *  journal, closed with a write in flight); a sizing mismatch is a refusal, logged once at error until an operator
+   *  repairs the directory; either resets the count, as does a lost journal's later failure (AfterLost), so a lock
+   *  never adds up with other transient failures to a lost journal. A transient failure counts towards
+   *  FsifJournalOpenAttempts only on a device scan */
   private def fsifJournalOpenFailed(devicePath: os.Path, t: Throwable, how: CrlOpenFailure, counted: Boolean): Unit =
     how match
       case CrlOpenFailure.Refused =>
@@ -902,6 +904,10 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
               logger.error(s"Refusing to load storage device $devicePath: its FSIF device journal does not match the " +
                            s"sizing it was created with. Its FSIF copies are not declared lost. Restore the journal's " +
                            s"files and sizing file, then the next scan loads it: $t")
+          case _: JournalLocked =>
+            logger.warn(s"The FSIF device journal of storage device $devicePath is locked, usually by this host's own " +
+                        s"journal closing with a write in flight. Its FSIF copies are not declared lost. Retrying on " +
+                        s"the next scan: $t")
           case _ => ()
       case CrlOpenFailure.AfterLost =>
         transientJournalFailures -= devicePath

@@ -936,7 +936,7 @@ Tests for the automatic paths:
 
 Tests for the non-cases: `DeviceJournalScanSuite` "torn last batch in the newest file is a torn tail", "a rotted
 batch below oldestNeeded is not read" and "a torn header rewrite of the file being entered is ignored";
-`FsifJournalLostSuite` "a locked journal leaves the device unloaded, a transient failure, and moves nothing", "a
+`FsifJournalLostSuite` "a locked journal leaves the device unloaded, a refusal, and moves nothing", "a journal locked on two scans then failing transiently is not lost: a lock never counts as transient", "a
 journal open that fails before anything is decided never loses the journal, however many scans" and "Review Focus
 2: a device whose FSIF copies all came from another host loads Absent"; `FsifRecoverySuite` "openDirectory refuses an
 undetached index of its own journal with an IOException"; `FsifInitializationSuite` "a store holding objects is

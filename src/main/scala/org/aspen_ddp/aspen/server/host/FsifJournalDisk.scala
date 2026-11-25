@@ -72,9 +72,9 @@ object FsifJournalDisk extends Logging:
    *  directory's newest index is detached is Absent; one with an undetached index (J2: it names the journal that is
    *  gone) has lost its journal. Otherwise the journal is locked (CrlLock), its sizing read, the ring recovered and
    *  replayed into every directory (DeviceJournalRecovery). Those steps' failures: a journal locked elsewhere
-   *  (JournalLocked) is Failed(Transient), never lost (most often this host's own journal, closed with a write in
-   *  flight, whose lock is released once that write ends), and Failed(Refused) once `transientIsLost` (the caller's
-   *  count of device scans in a row reached FsifJournalOpenAttempts); on a device holding no FSIF directory any other
+   *  (JournalLocked) is Failed(Refused), never lost and never counted towards `transientIsLost` (most often this
+   *  host's own journal, closed with a write in flight, whose lock is released once that write ends; the next scan
+   *  retries); on a device holding no FSIF directory any other
    *  failure replaces the journal through `replaceLost`, nothing to move, logged at warn (Ruling R22: nothing needs
    *  it); one whose files do not match its sizing (JournalSizingMismatch) is Failed(Refused), never lost; a transient
    *  one (DeviceDiscovery.isTransient) is Failed(Transient) unless `transientIsLost`; anything else, a corrupt ring
@@ -107,10 +107,10 @@ object FsifJournalDisk extends Logging:
         try openPresent(devicePath, dir, dirs, run, earlierUnforced, syncDirectory, rename)
         catch
           case t: JournalLocked =>
-            // Usually this host's own journal, closed while a write was in flight, whose lock goes with that write.
-            // One still held after FsifJournalOpenAttempts scans is another writer's: refused, as a locked CRL is
-            val how = if transientIsLost then CrlOpenFailure.Refused else CrlOpenFailure.Transient
-            FsifJournalOpenResult.Failed(t, how, Nil)
+            // Refused, as a locked CRL is: never counted as a transient failure, so a lock held by another writer can
+            // never add up, with other transient errors, to a lost journal. Usually it is this host's own journal,
+            // closed while a write was in flight, whose lock goes with that write: the next scan retries
+            FsifJournalOpenResult.Failed(t, CrlOpenFailure.Refused, Nil)
           case t: Throwable if dirs.isEmpty =>
             // Ruling R22: nothing needs this journal, so one that cannot be opened is replaced, nothing moved
             logger.warn(s"The FSIF device journal of storage device $devicePath cannot be opened, and no FSIF " +

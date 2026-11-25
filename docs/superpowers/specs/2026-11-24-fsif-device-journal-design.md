@@ -406,7 +406,7 @@ others (R5, R7, R9, R10, R14) only ordered the work. `store/backend/fsif/DESIGN.
   otherwise detached) creates the journal (`FsifJournalDisk.forOpen`), as a create does.
 - **R18**: the device-load open classifies failures as `DeviceCrlDisk.open` does: Refused (locked, sizing mismatch, a
   config that cannot size a replacement), Transient (counted by `FsifJournalOpenAttempts`), Undecided (before anything
-  was decided, or any failure on a device with no FSIF directory), and anything else the lost-journal path.
+  was decided), and anything else the lost-journal path. (R22 changes the no-FSIF-directory case.)
 - **R19**: a copy whose store config cannot be read but which holds FSIF index files leaves the device unloaded for
   the next scan (Undecided); one with neither is not an FSIF directory.
 - **R20**: at store open, an undetached index naming another journal is that copy's loss (`StoreLost`), as at device
@@ -414,8 +414,9 @@ others (R5, R7, R9, R10, R14) only ordered the work. `store/backend/fsif/DESIGN.
 - **R22** (final review): the writer re-enters a tail file holding no batch of its pass (4.7 step 3), and the scan
   orders or rejects equal firsts safely. On a device with no FSIF directory, a journal that cannot be opened (any
   failure after the pre-decision steps but a lock) is replaced through the lost-journal path with nothing to move,
-  logged at warn, instead of Undecided forever. A locked journal at device load is Transient (usually this host's
-  own journal closed with a write in flight), Refused once transient failures count as lost. A copy lost alone by
+  logged at warn, instead of Undecided forever. A locked journal at device load stays Refused (as R18), logged as
+  possibly transient (usually this host's own journal closed with a write in flight): counting it as transient would
+  let a lock held by another writer add up with other transient failures to a lost journal under that writer. A copy lost alone by
   its replay is forced with its earlier unforced move's directories, as the lost-journal path's copies are.
 
 Also differing from sections 4-7:

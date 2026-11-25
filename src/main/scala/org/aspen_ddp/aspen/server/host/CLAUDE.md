@@ -896,9 +896,10 @@ device (project 3's job), and a false Hung must never come from a merely busy de
     retrying; a failure before anything is decided (listing, stats, unreadable configs) is Undecided; a transient one
     is Transient, counted on device scans apart from the CRL's (`FsifJournalOpenAttempts` = 3,
     `transientJournalFailures`, reset on Refused, AfterLost or success); anything else (a corrupt ring,
-    `JournalCorrupt`, logged as such) loses the journal. A locked journal (`JournalLocked`) is Transient, never lost:
-    most often it is this host's own journal, closed while a write was in flight, whose lock is released when that
-    write ends; once transient failures count as lost it is Refused (another writer holds it). On a device with no
+    `JournalCorrupt`, logged as such) loses the journal. A locked journal (`JournalLocked`) is Refused, never lost, and
+    resets the transient count, so a lock held by another writer never adds up with other transient failures to a
+    lost journal; it is logged at warn as possibly transient (most often this host's own journal, closed while a write
+    was in flight, whose lock is released when that write ends), and each scan retries. On a device with no
     FSIF directory, any failure after the decision but a lock replaces the journal through `replaceLost` with
     nothing to move, logged at warn (Ruling R22: nothing needs it, and otherwise an unreadable ring would keep the
     device and its RocksDB stores unloaded forever)

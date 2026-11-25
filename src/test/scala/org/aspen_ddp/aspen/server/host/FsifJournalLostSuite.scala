@@ -168,7 +168,7 @@ class FsifJournalLostSuite extends IntegrationTestSuite with CopyHostFixture:
       lostAside(dev) should be(Nil)
       loadedDevices(host).keySet should be(Set(deviceA))
 
-  atest("a locked journal leaves the device unloaded, a transient failure, and moves nothing"):
+  atest("a locked journal leaves the device unloaded, a refusal, and moves nothing"):
     val (hostRoot, dev) = device()
     val sizing = journal(dev)
     val copy = fsifCopy(dev, s)
@@ -325,6 +325,32 @@ class FsifJournalLostSuite extends IntegrationTestSuite with CopyHostFixture:
       CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Lost))
       lostAside(dev).size should be(1)
       journalId(dev) should not be old.journalId
+
+  atest("a journal locked on two scans then failing transiently is not lost: a lock never counts as transient"):
+    val (hostRoot, dev) = device()
+    val old = journal(dev)
+    val copy = fsifCopy(dev, s)
+    writeIndex(copy, attached(old.journalId, covered = -1))
+    // Another writer holds the lock from before the host starts (its startup load is refused, uncounted)
+    var lock: Option[CrlLock] = Some(CrlLock.acquire(dev / DeviceJournalFiles.DirName))
+    val host = realHost(hostRoot, new TestOpener)
+    host.testingOnlyHandleEvents()
+    def lockFile = dev / DeviceJournalFiles.DirName / CrlLock.LockFilename
+    given ExecutionContext = executionContext
+    // Scans 1-2: still locked. Scans 3-4: every open fails with an I/O error (the lock file is a directory). Had the
+    // locks counted as transient, scan 3 would have lost the journal under its writer
+    scans(host, 4): i =>
+      if i == 3 then
+        lock.foreach(_.release())
+        lock = None
+        os.remove(lockFile)
+        os.makeDir(lockFile)
+    .map: loaded =>
+      lock.foreach(_.release())
+      loaded should be(List(false, false, false, false))
+      CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Live))
+      journalId(dev) should be(old.journalId)
+      lostAside(dev) should be(Nil)
 
   atest("a journal open that fails before anything is decided never loses the journal, however many scans"):
     val (hostRoot, dev) = device()
@@ -508,7 +534,7 @@ class FsifJournalLostSuite extends IntegrationTestSuite with CopyHostFixture:
     FsifJournalDisk.open(dev, deviceCfg(dev), CopyLayoutDisk.list(dev), r => r.run(), transientIsLost, earlierUnforced,
       syncDirectory, DurableFiles.atomicRename)
 
-  atest("a locked journal is a transient failure, and a refusal once transient failures count as lost"):
+  atest("a locked journal is a refusal, whether or not transient failures count as lost"):
     val (_, dev) = device()
     val sizing = journal(dev)
     writeIndex(fsifCopy(dev, s), attached(sizing.journalId, covered = -1))
@@ -520,7 +546,7 @@ class FsifJournalLostSuite extends IntegrationTestSuite with CopyHostFixture:
       results.map:
         case FsifJournalOpenResult.Failed(_: JournalLocked, how, Nil) => how
         case other => fail(other.toString)
-      .should(be(List(CrlOpenFailure.Transient, CrlOpenFailure.Refused)))
+      .should(be(List(CrlOpenFailure.Refused, CrlOpenFailure.Refused)))
       lostAside(dev) should be(Nil)
 
   atest("a copy lost alone by its replay is forced with the directories an earlier unforced move of it left"):

@@ -875,7 +875,8 @@ device (project 3's job), and a false Hung must never come from a merely busy de
   disk work is `FsifJournalDisk`'s, in lane jobs:
   - Creation is lazy: an FSIF create first calls `FsifJournalDisk.ensure` (in its `BackendCreate` job), which creates
     the journal (sized by the device config, `fsif-journal-files`/`fsif-journal-file-size-mb`, default 4 x 256 MiB) in
-    `fsif-journal.creating`, renames it into place durably and sets the slot. An FSIF open on a device with no journal
+    `fsif-journal.creating`, renames it into place durably and sets the slot. Creation zero-fills the whole ring (1 GiB
+    by default) inside that one lane job, so it logs its duration at info. An FSIF open on a device with no journal
     directory (loaded Absent: its FSIF copies arrived detached) creates it too (`forOpen`, Ruling R17). A journal
     directory present while the slot is empty, or a failed journal, is an `IOException`: a load retry
   - The load's open (`FsifJournalDisk.open`) serves the FSIF copies in every phase but Lost and Retired plus the FSIF
@@ -887,14 +888,20 @@ device (project 3's job), and a false Hung must never come from a merely busy de
     (`DeviceJournalRecovery`)
   - A directory whose own replay fails (L1, L7-L12), or whose undetached index names another journal (Ruling R20), is
     lost alone (`moveLostAlone`): a copy moved to `lost/` through `CopyDisk.relocate`, a staging directory removed; a
-    move that fails or lands unforced is Failed(AfterLost), its unforced move held for the resync. A store open finds
+    move that fails or lands unforced is Failed(AfterLost), its unforced move held for the resync. Each moved copy is
+    then forced with the directories an earlier unforced move of it left, as `replaceLost` does. A store open finds
     the same foreign undetached index `StoreLost` (`FsifRecovery.openDirectory`)
-  - Classification mirrors `DeviceCrlDisk.open` (Ruling R18): a locked journal (`JournalLocked`), files not matching
-    the sizing (`JournalSizingMismatch`, logged once at error) and a config that cannot size a replacement are
-    Refused, nothing moved, each scan retrying; a failure before anything is decided (listing, stats, unreadable
-    configs), or any failure on a device with no FSIF directory, is Undecided; a transient one is Transient, counted
-    on device scans apart from the CRL's (`FsifJournalOpenAttempts` = 3, `transientJournalFailures`, reset on Refused,
-    AfterLost or success); anything else (a corrupt ring, `JournalCorrupt`, logged as such) loses the journal
+  - Classification mirrors `DeviceCrlDisk.open` (Ruling R18): files not matching the sizing (`JournalSizingMismatch`,
+    logged once at error) and a config that cannot size a replacement are Refused, nothing moved, each scan
+    retrying; a failure before anything is decided (listing, stats, unreadable configs) is Undecided; a transient one
+    is Transient, counted on device scans apart from the CRL's (`FsifJournalOpenAttempts` = 3,
+    `transientJournalFailures`, reset on Refused, AfterLost or success); anything else (a corrupt ring,
+    `JournalCorrupt`, logged as such) loses the journal. A locked journal (`JournalLocked`) is Transient, never lost:
+    most often it is this host's own journal, closed while a write was in flight, whose lock is released when that
+    write ends; once transient failures count as lost it is Refused (another writer holds it). On a device with no
+    FSIF directory, any failure after the decision but a lock replaces the journal through `replaceLost` with
+    nothing to move, logged at warn (Ruling R22: nothing needs it, and otherwise an unreadable ring would keep the
+    device and its RocksDB stores unloaded forever)
   - The lost journal (`replaceLost`, step for step the lost CRL's): every FSIF copy not in `lost/` decided, then moved
     to `lost/` (`CopyDisk.relocate`; one that fails or lands unforced fails the job, nothing more done, the journal
     untouched for the next scan); the phase directories forced, then each `lost/` copy with the directories an

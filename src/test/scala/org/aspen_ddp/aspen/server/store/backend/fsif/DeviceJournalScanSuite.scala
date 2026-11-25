@@ -162,3 +162,33 @@ class DeviceJournalScanSuite extends AnyFunSuite:
     bb.putInt(4 + len, c.getValue.toInt)
     put(files, "0.fj", 4096L + batchLen(1), enc)
     assert(DeviceJournalScan.scan(files, sizing).isInstanceOf[Scan.Corrupt])
+
+  test("equal firsts: a header-only file is older than the file holding batches from that first"):
+    // A crash left file 2 header-only at first 4; a writer that then entered file 0 at first 4 (the bug R22 fixed)
+    val files = newFiles()
+    writeRing(files, sizing, Seq(
+      (2, 4L, 4L, Seq.empty),
+      (0, 4L, 4L, Seq(batch(4), batch(5))),
+      (1, 6L, 4L, Seq(batch(6)))))
+    val s = DeviceJournalScan.scan(files, sizing)
+    assert(serials(s) == Vector(4L, 5L, 6L))
+    val Scan.Valid(_, tail) = s: @unchecked
+    assert(tail.file == 1 && tail.nextSerial == 7)
+
+  test("equal firsts: the newest header-only file does not hide the batches of its twin"):
+    val files = newFiles()
+    writeRing(files, sizing, Seq(
+      (2, 4L, 4L, Seq.empty),
+      (0, 4L, 4L, Seq(batch(4))),
+      (1, 2L, 2L, Seq(batch(2), batch(3)))))
+    val s = DeviceJournalScan.scan(files, sizing)
+    assert(serials(s) == Vector(4L))
+    val Scan.Valid(_, tail) = s: @unchecked
+    assert(tail.file == 0 && tail.nextSerial == 5)
+
+  test("equal firsts both holding a batch at that first are Corrupt"):
+    val files = newFiles()
+    writeRing(files, sizing, Seq(
+      (0, 4L, 4L, Seq(batch(4))),
+      (2, 4L, 4L, Seq(batch(4), batch(5)))))
+    assert(DeviceJournalScan.scan(files, sizing).isInstanceOf[Scan.Corrupt])

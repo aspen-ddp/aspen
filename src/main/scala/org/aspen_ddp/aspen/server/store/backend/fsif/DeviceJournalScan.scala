@@ -37,8 +37,35 @@ object DeviceJournalScan:
       h.read(0, h.size.toInt)
     finally h.close()
 
+  /** The file holds an Ok batch with serial `first` right after its header */
+  private def holdsFirst(files: FsifFiles, sizing: JournalSizing, f: Found): Boolean =
+    DeviceJournalFormat.decodeBatchAt(loadBytes(files, f), DeviceJournalFormat.HeaderSize, sizing.journalId,
+      f.header.salt) match
+      case BatchRead.Ok(b, _) => b.serial == f.header.first
+      case _ => false
+
+  /** Valid headers in serial order. The writer gives every entry a `first` no other valid header holds (it re-enters
+    * a tail file that holds no batch of its pass, spec 4.7 step 3), so equal firsts are never expected. Should they
+    * occur, a file holding no batch at its first holds nothing and sorts before its twin that does, so it can neither
+    * hide that twin's batches nor be required to hold them; two that both hold a batch at the same first are
+    * ambiguous: Left.
+    */
+  private def ordered(files: FsifFiles, sizing: JournalSizing, headers: Vector[Found]): Either[String, Vector[Found]] =
+    val holders = headers.groupBy(_.header.first).valuesIterator.filter(_.size > 1).flatten
+      .filter(holdsFirst(files, sizing, _)).map(_.index).toSet
+    val twinHolders = headers.filter(f => holders.contains(f.index)).groupBy(_.header.first).find(_._2.size > 1)
+    twinHolders match
+      case Some((first, fs)) =>
+        Left(s"${fs.map(f => fileName(f.index)).mkString(" and ")} both hold batch $first")
+      case None =>
+        Right(headers.sortBy(f => (f.header.first, if holders.contains(f.index) then 1 else 0)))
+
   def scan(files: FsifFiles, sizing: JournalSizing): Scan =
-    val found = (0 until sizing.files).flatMap(loadHeader(files, sizing, _)).sortBy(_.header.first).toVector
+    ordered(files, sizing, (0 until sizing.files).flatMap(loadHeader(files, sizing, _)).toVector) match
+      case Left(r) => Scan.Corrupt(r)
+      case Right(found) => scanOrdered(files, sizing, found)
+
+  private def scanOrdered(files: FsifFiles, sizing: JournalSizing, found: Vector[Found]): Scan =
     if found.isEmpty then
       Scan.Empty
     else

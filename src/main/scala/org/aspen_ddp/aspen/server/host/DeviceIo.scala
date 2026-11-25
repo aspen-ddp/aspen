@@ -81,7 +81,7 @@ object DeviceIo:
   /** Data threads per device by default: 4. With the FSIF device journal the data pool carries no journal writes, only
    *  reads, in-place writes, data forces and index writes. Measured with FsifDeviceBench (16 FSIF stores, depth 8, six
    *  10 s runs each, 2026-11-24): mean ops/s 2231 at 1 thread, 1532 at 2, 2638 at 4, 2409 at 8, 2246 at 16, 2644 at
-   *  24; 1 and 2 threads fell to 288-578 in some runs as reads queued (25-50 ms), 4 never below 2449. The per-store
+   *  24; 1 and 2 threads fell to 288-578 in some runs as reads queued (22-50 ms), 4 never below 2449. The per-store
    *  journals before it needed 24 threads for 767 (docs/host-threading-measurement.md, "FSIF device journal"). */
   def defaultDataThreads: Int = 4
 

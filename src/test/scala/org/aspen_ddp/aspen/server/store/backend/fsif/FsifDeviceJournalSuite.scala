@@ -24,11 +24,11 @@ class FsifDeviceJournalSuite extends AnyFunSuite:
   private def bytesOf(n: Int): Long = n.toLong * DeviceJournalFormat.taggedRecordSize(rec(0))
 
   /** A zero-filled ring, as DeviceJournalFiles.create leaves it */
-  private def newFiles(seed: Long = 1): SimulatedFsifFiles =
+  private def newFiles(seed: Long = 1, sz: JournalSizing = sizing): SimulatedFsifFiles =
     val files = new SimulatedFsifFiles(new Random(seed))
-    for n <- 0 until sizing.files do
+    for n <- 0 until sz.files do
       val f = files.open(DeviceJournalScan.fileName(n))
-      f.write(0, new Array[Byte](sizing.fileSize.toInt))
+      f.write(0, new Array[Byte](sz.fileSize.toInt))
       f.force()
       f.close()
     files
@@ -359,3 +359,149 @@ class FsifDeviceJournalSuite extends AnyFunSuite:
     assert(j.needsReplay(a))
     j.release(a)
     assert(!j.needsReplay(a))
+
+  test("after recovery to a header-only tail file the writer re-enters that file"):
+    // Lifetime 1 fills files 0 and 1; a crash after file 2's entry header, before its batch
+    val files = newFiles()
+    val j = direct(files)
+    val a = UUID.randomUUID()
+    j.attach(a, dir / "a", new TestOwner)
+    for i <- 0 until 2 * perFile do
+      j.covered(a, value(j.append(a, List(rec(i)))))
+    val n = 2L * perFile
+    val f2 = files.open(DeviceJournalScan.fileName(2))
+    f2.write(0, DeviceJournalFormat.encodeHeader(FileHeader(sizing.journalId, 42L, n, n)))
+    f2.force()
+    f2.close()
+    val Scan.Valid(_, tail) = DeviceJournalScan.scan(files, sizing): @unchecked
+    assert(tail == Tail(2, DeviceJournalFormat.HeaderSize, n, 42L))
+    // Lifetime 2: its first batch goes into file 2, not file 0 (which would also start at serial n)
+    val j2 = new FsifDeviceJournal(files, sizing, Some(tail), r => r.run(), forceAfterWrite = true)
+    val b = UUID.randomUUID()
+    j2.attach(b, dir / "b", new TestOwner)
+    assert(value(j2.append(b, List(rec(99)))) == n)
+    val Scan.Valid(bs, tail2) = DeviceJournalScan.scan(files, sizing): @unchecked
+    assert(tail2.file == 2 && tail2.nextSerial == n + 1 && tail2.salt != 42L)
+    assert(bs.map(_.records) == Vector(Vector(TaggedRecord(b, rec(99)))))
+
+  test("crash at every op of restarts wrapping the ring, then of the run after it, loses no acknowledged append"):
+    // Three batches per file; each lifetime makes five appends, so three lifetimes wrap the ring of nine
+    val small = JournalSizing(new UUID(7, 8), 3, 4 * 4096L)
+    final class Chain(var needed: Map[Long, Vector[JournalRecord]], var next: Int, var headerOnlyTails: Int):
+      def copy(): Chain = new Chain(needed, next, headerOnlyTails)
+
+      /** A device load's scan: every acknowledged append its attachment has not covered is there. None when the
+        * scan's own I/O hit the crash; else the writer's start (replay then covers everything) */
+      def recover(files: SimulatedFsifFiles): Option[Option[Tail]] =
+        val scan =
+          try Some(DeviceJournalScan.scan(files, small))
+          catch case _: IOException => None
+        scan.map:
+          case Scan.Empty =>
+            assert(needed.isEmpty)
+            None
+          case Scan.Valid(bs, tail) =>
+            assert(bs.map(_.serial) == bs.headOption.map(h => (h.serial until h.serial + bs.size).toVector)
+              .getOrElse(Vector.empty))
+            val bySerial = bs.map(b => b.serial -> b.records.map(_.record)).toMap
+            needed.foreach((s, records) => assert(bySerial.get(s).contains(records), s"acknowledged batch $s"))
+            needed = Map.empty
+            if tail.nextPos == DeviceJournalFormat.HeaderSize then
+              headerOnlyTails += 1
+            Some(tail)
+          case other => fail(other.toString)
+
+      /** `lifetimes` device loads, each recovering then appending five times, until the crash stops the I/O */
+      def run(files: SimulatedFsifFiles, lifetimes: Int): Unit =
+        var go = true
+        var l = 0
+        while go && l < lifetimes do
+          recover(files) match
+            case None => go = false
+            case Some(start) =>
+              val j = new FsifDeviceJournal(files, small, start, r => r.run(), forceAfterWrite = true)
+              val a = UUID.randomUUID()
+              j.attach(a, dir / "a", new TestOwner)
+              var i = 0
+              while go && i < 5 do
+                val records = List(rec(next))
+                next += 1
+                j.append(a, records).value match
+                  case Some(Success(s)) =>
+                    // The two newest stay uncovered, so the scan must find them
+                    j.covered(a, s - 2)
+                    needed = needed.filter(_._1 > s - 2) + (s -> records.toVector)
+                  case _ => go = false
+                i += 1
+              j.close()
+          l += 1
+
+    def opsOf(files: SimulatedFsifFiles, chain: Chain): Int =
+      val before = files.opCount
+      chain.run(files, 3)
+      (files.opCount - before).toInt
+    val outerOps = opsOf(newFiles(sz = small), new Chain(Map.empty, 0, 0))
+    var headerOnly = 0
+    for k <- 0 to outerOps do
+      val files = newFiles(k, small)
+      files.crashAfterOps(k)
+      val outer = new Chain(Map.empty, 0, 0)
+      outer.run(files, 3)
+      val base = files.crash()
+      val innerOps = opsOf(base.snapshot(), outer.copy())
+      for i <- 0 to innerOps do
+        withClue(s"k=$k i=$i: "):
+          val f = base.snapshot()
+          f.crashAfterOps(i)
+          val inner = outer.copy()
+          inner.run(f, 3)
+          assert(inner.recover(f.crash()).isDefined)
+          headerOnly += inner.headerOnlyTails
+    // The sweep reached the state the fix is for: recoveries to a tail file holding no batch of its pass
+    assert(headerOnly > 0)
+
+  /** Every callback throws */
+  private final class ThrowingOwner extends FsifDeviceJournal.Owner:
+    var calls = 0
+    private def boom(): Nothing =
+      calls += 1
+      throw new IllegalStateException("owner callback")
+    def complete(task: Runnable): Unit = boom()
+    def roomAvailable(): Unit = boom()
+    def checkpointRequested(): Unit = boom()
+    def journalFailed(t: Throwable): Unit = boom()
+
+  test("owner callbacks that throw stop neither the next write nor the other owners"):
+    val io = new ManualEc
+    val files = newFiles()
+    val j = new FsifDeviceJournal(files, sizing, None, io.execute, forceAfterWrite = true)
+    val (a, b) = (UUID.randomUUID(), UUID.randomUUID())
+    val bad = new ThrowingOwner
+    j.attach(a, dir / "a", bad)
+    j.attach(b, dir / "b", new TestOwner)
+    j.append(a, List(rec(1)))
+    val fb = j.append(b, List(rec(2))) // queued behind the batch in flight
+    io.runOne()
+    assert(bad.calls == 1)
+    assert(io.pending == 1) // the next write was submitted
+    io.runOne()
+    assert(value(fb) == 1)
+    // And the journal still writes after it
+    assert(value({ val f = j.append(b, List(rec(3))); io.runAll(); f }) == 2)
+
+  test("a journalFailed that throws still calls the other owners and completes whenFailed"):
+    val io = new ManualEc
+    val files = newFiles()
+    val j = new FsifDeviceJournal(files, sizing, None, io.execute, forceAfterWrite = true)
+    val (a, b) = (UUID.randomUUID(), UUID.randomUUID())
+    val bad = new ThrowingOwner
+    val good = new TestOwner
+    j.attach(a, dir / "a", bad)
+    j.attach(b, dir / "b", good)
+    val fb = j.append(b, List(rec(1)))
+    j.append(a, List(rec(2)))
+    files.failNext(Fault.IoError, ops = Set(FaultOp.Write))
+    io.runAll()
+    assert(fb.value.exists(_.isFailure))
+    assert(good.failures.size == 1)
+    assert(j.whenFailed.value.exists(_.isSuccess))

@@ -4,12 +4,13 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceState
 import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.{DurableFiles, Host, RecordingRebuildFactory, StoreConfig}
+import org.aspen_ddp.aspen.server.{DurableFiles, Host, RecordingRebuildFactory, StorageDeviceConfig, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.simple.CrlLock
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.{DefaultBackendOpener, StoreCreation}
-import org.aspen_ddp.aspen.server.store.backend.fsif.{DeviceJournalFiles, FsifDeviceJournal, FsifLayout, FsifRecovery,
-  IndexFile, IndexMap, IndexMeta, JournalSizing, NioFsifFiles}
+import org.aspen_ddp.aspen.server.store.backend.fsif.{DeviceJournalFiles, DeviceJournalFormat, DeviceJournalScan,
+  FileHeader, FsifDeviceJournal, FsifLayout, FsifRecovery, IndexFile, IndexMap, IndexMeta, JournalLocked, JournalSizing,
+  NioFsifFiles}
 
 import org.aspen_ddp.aspen.{FsifIntegrationSuite, TestNetwork}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
@@ -24,8 +25,9 @@ import scala.concurrent.duration.{Duration, SECONDS}
 
 /** The FSIF device journal at device load (spec 4.7) and its runtime failure (4.8, R16), on hosts that load their
  *  stores for real: a lost journal moves every FSIF copy to lost/ through the lost-CRL path's steps, a copy whose own
- *  replay fails is moved alone, a locked journal refuses the device, a device whose FSIF copies all arrived detached
- *  loads with no journal, and a journal failing at runtime takes the device out of service as a failed CRL does. */
+ *  replay fails is moved alone, a locked journal leaves the device unloaded, a device whose FSIF copies all arrived
+ *  detached loads with no journal, a journal no FSIF directory needs is replaced when it cannot be opened, and a
+ *  journal failing at runtime takes the device out of service as a failed CRL does. */
 class FsifJournalLostSuite extends IntegrationTestSuite with CopyHostFixture:
 
   private val layout = FsifLayout(1024, 64)
@@ -166,7 +168,7 @@ class FsifJournalLostSuite extends IntegrationTestSuite with CopyHostFixture:
       lostAside(dev) should be(Nil)
       loadedDevices(host).keySet should be(Set(deviceA))
 
-  atest("a locked journal refuses the device and moves nothing"):
+  atest("a locked journal leaves the device unloaded, a transient failure, and moves nothing"):
     val (hostRoot, dev) = device()
     val sizing = journal(dev)
     val copy = fsifCopy(dev, s)
@@ -460,3 +462,86 @@ class FsifJournalLostSuite extends IntegrationTestSuite with CopyHostFixture:
       loadedFirst should be(true)
       host.control.router.loaded.keySet should not contain s
       CopyFixtures.phaseOf(dev, s) should be(Some(Phase.Lost))
+
+  /** The journal's ring made corrupt: file 1's header claims first serial 5 while file 0's pass starts at 0 and holds
+   *  no batch (serials 0-4 are missing) */
+  private def corruptRing(dev: os.Path, sizing: JournalSizing): Unit =
+    val files = new NioFsifFiles(dev / DeviceJournalFiles.DirName)
+    for (n, first) <- List(0 -> 0L, 1 -> 5L) do
+      val f = files.open(DeviceJournalScan.fileName(n))
+      try f.write(0, DeviceJournalFormat.encodeHeader(FileHeader(sizing.journalId, 100L + n, first, 0L)))
+      finally f.close()
+
+  atest("R22: a corrupt journal on a device with no FSIF directory is replaced, nothing moved; its RocksDB copies load"):
+    val (hostRoot, dev) = device()
+    val old = journal(dev)
+    corruptRing(dev, old)
+    val rocks = rocksCopy(dev, s1)
+    val host = realHost(hostRoot, new TestOpener)
+    given ExecutionContext = executionContext
+    pump(host, host.control.router.loaded.contains(s1)).map: _ =>
+      loadedDevices(host).keySet should be(Set(deviceA))
+      CopyFixtures.copyPath(dev, s1) should be(Some(rocks))
+      lostAside(dev).size should be(1)
+      DeviceJournalFiles.readSizing(lostAside(dev).head).journalId should be(old.journalId)
+      journalId(dev) should not be old.journalId
+
+  atest("R22: a journal whose open fails transiently on a device with no FSIF directory is replaced at once"):
+    val (hostRoot, dev) = device()
+    val old = journal(dev)
+    // The lock file is a directory: every open of the journal fails with an I/O error (transient)
+    os.makeDir(dev / DeviceJournalFiles.DirName / CrlLock.LockFilename)
+    rocksCopy(dev, s1)
+    val host = realHost(hostRoot, new TestOpener)
+    given ExecutionContext = executionContext
+    pump(host, host.control.router.loaded.contains(s1)).map: _ =>
+      loadedDevices(host).keySet should be(Set(deviceA))
+      lostAside(dev).size should be(1)
+      journalId(dev) should not be old.journalId
+
+  private def deviceCfg(dev: os.Path): StorageDeviceConfig =
+    StorageDeviceConfig.loadStorageDeviceConfig(dev / StorageDeviceConfig.configFilename)
+
+  private def openJournal(dev: os.Path, transientIsLost: Boolean,
+                          earlierUnforced: Map[os.Path, List[os.Path]] = Map(),
+                          syncDirectory: os.Path => Unit = DurableFiles.syncDirectory): FsifJournalOpenResult =
+    FsifJournalDisk.open(dev, deviceCfg(dev), CopyLayoutDisk.list(dev), r => r.run(), transientIsLost, earlierUnforced,
+      syncDirectory, DurableFiles.atomicRename)
+
+  atest("a locked journal is a transient failure, and a refusal once transient failures count as lost"):
+    val (_, dev) = device()
+    val sizing = journal(dev)
+    writeIndex(fsifCopy(dev, s), attached(sizing.journalId, covered = -1))
+    val lock = CrlLock.acquire(dev / DeviceJournalFiles.DirName)
+    val results =
+      try List(openJournal(dev, transientIsLost = false), openJournal(dev, transientIsLost = true))
+      finally lock.release()
+    Future.successful:
+      results.map:
+        case FsifJournalOpenResult.Failed(_: JournalLocked, how, Nil) => how
+        case other => fail(other.toString)
+      .should(be(List(CrlOpenFailure.Transient, CrlOpenFailure.Refused)))
+      lostAside(dev) should be(Nil)
+
+  atest("a copy lost alone by its replay is forced with the directories an earlier unforced move of it left"):
+    val (_, dev) = device()
+    val sizing = journal(dev)
+    // Its index maps an ext to a slot past the end of its (empty) data file: the replay's slot check finds it lost
+    val broken = fsifCopy(dev, s)
+    val map = IndexMap.empty(layout.segmentCount)
+    map.slots(0) = 0
+    map.ids(0) = ObjectId(new UUID(7, 7))
+    writeIndex(broken, attached(sizing.journalId, covered = -1), map)
+    val earlier = dev / "earlier-source"
+    os.makeDir(earlier)
+    val synced = collection.mutable.ArrayBuffer[os.Path]()
+    val result = openJournal(dev, transientIsLost = false, Map(broken -> List(earlier)),
+      p => { synced += p; DurableFiles.syncDirectory(p) })
+    Future.successful:
+      result match
+        case FsifJournalOpenResult.Opened(j, List((from, to))) =>
+          j.close()
+          from should be(broken)
+          synced should contain(earlier)
+          synced should contain(to)
+        case other => fail(other.toString)

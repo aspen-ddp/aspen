@@ -178,7 +178,9 @@ detached needs nothing from any journal.
   `dev-<label>-fjournal-0` (`DeviceIo.journalRun`, behind the device's gate and recorded in its observer as
   `fsif-journal`, so hang detection sees a stuck journal write). One batch is in flight; appends made meanwhile, from
   every store, form the next batch. Each append's Future completes on its store's serial executor
-  (`Owner.complete`), and `roomAvailable`, `checkpointRequested` and `journalFailed` are posted there too. The data
+  (`Owner.complete`), and `roomAvailable`, `checkpointRequested` and `journalFailed` are posted there too. An owner
+  callback that throws is logged at error and stops neither the other owners, the next write nor `whenFailed`, and a
+  timing record that throws cannot either: a write's completion is handled before its timing is recorded. The data
   pool carries no journal writes. Tests give each machine one journal over `SimulatedFsifFiles` (`SharedJournal`),
   its writes on a test EC.
 - **ENOSPC retries** are scheduled on `backend.SharedRetryScheduler` (one `backend-retry` thread, shared with RocksDB's read retry).
@@ -603,9 +605,12 @@ under `src/test/scala/org/aspen_ddp/aspen/server/store/backend/fsif/` unless nam
 
 ### 3.9 Torn tail versus corruption, with the salt
 - **Rule** (`DeviceJournalScan.scan`, spec 4.7 step 1):
-  - Every file header is read; the valid ones are ordered by `first`. The needed range runs from the newest header's
-    oldest needed serial to the tail. Batches below it are not read; where one fails, the walk resumes at the later
-    4096 boundary holding the oldest needed serial (none there is corrupt).
+  - Every file header is read; the valid ones are ordered by `first`. Equal firsts are never written (below);
+    should two valid headers share one, a file holding no batch at its `first` sorts before the one that does (it
+    holds nothing), and two that both hold a batch at that `first` are corrupt.
+  - The needed range runs from the newest header's oldest needed serial to the tail. Batches below it are not read;
+    where one fails, the walk resumes at the later 4096 boundary holding the oldest needed serial (none there is
+    corrupt).
   - Every needed serial must be present, CRC-valid and in order in the file 4.1 assigns it to. A failed batch in a
     file other than the newest is corrupt, as is an oldest needed serial below the oldest valid file's `first`.
   - In the newest file, the first batch that fails or has the wrong serial ends the journal: a torn tail unless a
@@ -618,14 +623,22 @@ under `src/test/scala/org/aspen_ddp/aspen/server/store/backend/fsif/` unless nam
   journal id and that salt, so an earlier pass's batches and another journal's bytes end the file instead of passing
   as batches. A file being entered when a crash tore its header holds nothing needed, which the needed range decides.
   After recovery the writer enters the next file before its first batch, so it never appends after a torn tail
-  (Ruling R4). User data inside a torn batch cannot pose as the next batch: it would need the salt.
+  (Ruling R4), unless the tail file holds no batch of its pass (the tail at its header: a crash or a failed write
+  between its entry header and its first batch). That file's header already claims the next serial as its `first`,
+  so the writer re-enters the tail file itself (a fresh salt also invalidates any torn batch there), Ruling R22.
+  Every valid header's `first` is therefore unique: entering the next file instead would give it the same `first`,
+  and where the tail file is the last index, the next file (file 0) sorted before it, hiding its batches behind an
+  empty "newest" file (silent loss of acknowledged appends) or later demanding that empty file hold them (a false
+  corrupt journal). User data inside a torn batch cannot pose as the next batch: it would need the salt.
 - **Tests:** `DeviceJournalScanSuite` (all of it, e.g. "torn last batch in the newest file is a torn tail", "a rotted
   batch followed by a valid next batch is Corrupt", "a torn header rewrite of the file being entered is ignored", "a
   rotted header of a file inside the needed range is Corrupt", "stale batches of an earlier pass (old salt) after the
   current pass's last batch end the file, not Corrupt"); `DeviceJournalFormatSuite` "truncation at every byte of a
   batch is Invalid, never Unparseable" and "a batch is Invalid under another salt or journal id";
   `DeviceJournalRecoverySuite` "an empty ring with an attached directory whose covered serial is >= 0 throws
-  JournalCorrupt and writes nothing".
+  JournalCorrupt and writes nothing"; `DeviceJournalScanSuite` "equal firsts: ..." (three);
+  `FsifDeviceJournalSuite` "after recovery to a header-only tail file the writer re-enters that file" and "crash at
+  every op of restarts wrapping the ring, then of the run after it, loses no acknowledged append".
 
 ### 3.10 ObjectId checks against reused exts
 - **Why:** an ext is reused after deletion. A store that missed O's delete may later hold P at the same ext. A
@@ -923,10 +936,10 @@ Tests for the automatic paths:
 
 Tests for the non-cases: `DeviceJournalScanSuite` "torn last batch in the newest file is a torn tail", "a rotted
 batch below oldestNeeded is not read" and "a torn header rewrite of the file being entered is ignored";
-`FsifJournalLostSuite` "a locked journal refuses the device and moves nothing", "a journal open that fails before
-anything is decided never loses the journal, however many scans" and "Review Focus 2: a device whose FSIF copies all
-came from another host loads Absent"; `FsifRecoverySuite` "openDirectory refuses an undetached index of its own journal
-with an IOException"; `FsifInitializationSuite` "a store holding objects is
+`FsifJournalLostSuite` "a locked journal leaves the device unloaded, a transient failure, and moves nothing", "a
+journal open that fails before anything is decided never loses the journal, however many scans" and "Review Focus
+2: a device whose FSIF copies all came from another host loads Absent"; `FsifRecoverySuite` "openDirectory refuses an
+undetached index of its own journal with an IOException"; `FsifInitializationSuite` "a store holding objects is
 recovered on open", "an initialized store is recovered as the empty store, not re-initialized" and "a directory with
 non-empty files and no valid index is lost and left untouched"; `StoreCreationSuite` (a failed create leaves nothing at
 the store path); `HostFsifLoadSuite` "an FSIF store whose files hold no valid index is marked for rebuild, not

@@ -8,6 +8,8 @@ import scala.collection.mutable
 import scala.concurrent.{Future, Promise}
 import scala.util.control.NonFatal
 
+import scribe.Logging
+
 import org.aspen_ddp.aspen.server.store.backend.BackendTiming
 
 /** The device journal's writer (spec 4.3, 4.5, 4.8): the only writer of the ring's files `<n>.fj` in `files`.
@@ -23,7 +25,11 @@ import org.aspen_ddp.aspen.server.store.backend.BackendTiming
   *
   * '''Start.''' `start` None is a fresh ring: the writer enters file 0 with first serial 0. `Some(tail)` follows a
   * device-load replay after which no batch is needed: the writer enters the file after `tail.file` before its first
-  * batch (never appending after a possibly torn tail), continuing at `tail.nextSerial`.
+  * batch (never appending after a possibly torn tail), continuing at `tail.nextSerial`. When the tail file holds no
+  * batch of its pass (`tail.nextPos` is the header size: a crash or failed write between its entry header and its
+  * first batch), its header already claims `tail.nextSerial` as its first, so the writer re-enters `tail.file`
+  * itself instead (a fresh salt also invalidates any torn batch there): every entry's `first` is then unique among
+  * the valid headers, which the scan's ordering relies on.
   *
   * '''Entering a file.''' The ring is used in order. The writer enters the next file only when it is free: every
   * unreleased attachment's oldest needed serial (the lowest serial of its records above its covered serial; none for
@@ -63,7 +69,8 @@ import org.aspen_ddp.aspen.server.store.backend.BackendTiming
   * '''Close.''' `onClosed` runs once, after the files are closed (the device's journal lock is released there).
   */
 final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start: Option[Tail],
-                              run: Runnable => Unit, forceAfterWrite: Boolean, onClosed: () => Unit = () => ()):
+                              run: Runnable => Unit, forceAfterWrite: Boolean, onClosed: () => Unit = () => ())
+  extends Logging:
   import FsifDeviceJournal.*
 
   private val lock = new Object
@@ -79,6 +86,8 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
   private val lastOf = Array.fill(count)(-1L)
   /** The current file. Before the first entry it is the one before the entry file, with nothing left in it */
   private var cur = start match
+    // The tail file holds no batch of its pass: re-enter it, so no two valid headers share a `first`
+    case Some(t) if t.nextPos == header => (t.file + count - 1) % count
     case Some(t) => t.file
     case None => count - 1
   private var entered = false
@@ -144,7 +153,7 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
           a.refusedCharge = charge
           refused += a
           (false, pressureNotes())
-    notes.foreach(_())
+    notify(notes)
     ok
 
   def unreserve(attachment: UUID, bytes: Long): Unit =
@@ -157,7 +166,7 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
           a.reserved -= back
           reservedTotal -= back
           roomNotes()
-    notes.foreach(_())
+    notify(notes)
 
   def append(attachment: UUID, records: List[JournalRecord]): Future[Long] =
     val bytes = records.iterator.map(r => DeviceJournalFormat.taggedRecordSize(r).toLong).sum
@@ -179,7 +188,7 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
               // Waiting for a file: ask for checkpoints (rare)
               val n = if w.isEmpty && !inFlight then pressureNotes() else Nil
               (p.future, w, n)
-    notes.foreach(_())
+    notify(notes)
     write.foreach(submit)
     result
 
@@ -196,21 +205,21 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
           // A checkpoint finished: one that left its owner still pinning (its snapshot predated head) is asked again
           a.requestedFor = NoSerial
           (nextWrite(), roomNotes() ++ pressureNotes())
-    notes.foreach(_())
+    notify(notes)
     write.foreach(submit)
 
   def release(attachment: UUID): Unit =
     val (write, notes) = lock.synchronized:
       attachments.get(attachment).foreach(releaseLocked)
       (nextWrite(), roomNotes() ++ pressureNotes())
-    notes.foreach(_())
+    notify(notes)
     write.foreach(submit)
 
   def releaseDirectory(directory: os.Path): Unit =
     val (write, notes) = lock.synchronized:
       attachments.values.filter(_.directory == directory).toList.foreach(releaseLocked)
       (nextWrite(), roomNotes() ++ pressureNotes())
-    notes.foreach(_())
+    notify(notes)
     write.foreach(submit)
 
   /** Pending appends fail; a write in flight finishes first, then the files are closed */
@@ -224,7 +233,7 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
         queue.clear()
         (ps, !inFlight)
     val t = new IOException("the device journal is closed")
-    pending.foreach(p => p.att.owner.complete(() => p.promise.failure(t)))
+    pending.foreach(p => guarded("complete")(p.att.owner.complete(() => p.promise.failure(t))))
     if closeNow then
       closeHandles()
 
@@ -364,22 +373,27 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
       case Some(t) => fail(t, w.pending)
       case None =>
         val now = System.nanoTime()
-        BackendTiming.report.record("fsif journal write", now - started)
-        BackendTiming.report.record("fsif journal batch (records)", now - w.pending.iterator.map(_.queued).min,
-          w.pending.iterator.map(_.records.size.toLong).sum)
         written(w)
+        try
+          BackendTiming.report.record("fsif journal write", now - started)
+          BackendTiming.report.record("fsif journal batch (records)", now - w.pending.iterator.map(_.queued).min,
+            w.pending.iterator.map(_.records.size.toLong).sum)
+        catch case NonFatal(t) => logger.error(s"FSIF device journal: recording timing failed: $t")
 
+  /** Owner callbacks cannot throw past it, so the next write is always submitted (`inFlight` never stays set). They
+    * run before that submit: a direct `run` (tests) would otherwise complete a later batch's appends first */
   private def written(w: Write): Unit =
     val (next, notes, closeNow) = lock.synchronized:
       inFlight = false
       tail = w.serial
       val nw = nextWrite()
       (nw, roomNotes() ++ pressureNotes(), closed && !inFlight)
-    w.pending.foreach(p => p.att.owner.complete(() => p.promise.success(w.serial)))
-    notes.foreach(_())
-    if closeNow then
-      closeHandles()
-    next.foreach(submit)
+    try
+      w.pending.foreach(p => guarded("complete")(p.att.owner.complete(() => p.promise.success(w.serial))))
+      notify(notes)
+      if closeNow then
+        closeHandles()
+    finally next.foreach(submit)
 
   private def fail(t: Throwable, inFlightPending: List[Pending]): Unit =
     val (pending, owners, closeNow, first) = lock.synchronized:
@@ -393,12 +407,22 @@ final class FsifDeviceJournal(files: FsifFiles, val sizing: JournalSizing, start
         refused.clear()
         val os = attachments.valuesIterator.filter(!_.released).map(_.owner).toList.distinct
         (ps, os, closed, true)
-    pending.foreach(p => p.att.owner.complete(() => p.promise.failure(t)))
-    owners.foreach(_.journalFailed(t))
-    if first then
-      failedPromise.trySuccess(t)
+    try
+      pending.foreach(p => guarded("complete")(p.att.owner.complete(() => p.promise.failure(t))))
+      owners.foreach(o => guarded("journalFailed")(o.journalFailed(t)))
+    finally
+      if first then
+        failedPromise.trySuccess(t)
     if closeNow then
       closeHandles()
+
+  /** Runs owner callbacks, none of which may stop the others or the journal */
+  private def notify(notes: List[() => Unit]): Unit =
+    notes.foreach(n => guarded("notification")(n()))
+
+  private def guarded(what: String)(f: => Unit): Unit =
+    try f
+    catch case NonFatal(t) => logger.error(s"FSIF device journal: an owner's $what callback threw: $t")
 
   private def closeHandles(): Unit =
     val firstClose = lock.synchronized:

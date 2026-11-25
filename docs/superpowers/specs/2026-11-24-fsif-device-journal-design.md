@@ -246,7 +246,12 @@ store create (4.1).
    EOF"), absolute Deltas written and forced, then an index s+1 written with the journal's tail serial as covered
    serial and the detached flag set. After this, no directory needs any batch; the ring's contents are dead.
 3. **Open the writer** positioned after the tail, entering the next file (header rewrite, oldest needed serial =
-   its own `first`) before the first batch.
+   its own `first`) before the first batch. When the tail file holds no batch of its pass (the tail is at its
+   header: a crash or a failed write came between its entry header and its first batch), the writer re-enters the
+   tail file itself instead, with a fresh salt: its header already claims the next serial as its `first`, and
+   entering the next file would give a second valid header that `first` (R22). Every valid header's `first` is
+   thereby unique; should two ever be equal, step 1 orders a file holding no batch at its `first` before the one
+   that does, and finds two that both hold one corrupt.
 
 Records whose attachment matches no listed directory are ignored: their directory was released (moved to `lost/`,
 deleted, or detached before shipping).
@@ -380,8 +385,9 @@ others (R5, R7, R9, R10, R14) only ordered the work. `store/backend/fsif/DESIGN.
 
 - **R3**: a journal file is at most 1 GiB (`fsif-journal-file-size-mb` 1-1024), and recovery reads the headers first,
   then one file at a time.
-- **R4**: the writer starts on a fresh ring in file 0 (first serial 0); after a replay it always enters the file
-  after the tail before its first batch, never appending after a possibly torn tail.
+- **R4**: the writer starts on a fresh ring in file 0 (first serial 0); after a replay it enters the file after the
+  tail before its first batch, never appending after a possibly torn tail, or re-enters the tail file itself when it
+  holds no batch of its pass (R22: no two valid headers share a `first`).
 - **R6**: device-load replay reports `ForeignUndetached` (newest index undetached but naming another journal), which
   the device load treats as that copy's loss.
 - **R8**: a checkpoint holds the store's new appends in a drain buffer from its snapshot until the snapshot's last
@@ -405,6 +411,12 @@ others (R5, R7, R9, R10, R14) only ordered the work. `store/backend/fsif/DESIGN.
   the next scan (Undecided); one with neither is not an FSIF directory.
 - **R20**: at store open, an undetached index naming another journal is that copy's loss (`StoreLost`), as at device
   load (R6).
+- **R22** (final review): the writer re-enters a tail file holding no batch of its pass (4.7 step 3), and the scan
+  orders or rejects equal firsts safely. On a device with no FSIF directory, a journal that cannot be opened (any
+  failure after the pre-decision steps but a lock) is replaced through the lost-journal path with nothing to move,
+  logged at warn, instead of Undecided forever. A locked journal at device load is Transient (usually this host's
+  own journal closed with a write in flight), Refused once transient failures count as lost. A copy lost alone by
+  its replay is forced with its earlier unforced move's directories, as the lost-journal path's copies are.
 
 Also differing from sections 4-7:
 - Checkpoints start on the journal's request (pressure) or when an operation waits for journal room while the store

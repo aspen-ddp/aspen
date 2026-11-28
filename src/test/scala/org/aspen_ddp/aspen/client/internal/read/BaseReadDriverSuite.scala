@@ -13,6 +13,7 @@ import org.aspen_ddp.aspen.server.store.{KVObjectState, ValueState => StoreValue
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.scalatest.funsuite.AsyncFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -550,5 +551,111 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     reply(r, ds0, tRev, Set(later))
     r.readResult.value.get.get.revision should be (tRev)
     awaitedBy(m) should be (List(ds0 -> Set(t)))
+  }
+
+  // Settled re-read backoff (BaseReadDriver.rereadSettling)
+
+  /** Holds scheduled tasks until the test runs them, recording their delays */
+  class ManualScheduler extends BackgroundTaskManager(ExecutionContext.parasitic):
+    var pending: List[(Duration, () => Unit)] = Nil
+
+    override def schedule(delay: Duration)(fn: => Unit): BackgroundTaskManager.ScheduledTask =
+      pending = pending :+ (delay -> (() => fn))
+      BackgroundTaskManager.ShutdownTask
+
+    def runNext(): Duration =
+      val (delay, fn) = pending.head
+      pending = pending.tail
+      fn()
+      delay
+
+  class SchedulingClient extends RecordingClient:
+    val scheduler = new ManualScheduler
+    override def backgroundTaskManager: BackgroundTaskManager = scheduler
+
+  /** A settled read whose clock the test sets */
+  private def clockedSettledReader(m: ReadDriverClient): (BaseReadDriver, Long => Unit) =
+    var now = 0L
+    val r = new BaseReadDriver(m, ptr, ida, readUUID, "", FullObject()):
+      given ec: ExecutionContext = this.client.clientContext
+      override protected def nanoTime(): Long = now
+    r.settle()
+    (r, (d: Long) => now += d)
+
+  test("a settled re-read the store answers without parking is re-sent with growing delays") {
+    val m = new SchedulingClient
+    val (r, _) = clockedSettledReader(m)
+    // The first reply holding t is re-read at once: the store can park that re-read
+    reply(r, ds0, rev, Set(t))
+    awaitedBy(m) should be (List(ds0 -> Set(t)))
+    m.scheduler.pending shouldBe empty
+
+    // The store is at its parked-read cap and answers at once, still locked: re-read after 10, 20, 40 ms
+    val delays = (1 to 3).map: _ =>
+      val sentBefore = awaitedBy(m).size
+      reply(r, ds0, rev, Set(t))
+      awaitedBy(m).size shouldBe sentBefore // nothing sent at once
+      m.scheduler.pending.size shouldBe 1
+      val d = m.scheduler.runNext()
+      awaitedBy(m).size shouldBe sentBefore + 1
+      awaitedBy(m).head should be (ds0 -> Set(t))
+      d
+    delays.toList shouldBe List(10.millis, 20.millis, 40.millis)
+
+    // A reply in the meantime from another full read adds no second re-read while one is scheduled
+    reply(r, ds0, rev, Set(t))
+    reply(r, ds0, rev, Set(t))
+    m.scheduler.pending.size shouldBe 1
+    val sent = awaitedBy(m).size
+    m.scheduler.runNext() shouldBe 80.millis
+    awaitedBy(m).size shouldBe sent + 1
+
+    r.readResult.isCompleted shouldBe false
+    // Once the lock is gone the read completes
+    reply(r, ds0, tRev, Set())
+    reply(r, ds1, tRev, Set())
+    r.readResult.value.get.get.revision should be (tRev)
+  }
+
+  test("the settled backoff is capped at the parked-read wait, and a reply slower than it is re-read at once") {
+    val m = new SchedulingClient
+    val (r, advance) = clockedSettledReader(m)
+    reply(r, ds0, rev, Set(t))
+    val delays = (1 to 9).map: _ =>
+      reply(r, ds0, rev, Set(t))
+      m.scheduler.runNext()
+    delays.last shouldBe BaseReadDriver.SettleBackoffMax
+    delays.max shouldBe BaseReadDriver.SettleBackoffMax
+
+    // A parked read answered at its expiry: as slow as the backoff, so no delay is added
+    val sent = awaitedBy(m).size
+    advance(BaseReadDriver.SettleBackoffMax.toNanos)
+    reply(r, ds0, rev, Set(t))
+    m.scheduler.pending shouldBe empty
+    awaitedBy(m).size shouldBe sent + 1
+  }
+
+  test("a delayed settled re-read is not sent once the read has completed") {
+    val m = new SchedulingClient
+    val (r, _) = clockedSettledReader(m)
+    reply(r, ds0, rev, Set(t))
+    reply(r, ds0, rev, Set(t))
+    m.scheduler.pending.size shouldBe 1
+    reply(r, ds1, tRev, Set())
+    reply(r, ds2, tRev, Set())
+    r.readResult.value.get.get.revision should be (tRev)
+    val sent = m.requests.size
+    m.scheduler.runNext()
+    m.requests.size shouldBe sent
+  }
+
+  test("an ordinary read re-reads a store holding a known-committed lock at once, however fast it answers") {
+    val m = new SchedulingClient:
+      override val txStatusCache: TransactionStatusCache = new TransactionStatusCache()
+    val r = mkReader(m)
+    m.txStatusCache.transactionCommitted(t)
+    (1 to 3).foreach(_ => reply(r, ds0, rev, Set(t)))
+    m.scheduler.pending shouldBe empty
+    awaitedBy(m) should be (List.fill(3)(ds0 -> Set(t)))
   }
 }

@@ -400,7 +400,8 @@
   expiry discard (`Tx.expire`) and forget all release them. `doCommit` drops its locks before applying, but calls
   `answerParkedReads` only after `issueCommits` applied the update in memory, so the answer shows it. Past
   `Frontend.ParkedReadWait` (1 s; a test seam, `parkedReadWait`; `expireParkedReads` on the store heartbeat) a parked read is answered with the
-  state as it is then. At `Frontend.MaxParkedReads` (1024) parked a read is answered at once. A read reaching the
+  state as it is then. At `Frontend.MaxParkedReads` (1024) parked a read is answered at once (a settled
+  reader then backs off before re-reading, `client/internal/CLAUDE.md`). A read reaching the
   backend is never parked (an uncached object holds no locks). Fail-stop and close drop parked reads unanswered; the
   client retransmits. Safety is unaffected: a parked read only delays its own answer
 - Parked allocation reads: a client read that misses in the backend while `allocationPending` holds is parked too

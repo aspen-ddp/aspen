@@ -75,7 +75,13 @@
   e.g. Replication(3,2), A voted commit and holds the lock, B voted abort, C is down; B alone is below the read
   threshold and A+C may have committed, so the read must wait for C, possibly for hours). The wait is required for
   soundness, so a settled read never returns early; a caller that must not wait forever uses `settledReaderBy` and
-  fails. Sound because a commit voter holds T's locks until it applies T
+  fails. A store at `Frontend.MaxParkedReads` answers the awaiting re-read at once, still locked; re-sending at once
+  would ping-pong at network speed on an overloaded store for as long as the holder stays undecided, so a reply to an
+  awaiting re-read that came back sooner than the store's backoff is re-read after it (`BaseReadDriver.rereadSettling`:
+  per store, 10 ms doubling to `ParkedReadWait`, reset once the store settles; at most one delayed re-read per store,
+  on `backgroundTaskManager`). Any other reply (the first, one after a full resend's quick answer outside a backoff, a
+  parked read answered at its expiry) is re-read at once. Only the settled path backs off: ordinary reads and the
+  known-committed re-read are unchanged. Sound because a commit voter holds T's locks until it applies T
   (`Tx.doCommit` releases and applies in one executor step), T committed means `writeThreshold` voters per object,
   and the stores that neither applied T nor held its lock number at most `width - writeThreshold`, below the read
   threshold. Cost is on the settled reader only; used by the system event log reader (`common/eventlog/DESIGN.md` 6.1)

@@ -103,7 +103,40 @@ abstract class BaseReadDriver(
   /** Settled reads: each store's locks still awaited (from its first reply). A store's entry is empty once settled */
   private var awaitedLocks: Map[StoreId, Set[TransactionId]] = Map()
 
+  /** Settled reads: when each store's last awaiting re-read was sent (nanoTime), the backoff before its next one, and
+    * the stores with a delayed re-read scheduled. A store at Frontend.MaxParkedReads answers an awaiting re-read at
+    * once, still holding the locks; re-sending at once would ping-pong at network speed for as long as the holder
+    * takes to resolve (indefinitely while a store of it is silent), on a store already overloaded */
+  private var settleSentAt: Map[StoreId, Long] = Map()
+  private var settleBackoff: Map[StoreId, FiniteDuration] = Map()
+  private var settleDelayed: Set[StoreId] = Set()
+
+  /** The clock settled re-reads are timed by; tests override it */
+  protected def nanoTime(): Long = System.nanoTime()
+
   def settle(): Unit = synchronized { settling = true }
+
+  /** Re-reads a settling store awaiting `locks`. A reply to an awaiting re-read that came back sooner than the
+    * store's backoff (not parked: the store is at its cap) is re-read after the backoff, which then doubles up to
+    * Frontend.ParkedReadWait. Any other reply (the first, one after a full resend, or a parked read answered at its
+    * expiry) is re-read at once. While a delayed re-read is scheduled, no other is sent */
+  private def rereadSettling(store: StoreId, locks: Set[TransactionId]): Unit =
+    if !settleDelayed.contains(store) then
+      val now = nanoTime()
+      val backoff = settleBackoff.getOrElse(store, BaseReadDriver.SettleBackoffStart)
+      if settleSentAt.get(store).exists(sent => now - sent < backoff.toNanos) then
+        settleDelayed += store
+        settleBackoff += store -> (backoff * 2).min(BaseReadDriver.SettleBackoffMax)
+        client.backgroundTaskManager.schedule(backoff):
+          synchronized:
+            settleDelayed -= store
+            val awaited = awaitedLocks.getOrElse(store, Set())
+            if !promise.isCompleted && awaited.nonEmpty then
+              settleSentAt += store -> nanoTime()
+              sendReadRequest(store, awaited)
+      else
+        settleSentAt += store -> now
+        sendReadRequest(store, locks)
 
   /** For a settled read: the awaited locks the store's reply still holds, recording its first reply's locks. Empty
     * once the store has settled: its later replies go to the object reader as in an ordinary read */
@@ -211,16 +244,23 @@ abstract class BaseReadDriver(
 
     if (isUnknownStoreResponse || isAllocationPending || hasLocksForKnownCommittedTransactions || settleLocks.nonEmpty) {
       // We know for certain that the response from this store has out-of-date information, or a settled read awaits
-      // the locks its first reply held. Transactions _should_ resolve quickly so we'll immediately reread from the store
+      // the locks its first reply held. Transactions _should_ resolve quickly so we re-read from the store at once (a
+      // settled re-read the store answered without parking backs off first: rereadSettling)
       if hasLocksForKnownCommittedTransactions then
         committedLockRereads += 1
         if elapsedMillis >= BaseReadDriver.SlowReadMillis && !committedLockStoresReported.contains(response.fromStore) then
           committedLockStoresReported += response.fromStore
           logger.warn(s"Read UUID $readUUID of object ${objectPointer.id}: store ${response.fromStore} still holds a " +
             s"lock of a committed transaction after ${elapsedMillis}ms. Replies so far: $responseSummary")
-      sendReadRequest(response.fromStore, committedLocks ++ settleLocks)
+      if settleLocks.nonEmpty && !hasLocksForKnownCommittedTransactions then
+        rereadSettling(response.fromStore, settleLocks)
+      else
+        sendReadRequest(response.fromStore, committedLocks ++ settleLocks)
     }
     else {
+      if settling then
+        settleBackoff -= response.fromStore
+        settleSentAt -= response.fromStore
       response.result.foreach: cs =>
         if cs.lockedWriteTransactions.nonEmpty then
           undecidedLockStores += response.fromStore -> cs.lockedWriteTransactions
@@ -280,6 +320,12 @@ object BaseReadDriver:
   val ResendEvery: FiniteDuration = FiniteDuration(100, MILLISECONDS)
   val HungAfter: FiniteDuration = FiniteDuration(2, SECONDS)
   val MaxResends: Int = 600
+
+  /** Settled reads: the first and largest backoff before re-reading a store that answered an awaiting re-read without
+    * parking it. The largest is how long a store parks a read, so a store that cannot park is asked no more often than
+    * one that can */
+  val SettleBackoffStart: FiniteDuration = FiniteDuration(10, MILLISECONDS)
+  val SettleBackoffMax: FiniteDuration = org.aspen_ddp.aspen.server.store.Frontend.ParkedReadWait
 
   /** Reads slower than this are logged with every store's last reply */
   val SlowReadMillis: Long = 2000

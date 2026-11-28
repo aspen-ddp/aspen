@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.tkvl.{DataObjectTKVL, KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.ServiceMessage
-import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.{NoTask, ScheduledTask}
 import org.aspen_ddp.aspen.compute.{DurableService, DurableServiceFactory}
@@ -71,6 +71,12 @@ object EventLogDurableService extends DurableServiceFactory with Logging:
   * tail's records are sorted into new full objects inserted into loggedEvents, the tails emptied (and refilled with
   * the rest of the batch) and tailFloor advanced. An entry too large for any log object is replaced by a
   * DroppedEvent with its timestamp.
+  *
+  * With full objects present, a record at or below tailFloor is late. The batch's oldest late record picks the full
+  * object covering it (filed under the largest key at or below it, else the first), which is read and rewritten in
+  * the same transaction with every late record of the batch in its range merged in: split at timestamp boundaries
+  * when it outgrows the target (the new parts allocated and inserted into loggedEvents), rekeyed when a record
+  * precedes the first object. Late records outside that range wait for a later batch.
   *
   * Every move transaction deletes the moved incoming keys at their read KeyRevision (its pin) and checks the tails and
   * the state keys it writes, so two instances overlapping after a lease handoff never both commit the same entry: the
@@ -185,6 +191,25 @@ class EventLogDurableService(val client: AspenClient,
       () => first.isDefined
     ).map(_ => first.map(LogKey.decode))
 
+  /** Loads the full object covering ts: the one filed under the largest key at or below ts, else the first */
+  private def loadCovering(logged: DataObjectTKVL, ts: HLCTimestamp): Future[LoadedFull] =
+    var covering: Option[(HLCTimestamp, DataObjectPointer)] = None
+    var next: Option[HLCTimestamp] = None
+    logged.foreach(
+      (k, v) =>
+        if next.isEmpty then
+          val key = LogKey.decode(k)
+          if covering.isEmpty || key <= ts then
+            covering = Some(key -> DataObjectPointer(v.bytes))
+          else
+            next = Some(key)
+        Future.unit,
+      () => next.isDefined
+    ).flatMap: _ =>
+      covering match
+        case Some((key, ptr)) => LogWriter.loadFull(client, key, ptr, next)
+        case None => Future.failed(new IllegalStateException("loggedEvents is empty, so no record can be late"))
+
   private def moveBatch(): Future[BatchResult] =
     for
       kvos <- client.read(statePointer, "event log service state")
@@ -227,6 +252,7 @@ class EventLogDurableService(val client: AspenClient,
       def planWith(loaded: Vector[LoadedTail],
                    tailRecords: Option[Vector[LoggedRecord]],
                    first: Option[HLCTimestamp],
+                   late: Option[LoadedFull],
                    cap: Option[Int]): LogPlan =
         LogPlanner.plan(PlanInput(
           batch = records,
@@ -235,7 +261,7 @@ class EventLogDurableService(val client: AspenClient,
           tailRecords = tailRecords,
           tailFloor = tailFloor,
           firstFullKey = first,
-          lateTarget = None,
+          lateTarget = late.map(_.view),
           target = cap.fold(targetObjectSize)(math.min(targetObjectSize, _)),
           newObjectCap = cap,
           dropReplacement = dropReplacement))
@@ -243,10 +269,12 @@ class EventLogDurableService(val client: AspenClient,
       /** The plan from the tails' lengths alone. When an in-order record is left over, no tail had room for it, so
         * the tails are read whole and the batch planned again, now able to compact them.
         */
-      def planBatch(first: Option[HLCTimestamp], cap: Option[Int]): Future[(LogPlan, Vector[LoadedTail])] =
+      def planBatch(first: Option[HLCTimestamp],
+                    late: Option[LoadedFull],
+                    cap: Option[Int]): Future[(LogPlan, Vector[LoadedTail])] =
         for
           loaded <- Future.traverse(tails.pointers)(LogWriter.load(client, _))
-          plan = planWith(loaded, None, first, cap)
+          plan = planWith(loaded, None, first, late, cap)
           inOrderLeft = plan.consumed.size < records.size && {
             val taken = java.util.Collections.newSetFromMap(new IdentityHashMap[LoggedRecord, java.lang.Boolean]())
             plan.consumed.foreach(taken.add)
@@ -258,14 +286,18 @@ class EventLogDurableService(val client: AspenClient,
             else
               Future.traverse(tails.pointers)(LogWriter.loadWhole(client, _)).map: whole =>
                 val tailRecords = whole.flatMap(t => LogRecords.decodeFrames(t.state.data.getByteArray))
-                (planWith(whole, Some(tailRecords), first, cap), whole)
+                (planWith(whole, Some(tailRecords), first, late, cap), whole)
         yield result
 
       for
         logged <- loggedRoot.getDataObjectTree()
         first <- firstFullKey(logged)
+        // The covering object of the oldest late record; the plan merges every late record in its range
+        oldestLate = first.flatMap(_ => records.iterator.map(_.timestamp).filter(_ <= tailFloor).minOption)
+        late <- oldestLate.fold(Future.successful(Option.empty[LoadedFull])):
+                  ts => loadCovering(logged, ts).map(Some(_))
         allocator <- client.getAllocator(allocatorId)
-        (plan, loaded) <- planBatch(first, allocator.maxObjectSize)
+        (plan, loaded) <- planBatch(first, late, allocator.maxObjectSize)
         result <-
           val moved = plan.consumed.map(keyOf.get) ++ undecodable
           if moved.isEmpty then
@@ -277,9 +309,12 @@ class EventLogDurableService(val client: AspenClient,
               given Transaction = tx
 
               // Every move checks TailsKey, so an instance holding stale state cannot append after another advanced
-              // `current` or compacted; its transaction aborts and its next batch re-reads
+              // `current` or compacted; its transaction aborts and its next batch re-reads. It checks TailFloorKey
+              // too, since that decides which records are late and where they go
               val tailsReq = KeyValueUpdate.KeyRevision(EventLogState.TailsKey, value(EventLogState.TailsKey).revision)
-              var reqs = List[KeyValueUpdate.KeyRequirement](tailsReq)
+              val floorReq =
+                KeyValueUpdate.KeyRevision(EventLogState.TailFloorKey, value(EventLogState.TailFloorKey).revision)
+              var reqs = List[KeyValueUpdate.KeyRequirement](tailsReq, floorReq)
               var ops = List.empty[Insert]
               if ids.size != typeIds.size then
                 reqs ::= KeyValueUpdate.KeyRevision(EventLogState.TypeIdsKey, value(EventLogState.TypeIdsKey).revision)
@@ -288,13 +323,11 @@ class EventLogDurableService(val client: AspenClient,
                 ops ::= Insert(EventLogState.TailsKey,
                   EventLogState.encodeTails(tails.copy(current = plan.newCurrent)))
               compaction.foreach: c =>
-                reqs ::= KeyValueUpdate.KeyRevision(EventLogState.TailFloorKey,
-                  value(EventLogState.TailFloorKey).revision)
                 ops ::= Insert(EventLogState.TailFloorKey, EventLogState.encodeTailFloor(c.newTailFloor))
               tx.update(statePointer, None, None, reqs, ops)
 
               for
-                _ <- LogWriter(plan, loaded, allocator, logged)
+                _ <- LogWriter(plan, loaded, late, allocator, logged)
                 _ <- incoming.prepareUpdates(Nil, Nil, moved.toList.map(in => in.key -> in.revision))
               yield ()
             .map(_ => BatchResult.Moved)

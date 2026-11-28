@@ -24,6 +24,10 @@ class EventLogSmallSliceSuite extends EventLogSuiteBase:
 
   override def testIda: IDA = ReedSolomon(5, 3, 4)
 
+  override def userTypeFactories: List[org.aspen_ddp.aspen.client.RegisteredTypeFactory] =
+    List(EventLogDurableService, ObserverTestTypes.FactoryA, ObserverTestTypes.FactoryB,
+      ObserverTestTypes.ObserverFactory)
+
   private val logIda = ReedSolomon(5, 3, 4)
   private val logSliceSize = 2048
 
@@ -126,3 +130,24 @@ class EventLogSmallSliceSuite extends EventLogSuiteBase:
       multiset(all.filter(_.typeUUID != DroppedEvent.TypeUUID)) shouldBe multiset(kept)
       all.filter(_.typeUUID == DroppedEvent.TypeUUID).map(DroppedEvent.createEvent).sortBy(_.timestamp) shouldBe
         oversized.map(e => DroppedEvent(e.timestamp, e.typeUUID, DropReason.ExceededMaximumLogEntrySize))
+
+  atest("an observer sees the DroppedEvent replacement and not the dropped original"):
+    given ExecutionContext = executionContext
+    import ObserverTestTypes.*
+    val rnd = new Random(9)
+    val base = HLCTimestamp.now.asLong
+    val small = EventLogEntry(HLCTimestamp(base), EvA, incompressible(rnd, 100))
+    val big = EventLogEntry(HLCTimestamp(base + 1), EvB, incompressible(rnd, 10 * 1024))
+    val c = s"${UUID.randomUUID()}|ALL"
+    for
+      poolId <- createLogPool()
+      _ <- moveLogTo(poolId)
+      _ <- client.addSystemEventObserver(ObserverFactory.typeUUID, c.getBytes)
+      _ <- logInGroups(List(small, big))
+      ptr <- SystemEventLog.statePointer(client)
+      _ = makeService(ptr)
+      _ <- awaitIncomingEmpty()
+      _ <- awaitUntil("both events observed")(Future.successful(seenBy(c).size >= 2))
+    yield
+      seenBy(c) shouldBe Vector(TestEvent(small.timestamp, EvA),
+        DroppedEvent(big.timestamp, EvB, DropReason.ExceededMaximumLogEntrySize))

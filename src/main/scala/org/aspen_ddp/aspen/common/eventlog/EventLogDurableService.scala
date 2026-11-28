@@ -105,6 +105,7 @@ class EventLogDurableService(val client: AspenClient,
 
   // The observers are loaded before the first scan, so events it moves are observed
   private var loadedRevision: Option[ObjectRevision] = None
+  private var loadedTimestamp: Option[HLCTimestamp] = None
   private var observers: List[EventObserver] = Nil
 
   loadObservers().onComplete(_ => requestScan())
@@ -131,12 +132,14 @@ class EventLogDurableService(val client: AspenClient,
     .recover:
       case err => logger.warn(s"EventLogDurableService: observer reload failed: $err")
 
-  /** Replaces the observer set when `kvos` holds a different ObserversKey revision than the loaded one. The new set
-    * is built first and swapped in under the lock.
+  /** Replaces the observer set with the one in `kvos` unless an equal or newer one is installed. Observer lists are
+    * ordered by the write timestamp of ObserversKey's value, so a read that started earlier but finishes later
+    * (a poll racing a batch) never replaces a newer set. The check, build and swap are one critical section, so
+    * factories run once per installed set.
     */
-  private def applyObservers(kvos: KeyValueObjectState): Unit =
+  private def applyObservers(kvos: KeyValueObjectState): Unit = synchronized:
     val vs = kvos.contents(EventLogState.ObserversKey)
-    if !synchronized(loadedRevision.contains(vs.revision)) then
+    if loadedTimestamp.forall(_ < vs.timestamp) then
       val built = EventLogState.decodeObservers(vs.value.bytes).flatMap: o =>
         client.typeRegistry.getType[EventObserverFactory](o.factoryType) match
           case None =>
@@ -148,9 +151,12 @@ class EventLogDurableService(val client: AspenClient,
               case err: Throwable =>
                 logger.warn(s"EventLogDurableService: observer of ${o.factoryType} could not be created: $err")
                 None
-      synchronized:
-        loadedRevision = Some(vs.revision)
-        observers = built
+      loadedTimestamp = Some(vs.timestamp)
+      loadedRevision = Some(vs.revision)
+      observers = built
+
+  /** The revision of ObserversKey's value that the installed observers were built from */
+  private[aspen] def loadedObserversRevision: Option[ObjectRevision] = synchronized(loadedRevision)
 
   /** Calls the observers of each event moved by a committed transaction, in timestamp order. Observers must be fast;
     * an exception from one is logged and does not affect the others or the log.

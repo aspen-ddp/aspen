@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
 import java.util.UUID
 import java.util.concurrent.{ConcurrentHashMap, CopyOnWriteArrayList}
+import scala.concurrent.duration.{Duration, SECONDS}
 import scala.concurrent.{ExecutionContext, Future}
 import scala.jdk.CollectionConverters.*
 
@@ -110,7 +111,7 @@ class EventLogObserverSuite extends EventLogSuiteBase:
     val c = config("ALL")
     for
       ptr <- SystemEventLog.statePointer(client)
-      _ = makeService(ptr)
+      service = makeService(ptr)
       kvos <- client.read(ptr)
       rev = kvos.contents(EventLogState.ObserversKey).revision
       // Written directly: no reload message is sent
@@ -119,7 +120,11 @@ class EventLogObserverSuite extends EventLogSuiteBase:
                List(Insert(EventLogState.ObserversKey, EventLogState.encodeObservers(
                  List(EventLogState.ObserverConfig(ObserverFactory.typeUUID, c.getBytes))))))
              Future.unit
-      // An observer active after a poll observes events moved afterwards
+      written <- client.read(ptr)
+      newRev = written.contents(EventLogState.ObserversKey).revision
+      // Only the poll can have loaded it: no event has been logged, so no batch has moved
+      _ <- awaitUntil("poll to load the observer", Duration(30, SECONDS)):
+             Future.successful(service.loadedObserversRevision.contains(newRev))
       _ <- logInGroups(Vector(ev(0, EvA)))
       _ <- awaitSeen(c, 1)
     yield succeed

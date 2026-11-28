@@ -94,9 +94,8 @@ Tests under `src/test/scala/org/aspen_ddp/aspen/common/eventlog/`.
     `def encode(): Array[Byte]`, `object EventLogEntry { def decode(b: Array[Byte]): EventLogEntry }` (proto
     `EventLogEntry { fixed64 timestamp; UUID typeUUID; bytes data }`, reuse the existing `UUID` proto message).
     Override `equals`/`hashCode` to compare `data` by content.
-  - `trait Event { def timestamp: HLCTimestamp; def typeUUID: UUID; def describe: String }`; a
-    `trait Event` default for `describe` is not possible without data, so add `abstract class BasicEvent(entry:
-    EventLogEntry) extends Event` with `describe = s"${entry.data.length} bytes"`.
+  - `trait Event { def timestamp: HLCTimestamp; def typeUUID: UUID; def describe: String = "" }` — an empty
+    `describe` makes display fall back to the entry's byte count (Task 11).
   - `trait EventFactory extends RegisteredTypeFactory { def createEvent(e: EventLogEntry): Event }`
   - `trait EventObserver { def observedTypes: Option[Set[UUID]]; def observe(e: Event): Unit }`
   - `trait EventObserverFactory extends RegisteredTypeFactory { def createEventObserver(typeUUID: UUID, configData:
@@ -168,7 +167,8 @@ Tests under `src/test/scala/org/aspen_ddp/aspen/common/eventlog/`.
   - `final case class ObserverConfig(factoryType: UUID, config: Array[Byte])` (content equality);
     `encodeObservers(List[ObserverConfig]) / decodeObservers`.
   - `encodeAllocator(ObjectAllocatorId) / decodeAllocator` (the 17-byte `toArray`).
-  - `final case class Tails(pointers: Vector[DataObjectPointer], current: Int)`; `encodeTails/decodeTails`.
+  - `final case class Tails(pointers: Vector[DataObjectPointer], current: Int, allocator: ObjectAllocatorId)` (the
+    allocator the tails came from; Task 10 compares it with `AllocatorKey`); `encodeTails/decodeTails`.
   - `encodeTailFloor(HLCTimestamp) / decodeTailFloor`.
   - `val TailCount = 10`.
 - Produces `sealed trait EventLogMessage` with `case object Nudge`, `case object ReloadObservers`,
@@ -263,7 +263,7 @@ Tests under `src/test/scala/org/aspen_ddp/aspen/common/eventlog/`.
   - `object SystemEventLog`:
     `private[aspen] def initialState(incoming: Root, logged: Root, tails: Vector[DataObjectPointer], allocator:
     ObjectAllocatorId): Map[Key, Array[Byte]]` (empty typeIds/observers, `tailFloor = HLCTimestamp.Zero`,
-    `Tails(tails, 0)`); `private[aspen] def statePointer(client): Future[KeyValueObjectPointer]` (services TKVL lookup,
+    `Tails(tails, 0, allocator)`); `private[aspen] def statePointer(client): Future[KeyValueObjectPointer]` (services TKVL lookup,
     as `RebalancingDurableService.readServiceStatePointer`).
   - `AspenClient` (concrete methods delegating to `SystemEventLog`):
     - `def prepareSystemEventLogEntry(e: EventLogEntry)(using Transaction): Future[Unit]`
@@ -278,8 +278,8 @@ Tests under `src/test/scala/org/aspen_ddp/aspen/common/eventlog/`.
 - Service: on create, read state, load typeIds; poll via `scheduleNonConcurrentPollingTask("event-log-move",
   pollPeriod)`; `receiveMessage(Nudge)` runs a scan now (one scan at a time: a scan already running sets a "rescan"
   flag, as the rebalancing `beginSweep` claim). A scan loops: read up to 1000 entries / 1 MiB raw from `incomingEvents`
-  (`foreach`, stop early), assign new type ids (next = max + 1; > `Short.MaxValue` unsigned range `0xFFFF` → log error,
-  stop), build `PlanInput`, `LogWriter.apply(plan)` + delete consumed keys + revision-checked state updates in one
+  (`foreach`, stop early), assign new type ids (next = max + 1, ids 0–65535 held in a `Short` read unsigned; past 65535 → log
+  an error and stop moving), build `PlanInput`, `LogWriter.apply(plan)` + delete consumed keys + revision-checked state updates in one
   `transact` (collision → re-read and retry next loop), until the tree is empty.
 - `LogWriter`: `AppendToTail` → `tx.append(readAppendPosition(tail), frame)` when the tail's pool IDA is `Replication`
   or `RandomAccessReedSolomon`, else `tx.overwrite(tail, rev, old ++ frame)`. (Compaction/RewriteFull/Drop executors
@@ -310,7 +310,7 @@ Tests under `src/test/scala/org/aspen_ddp/aspen/common/eventlog/`.
 **Interfaces:**
 - `Compact` executor in one transaction: allocate each object from `getAllocator(logAllocator)` with
   `allocateDataObject(DataBuffer(FullObject.encode(...)))`, insert `LogKey(filedKey) -> ptr.toArray` into
-  `loggedEvents` (one `prepareUpdates`), overwrite every tail with empty content, write `Tails(_, 0)` and the new
+  `loggedEvents` (one `prepareUpdates`), overwrite every tail with empty content, write `Tails(_, 0, _)` and the new
   `tailFloor` with `KeyRevision` requirements.
 - `Drop` executor: put `DroppedEvent.entryFor(entry, ExceededMaximumLogEntrySize)` (as a `LoggedRecord`, its type id
   assigned like any other) into the in-order path; the original entry's incoming key is deleted.
@@ -424,9 +424,7 @@ Tests under `src/test/scala/org/aspen_ddp/aspen/common/eventlog/`.
   (fails if missing); one `transactUntilSuccessful`: `KVObjectRootManager.setNewRoot`-style rewrite of `LoggedKey`
   with the root's `NodeAllocator` replaced by `NodeAllocator(client, List((id, size)))` (size = existing tier-0 size,
   checked by `validate(TreeKind.DataObjects)`), and `AllocatorKey`, both revision-checked; then `Nudge`.
-- Compaction: when a tail's pool is not the current allocator's pool set (compare `ptr.poolId` against a fresh
-  allocation's pool — simplest: tails recorded with the `ObjectAllocatorId` they came from in `Tails`; add
-  `allocator: ObjectAllocatorId` to `Tails`, update Task 3's codec), allocate 10 new empty tails from the new allocator,
+- Compaction: when `Tails.allocator` differs from `AllocatorKey`, allocate 10 new empty tails from the new allocator,
   `setRefcount(old, rc, rc.decrement())` each old tail, store the new `Tails`.
 
 - [ ] **Step 1: Failing tests** — create a second pool (as existing pool-creation tests do, e.g. `client.createPool`
@@ -447,7 +445,7 @@ Tests under `src/test/scala/org/aspen_ddp/aspen/common/eventlog/`.
 - Commands (`Commands` list, beside `system-rebalance-period`):
   - `event-log <client-config> [--since <time>] [--until <time>] [--type <uuid>] [--limit N]` — times ISO-8601
     instants (`java.time.Instant.parse`) converted to `HLCTimestamp`; prints one line per entry:
-    `<ISO instant>  <typeName or UUID>  <describe>`; type name is the factory's class simple name; unregistered:
+    `<ISO instant>  <typeName or UUID>  <describe, or "N bytes" when empty>`; type name is the factory's class simple name; unregistered:
     `<uuid> (no factory, N bytes)`. `--type` filters client-side.
   - `event-log-observers <client-config>` — lists `factoryType` and config length.
   - `event-log-add-observer <client-config> <factory-uuid> [--config-file <path>]`,

@@ -59,6 +59,20 @@ object TierCache:
 
   def default(): TierCache = new LruTierCache(DefaultNodesPerTier)
 
+  /** A view of `underlying` for a root manager whose reads must not mix with its owner's (`RootManager.forWrites`):
+    * every lookup misses and every fill is ignored, but clears, evictions and suspensions reach `underlying`, so a
+    * write that changes the tree still invalidates what its owner's reads cached */
+  def invalidateOnly(underlying: TierCache): TierCache = new TierCache:
+    def root: Option[RootState] = None
+    def generation: Long = underlying.generation
+    def putRoot(r: RootState, generation: Long): Unit = ()
+    def dropRoot(): Unit = underlying.dropRoot()
+    def node(tier: Int, id: ObjectId): Option[ListNode] = None
+    def put(tier: Int, node: ListNode, generation: Long): Unit = ()
+    def stale(tier: Int, node: ListNode): Unit = underlying.stale(tier, node)
+    def clear(): Unit = underlying.clear()
+    def suspendUntil(f: Future[?]): Unit = underlying.suspendUntil(f)
+
 /** Stores nothing, every lookup misses */
 object NoCache extends TierCache:
   def root: Option[RootState] = None

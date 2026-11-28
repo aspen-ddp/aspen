@@ -94,7 +94,7 @@ class TieredKeyValueList(val client: AspenClient,
     * check alone is no pin: a transaction made of it writes nothing, so replaying it is harmless (`replaySafe`).
     */
   def prepareRequireRevisions(keys: List[(Key, ObjectRevision)])(using t: Transaction): Future[Unit] =
-    Future.sequence(keys.map((k, rev) => engine.getContainingNode(k).map(on => (k, rev, on)))).map: found =>
+    Future.sequence(keys.map((k, rev) => engine.getContainingNodeForWrite(k).map(on => (k, rev, on)))).map: found =>
       val located = found.map:
         case (k, rev, Some(node)) if kvNode(node).contents.get(k).exists(_.revision == rev) => (k, rev, kvNode(node))
         case (k, rev, _) => t.abortAndThrow(KeyNotAtRevision(k, rev))

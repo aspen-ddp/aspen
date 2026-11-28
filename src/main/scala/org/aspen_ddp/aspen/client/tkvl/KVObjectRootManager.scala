@@ -12,7 +12,8 @@ import scala.util.{Failure, Success}
 
 /** `readWith` reads the root's host object and the root node (and so, through the nodes, every read of a walk from
   * the root); the client when None. A reader with settled reads (AspenClient.settledReader) makes the tree's reads
-  * settled. Not encoded: a decoded root manager reads with its client
+  * settled. Writes always read with the client (`forWrites`). Not encoded: a decoded root manager reads with its
+  * client
   */
 class KVObjectRootManager(val client: AspenClient,
                           val treeKey: Key,
@@ -29,6 +30,10 @@ class KVObjectRootManager(val client: AspenClient,
   def typeId: RootManagerTypeId = RootManagerTypeId(typeUUID)
 
   def getRoot(): Future[Root] = getRData().map(_.root)
+
+  override lazy val forWrites: RootManager = readWith match
+    case None => this
+    case Some(_) => new KVObjectRootManager(client, treeKey, pointer, TierCache.invalidateOnly(cache))
   
   private def getRData(fresh: Boolean = false): Future[RootState] =
     RootManager.cachedRead(cache, fresh)(readRData())

@@ -34,8 +34,13 @@
   descents and right scans (`TierEngine.containingNode`, `readRight`, the `fetch*`/`scan*` helpers, which take an
   `ObjectReader`) read the nodes they reach with the reader of the node they came from. `KVObjectRootManager`'s
   `readWith` sets the reader of the root's host object and root node, and so of a whole read walk (the event log
-  reader passes `client.settledReader`). Write paths (`prepareUpdates`, joins, splits, `foreachNode`) read with the
-  client
+  reader passes `client.settledReader`). Write paths (`setPinned`, `prepareUpdates`, deletes and the joins they cause,
+  splits, `splitTree`, `deleteTree`, `prepareRequireRevisions`, `foreachNode`) read with the client, root included:
+  `TierEngine.writeRoot` is `RootManager.forWrites`, which for a `KVObjectRootManager` with `readWith` is a manager
+  reading with the client on `TierCache.invalidateOnly(cache)` (lookups miss, fills are ignored, so nodes it reads
+  never reach a read walk; clears, evictions and suspensions still reach the shared cache). Settled reads are never
+  needed for writes: their requirements catch stale reads. The finalization actions decode their root managers,
+  which read with the client
 - The entry walks (`foreach*`, through `TierEngine.walk`) survive joins: a right-neighbour read that fails because a
   join deleted the neighbour (often caused by `fn` itself deleting what it visits) descends again to the node holding
   the last visited key and continues after it, up to `MaxJoinRaceRestarts` restarts in a row without a visited key.

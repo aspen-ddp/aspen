@@ -28,6 +28,10 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
 
   import TierEngine.*
 
+  /** The root manager of the write paths (setPinned, prepareUpdates, deleteFromContainingNode, deleteTree, splitTree,
+    * foreachNode, getContainingNodeForWrite), which read with the client whatever reader `rootManager` reads with (`RootManager.forWrites`) */
+  private val writeRoot: RootManager = rootManager.forWrites
+
   /** Runs `nav` with the instance's cache and root. A BrokenTree or InvalidObject clears the cache and runs `nav`
     * once more with NoCache and a fresh root. Only wrap code that stages nothing in a transaction.
     *
@@ -44,15 +48,16 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     */
   private def navigate[A](write: Boolean = false)
                          (nav: (TierCache, () => Future[(Int, KeyOrdering, Option[ListNode])]) => Future[A]): Future[A] =
+    val mgr = if write then writeRoot else rootManager
     val root = () =>
-      if write && rootManager.cache.anyRoot then rootManager.getFreshRootNode() else rootManager.getRootNode()
-    Future.delegate(nav(rootManager.cache, root)).recoverWith:
+      if write && mgr.cache.anyRoot then mgr.getFreshRootNode() else mgr.getRootNode()
+    Future.delegate(nav(mgr.cache, root)).recoverWith:
       case _: BrokenTree | _: InvalidObject =>
-        rootManager.cache.clear()
-        nav(NoCache, () => rootManager.getFreshRootNode())
+        mgr.cache.clear()
+        nav(NoCache, () => mgr.getFreshRootNode())
 
   /** The tier-0 node containing `key`, or None for an empty tree. The descent goes through the cached upper tiers,
-    * within the safety net (see `navigate`).
+    * within the safety net (see `navigate`). A read descends with the root node's reader, a write with the client.
     */
   private def containingNode(key: Key, write: Boolean = false): Future[Option[ListNode]] =
     navigate(write): (cache, getRoot) =>
@@ -60,7 +65,8 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
         oroot match
           case None => Future.successful(None)
           case Some(root) =>
-            fetchContainingNode(root.reader, tier, 0, ordering, key, root, Set(), cache = cache).map:
+            val reader = if write then client else root.reader
+            fetchContainingNode(reader, tier, 0, ordering, key, root, Set(), cache = cache).map:
               case Left(_) => throw new BrokenTree()
               case Right(node) => Some(node)
 
@@ -74,6 +80,9 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
 
   /** The tier-0 node whose range holds `key`, or None for an empty tree */
   def getContainingNode(key: Key): Future[Option[ListNode]] = containingNode(key)
+
+  /** getContainingNode for a write, which reads with the client (`writeRoot`) */
+  def getContainingNodeForWrite(key: Key): Future[Option[ListNode]] = containingNode(key, write = true)
 
   def get(key: Key): Future[Option[Value]] =
     getContainingNode(key).map(_.flatMap(_.get(key)))
@@ -235,7 +244,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
         case Nil => Future.unit
         case (tier, node) :: rest => walkTier(encoding, tier, node).flatMap(_ => walkTiers(encoding, rest))
 
-    rootManager.readStoredRoot().flatMap: stored =>
+    writeRoot.readStoredRoot().flatMap: stored =>
       stored.orootObject match
         case None => Future.successful(NodeWalk(0, complete = true))
         case Some(rootPointer) =>
@@ -275,11 +284,11 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
       Future.unit
 
     containingNode(key, write = true).flatMap:
-      case None => rootManager.createInitialNode(Map(key -> value))
+      case None => writeRoot.createInitialNode(Map(key -> value))
       case Some(node) =>
         for
-          alloc <- rootManager.getAllocatorForTier(0)
-          maxNodeSize <- rootManager.getMaxNodeSize(0)
+          alloc <- writeRoot.getAllocatorForTier(0)
+          maxNodeSize <- writeRoot.getMaxNodeSize(0)
           _ <- KeyValueListNode.insert(TieredKeyValueList.kvNode(node), node.ordering, key, value, maxNodeSize, alloc,
                  onSplit, requirement, pinned = true)
         yield ()
@@ -307,7 +316,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
       if puts.isEmpty then
         Future.unit
       else
-        rootManager.createInitialNode(puts.toMap)
+        writeRoot.createInitialNode(puts.toMap)
 
     // Every read of the batch. A racing join can delete a node read along the way, which fails the read with
     // InvalidObject. Nothing is staged yet, so the batch restarts from the root. Nothing is staged by any attempt,
@@ -335,8 +344,8 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
         case None => empty()
         case Some(targets) =>
           for
-            alloc <- rootManager.getAllocatorForTier(0)
-            maxNodeSize <- rootManager.getMaxNodeSize(0)
+            alloc <- writeRoot.getAllocatorForTier(0)
+            maxNodeSize <- writeRoot.getMaxNodeSize(0)
             emptied <- ListBatch.stage(targets, maxNodeSize, alloc, onSplit, onJoin)
           yield
             emptied.foreach(node => prepareEmptyNodeRemoval(rootManager, 0, node))
@@ -456,7 +465,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
           ()
 
     for
-      (tier, ordering, onode) <- rootManager.getFreshRootNode()
+      (tier, ordering, onode) <- writeRoot.getFreshRootNode()
 
       _ <- onode match
         case None => Future.unit
@@ -466,7 +475,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
             path <- fetchRootNodes(encoding, List((tier, node)))
             _ <- rdelete(encoding, path)
             tx = client.newTransaction()
-            _ <- rootManager.prepareRootUpdate(0, None)(using tx)
+            _ <- writeRoot.prepareRootUpdate(0, None)(using tx)
             _ <- tx.commit()
             // The cached root, and any upper-tier nodes cached during the deletion, name deleted nodes
             _ = rootManager.cache.clear()
@@ -506,8 +515,8 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
       else
         val odown = if tier > 0 then Some(downPointer) else None
         for
-          alloc <- rootManager.getAllocatorForTier(tier)
-          maxNodeSize <- rootManager.getMaxNodeSize(tier)
+          alloc <- writeRoot.getAllocatorForTier(tier)
+          maxNodeSize <- writeRoot.getMaxNodeSize(tier)
           down <- splitContaining(encoding, rpath.head, odown, alloc, maxNodeSize)
           kvp <- rinsert(encoding, tier + 1, rpath.tail, down.pointer)
         yield
@@ -528,8 +537,8 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
 
         // There will always be a tier0 entry, split that then recurse through
         // the full path
-        alloc <- rootManager.getAllocatorForTier(0)
-        maxNodeSize <- rootManager.getMaxNodeSize(0)
+        alloc <- writeRoot.getAllocatorForTier(0)
+        maxNodeSize <- writeRoot.getMaxNodeSize(0)
 
         down <- splitContaining(encoding, rpath.head, None, alloc, maxNodeSize)
 
@@ -538,15 +547,15 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
         (rpath.length - 1, kvp)
 
     for
-      oldRoot <- rootManager.getRoot()
+      oldRoot <- writeRoot.getRoot()
       encoding = NodeEncoding(oldRoot.kind)
-      (tier, ordering, oroot) <- rootManager.getFreshRootNode()
+      (tier, ordering, oroot) <- writeRoot.getFreshRootNode()
       (newTier, ptr) <- oroot match
         case Some(root) => nonEmpty(encoding, tier, ordering, root)
         case None =>
           for
-            _ <- rootManager.createInitialNode(Map())
-            alloc <- rootManager.getAllocatorForTier(0)
+            _ <- writeRoot.createInitialNode(Map())
+            alloc <- writeRoot.getAllocatorForTier(0)
             ptr <- encoding.allocate(alloc, ordering, Map[Key, Value]())
           yield
             (tier, ptr)

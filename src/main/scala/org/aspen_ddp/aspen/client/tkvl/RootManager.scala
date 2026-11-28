@@ -13,6 +13,13 @@ trait RootManager {
   def cache: TierCache
 
   def getRoot(): Future[Root]
+
+  /** The root manager the tree's write paths use (`TierEngine`): one that reads with the client, on a view of this
+   *  one's cache that invalidates but never serves or fills (`TierCache.invalidateOnly`). A write never needs a
+   *  special reader such as a settled one: its requirements catch stale reads. This manager itself when it already
+   *  reads with the client
+   */
+  def forWrites: RootManager = this
   
   /** Returns (numTiers, keyOrdering, rootNode) */
   def getRootNode(): Future[(Int, KeyOrdering, Option[ListNode])]

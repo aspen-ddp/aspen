@@ -336,3 +336,49 @@ class KVObjectRootManagerSuite extends IntegrationTestSuite:
     yield
       assert(node.isEmpty)
       assert(v.isEmpty)
+
+  /** Forwards to the client's settled reader, counting the reads */
+  private final class CountingReader extends org.aspen_ddp.aspen.client.ObjectReader:
+    import org.aspen_ddp.aspen.client.*
+    import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyOrdering}
+    val reads = new java.util.concurrent.atomic.AtomicInteger(0)
+    private def r = { reads.incrementAndGet(); client.settledReader }
+    def client: AspenClient = KVObjectRootManagerSuite.this.client
+    def read(p: DataObjectPointer, c: String): Future[DataObjectState] = r.read(p, c)
+    def read(p: KeyValueObjectPointer, c: String): Future[KeyValueObjectState] = r.read(p, c)
+    def readKeys(p: KeyValueObjectPointer, keys: List[Key], c: String): Future[KeyValueObjectState] =
+      r.readKeys(p, keys, c)
+    def readKeyRange(p: KeyValueObjectPointer, s: Key, e: Key, o: KeyOrdering, c: String): Future[KeyValueObjectState] =
+      r.readKeyRange(p, s, e, o, c)
+    def readMetadata(p: ObjectPointer, c: String): Future[MetadataObjectState] = r.readMetadata(p, c)
+    def readRange(p: DataObjectPointer, o: Int, l: Option[Int], c: String): Future[DataObjectRangeState] =
+      r.readRange(p, o, l, c)
+    def readRanges(p: DataObjectPointer, rs: List[(Int, Int)], c: String): Future[List[DataObjectRangeState]] =
+      r.readRanges(p, rs, c)
+    def readRangedWriteState(p: DataObjectPointer, ws: List[RangedWrite], c: String): Future[RangedWriteState] =
+      r.readRangedWriteState(p, ws, c)
+    def readAppendPosition(p: DataObjectPointer, c: String): Future[AppendPosition] = r.readAppendPosition(p, c)
+
+  atest("a tree reading with a settled reader writes with the client"):
+    val counting = new CountingReader
+    for
+      plain <- multiTierTree()
+      rm = new KVObjectRootManager(client, treeKey, plain.pointer, readWith = Some(counting))
+      tree = new TieredKeyValueList(client, rm)
+      v0 <- tree.get(Key(0))
+      readsByGet = counting.reads.getAndSet(0)
+      // Inserts that split nodes, deletes that empty and join them, a pinned set, a delete and a revision check
+      _ <- inTx(tx => tree.prepareUpdates((40 until 60).toList.map(i => TKVLInsert(Key(i), value(i))),
+             (0 until 20).toList.map(Key(_)))(using tx))
+      _ <- inTx(tx => tree.prepareSetPinned(Key(70), value(70), PutRequirement.Checked)(using tx))
+      _ <- inTx(tx => tree.delete(Key(20))(using tx))
+      v21 <- plain.getTree().flatMap(_.get(Key(21))).map(_.get)
+      _ <- inTx(tx => tree.prepareRequireRevisions(List(Key(21) -> v21.revision))(using tx))
+      _ <- tree.foreachNode((_, _) => Future.unit)
+      readsByWrites = counting.reads.get
+      keys <- plain.getTree().flatMap(_.foldLeft(Set[Key]())((acc, c) => acc ++ c.keys))
+    yield
+      assert(v0.isDefined)
+      assert(readsByGet > 0)
+      assert(readsByWrites == 0)
+      assert(keys == ((21 until 60).map(Key(_)).toSet + Key(70)))

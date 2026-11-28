@@ -118,7 +118,7 @@ reads it and rewrites it in the same transaction with every late record of the b
 
 ## 6. The reader
 
-`EventLogReader.read(from, to, limit)` (via `AspenClient.readSystemEvents`) returns entries in `[from, to]` sorted
+`EventLogReader.read(from, to, limit, timeout)` (via `AspenClient.readSystemEvents`) returns entries in `[from, to]` sorted
 by timestamp, at most `limit`. It never omits an event logged before the read began, and may return duplicates
 (section 7). It exploits the forward-only movement of section 3:
 
@@ -150,7 +150,15 @@ The walk stops past `to`, or once `limit` records timestamped before the next ke
 
 A settled read waits for the transactions holding write locks in each store's first reply to resolve, so a read of a
 busy current tail or of `incomingEvents` under heavy logging takes up to a transaction's resolution longer. The cost
-is the reader's alone; the service and loggers are unaffected.
+is the reader's alone; the service and loggers are unaffected. The wait is not bounded by the horizon: it lasts until
+each first-reply lock holder resolves at that store, which lasts as long as a store of that transaction is silent
+(expiry rule G, `server/transaction/CLAUDE.md`). With Replication(3,2), a store A that voted commit holds the lock, B
+voted abort and C is down: B alone is below the read threshold and A+C may have committed (C applied, then died), so
+the read must wait for C, possibly for hours. Returning early with what the other stores hold could omit events, so
+the reader never does: the whole read (every attempt and restart) runs under one deadline, `timeout` (default
+`EventLogReader.DefaultReadTimeout`, 60 s). Every read it makes is given the time left (`AspenClient.settledReaderBy`),
+and a `ReadTimeout` from any of them, or the deadline passing between attempts, fails the read with
+`SystemEventLogReadTimeout`: the log is not readable right now. It never returns a partial result.
 
 The reader holds test hooks per instance (`testAfterIncomingRead`, `testDuringIncomingWalk`, `testAfterTailsRead`,
 `testAfterContainingNode`, `testBeforeFirstObjectRead`, and the `restarts` counter), so instances are not shared
@@ -225,7 +233,7 @@ On `AspenClient`:
 - `logSystemEvent(entry)`: logs in its own transaction.
 - `prepareSystemEventLogEntry(entry)(using tx)` / `prepareSystemEventLogEntries(entries)`: add entries to the
   caller's transaction, committed or not with it. The caller's transaction must be pinned or `replaySafe`.
-- `readSystemEvents(from, to, limit)`: the reader. `decodeSystemEvent(entry)`: the entry's `Event`, when its factory
+- `readSystemEvents(from, to, limit, timeout)`: the reader. `decodeSystemEvent(entry)`: the entry's `Event`, when its factory
   is registered.
 - `addSystemEventObserver` / `removeSystemEventObserver` / `listSystemEventObservers`: edit `ObserversKey` with a
   revision-checked write that retries on conflict, then send `ReloadObservers`. An edit that changes nothing (adding

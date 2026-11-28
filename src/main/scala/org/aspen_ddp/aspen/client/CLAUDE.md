@@ -7,8 +7,8 @@
 - Transaction rules every caller must follow (pin rule, one update per object, store new pointers) are in the root
   CLAUDE.md; builder internals in `internal/transaction/CLAUDE.md`
 - Reads are untimed: they retry until they restore the object or fail fatally. `withReadTimeout(d)` returns an
-  `ObjectReader` (`internal/TimedObjectReader`) whose every read method fails with `ReadTimeout` after `d` and stops
-  retrying. `ReadTimeout` is not an `InvalidObject` (it proves nothing about existence) and `readOptional` does not
+  `ObjectReader` (`internal/ClientObjectReader`, `Limit.Each`) whose every read method fails with `ReadTimeout` after
+  `d` and stops retrying. `ReadTimeout` is not an `InvalidObject` (it proves nothing about existence) and `readOptional` does not
   swallow it. `Duration.Inf` returns the client; non-positive or non-finite durations are refused. The timeout is one
   deadline over IDA resolution (an uncached pool's load) and the object read; only the caller's wait on the pool
   load is bounded, since `getStoragePool` shares that load with untimed callers and must never fail it with a
@@ -17,7 +17,8 @@
 
 ### System event log
 - `logSystemEvent`, `prepareSystemEventLogEntry(ies)` (inside the caller's transaction), `readSystemEvents(from, to,
-  limit)`, `decodeSystemEvent`, observer add/remove/list and `setSystemLogAllocator` are thin wrappers over
+  limit, timeout)` (one deadline for the whole read, default 60 s, failing `SystemEventLogReadTimeout`),
+  `decodeSystemEvent`, observer add/remove/list and `setSystemLogAllocator` are thin wrappers over
   `common.eventlog.SystemEventLog` / `EventLogReader`. Reads may return duplicates and never omit; observers are
   best-effort; an event too large for the log allocator is replaced by a `DroppedEvent`. Details: `common/eventlog/DESIGN.md`
 

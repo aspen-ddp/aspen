@@ -303,6 +303,13 @@ class MainSuite extends AnyFunSuite with Matchers:
     parseCmd("event-log", "--type", "not-a-uuid") shouldBe None
     parseCmd("event-log", "--limit", "0") shouldBe None
 
+  test("event-log takes a read timeout in seconds, 60 by default"):
+    import scala.concurrent.duration.DurationInt
+    parseCmd("event-log").getOrElse(fail("event-log did not parse")).eventTimeout shouldBe 60.seconds
+    parseCmd("event-log", "--timeout", "5").getOrElse(fail("--timeout did not parse")).eventTimeout shouldBe 5.seconds
+    parseCmd("event-log", "--timeout", "0") shouldBe None
+    parseCmd("event-log", "--timeout", "soon") shouldBe None
+
   test("event-log-observers and the add/remove commands parse their arguments"):
     parseCmd("event-log-observers").map(_.mode) shouldBe Some("event-log-observers")
     val id = "367b01ad-b822-4827-8603-97fb0308abd6"

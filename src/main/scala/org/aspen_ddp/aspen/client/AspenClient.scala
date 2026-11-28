@@ -96,9 +96,15 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     * transaction replaces when this client cannot tell it committed (it learned the commit only through another
     * object). A settled read waits for the transactions holding write locks in each store's first reply to resolve,
     * so it is slower on a busy object; for a reader that needs a transaction it saw applied on one object to show on
-    * every object it reads next (the system event log reader, `client/internal/CLAUDE.md`). Untimed
+    * every object it reads next (the system event log reader, `client/internal/CLAUDE.md`). Untimed: a settled read
+    * waits as long as a first-reply lock holder stays undecided, which lasts while a store of that transaction is
+    * silent
     */
   private[aspen] def settledReader: ObjectReader
+
+  /** A settledReader whose every read gives up at `deadline`, failing with ReadTimeout; a read begun past the
+    * deadline fails at once. One deadline for a sequence of reads, such as the system event log reader's */
+  private[aspen] def settledReaderBy(deadline: scala.concurrent.duration.Deadline): ObjectReader
 
   def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState]
 
@@ -1028,12 +1034,17 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    *  logged but not yet moved by the event log service are included. No entry logged before the read began is
    *  omitted, but an entry may appear more than once (logged twice, or read before and again after the service
    *  moved it on: from incomingEvents to a tail, or from a tail to a full object). A read racing changes that move records between full objects restarts,
-   *  failing with IllegalStateException after `EventLogReader.MaxRestarts` restarts.
+   *  failing with IllegalStateException after `EventLogReader.MaxRestarts` restarts. The whole read, restarts
+   *  included, fails with SystemEventLogReadTimeout once `timeout` has passed: its reads wait for undecided
+   *  transactions holding locks on the log, which can take as long as a store of such a transaction is unreachable.
+   *  It never returns a partial result.
    */
   def readSystemEvents(from: HLCTimestamp = EventLogReader.Earliest,
                        to: Option[HLCTimestamp] = None,
-                       limit: Option[Int] = None): Future[Vector[EventLogEntry]] =
-    new EventLogReader(this).read(from, to, limit)
+                       limit: Option[Int] = None,
+                       timeout: scala.concurrent.duration.FiniteDuration = EventLogReader.DefaultReadTimeout)
+      : Future[Vector[EventLogEntry]] =
+    new EventLogReader(this).read(from, to, limit, timeout)
 
   /** Adds an observer to the system event log service: `factoryType`'s EventObserverFactory builds it from `config`.
    *  Fails with IllegalArgumentException when no EventObserverFactory is registered for `factoryType`. Adding an

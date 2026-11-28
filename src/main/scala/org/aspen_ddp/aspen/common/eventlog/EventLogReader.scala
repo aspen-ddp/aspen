@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.common.eventlog
 
-import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject}
+import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, ObjectReader, ReadTimeout}
 import org.aspen_ddp.aspen.client.tkvl.{DataObjectTKVL, KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, Value}
@@ -9,6 +9,7 @@ import scribe.Logging
 import java.util.UUID
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration.{Deadline, Duration, DurationInt, FiniteDuration}
 import scala.util.control.NonFatal
 import scala.util.{Failure, Success}
 
@@ -16,6 +17,9 @@ object EventLogReader:
 
   /** Attempts after the first that a read makes before failing */
   val MaxRestarts: Int = 5
+
+  /** How long a read may take, all attempts included, before failing with SystemEventLogReadTimeout */
+  val DefaultReadTimeout: FiniteDuration = 60.seconds
 
   /** The smallest timestamp: a read from it includes every entry */
   val Earliest: HLCTimestamp = HLCTimestamp(Long.MinValue)
@@ -46,6 +50,11 @@ object EventLogReader:
   * a record whose type id the state read does not know. The attempt is then abandoned and the read starts again from
   * incomingEvents, at most MaxRestarts times, and fails with IllegalStateException after that.
   *
+  * A settled read waits until every lock holder of each store's first reply resolves there, which lasts as long as a
+  * store of that transaction is silent (DESIGN.md section 6). It must not return early, so the whole read (every
+  * attempt) runs under one deadline: each read is given the time left (AspenClient.settledReaderBy), and a ReadTimeout
+  * from any of them, or the deadline passing between attempts, fails the read with SystemEventLogReadTimeout.
+  *
   * Each instance holds test seams and counts its restarts, so instances are not shared between reads in tests.
   */
 final class EventLogReader(client: AspenClient) extends Logging:
@@ -53,8 +62,6 @@ final class EventLogReader(client: AspenClient) extends Logging:
   import EventLogReader.*
 
   private given ExecutionContext = client.clientContext
-
-  private val reader = client.settledReader
 
   /** Runs between the incomingEvents walk and the state read, once per attempt */
   private[eventlog] var testAfterIncomingRead: () => Future[Unit] = () => Future.unit
@@ -74,13 +81,23 @@ final class EventLogReader(client: AspenClient) extends Logging:
   /** Attempts restarted so far */
   @volatile private[eventlog] var restarts: Int = 0
 
-  /** Entries with timestamps in `[from, to]`, sorted by timestamp, at most `limit` of them; duplicates possible */
-  def read(from: HLCTimestamp, to: Option[HLCTimestamp], limit: Option[Int]): Future[Vector[EventLogEntry]] =
+  /** Entries with timestamps in `[from, to]`, sorted by timestamp, at most `limit` of them; duplicates possible.
+    * Fails with SystemEventLogReadTimeout once `timeout` has passed */
+  def read(from: HLCTimestamp,
+           to: Option[HLCTimestamp],
+           limit: Option[Int],
+           timeout: FiniteDuration = DefaultReadTimeout): Future[Vector[EventLogEntry]] =
     limit.foreach(n => require(n >= 0, s"limit must not be negative: $n"))
+    require(timeout > Duration.Zero, s"timeout must be positive: $timeout")
+    val deadline = Deadline.now + timeout
+    val reader = client.settledReaderBy(deadline)
     def attempt(n: Int): Future[Vector[EventLogEntry]] =
-      Future.delegate(readOnce(from, to, limit)).recoverWith:
+      Future.delegate(readOnce(reader, from, to, limit)).recoverWith:
+        case err if isTimeout(err) => Future.failed(new SystemEventLogReadTimeout(timeout))
         case err @ (_: Inconsistent | _: InvalidObject) =>
-          if n >= MaxRestarts then
+          if deadline.isOverdue() then
+            Future.failed(new SystemEventLogReadTimeout(timeout))
+          else if n >= MaxRestarts then
             Future.failed(new IllegalStateException(
               s"Event log read gave up after $MaxRestarts restarts; the log kept changing under it", err))
           else
@@ -89,12 +106,20 @@ final class EventLogReader(client: AspenClient) extends Logging:
             attempt(n + 1)
     if limit.contains(0) then Future.successful(Vector.empty) else attempt(0)
 
+  /** A ReadTimeout, possibly wrapped by the tree code that made the read */
+  private def isTimeout(err: Throwable): Boolean =
+    err match
+      case null => false
+      case _: ReadTimeout => true
+      case e => e.getCause != e && isTimeout(e.getCause)
+
   private def inRange(from: HLCTimestamp, to: Option[HLCTimestamp])(ts: HLCTimestamp): Boolean =
     ts >= from && to.forall(ts <= _)
 
   /** The decodable entries of incomingEvents in the range. The walk survives the joins the service's deletes cause
     * (TieredKeyValueList.foreach resumes after the last key visited) */
-  private def readIncoming(ptr: KeyValueObjectPointer,
+  private def readIncoming(reader: ObjectReader,
+                           ptr: KeyValueObjectPointer,
                            from: HLCTimestamp,
                            to: Option[HLCTimestamp]): Future[Vector[EventLogEntry]] =
     val found = ArrayBuffer.empty[EventLogEntry]
@@ -114,12 +139,13 @@ final class EventLogReader(client: AspenClient) extends Logging:
         Future.unit
     .map(_ => found.toVector)
 
-  private def readOnce(from: HLCTimestamp,
+  private def readOnce(reader: ObjectReader,
+                       from: HLCTimestamp,
                        to: Option[HLCTimestamp],
                        limit: Option[Int]): Future[Vector[EventLogEntry]] =
     for
-      ptr <- SystemEventLog.statePointer(client)
-      incoming <- readIncoming(ptr, from, to)
+      ptr <- SystemEventLog.statePointer(client, Some(reader))
+      incoming <- readIncoming(reader, ptr, from, to)
       _ <- testAfterIncomingRead()
       kvos <- reader.read(ptr, "event log state")
       typeIds = EventLogState.decodeTypeIds(kvos.contents(EventLogState.TypeIdsKey).value.bytes)
@@ -130,7 +156,7 @@ final class EventLogReader(client: AspenClient) extends Logging:
         .filter(r => inRange(from, to)(r.timestamp))
       // A fresh root manager per attempt, so a restart never walks cached nodes
       logged <- KVObjectRootManager(client, EventLogState.LoggedKey, ptr, readWith = Some(reader)).getDataObjectTree()
-      fullRecords <- walk(logged, from, to, limit)
+      fullRecords <- walk(reader, logged, from, to, limit)
     yield
       val merged: Vector[Either[LoggedRecord, EventLogEntry]] =
         (incoming.map(Right(_)) ++ (tailRecords ++ fullRecords).map(Left(_)))
@@ -155,7 +181,8 @@ final class EventLogReader(client: AspenClient) extends Logging:
     * timestamped before that key are in hand: every later object's records are at or after its key, so they would
     * sort after those and be cut by the limit.
     */
-  private def walk(logged: DataObjectTKVL,
+  private def walk(reader: ObjectReader,
+                   logged: DataObjectTKVL,
                    from: HLCTimestamp,
                    to: Option[HLCTimestamp],
                    limit: Option[Int]): Future[Vector[LoggedRecord]] =

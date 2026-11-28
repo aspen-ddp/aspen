@@ -86,7 +86,10 @@ abstract class BaseReadDriver(
   /** A settled read (`settle`) hands the object reader no store's reply until that store holds none of the write locks
     * its first reply held: such a reply is re-read with `awaitCommit` naming them, so the store parks it until they
     * release. Locks a store takes after its first reply are not waited for, so a busy object cannot hold the read
-    * forever: each of the first reply's lock holders resolves (commit, abort or expiry) within the horizon.
+    * forever. The wait is not bounded by the horizon, though: it lasts until each of the first reply's lock holders
+    * resolves (commit, abort or expiry) at that store, which lasts as long as a store of that transaction is silent
+    * (expiry rule G, server/transaction/CLAUDE.md). The wait is required: such a holder may have committed. A caller
+    * that must not wait forever times the read out (AspenClient.settledReaderBy) and fails.
     *
     * Why this makes the result reflect every transaction T that committed before the read began: T committed means
     * `writeThreshold` stores of this object's pool voted commit, and a commit voter holds T's locks until it applies

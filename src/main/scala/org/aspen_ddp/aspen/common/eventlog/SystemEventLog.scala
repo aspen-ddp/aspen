@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.common.eventlog
 
-import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocatorId, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocatorId, ObjectReader, Transaction}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, NodeAllocator, Root, TKVLInsert, TieredKeyValueList,
   TreeKind}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
@@ -36,13 +36,15 @@ object SystemEventLog extends Logging:
   private val statePointers =
     java.util.Collections.synchronizedMap(new java.util.WeakHashMap[AspenClient, KeyValueObjectPointer]())
 
-  /** The service state object's pointer, from the services tree */
-  private[aspen] def statePointer(client: AspenClient): Future[KeyValueObjectPointer] =
+  /** The service state object's pointer, from the services tree, read with `readWith` (the client when None) when not cached */
+  private[aspen] def statePointer(client: AspenClient,
+                                  readWith: Option[ObjectReader] = None): Future[KeyValueObjectPointer] =
     given ExecutionContext = client.clientContext
     Option(statePointers.get(client)) match
       case Some(ptr) => Future.successful(ptr)
       case None =>
-        val tkvl = TieredKeyValueList(client, KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer))
+        val tkvl = TieredKeyValueList(client,
+          KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer, readWith = readWith))
         tkvl.get(Key(EventLogDurableService.ServiceUUID)).map:
           case Some(vs) =>
             val ptr = ServiceEntry.decode(vs.value.bytes).statePointer

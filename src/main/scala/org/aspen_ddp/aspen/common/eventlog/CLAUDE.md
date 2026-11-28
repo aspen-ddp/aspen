@@ -15,10 +15,12 @@ optimizations) are in `DESIGN.md` next to this file: read it before changing any
 - **Reader header checks**: every full object read is checked (`filedKey` == tree key, `upperBound` == next tree key,
   first visited key == the floor key) and the read restarts, boundedly, when a check fails. Read order is incoming,
   state/tails, tree. Anything that moves records must keep that forward-only order, or the reader can omit events.
-- **Reader reads are settled**: every read the reader makes (incomingEvents and loggedEvents nodes, state, tails, full
-  objects) goes through `client.settledReader` (the trees through `KVObjectRootManager(readWith = ...)`), so a move
-  seen applied in one read shows in every later one even across pools (`DESIGN.md` 6.1). A new read in the reader
-  must be settled too
+- **Reader reads are settled and share one deadline**: every read the reader makes (the services tree when the state
+  pointer is not cached, incomingEvents and loggedEvents nodes, state, tails, full objects) goes through the
+  `client.settledReaderBy(deadline)` of that `read` call (the trees through `KVObjectRootManager(readWith = ...)`), so
+  a move seen applied in one read shows in every later one even across pools (`DESIGN.md` 6.1), and the whole read
+  fails with `SystemEventLogReadTimeout` at the deadline (a settled read can wait as long as a store holding an
+  undecided lock is down). A new read in the reader must use that reader too. Never return a partial result
 - **Pin rule**: the move transaction's pin is the revision-checked delete of the moved incoming keys. Client inserts
   are `requireDoesNotExist` (no pin), so `logSystemEvent` is `replaySafe` (hence duplicates, `DESIGN.md` section 7);
   observer and allocator edits are pinned by `KeyRevision` on the key they write.

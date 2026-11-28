@@ -109,13 +109,15 @@ class EventLogAllocatorSuite extends EventLogSuiteBase:
       afterAllocator shouldBe beforeAllocator
       after.nodeAllocator.tiers.toList shouldBe before.nodeAllocator.tiers.toList
 
-  atest("a move whose outcome its tails' pool has not heard yet is still read"):
+  /** Logs `es` with the tails in a new pool, then logs one more entry whose move commits but whose outcome the new
+    * pool's stores do not hear: they vote commit for it and keep its lock on the tail, while the bootstrap pool
+    * applies it. Returns the entry and a release that delivers the held outcome. This client learns commits only
+    * from votes and keeps no status cache, so nothing it reads tells it the move committed except the move's
+    * applied effects */
+  private def holdMoveOutcome(es: Vector[EventLogEntry]): Future[(EventLogEntry, () => Unit)] =
     given ExecutionContext = executionContext
-    // Enough to compact after the change, so the tails move to the new pool
-    val es = entries(130, 1000, 5)
     var holding = false
     var held = List[TxMessage]()
-    var released = false
     for
       poolId <- createPool()
       _ <- client.setSystemLogAllocator(PoolObjectAllocatorId(poolId))
@@ -126,9 +128,7 @@ class EventLogAllocatorSuite extends EventLogSuiteBase:
       st <- readState()
       _ = st.tails.pointers.foreach(p => p.poolId shouldBe poolId)
       newPool = (0 until poolIda.width).map(i => StoreId(poolId, i.toByte)).toSet
-      // The new pool's stores never lead, and hear no outcome while holding: they vote commit for the next move and
-      // keep its lock, while the bootstrap pool applies it. This client learns commits only from votes and keeps no
-      // status cache, so nothing it reads tells it the move committed except the move's applied effects
+      // The new pool's stores never lead, and hear no outcome while holding
       _ = net.unreachableStores = newPool
       _ = net.dropTxMessage =
             case m @ (_: TxResolved | _: TxFinalized) if holding && newPool.contains(m.to) =>
@@ -140,16 +140,28 @@ class EventLogAllocatorSuite extends EventLogSuiteBase:
       _ <- client.logSystemEvent(e)
       // Gone from incomingEvents: its move committed and applied there, not yet at the tail
       _ <- awaitIncomingEmpty()
+    yield
+      val release = () =>
+        holding = false
+        net.dropTxMessage = _ => false
+        net.unreachableStores = Set()
+        held.foreach(net.deliverTransactionMessage)
+      (e, release)
+
+  atest("a move whose outcome its tails' pool has not heard yet is still read"):
+    given ExecutionContext = executionContext
+    // Enough to compact after the change, so the tails move to the new pool
+    val es = entries(130, 1000, 5)
+    var released = false
+    for
+      (e, release) <- holdMoveOutcome(es)
       reader = new EventLogReader(client)
       // The outcome reaches the new pool only after the reader has read incomingEvents and sent its tail reads
       _ = reader.testAfterIncomingRead = () =>
             client.backgroundTaskManager.schedule(Duration(300, MILLISECONDS)):
               executionContext.execute: () =>
-                holding = false
-                net.dropTxMessage = _ => false
-                net.unreachableStores = Set()
+                release()
                 released = true
-                held.foreach(net.deliverTransactionMessage)
             Future.unit
       read <- reader.read(EventLogReader.Earliest, None, None)
       releasedBeforeRead = released
@@ -159,3 +171,23 @@ class EventLogAllocatorSuite extends EventLogSuiteBase:
       read should contain (e)
       releasedBeforeRead shouldBe true
       multiset(read).filter(_._1 != e) shouldBe multiset(es)
+
+  atest("a read that cannot settle before its timeout fails with SystemEventLogReadTimeout"):
+    given ExecutionContext = executionContext
+    val es = entries(130, 1000, 6)
+    val timeout = Duration(300, MILLISECONDS)
+    for
+      (e, release) <- holdMoveOutcome(es)
+      // The tail's stores hold the move's lock until they hear its outcome, which they never do while held: a
+      // settled read of the tail must wait, and returning without e would omit it
+      started = System.nanoTime()
+      err <- new EventLogReader(client).read(EventLogReader.Earliest, None, None, timeout).failed
+      elapsed = Duration.fromNanos(System.nanoTime() - started)
+      _ = release()
+      read <- client.readSystemEvents()
+    yield
+      err shouldBe a[SystemEventLogReadTimeout]
+      err.asInstanceOf[SystemEventLogReadTimeout].timeout shouldBe timeout
+      elapsed should be >= timeout
+      // Once the outcome arrives the log reads in full
+      read should contain (e)

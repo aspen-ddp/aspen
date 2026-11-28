@@ -61,7 +61,7 @@ import java.util.UUID
 import java.util.concurrent.{Executors, TimeoutException}
 import java.util.concurrent.atomic.AtomicReference
 import scala.concurrent.ExecutionContext.Implicits.global
-import scala.concurrent.duration.{DAYS, Duration, HOURS, MILLISECONDS, MINUTES, SECONDS}
+import scala.concurrent.duration.{DAYS, Duration, FiniteDuration, HOURS, MILLISECONDS, MINUTES, SECONDS}
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
 import scala.util.control.NonFatal
@@ -89,6 +89,9 @@ object Main {
   // exits. Both apply whichever NetworkPlugin --network selected.
   val NotificationDrainTimeout: Duration = Duration(5, SECONDS)
   val NotificationSendLinger: Duration = Duration(1, SECONDS)
+
+  // event-log waits this much past the read's own timeout, which fails the read first (with a message, not a trace)
+  val EventLogAwaitMargin: FiniteDuration = FiniteDuration(10, SECONDS)
 
   // Set by createNetwork so main can drain outbound messages before System.exit. Plain rather
   // than volatile because it is thread-confined: every command builds its network by a direct
@@ -146,6 +149,7 @@ object Main {
                   eventUntil:Option[HLCTimestamp]=None,
                   eventType:Option[UUID]=None,
                   eventLimit:Option[Int]=None,
+                  eventTimeout:FiniteDuration=EventLogReader.DefaultReadTimeout,
                   observerFactory:String="",
                   observerConfigFile:Option[os.Path]=None,
                   networkCacheDir:Option[os.Path]=None,
@@ -904,6 +908,12 @@ object Main {
       opt[Int]("limit").valueName("<N>").text("Show at most N entries").
         validate(x => if x > 0 then success else failure("--limit must be positive")).
         action((x, c) => c.copy(eventLimit = Some(x))),
+
+      opt[Int]("timeout").valueName("<seconds>").
+        text(s"Give up reading after this many seconds (default ${EventLogReader.DefaultReadTimeout.toSeconds}). " +
+             "The log is unreadable while a store holding an undecided transaction on it is unreachable").
+        validate(x => if x > 0 then success else failure("--timeout must be positive")).
+        action((x, c) => c.copy(eventTimeout = FiniteDuration(x, SECONDS))),
     )
 
   private def eventLogObserverArgs(p: ArgParser): List[OptionDef[?, Args]] =
@@ -1180,7 +1190,8 @@ object Main {
             case "rebalance" => rebalance(session, cfg.setId)
             case "system-rebalance-period" =>
               systemRebalancePeriod(session, cfg.rebalancePeriod, cfg.rebalancePeriodUnit)
-            case "event-log" => event_log(session, cfg.eventSince, cfg.eventUntil, cfg.eventType, cfg.eventLimit)
+            case "event-log" =>
+              event_log(session, cfg.eventSince, cfg.eventUntil, cfg.eventType, cfg.eventLimit, cfg.eventTimeout)
             case "event-log-observers" => event_log_observers(session)
             case "event-log-add-observer" =>
               event_log_observer_change(session, cfg.observerFactory, cfg.observerConfigFile, add = true)
@@ -2783,7 +2794,8 @@ object Main {
                 since: Option[HLCTimestamp],
                 until: Option[HLCTimestamp],
                 eventType: Option[UUID],
-                limit: Option[Int]): Int =
+                limit: Option[Int],
+                timeout: FiniteDuration = EventLogReader.DefaultReadTimeout): Int =
     configureLogging()
 
     val (client, network, _) = createAspenClient(session)
@@ -2793,13 +2805,14 @@ object Main {
 
     val from = since.getOrElse(EventLogReader.Earliest)
     val f = eventType match
-      case None => client.readSystemEvents(from, until, limit)
+      case None => client.readSystemEvents(from, until, limit, timeout)
       case Some(t) =>
-        client.readSystemEvents(from, until, None).map: entries =>
+        client.readSystemEvents(from, until, None, timeout).map: entries =>
           val matching = entries.filter(_.typeUUID == t)
           limit.fold(matching)(matching.take)
 
-    awaitAndReport(f):
+    // The read fails by itself at its timeout; the margin only keeps Await from beating it to it
+    awaitAndReport(f, timeout + EventLogAwaitMargin):
       case Success(entries) =>
         entries.foreach: e =>
           val name = client.typeRegistry.getType[RegisteredTypeFactory](e.typeUUID)

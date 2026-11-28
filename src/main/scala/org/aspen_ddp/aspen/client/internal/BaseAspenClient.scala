@@ -27,7 +27,7 @@ import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
 import org.aspen_ddp.aspen.compute.systemtask.{NewSystemTaskAdded, SystemTaskExecutorService, SystemTaskMessage, SystemTaskServiceState}
 
 import java.util.UUID
-import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS, NANOSECONDS}
+import scala.concurrent.duration.{Deadline, Duration, FiniteDuration, MILLISECONDS, NANOSECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
 private object Namespaces:
@@ -105,14 +105,19 @@ abstract class BaseAspenClient(
   // ---- Reads ----
   //
   // Each read method's body takes the timeout ReadManager.read applies. The ObjectReader overrides pass Duration.Inf
-  // (untimed); TimedObjectReader, from withReadTimeout, passes its own. Each also takes `settled`
-  // (ReadManager.read), which only SettledObjectReader, from settledReader, sets
+  // (untimed); a ClientObjectReader (withReadTimeout, settledReader, settledReaderBy) passes its own. Each also takes
+  // `settled` (ReadManager.read), which only the settled ClientObjectReaders set
 
-  override private[aspen] lazy val settledReader: ObjectReader = new SettledObjectReader(this)
+  override private[aspen] lazy val settledReader: ObjectReader =
+    new ClientObjectReader(this, ClientObjectReader.Limit.Untimed, settled = true)
+
+  override private[aspen] def settledReaderBy(deadline: Deadline): ObjectReader =
+    new ClientObjectReader(this, ClientObjectReader.Limit.By(deadline), settled = true)
 
   override def withReadTimeout(timeout: Duration): ObjectReader = timeout match
     case Duration.Inf => this
-    case fd: FiniteDuration if fd > Duration.Zero => new TimedObjectReader(this, fd)
+    case fd: FiniteDuration if fd > Duration.Zero =>
+      new ClientObjectReader(this, ClientObjectReader.Limit.Each(fd), settled = false)
     case _ => throw new IllegalArgumentException(s"A read timeout must be positive or Duration.Inf, not $timeout")
 
   override def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] =

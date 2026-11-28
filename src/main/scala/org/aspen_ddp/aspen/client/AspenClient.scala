@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateMarker, Tran
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.config.BootstrapConfig
+import org.aspen_ddp.aspen.common.eventlog.EventLogState.ObserverConfig
 import org.aspen_ddp.aspen.common.eventlog.{Event, EventFactory, EventLogEntry, EventLogReader, SystemEventLog}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, IDAPolicy, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
@@ -1015,6 +1016,20 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
                        to: Option[HLCTimestamp] = None,
                        limit: Option[Int] = None): Future[Vector[EventLogEntry]] =
     new EventLogReader(this).read(from, to, limit)
+
+  /** Adds an observer to the system event log service: `factoryType`'s EventObserverFactory builds it from `config`.
+   *  Fails with IllegalArgumentException when no EventObserverFactory is registered for `factoryType`. Adding an
+   *  existing pair is a no-op. Observers are best-effort (see EventObserver).
+   */
+  def addSystemEventObserver(factoryType: UUID, config: Array[Byte]): Future[Unit] =
+    SystemEventLog.addObserver(this, factoryType, config)
+
+  /** Removes an observer; a pair that is not present is a no-op */
+  def removeSystemEventObserver(factoryType: UUID, config: Array[Byte]): Future[Unit] =
+    SystemEventLog.removeObserver(this, factoryType, config)
+
+  def listSystemEventObservers(): Future[List[ObserverConfig]] =
+    SystemEventLog.listObservers(this)
 
   /** `e` as an Event, by its type's registered EventFactory; None when no EventFactory is registered for it */
   def decodeSystemEvent(e: EventLogEntry): Option[Event] =

@@ -103,8 +103,13 @@ class EventLogDurableService(val client: AspenClient,
   private var pollTask: ScheduledTask = NoTask
   @volatile private var stopped = false
 
-  requestScan()
+  // The observers are loaded before the first scan, so events it moves are observed
+  private var loadedRevision: Option[ObjectRevision] = None
+  private var observers: List[EventObserver] = Nil
+
+  loadObservers().onComplete(_ => requestScan())
   pollTask = client.backgroundTaskManager.scheduleNonConcurrentPollingTask("event-log-move", pollPeriod):
+    loadObservers()
     requestScan()
 
   override def shutdown(): Unit = synchronized:
@@ -115,9 +120,54 @@ class EventLogDurableService(val client: AspenClient,
     try
       EventLogMessage.decode(msg.encodedContent) match
         case Nudge => requestScan()
-        case ReloadObservers => ()
+        case ReloadObservers => loadObservers()
     catch
       case err: Throwable => logger.warn(s"EventLogDurableService: undecodable service message: $err")
+
+  /** Reads the state object and rebuilds the observers when ObserversKey's revision is not the one last loaded */
+  private def loadObservers(): Future[Unit] =
+    Future.delegate(client.read(statePointer, "event log observers")).map: kvos =>
+      applyObservers(kvos)
+    .recover:
+      case err => logger.warn(s"EventLogDurableService: observer reload failed: $err")
+
+  /** Replaces the observer set when `kvos` holds a different ObserversKey revision than the loaded one. The new set
+    * is built first and swapped in under the lock.
+    */
+  private def applyObservers(kvos: KeyValueObjectState): Unit =
+    val vs = kvos.contents(EventLogState.ObserversKey)
+    if !synchronized(loadedRevision.contains(vs.revision)) then
+      val built = EventLogState.decodeObservers(vs.value.bytes).flatMap: o =>
+        client.typeRegistry.getType[EventObserverFactory](o.factoryType) match
+          case None =>
+            logger.warn(s"EventLogDurableService: no EventObserverFactory registered for ${o.factoryType}; skipped")
+            None
+          case Some(f) =>
+            try Some(f.createEventObserver(o.factoryType, o.config))
+            catch
+              case err: Throwable =>
+                logger.warn(s"EventLogDurableService: observer of ${o.factoryType} could not be created: $err")
+                None
+      synchronized:
+        loadedRevision = Some(vs.revision)
+        observers = built
+
+  /** Calls the observers of each event moved by a committed transaction, in timestamp order. Observers must be fast;
+    * an exception from one is logged and does not affect the others or the log.
+    */
+  private def deliver(entries: Vector[EventLogEntry]): Unit =
+    val current = synchronized(observers)
+    if current.nonEmpty then
+      entries.sortBy(_.timestamp).foreach: entry =>
+        try
+          client.decodeSystemEvent(entry).foreach: event =>
+            current.foreach: o =>
+              if o.observedTypes.forall(_.contains(event.typeUUID)) then
+                try o.observe(event)
+                catch
+                  case err: Throwable => logger.warn(s"EventLogDurableService: observer failed: $err")
+        catch
+          case err: Throwable => logger.warn(s"EventLogDurableService: event could not be decoded: $err")
 
   /** Starts a scan, or marks the running one to scan again when it is done */
   private def requestScan(): Future[Unit] =
@@ -339,5 +389,24 @@ class EventLogDurableService(val client: AspenClient,
                 _ <- LogWriter(plan, loaded, late, allocator, logged)
                 _ <- incoming.prepareUpdates(Nil, Nil, moved.toList.map(in => in.key -> in.revision))
               yield ()
-            .map(_ => BatchResult.Moved)
+            .map: _ =>
+              // The observer list read with this batch's state is current for events moved by it
+              try
+                applyObservers(kvos)
+                val drops = new IdentityHashMap[LoggedRecord, java.lang.Boolean]()
+                plan.steps.foreach:
+                  case LogStep.Drop(r, placed) => drops.put(r, placed)
+                  case _ =>
+                deliver(plan.consumed.flatMap: r =>
+                  val placed = drops.get(r)
+                  if placed == null then
+                    Some(EventLogEntry(r.timestamp, uuidOf(r.typeId), r.data))
+                  else if placed.booleanValue then
+                    val d = dropReplacement(r)
+                    Some(EventLogEntry(d.timestamp, uuidOf(d.typeId), d.data))
+                  else
+                    None)
+              catch
+                case err: Throwable => logger.warn(s"EventLogDurableService: observer delivery failed: $err")
+              BatchResult.Moved
       yield result

@@ -3,7 +3,9 @@ package org.aspen_ddp.aspen.common.eventlog
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocatorId, Transaction}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, TKVLInsert, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, Value}
+import org.aspen_ddp.aspen.common.eventlog.EventLogState.ObserverConfig
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, Value}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.compute.ServiceEntry
 import scribe.Logging
 
@@ -62,6 +64,54 @@ object SystemEventLog extends Logging:
       given Transaction = tx
       tx.replaySafe("event log entries may be duplicated")
       prepareEntries(client, List(e))
+
+  private def readObservers(client: AspenClient)(using ExecutionContext) =
+    for
+      ptr <- statePointer(client)
+      kvos <- client.read(ptr, "event log observers")
+      vs = kvos.contents(EventLogState.ObserversKey)
+    yield (ptr, vs.revision, EventLogState.decodeObservers(vs.value.bytes))
+
+  def listObservers(client: AspenClient): Future[List[ObserverConfig]] =
+    given ExecutionContext = client.clientContext
+    readObservers(client).map(_._3)
+
+  /** Rewrites the observer list with `change`. An unchanged list commits no transaction. The write requires the
+    * revision read, so concurrent changes retry rather than overwrite each other.
+    */
+  private def modifyObservers(client: AspenClient, change: List[ObserverConfig] => List[ObserverConfig]): Future[Unit] =
+    given ExecutionContext = client.clientContext
+    readObservers(client).flatMap: (_, _, current) =>
+      if change(current) == current then
+        Future.unit
+      else
+        client.transactUntilSuccessful: tx =>
+          readObservers(client).map: (ptr, revision, latest) =>
+            // When a concurrent change made this one redundant the unchanged list is rewritten, still revision
+            // checked: the write is this transaction's pin
+            tx.update(ptr, None, None, List(KeyValueUpdate.KeyRevision(EventLogState.ObserversKey, revision)),
+              List(Insert(EventLogState.ObserversKey, EventLogState.encodeObservers(change(latest)))))
+        .map(_ => reloadObservers(client))
+
+  def addObserver(client: AspenClient, factoryType: UUID, config: Array[Byte]): Future[Unit] =
+    if client.typeRegistry.getType[EventObserverFactory](factoryType).isEmpty then
+      Future.failed(new IllegalArgumentException(s"No EventObserverFactory registered for $factoryType"))
+    else
+      val o = ObserverConfig(factoryType, config)
+      modifyObservers(client, l => if l.contains(o) then l else l :+ o)
+
+  def removeObserver(client: AspenClient, factoryType: UUID, config: Array[Byte]): Future[Unit] =
+    val o = ObserverConfig(factoryType, config)
+    modifyObservers(client, _.filterNot(_ == o))
+
+  /** Best-effort: the service's poll covers a lost message */
+  private def reloadObservers(client: AspenClient): Unit =
+    given ExecutionContext = client.clientContext
+    try
+      client.sendServiceMessage(EventLogDurableService.ServiceUUID, EventLogMessage.encode(ReloadObservers)).failed
+        .foreach(err => logger.debug(s"Event log observer reload message failed: $err"))
+    catch
+      case err: Throwable => logger.debug(s"Event log observer reload message failed: $err")
 
   /** Best-effort: the service's poll picks the entries up anyway */
   private def nudge(client: AspenClient): Unit =

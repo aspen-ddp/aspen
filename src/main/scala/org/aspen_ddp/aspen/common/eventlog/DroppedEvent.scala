@@ -13,12 +13,15 @@ enum DropReason:
 final case class DroppedEvent(timestamp: HLCTimestamp, droppedType: UUID, reason: DropReason) extends Event:
   override def typeUUID: UUID = DroppedEvent.TypeUUID
 
-  override def describe: String = s"type=$droppedType reason=exceeded maximum log entry size"
+  override def describe: String = s"type=$droppedType reason=${DroppedEvent.describe(reason)}"
 
 object DroppedEvent extends EventFactory:
   val TypeUUID: UUID = UUID.fromString("367b01ad-b822-4827-8603-97fb0308abd6")
 
   val typeUUID: UUID = TypeUUID
+
+  def describe(reason: DropReason): String = reason match
+    case DropReason.ExceededMaximumLogEntrySize => "exceeded maximum log entry size"
 
   def entryFor(dropped: EventLogEntry, reason: DropReason): EventLogEntry =
     val protoReason = reason match

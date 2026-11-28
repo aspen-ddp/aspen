@@ -896,7 +896,8 @@ object Main {
         validate(x => parseEventTime(x).map(_ => ())).
         action((x, c) => c.copy(eventUntil = parseEventTime(x).toOption.map(eventTimeToHLCUpperBound))),
 
-      opt[String]("type").valueName("<uuid>").text("Show only entries of this event type").
+      opt[String]("type").valueName("<uuid>").
+        text("Show only entries of this event type. The filter is applied after reading, so the whole range is read").
         validate(validateUUID("Event type must be a valid UUID")).
         action((x, c) => c.copy(eventType = Some(UUID.fromString(x)))),
 
@@ -2785,7 +2786,7 @@ object Main {
                 limit: Option[Int]): Int =
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(session)
+    val (client, network, _) = createAspenClient(session)
     network.startIoThread(client)
 
     given ExecutionContext = client.clientContext
@@ -2810,7 +2811,7 @@ object Main {
   def event_log_observers(session: ClientSession): Int =
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(session)
+    val (client, network, _) = createAspenClient(session)
     network.startIoThread(client)
 
     awaitAndReport(client.listSystemEventObservers()):
@@ -2828,7 +2829,7 @@ object Main {
                                 add: Boolean): Int =
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(session)
+    val (client, network, _) = createAspenClient(session)
     network.startIoThread(client)
 
     val factory = UUID.fromString(factoryStr)

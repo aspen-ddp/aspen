@@ -49,6 +49,15 @@ class EventLogStateSuite extends AnyFunSuite:
     assert(decodeTails(encodeTails(t)) == t)
   }
 
+  test("Tails whose current index names no tail fail to decode") {
+    val pool = PoolId(UUID.randomUUID())
+    val ptrs = Vector.tabulate(TailCount)(_ => DataObjectPointer(ObjectId(UUID.randomUUID()), pool, Array.emptyByteArray))
+    val alloc = PoolObjectAllocatorId(pool)
+    List(-1, TailCount).foreach { c =>
+      intercept[IllegalArgumentException](decodeTails(encodeTails(Tails(ptrs, c, alloc))))
+    }
+  }
+
   test("TailFloor round trip") {
     List(Long.MinValue, -1L, 0L, Long.MaxValue).foreach { l =>
       assert(decodeTailFloor(encodeTailFloor(HLCTimestamp(l))) == HLCTimestamp(l))

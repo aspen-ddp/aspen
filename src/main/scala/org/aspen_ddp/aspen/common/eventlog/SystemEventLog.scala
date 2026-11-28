@@ -109,7 +109,8 @@ object SystemEventLog extends Logging:
     * AllocatorKey and, in the loggedEvents Root under LoggedKey, only the NodeAllocator: every tier now allocates from
     * `id`, at the existing tier-0 node size, lowered to `id`'s node size limit when that is smaller. The tree's nodes
     * stay where they are; only new ones go to `id`. Both keys are revision checked (the pin). New full objects come
-    * from `id` from the service's next batch on; the tails move at its next compaction.
+    * from `id` from the service's next batch on; the tails move at its next compaction. When `id`'s object size cap
+    * is smaller, that compaction turns tail records larger than it into DroppedEvents (DESIGN.md section 8).
     */
   def setAllocator(client: AspenClient, id: ObjectAllocatorId): Future[Unit] =
     given ExecutionContext = client.clientContext

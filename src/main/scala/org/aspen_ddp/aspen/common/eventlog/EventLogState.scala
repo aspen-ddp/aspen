@@ -69,10 +69,10 @@ object EventLogState:
 
   def decodeTails(bytes: Array[Byte]): Tails =
     val t = codec.EventLogTails.parseFrom(bytes)
-    Tails(
-      t.pointers.map(b => DataObjectPointer(b.toByteArray)).toVector,
-      t.current,
-      ObjectAllocatorId(t.allocator.toByteArray))
+    val pointers = t.pointers.map(b => DataObjectPointer(b.toByteArray)).toVector
+    if t.current < 0 || t.current >= pointers.size then
+      throw new IllegalArgumentException(s"Event log tails: current index ${t.current} is not one of ${pointers.size}")
+    Tails(pointers, t.current, ObjectAllocatorId(t.allocator.toByteArray))
 
   def encodeTailFloor(ts: HLCTimestamp): Array[Byte] = long2byte(ts.asLong)
 

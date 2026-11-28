@@ -118,3 +118,9 @@ restarted instance picks up where a crashed one stopped.
   map is the work list. It skips entries that are stale bookkeeping (TransferringIn, or the pool no longer names this
   device for that index), since rebuilding those would orphan the live copy. It reconstructs no data: the Rebuilding
   entry tells the destination Host to rebuild, and the former host is nudged with `CheckStorageDevice`
+
+#### System services
+- Bootstrap registers the system-critical singleton durable services in the Radicle services tree (`ServicesTreeKey`),
+  each a `ServiceEntry` naming its state object: `RebalancingDurableService`, `SystemTaskExecutorService`,
+  `NetworkCachingService` and `EventLogDurableService` (the system event log, `common/eventlog/CLAUDE.md`; its state
+  and its `loggedEvents` root node are allocated at bootstrap)

@@ -15,6 +15,12 @@
   timeout (`BaseAspenClient.resolveIdaWithin`). For callers that must not wait forever (repair scans, rebuild walks); the
   usage example is `UsageGuide.md` "Timed reads", kept compiling by `examples/TimedReadsSuite`
 
+### System event log
+- `logSystemEvent`, `prepareSystemEventLogEntry(ies)` (inside the caller's transaction), `readSystemEvents(from, to,
+  limit)`, `decodeSystemEvent`, observer add/remove/list and `setSystemLogAllocator` are thin wrappers over
+  `common.eventlog.SystemEventLog` / `EventLogReader`. Reads may return duplicates and never omit; observers are
+  best-effort; an event too large for the log allocator is replaced by a `DroppedEvent`. Details: `common/eventlog/DESIGN.md`
+
 ### IDA data operations
 - RandomAccessReedSolomon lays data out in rows of `k * cellSize` bytes with an 8-byte length trailer, so
   DataObjects in such pools support efficient appends (`Transaction.append` with an `AppendPosition`) and

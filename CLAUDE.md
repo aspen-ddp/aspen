@@ -20,6 +20,7 @@ or spans modules, Read the relevant guides below explicitly.**
 | `common/metadata/CLAUDE.md` | Pool, group, host, device and device-set state objects, metadata layout, management tasks |
 | `common/network/CLAUDE.md` | Codec/protobuf, messages, NetworkPlugin, NetworkCache, snapshots |
 | `common/network/implementations/quic/CLAUDE.md` | QUIC plugin: streams, send budget, MTU, endpoint repair, WrongHost |
+| `common/eventlog/CLAUDE.md` | System event log: entries, tails, full objects, reader, observers (DESIGN.md beside it) |
 | `server/CLAUDE.md` | Server-wide: threading rules, DurableFiles, user jars, diagnostic logs |
 | `server/host/CLAUDE.md` | Host threading model, StoreRouter/loader, device lifecycle, adoption, transfers, lost CRLs |
 | `server/store/CLAUDE.md` | Frontend: locks, collisions, in-flight commits, admission, object cache, backends, reconcile |

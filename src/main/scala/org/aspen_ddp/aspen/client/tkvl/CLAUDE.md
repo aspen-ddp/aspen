@@ -5,7 +5,9 @@
   pluggable `NodeEncoding`. `DataObjectTKVL` is more compact, stores values only (no per-key revisions/requirements)
   and uses whole-node revision checks: intended for single-writer / low-contention use. A second update to one of its
   nodes in a transaction fails with `NodeAlreadyModified`; `TieredKeyValueListNode` is KV-only
-  (`DataObjectTKVL.getContainingNode` returns the generic `ListNode`).
+  (`DataObjectTKVL.getContainingNode` returns the generic `ListNode`). `DataObjectTKVL.foreach` / `foreachFrom` take a
+  `stopWhen` predicate that ends the walk early, reading nothing more; with `getContainingNode` they let a caller walk
+  from a key near the end of a large tree without reading from the start (the event log's reader and service).
 - `prepareUpdates(inserts: List[TKVLInsert], deletes)` changes many keys in one transaction on either kind, updating
   each node once. `TKVLInsert.requireDoesNotExist` makes allocate-and-insert retry loops safe. Writes are per-key
   checked by default; `PutRequirement` (`MustNotExist`, ...) chooses the check. A `DoesNotExist` put is no pin, so it

@@ -30,6 +30,25 @@ class LogPlannerSuite extends AnyFunSuite:
 
   private def limit(cap: Option[Int]): Long = cap.map(_.toLong).getOrElse(Long.MaxValue)
 
+  /** Whether sorted-by-timestamp content splits at timestamp boundaries into objects within the caps (object 0 within
+    * firstCap, later ones within restCap). Filling each object as far as it goes is optimal when later caps are equal.
+    */
+  private def feasible(rs: Seq[LoggedRecord], firstCap: Long, restCap: Long): Boolean =
+    val runs = rs.sortBy(_.timestamp).groupBy(_.timestamp).toVector.sortBy(_._1).map(_._2.toVector)
+    var cur = Vector.empty[LoggedRecord]
+    var cap = firstCap
+    runs.forall { g =>
+      if objectBound(cur ++ g) <= cap then
+        cur ++= g
+        true
+      else if cur.isEmpty then
+        false
+      else
+        cap = restCap
+        cur = g
+        objectBound(g) <= restCap
+    }
+
   private def emptyTails(cap: Option[Int] = None): Vector[TailView] =
     Vector.tabulate(EventLogState.TailCount)(i => TailView(i, 0, cap))
 
@@ -48,13 +67,14 @@ class LogPlannerSuite extends AnyFunSuite:
   private def appends(p: LogPlan): Vector[AppendToTail] = p.steps.collect { case s: AppendToTail => s }
   private def compacts(p: LogPlan): Vector[Compact] = p.steps.collect { case s: Compact => s }
   private def rewrites(p: LogPlan): Vector[RewriteFull] = p.steps.collect { case s: RewriteFull => s }
-  private def drops(p: LogPlan): Vector[LoggedRecord] = p.steps.collect { case Drop(r) => r }
+  private def drops(p: LogPlan): Vector[LoggedRecord] = p.steps.collect { case Drop(r, _) => r }
+  private def dropSteps(p: LogPlan): Vector[Drop] = p.steps.collect { case d: Drop => d }
 
   private def placed(p: LogPlan): Vector[LoggedRecord] = p.steps.flatMap {
     case AppendToTail(_, rs) => rs
     case Compact(objects, _) => objects.flatMap(_._2)
     case RewriteFull(_, objects) => objects.flatMap(_._2)
-    case Drop(_) => Vector.empty
+    case Drop(_, _) => Vector.empty
   }
 
   test("in-order records fill tails in order and advance current at the soft target") {
@@ -138,7 +158,7 @@ class LogPlannerSuite extends AnyFunSuite:
   test("a record too large for one object is dropped") {
     val big = rec(100, 0, 2000, Some(new Random(5)))
     val plan = LogPlanner.plan(input(Vector(big), newObjectCap = Some(1000)))
-    assert(drops(plan) == Vector(big))
+    assert(dropSteps(plan) == Vector(Drop(big, replacementPlaced = true)))
     assert(placed(plan) == Vector(replacement(big)))
     assert(plan.consumed == Vector(big))
   }
@@ -198,10 +218,61 @@ class LogPlannerSuite extends AnyFunSuite:
     val late = rec(1000, 0, 70)
     val plan = LogPlanner.plan(input(Vector(late), tailFloor = ts(5000), firstFullKey = Some(ts(1000)),
       lateTarget = Some(view), target = cap, newObjectCap = Some(cap)))
-    assert(drops(plan) == Vector(late))
+    // the replacement does not fit either, so the object is left alone and the loss is flagged
+    assert(dropSteps(plan) == Vector(Drop(late, replacementPlaced = false)))
     assert(plan.consumed == Vector(late))
-    // the replacement does not fit either, so the object is left alone
     assert(rewrites(plan).isEmpty)
+  }
+
+  test("a late record whose merge cannot fit is replaced by its DroppedEvent when that fits") {
+    val existing = Vector.tabulate(10)(i => rec(1000, 20000 + i, 70))
+    val late = rec(1000, 0, 70)
+    val cap = objectBound(existing :+ replacement(late))
+    assert(objectBound(existing :+ late) > cap)
+    val view = fullView(1000, existing, nextKey = Some(2000), cap = Some(cap))
+    val plan = LogPlanner.plan(input(Vector(late), tailFloor = ts(5000), firstFullKey = Some(ts(1000)),
+      lateTarget = Some(view), target = cap, newObjectCap = Some(cap)))
+    assert(dropSteps(plan) == Vector(Drop(late, replacementPlaced = true)))
+    assert(rewrites(plan).head.objects.flatMap(_._2) == existing :+ replacement(late))
+  }
+
+  test("an oversized late record is replaced by its DroppedEvent in the covering object") {
+    val existing = Vector(rec(1000, 20000, 10))
+    val big = rec(1005, 0, 2000)
+    val view = fullView(1000, existing, nextKey = Some(2000))
+    val plan = LogPlanner.plan(input(Vector(big), tailFloor = ts(5000), firstFullKey = Some(ts(1000)),
+      lateTarget = Some(view), newObjectCap = Some(1000)))
+    assert(dropSteps(plan) == Vector(Drop(big, replacementPlaced = true)))
+    assert(rewrites(plan).head.objects.flatMap(_._2) == Vector(existing.head, replacement(big)))
+  }
+
+  test("compaction drops records past a cap's worth at one timestamp, keeping their DroppedEvents") {
+    val tailRecs = Vector.tabulate(12)(i => rec(1000, 10000 + i, 70))
+    // room for ten records and one DroppedEvent: the 11th is replaced, the 12th's replacement fits nowhere
+    val cap = objectBound(tailRecs.take(10) :+ replacement(tailRecs(10)))
+    val tails = Vector.tabulate(EventLogState.TailCount)(i => TailView(i, 990, Some(1000)))
+    val batch = Vector(rec(2000, 0, 10))
+    val plan = LogPlanner.plan(input(batch, tails = tails, current = 9, tailRecords = Some(tailRecs),
+      target = cap, newObjectCap = Some(cap)))
+    val ds = dropSteps(plan)
+    assert(ds.nonEmpty)
+    assert(ds.forall(d => tailRecs.contains(d.record)))
+    val compacted = compacts(plan).head.objects.flatMap(_._2)
+    compacts(plan).head.objects.foreach((_, rs) => assert(objectBound(rs) <= cap))
+    // every tail record is compacted or dropped, and a dropped record's replacement is placed exactly when flagged
+    tailRecs.foreach(r => assert(compacted.contains(r) != ds.exists(_.record == r)))
+    ds.foreach(d => assert(compacted.contains(replacement(d.record)) == d.replacementPlaced))
+    assert(ds == Vector(Drop(tailRecs(10), replacementPlaced = true), Drop(tailRecs(11), replacementPlaced = false)))
+    assert(appends(plan) == Vector(AppendToTail(0, batch)))
+  }
+
+  test("an oversized record whose DroppedEvent does not fit either is flagged unplaced") {
+    val big = rec(100, 0, 300)
+    val cap = objectBound(Vector(replacement(big))) - 1
+    val plan = LogPlanner.plan(input(Vector(big), newObjectCap = Some(cap)))
+    assert(dropSteps(plan) == Vector(Drop(big, replacementPlaced = false)))
+    assert(placed(plan).isEmpty)
+    assert(plan.consumed == Vector(big))
   }
 
   test("a record older than the first key rekeys the first object") {
@@ -271,14 +342,17 @@ class LogPlannerSuite extends AnyFunSuite:
         var i = 0
         var full = false
         while !full && i < 30 do
-          val r = rec(key + rnd.nextLong(hi - key), 20000 + i, size() / 8)
+          // few distinct timestamps, so late records often join a run that cannot be split
+          val r = rec(key + rnd.nextInt(4).toLong * ((hi - key) / 4), 20000 + i, size() / 4)
           if objectBound(recs :+ r) <= limit(objCap) then recs :+= r else full = true
           i += 1
         Some(FullView(ts(key), if rnd.nextBoolean() then Some(ts(hi)) else None, next.map(ts),
           recs.sortBy(_.timestamp), objCap))
       else None
     val nLate = if hasFull then rnd.nextInt(5) else 0
-    val late = Vector.fill(nLate)(rnd.nextLong(floor + 1))
+    val targetTs = lateTarget.map(_.records.map(_.timestamp.asLong)).getOrElse(Vector.empty)
+    val late = Vector.fill(nLate)(
+      if targetTs.nonEmpty && rnd.nextBoolean() then targetTs(rnd.nextInt(targetTs.size)) else rnd.nextLong(floor + 1))
     val batchTs = (late ++ Vector.fill(rnd.nextInt(25))(inOrderTs())).sorted
     val batch = batchTs.zipWithIndex.map((t, i) => rec(t, i, size()))
     val in = PlanInput(batch, tails, rnd.nextInt(EventLogState.TailCount), tailRecords, ts(floor),
@@ -352,7 +426,31 @@ class LogPlannerSuite extends AnyFunSuite:
       val n = placedRecs.count(_ == r) + dropped.count(_ == r)
       if plan.consumed.contains(r) then assert(n == 1, s"consumed $r in $n steps")
       else assert(n == 0)
+    }
+    (in.batch ++ in.tailRecords.getOrElse(Vector.empty)).foreach { r =>
       if !dropped.contains(r) then assert(!placedRecs.contains(replacement(r)))
+    }
+    // only batch and tail records are ever dropped
+    dropped.foreach(r => assert(plan.consumed.contains(r) || in.tailRecords.exists(_.contains(r))))
+    // every drop was necessary, and its replacement is placed whenever it can be
+    def runBound(rs: Seq[LoggedRecord], t: HLCTimestamp): Long = objectBound(rs.filter(_.timestamp == t)).toLong
+    dropSteps(plan).foreach { case Drop(r, replacementPlaced) =>
+      val rep = replacement(r)
+      val isLate = in.firstFullKey.isDefined && r.timestamp <= in.tailFloor
+      // with r (or rep) added to the object content it would join, that content splits into no objects within the caps
+      def cannotJoin(x: LoggedRecord): Boolean =
+        if isLate then
+          val t = in.lateTarget.get
+          val content = rewrites(plan).headOption.map(_.objects.flatMap(_._2)).getOrElse(t.records) :+ x
+          !feasible(content, limit(t.cap), capLimit)
+        else
+          val content = compacts(plan).flatMap(_.objects.flatMap(_._2)) :+ x
+          runBound(content, x.timestamp) > capLimit
+      def oversized(x: LoggedRecord): Boolean = objectBound(Vector(x)) > capLimit
+      assert(oversized(r) || cannotJoin(r), s"unnecessary drop of $r")
+      assert(replacementPlaced == placedRecs.contains(rep))
+      if replacementPlaced then assert(placedRecs.count(_ == rep) == 1)
+      else assert(oversized(rep) || cannotJoin(rep), s"replacement of $r not placed though it fits")
     }
     assert(placedRecs.count(isReplacement) == placedRecs.filter(isReplacement).distinct.size)
     assert(plan.newCurrent >= 0 && plan.newCurrent < EventLogState.TailCount)
@@ -368,6 +466,7 @@ class LogPlannerSuite extends AnyFunSuite:
     var compactions = 0
     var rewritten = 0
     var droppedSome = 0
+    var lateDrops = 0
     for _ <- 0 until 2000 do
       val c = randomCase(rnd)
       check(c)
@@ -375,7 +474,8 @@ class LogPlannerSuite extends AnyFunSuite:
       if compacts(c.plan).nonEmpty then compactions += 1
       if rewrites(c.plan).nonEmpty then rewritten += 1
       if drops(c.plan).nonEmpty then droppedSome += 1
+      if drops(c.plan).exists(r => c.in.firstFullKey.isDefined && r.timestamp <= c.in.tailFloor) then lateDrops += 1
     // the generator exercises every path
-    assert(consumedSome > 500 && compactions > 50 && rewritten > 50 && droppedSome > 50,
-      s"consumed=$consumedSome compactions=$compactions rewrites=$rewritten drops=$droppedSome")
+    assert(consumedSome > 500 && compactions > 50 && rewritten > 50 && droppedSome > 50 && lateDrops > 20,
+      s"consumed=$consumedSome compactions=$compactions rewrites=$rewritten drops=$droppedSome late=$lateDrops")
   }

@@ -1,5 +1,9 @@
 package org.aspen_ddp.aspen.common.eventlog
 
+import java.util.{Collections, IdentityHashMap}
+
+import scala.collection.mutable
+
 import org.aspen_ddp.aspen.common.HLCTimestamp
 
 /** A tail object: its current byte length and the hard cap of the pool it lives in */
@@ -17,13 +21,14 @@ final case class FullView(key: HLCTimestamp,
 
 /** Everything the planner decides from.
   *
-  * @param batch           incoming records, type ids assigned
+  * @param batch           incoming records sorted by timestamp, type ids assigned
   * @param tailRecords     content of every tail; Some only when compaction is possible
   * @param tailFloor       largest timestamp held by any full object (meaningful only when firstFullKey is defined)
   * @param lateTarget      covering object of the oldest late record, when loaded
   * @param target          full-object target size; tails target target / TailCount
   * @param newObjectCap    hard cap of the pool new full objects are allocated from
-  * @param dropReplacement the DroppedEvent record logged in place of a dropped one (same timestamp)
+  * @param dropReplacement the DroppedEvent record logged in place of a dropped one, with the same timestamp. It is
+  *                        called at most once per dropped record (batch or tail) and must be pure and cheap.
   */
 final case class PlanInput(batch: Vector[LoggedRecord],
                            tails: Vector[TailView],
@@ -39,21 +44,35 @@ final case class PlanInput(batch: Vector[LoggedRecord],
 enum LogStep:
   /** One new frame appended to the tail */
   case AppendToTail(index: Int, records: Vector[LoggedRecord])
+
   /** Every tail emptied; these new full objects inserted; tailFloor set to newTailFloor */
   case Compact(objects: Vector[(FullObjectHeader, Vector[LoggedRecord])], newTailFloor: HLCTimestamp)
-  /** The object filed under oldKey rewritten as objects(0) (rekeyed if its filedKey differs); the rest are new */
-  case RewriteFull(oldKey: HLCTimestamp, objects: Vector[(FullObjectHeader, Vector[LoggedRecord])])
-  /** The record is not logged; its drop replacement is placed by another step of the same plan (when it fits) */
-  case Drop(record: LoggedRecord)
 
-/** @param consumed exactly the batch records the plan placed or dropped; the rest stay in incomingEvents */
+  /** The object filed under oldKey rewritten as objects(0), the rest new. objects(0) is rekeyed when its filedKey
+    * differs from oldKey; then objects(1)'s key may equal oldKey, so the executor applies the delete of oldKey and
+    * the inserts as one batch in which oldKey ends up pointing at objects(1).
+    */
+  case RewriteFull(oldKey: HLCTimestamp, objects: Vector[(FullObjectHeader, Vector[LoggedRecord])])
+
+  /** A batch or tail record that is not logged. When replacementPlaced, its drop replacement is held by another step
+    * of the same plan. Otherwise the replacement itself fit nowhere (its run of equal timestamps already fills an
+    * object, or the cap is below one replacement record): the record vanishes without trace and the executor should
+    * log a warning.
+    */
+  case Drop(record: LoggedRecord, replacementPlaced: Boolean)
+
+/** @param consumed exactly the batch records the plan placed or dropped, as the batch's own instances in batch order;
+  *                 the rest stay in incomingEvents. Equal records may repeat in a batch, so executors match consumed
+  *                 records to incoming entries by reference (eq) or position, not by equality.
+  */
 final case class LogPlan(steps: Vector[LogStep], consumed: Vector[LoggedRecord], newCurrent: Int)
 
 /** Pure placement decisions for the event log service: tails, compaction, late-event rewrites, drops.
   *
   * With full objects present, a record is late when its timestamp is at or below tailFloor (strictly, so a compacted
   * object's key is always above every existing full object's key, even when the last one holds only records at
-  * tailFloor). All size checks use zstd's compress bound, so nothing written ever exceeds its cap.
+  * tailFloor). All size checks use zstd's compress bound, so nothing written ever exceeds its cap. Every dropped
+  * record's replacement is placed by timestamp like any other record whenever it fits.
   */
 object LogPlanner:
 
@@ -82,9 +101,14 @@ object LogPlanner:
 
   /** Splits sorted records into objects at timestamp boundaries. Each object stays within min(target, its cap),
     * except that its first run of equal timestamps may reach the cap. Object 0 uses firstCap, later ones restCap.
-    * None when some run fits no object; an unsplit object within firstCap is the fallback.
+    * When that fails, objects are filled to their caps, ignoring the target, which succeeds whenever any split
+    * within the caps exists. None when none does.
     */
   private def pack(rs: Vector[LoggedRecord], target: Int, firstCap: Long, restCap: Long)
+  : Option[Vector[Vector[LoggedRecord]]] =
+    packGreedy(rs, target.toLong, firstCap, restCap).orElse(packGreedy(rs, Long.MaxValue, firstCap, restCap))
+
+  private def packGreedy(rs: Vector[LoggedRecord], target: Long, firstCap: Long, restCap: Long)
   : Option[Vector[Vector[LoggedRecord]]] =
     val parts = Vector.newBuilder[Vector[LoggedRecord]]
     var cur = Vector.empty[LoggedRecord]
@@ -96,7 +120,7 @@ object LogPlanner:
       val g = it.next()
       val gRaw = rawSize(g)
       val cap = if index == 0 then firstCap else restCap
-      if cur.nonEmpty && fitsObject(curRaw + gRaw, math.min(target.toLong, cap)) then
+      if cur.nonEmpty && fitsObject(curRaw + gRaw, math.min(target, cap)) then
         cur ++= g
         curRaw += gRaw
       else
@@ -111,33 +135,67 @@ object LogPlanner:
     if ok then
       if cur.nonEmpty then parts += cur
       Some(parts.result())
-    else if fitsObject(rawSize(rs), firstCap) then
-      Some(Vector(rs))
     else
       None
 
-  /** pack for new objects that always succeeds: the records of a run of equal timestamps beyond what one object can
-    * hold are returned as dropped. Only reachable with more than a cap's worth of records sharing one timestamp.
+  /** One plan's mutable bookkeeping of drops and their replacements */
+  private final class Drops(dropReplacement: LoggedRecord => LoggedRecord):
+    private val replacementOf = new IdentityHashMap[LoggedRecord, LoggedRecord]()
+    private val replacements = Collections.newSetFromMap(new IdentityHashMap[LoggedRecord, java.lang.Boolean]())
+    private val dropped = mutable.ArrayBuffer.empty[LoggedRecord]
+
+    def replacement(r: LoggedRecord): LoggedRecord =
+      var rep = replacementOf.get(r)
+      if rep == null then
+        rep = dropReplacement(r)
+        require(rep.timestamp == r.timestamp, "a drop replacement keeps the dropped record's timestamp")
+        replacementOf.put(r, rep)
+        replacements.add(rep)
+      rep
+
+    def isReplacement(r: LoggedRecord): Boolean = replacements.contains(r)
+
+    /** Records r as dropped and returns its replacement, to be placed by the caller when it fits */
+    def drop(r: LoggedRecord): LoggedRecord =
+      dropped += r
+      replacement(r)
+
+    /** The Drop steps, each saying whether its replacement made it into the placing steps */
+    def steps(placing: Seq[LogStep]): Vector[LogStep] =
+      val placed = Collections.newSetFromMap(new IdentityHashMap[LoggedRecord, java.lang.Boolean]())
+      placing.foreach {
+        case LogStep.AppendToTail(_, rs) => rs.foreach(placed.add)
+        case LogStep.Compact(os, _) => os.foreach(_._2.foreach(placed.add))
+        case LogStep.RewriteFull(_, os) => os.foreach(_._2.foreach(placed.add))
+        case LogStep.Drop(_, _) =>
+      }
+      dropped.toVector.map(r => LogStep.Drop(r, placed.contains(replacementOf.get(r))))
+
+  /** pack for new objects that always succeeds. Within a run of equal timestamps too large for one object, the records
+    * past what fits are dropped and their replacements kept where they still fit. Only reachable with more than a
+    * cap's worth of records sharing one timestamp.
     */
-  private def packDropping(rs: Vector[LoggedRecord], target: Int, cap: Long)
-  : (Vector[Vector[LoggedRecord]], Vector[LoggedRecord]) =
-    pack(rs, target, cap, cap) match
-      case Some(parts) => (parts, Vector.empty)
-      case None =>
-        val kept = Vector.newBuilder[LoggedRecord]
-        val dropped = Vector.newBuilder[LoggedRecord]
-        groups(rs).foreach { g =>
-          var raw = 0L
-          g.foreach { r =>
-            val n = LogRecords.recordSize(r)
-            if fitsObject(raw + n, cap) then
-              raw += n
-              kept += r
-            else
-              dropped += r
-          }
+  private def packDropping(rs: Vector[LoggedRecord], target: Int, cap: Long, drops: Drops)
+  : Vector[Vector[LoggedRecord]] =
+    pack(rs, target, cap, cap).getOrElse {
+      val kept = Vector.newBuilder[LoggedRecord]
+      groups(rs).foreach { g =>
+        var raw = 0L
+        def keep(r: LoggedRecord): Boolean =
+          val n = LogRecords.recordSize(r)
+          if fitsObject(raw + n, cap) then
+            raw += n
+            kept += r
+            true
+          else
+            false
+        g.foreach { r =>
+          // a replacement that does not fit is just not placed; its original's Drop already exists
+          if !keep(r) && !drops.isReplacement(r) then keep(drops.drop(r))
         }
-        (pack(kept.result(), target, cap, cap).get, dropped.result())
+      }
+      pack(kept.result(), target, cap, cap).get
+    }
 
   def plan(in: PlanInput): LogPlan =
     val tailCount = in.tails.size
@@ -146,32 +204,31 @@ object LogPlanner:
 
     val newCap = limitOf(in.newObjectCap)
     val softTarget = (in.target / EventLogState.TailCount).toLong
-
-    val dropSteps = Vector.newBuilder[LogStep]
+    val drops = new Drops(in.dropReplacement)
     val consumed = Vector.newBuilder[LoggedRecord]
+
+    def oversized(r: LoggedRecord): Boolean = !fitsObject(LogRecords.recordSize(r), newCap)
 
     /** Where a batch record lands: itself, or its replacement when too large for any object (None when that is too) */
     def placement(r: LoggedRecord): Option[LoggedRecord] =
-      if fitsObject(LogRecords.recordSize(r), newCap) then
+      if !oversized(r) then
         Some(r)
       else
-        val rep = in.dropReplacement(r)
-        require(rep.timestamp == r.timestamp, "a drop replacement keeps the dropped record's timestamp")
-        if fitsObject(LogRecords.recordSize(rep), newCap) then Some(rep) else None
+        val rep = drops.replacement(r)
+        if oversized(rep) then None else Some(rep)
 
-    /** Marks r consumed and returns the record to place */
+    /** Marks r consumed (dropping it when oversized) and returns the record to place */
     def consume(r: LoggedRecord): Option[LoggedRecord] =
       consumed += r
-      val p = placement(r)
-      if !p.contains(r) then dropSteps += LogStep.Drop(r)
-      p
+      if oversized(r) then drops.drop(r)
+      placement(r)
 
     val batch = sorted(in.batch)
     val (late, inOrder) = in.firstFullKey match
       case Some(_) => batch.partition(_.timestamp <= in.tailFloor)
       case None => (Vector.empty, batch)
 
-    val rewrite = planLate(in, late, newCap, consume, r => dropSteps += LogStep.Drop(r))
+    val rewrite = planLate(in, late, newCap, consume, drops)
 
     // ---- tails ----
     val lengths = in.tails.map(_.length.toLong).toArray
@@ -233,8 +290,7 @@ object LogPlanner:
               in.firstFullKey.foreach { _ =>
                 require(set.forall(_.timestamp > in.tailFloor), "tail records must lie above the tail floor")
               }
-              val (parts, dropped) = packDropping(sorted(set), in.target, newCap)
-              dropped.foreach(d => dropSteps += LogStep.Drop(d))
+              val parts = packDropping(sorted(set), in.target, newCap, drops)
               val objects: Objects = parts.map(rs => FullObjectHeader(rs.head.timestamp, None) -> rs)
               compact = Some(LogStep.Compact(objects, floor.getOrElse(in.tailFloor)))
               for i <- 0 until tailCount do
@@ -244,7 +300,8 @@ object LogPlanner:
               current = 0
 
     val appends = (0 until tailCount).filter(pending(_).nonEmpty).map(i => LogStep.AppendToTail(i, pending(i)))
-    LogPlan(dropSteps.result() ++ rewrite ++ compact ++ appends, consumed.result(), current)
+    val placing = rewrite.toVector ++ compact ++ appends
+    LogPlan(drops.steps(placing) ++ placing, consumed.result(), current)
 
   /** At most one RewriteFull: the late records in lateTarget's range merged into it, split as needed. A record whose
     * merge cannot fit (no split point within the caps) is dropped, its replacement merged when that fits.
@@ -253,7 +310,7 @@ object LogPlanner:
                        late: Vector[LoggedRecord],
                        newCap: Long,
                        consume: LoggedRecord => Option[LoggedRecord],
-                       drop: LoggedRecord => Unit): Option[LogStep.RewriteFull] =
+                       drops: Drops): Option[LogStep.RewriteFull] =
     in.lateTarget.flatMap { t =>
       val isFirst = in.firstFullKey.contains(t.key)
       def covers(ts: HLCTimestamp): Boolean = (isFirst || ts >= t.key) && t.nextKey.forall(ts < _)
@@ -262,34 +319,30 @@ object LogPlanner:
         None
       else
         val firstCap = limitOf(t.cap)
-        def packMerged(rs: Vector[LoggedRecord]) = pack(sorted(rs), in.target, firstCap, newCap)
+        def packs(rs: Vector[LoggedRecord]): Boolean = pack(sorted(rs), in.target, firstCap, newCap).isDefined
 
-        // (record to merge, the batch original when it may still be dropped on a failed merge)
-        val candidates = inRange.flatMap(r => consume(r).map(p => p -> (if p == r then Some(r) else None)))
-        val all = t.records ++ candidates.map(_._1)
+        val candidates = inRange.flatMap(consume)
+        val all = t.records ++ candidates
         val merged =
-          if packMerged(all).isDefined then
+          if packs(all) then
             all
-          else if packMerged(t.records).isEmpty then
-            // the existing content no longer packs under the caps: leave it, drop every late record
-            candidates.foreach((_, orig) => orig.foreach(drop))
-            t.records
           else
-            candidates.foldLeft(t.records) { case (acc, (p, orig)) =>
-              if packMerged(acc :+ p).isDefined then
+            // add one at a time; a record that cannot merge is dropped and its replacement tried in its place.
+            // When the existing content alone no longer packs under the caps, nothing merges.
+            val existingPacks = packs(t.records)
+            candidates.foldLeft(t.records) { (acc, p) =>
+              if existingPacks && packs(acc :+ p) then
                 acc :+ p
+              else if drops.isReplacement(p) then
+                acc
               else
-                orig match
-                  case None => acc
-                  case Some(r) =>
-                    drop(r)
-                    val rep = in.dropReplacement(r)
-                    if packMerged(acc :+ rep).isDefined then acc :+ rep else acc
+                val rep = drops.drop(p)
+                if existingPacks && packs(acc :+ rep) then acc :+ rep else acc
             }
         if merged.size == t.records.size then
           None
         else
-          val parts = packMerged(merged).get
+          val parts = pack(sorted(merged), in.target, firstCap, newCap).get
           val keys = parts.indices.map { i =>
             if i > 0 then parts(i).head.timestamp
             else if isFirst && parts(0).head.timestamp < t.key then parts(0).head.timestamp

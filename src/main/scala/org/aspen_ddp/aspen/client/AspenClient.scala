@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateMarker, Tran
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.config.BootstrapConfig
+import org.aspen_ddp.aspen.common.eventlog.{EventLogEntry, SystemEventLog}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, IDAPolicy, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
@@ -981,6 +982,27 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
                                pinned: Boolean = false,
                                taskId: Option[UUID] = None)
                               (using tx: Transaction): Future[Unit]
+
+  /** Inserts `e` into the system event log's incoming entries, under a fresh random key. Completes when staged in
+   *  `tx`; committing is the caller's. A best-effort nudge to the event log service is sent once `tx` commits.
+   *
+   *  The insert requires its key not to exist, which is no pin: a transaction without a pin of its own must be
+   *  marked `tx.replaySafe("event log entries may be duplicated")` (a replay may log the entry twice). To log several
+   *  entries in one transaction, use `prepareSystemEventLogEntries` rather than calling this twice.
+   */
+  def prepareSystemEventLogEntry(e: EventLogEntry)(using tx: Transaction): Future[Unit] =
+    SystemEventLog.prepareEntries(this, List(e))
+
+  /** As `prepareSystemEventLogEntry`, for several entries in one batch update */
+  def prepareSystemEventLogEntries(es: Seq[EventLogEntry])(using tx: Transaction): Future[Unit] =
+    SystemEventLog.prepareEntries(this, es)
+
+  /** Logs `e` to the system event log in a transaction of its own. There is no automatic retry: a failure is
+   *  returned to the caller. The entry may be logged more than once (a replayed transaction can insert it again
+   *  after the event log service moved it), so readers must tolerate duplicates.
+   */
+  def logSystemEvent(e: EventLogEntry): Future[Unit] =
+    SystemEventLog.logSystemEvent(this, e)
 
   private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]]
 

@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
 
 import java.util.UUID
 import java.nio.charset.StandardCharsets
-import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root, SinglePoolNodeAllocator}
+import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root, SinglePoolNodeAllocator, TreeKind}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
@@ -20,6 +20,7 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
 import org.aspen_ddp.aspen.common.util.uuid2byte
 import org.aspen_ddp.aspen.common.network.snapshot.NetworkCachingService
 import org.aspen_ddp.aspen.common.rebalancing.RebalancingDurableService
+import org.aspen_ddp.aspen.common.eventlog.{EventLogDurableService, EventLogState, SystemEventLog}
 import org.aspen_ddp.aspen.compute.ServiceEntry
 import org.aspen_ddp.aspen.compute.systemtask.SystemTaskExecutorService
 
@@ -296,11 +297,25 @@ object Bootstrap:
       HLCTimestamp.Zero,
       networkCachingServicePtr)
 
+    // The EventLogDurableService (the system event log) is likewise a system-critical singleton. Its state names an
+    // empty KV tree of incoming entries, an empty DataObject tree of log objects and the empty tail objects.
+    val eventLogIncoming = allocateTree(ByteArrayKeyOrdering)
+    val eventLogLogged = Root(0, ByteArrayKeyOrdering, None, bootstrapNodeAllocator, TreeKind.DataObjects)
+    val eventLogTails = Vector.fill(EventLogState.TailCount)(allocateData(Array.empty))
+    val eventLogServicePtr = allocate(SystemEventLog.initialState(eventLogIncoming, eventLogLogged, eventLogTails,
+      PoolObjectAllocatorId(Radicle.poolId)).toList)
+    val eventLogServiceEntry = ServiceEntry(
+      EventLogDurableService.ServiceTypeUUID,
+      ServiceEntry.UnclaimedHostId,
+      HLCTimestamp.Zero,
+      eventLogServicePtr)
+
     val servicesTree = allocateTree(
       ByteArrayKeyOrdering,
       Key(RebalancingDurableService.ServiceUUID) -> rebalancingServiceEntry.encode(),
       Key(SystemTaskExecutorService.ServiceUUID) -> systemTaskServiceEntry.encode(),
-      Key(NetworkCachingService.ServiceUUID) -> networkCachingServiceEntry.encode()
+      Key(NetworkCachingService.ServiceUUID) -> networkCachingServiceEntry.encode(),
+      Key(EventLogDurableService.ServiceUUID) -> eventLogServiceEntry.encode()
     )
 
     val caCertificatePtr = allocateData(Pem.encodeCertificate(ca.certificate).getBytes(StandardCharsets.UTF_8))

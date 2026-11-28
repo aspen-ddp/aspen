@@ -62,6 +62,10 @@ class DataObjectTKVL(val client: AspenClient, val rootManager: RootManager):
   def foreach(fn: (Key, Value) => Future[Unit]): Future[Unit] =
     checked(engine.foreach((_, k, v) => fn(k, v)))
 
+  /** As `foreach`, ending early, reading nothing more, once `stopWhen` holds; see TierEngine.foreach */
+  def foreach(fn: (Key, Value) => Future[Unit], stopWhen: () => Boolean): Future[Unit] =
+    checked(engine.foreach((_, k, v) => fn(k, v), stopWhen))
+
   /** Visit every entry at or above `minKey`, in ascending key order. The bound is inclusive, as for
     * `TieredKeyValueList.foreachFrom`.
     */

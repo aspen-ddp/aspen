@@ -1,7 +1,10 @@
 package org.aspen_ddp.aspen.common.eventlog
 
-import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.client.{PoolObjectAllocatorId, Transaction}
+import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root}
+import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
+import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
@@ -189,6 +192,68 @@ class EventLogReaderSuite extends EventLogSuiteBase:
       tailed.foreach(e => counts.getOrElse(e, 0) shouldBe 2)
       l.entries.filterNot(tailed.toSet).foreach(e => counts.getOrElse(e, 0) shouldBe 1)
       result.toSet.subsetOf((l.entries ++ more).toSet) shouldBe true
+
+  atest("an entry moved from incomingEvents to a tail between those two reads is still returned"):
+    given ExecutionContext = executionContext
+    val base = HLCTimestamp.now.asLong
+    val entries = (0 until 5).toVector.map(i => EventLogEntry(HLCTimestamp(base + Spacing * i), typeA, data(20)))
+    for
+      ptr <- SystemEventLog.statePointer(client)
+      // No service runs yet, so the reader finds the entries in incomingEvents
+      _ <- logInGroups(entries, 2)
+      reader = new EventLogReader(client)
+      _ = reader.testAfterIncomingRead = once:
+        makeService(ptr)
+        for
+          _ <- awaitIncomingEmpty()
+          tailed <- tailEntries()
+        yield multiset(tailed) shouldBe multiset(entries)
+      result <- reader.read(EventLogReader.Earliest, None, None)
+    yield
+      reader.restarts shouldBe 0
+      // Read in incomingEvents, then again in a tail: a duplicate (DESIGN.md section 7, path 2), never a gap
+      multiset(result) shouldBe entries.map(_ -> 2).toMap
+
+  /** Gives the incomingEvents tree `size`-byte nodes, so a few entries span several of them */
+  private def shrinkIncomingNodes(ptr: KeyValueObjectPointer, size: Int): Future[Unit] =
+    given ExecutionContext = executionContext
+    client.transact: tx =>
+      client.read(ptr).map: kvos =>
+        val vs = kvos.contents(EventLogState.IncomingKey)
+        val root = Root(client, vs.value.bytes)
+        val small = new NodeAllocator(client, List((PoolObjectAllocatorId(Radicle.poolId), size)))
+        tx.update(ptr, None, None, List(KeyValueUpdate.KeyRevision(EventLogState.IncomingKey, vs.revision)),
+          List(Insert(EventLogState.IncomingKey, root.copy(nodeAllocator = small).encode())))
+
+  private def incomingNodes(ptr: KeyValueObjectPointer): Future[Int] =
+    given ExecutionContext = executionContext
+    SystemEventLog.incomingTree(client, ptr).foreachNode((_, _) => Future.unit).map(_.visited)
+
+  atest("a reader walking incomingEvents while the service drains it, removing nodes, does not restart"):
+    given ExecutionContext = executionContext
+    val base = HLCTimestamp.now.asLong
+    val entries = (0 until 40).toVector.map(i => EventLogEntry(HLCTimestamp(base + Spacing * i), typeA, data(100)))
+    for
+      ptr <- SystemEventLog.statePointer(client)
+      _ <- shrinkIncomingNodes(ptr, 1024)
+      _ <- logInGroups(entries, 5)
+      before <- incomingNodes(ptr)
+      reader = new EventLogReader(client)
+      // After the walk's first entry, the service moves every entry and the emptied nodes are removed: the walk's
+      // next node read fails with InvalidObject, and the walk resumes after the last key it visited
+      _ = reader.testDuringIncomingWalk = once:
+        makeService(ptr)
+        for
+          _ <- awaitIncomingEmpty()
+          _ <- waitForTransactionsToComplete()
+          _ <- awaitUntil("the emptied incomingEvents nodes to be removed")(incomingNodes(ptr).map(_ == 1))
+        yield ()
+      result <- reader.read(EventLogReader.Earliest, None, None)
+    yield
+      before should be > 2
+      reader.restarts shouldBe 0
+      entries.foreach(e => result should contain (e))
+      result.toSet shouldBe entries.toSet
 
   atest("entries logged but not yet moved by the service are returned"):
     given ExecutionContext = executionContext

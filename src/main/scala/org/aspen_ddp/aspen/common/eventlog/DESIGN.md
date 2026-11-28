@@ -48,6 +48,12 @@ absent one). Keys (`EventLogState`):
 | `TailsKey` | `Tails(pointers, current, allocator)`: `TailCount` (10) tail objects, the index being written, and the allocator they came from |
 | `TailFloorKey` | `tailFloor`: the largest timestamp held by any full object |
 
+Type ids are assigned in increasing order and never reused. Once all 65536 are taken, a batch that needs a new one
+(an event type never logged before) cannot be planned: the service logs an error and moves none of it. The entry
+stays in `incomingEvents`, and batches are read in key order, so every batch that includes it fails the same way:
+once fewer than `MaxBatchEntries` entries precede its key, moving stops for every type. `incomingEvents` then grows
+without bound while clients keep logging (they are not told), and readers still return the waiting entries from it.
+
 `loggedEvents` always has a root node: Bootstrap allocates an empty one. A rootless tree would make the first
 insert write the root into the state object in the same transaction as the move's own state update, and a
 transaction may update an object once.
@@ -59,13 +65,16 @@ Entries only ever move forward along `incoming -> tails -> full objects`.
 1. A client inserts the entry under a random UUID key in `incomingEvents` (`requireDoesNotExist`), either in its own
    transaction (`prepareSystemEventLogEntry`) or in a transaction of its own (`logSystemEvent`). After the commit
    the client sends the service a best-effort `Nudge`.
-2. The service reads up to one batch (at most `MaxBatchEntries` = 1000 entries or `MaxBatchBytes` = 1 MiB) and
+2. The service reads up to one batch (at most `MaxBatchEntries` = 1000 entries; `MaxBatchBytes` = 1 MiB is a soft
+   bound: reading stops once the batch reaches it, so the entry that crosses it is included) and
    moves it in one transaction: the batch's records go into the tails (and any full-object work below), and the
    moved incoming keys are deleted at their read `KeyRevision` (that delete is the move's pin). The transaction also
    requires the revisions of `TailsKey` and `TailFloorKey`, so two service instances overlapping after a lease
    handoff never both move the same entry: the loser aborts and its next batch re-reads. Scans run one at a time; a
    nudge arriving during a scan makes it scan again. A scan gives up after `MaxConsecutiveFailures` failed
-   transactions in a row, until the next poll (`DefaultPollPeriod`, 15 s) or nudge.
+   transactions in a row, until the next poll (`DefaultPollPeriod`, 15 s) or nudge. A failure that repeats on
+   every attempt (a planner exception on the batch at the front of `incomingEvents`, say) therefore stalls all moving:
+   each poll retries the same batch and fails again, and `incomingEvents` grows until the cause is fixed.
 3. Tails are `TailCount` data objects holding zstd frames of records. One tail is "current"; a batch is appended to
    it as a single new frame, moving to the next tail when the current one is full. A tail's target size is the full
    object target divided by `TailCount`. Tails hold only records strictly after `tailFloor`.
@@ -115,7 +124,18 @@ by timestamp, at most `limit`. It never omits an event logged before the read be
 
 1. read `incomingEvents`, then the state object (tails, type ids), then every tail, then walk `loggedEvents`,
    reading each full object as the walk reaches it. An entry that moves between two reads is seen twice, not
-   zero times.
+   zero times. Every one of these reads is settled (`AspenClient.settledReader`, `client/internal/CLAUDE.md`): it
+   reflects every transaction that committed before it began. That is what makes the order an argument. A read that
+   shows a move M applied (an entry gone from `incomingEvents`, tails emptied, a header or tree changed) proves M
+   committed before the read completed, so before the next read began, and the next read therefore shows M's
+   records where M put them. Without it, a later read of an object in another pool could return the state M
+   replaced, from stores that voted commit for M but have not applied it: the reader's client knows M committed only
+   if its status cache or another store of that same object says so. Objects of one pool would be safe without it
+   (a store applies all its objects of a transaction at once, and read majorities overlap), but once
+   `setSystemLogAllocator` points the log at another pool (or a group spanning pools), tails, tree nodes and full
+   objects live apart from `incomingEvents` and from each other. The walk of `incomingEvents` resumes after the last
+   key it visited when a join removes the next node (the service's deletes cause them), rather than restarting the
+   read.
 2. the walk starts at the largest key at or below `from` in the tier-0 node containing it (only when that node
    holds none, from the start of the tree). The first key the walk visits must be the key it started from: a rekey
    that deleted it in between would otherwise skip the object covering `from`.
@@ -123,13 +143,18 @@ by timestamp, at most `limit`. It never omits an event logged before the read be
    `upperBound` must be the next key the walk found (the last object has none). A split changes the upper bound and a
    rekey changes the filed key, so either committed between the walk and the read fails the check. So does an object
    read as `InvalidObject` or a record whose type id the state read does not know.
-4. a failed check restarts the read from the state object, at most `MaxRestarts` (5) times, then fails with
-   `IllegalStateException`.
+4. a failed check abandons the attempt and starts again from `incomingEvents`, at most `MaxRestarts` (5) times, then
+   fails with `IllegalStateException`.
 
 The walk stops past `to`, or once `limit` records timestamped before the next key are in hand.
 
-The reader holds test hooks per instance (`testAfterTailsRead`, `testAfterContainingNode`,
-`testBeforeFirstObjectRead`, and the `restarts` counter), so instances are not shared between reads in tests.
+A settled read waits for the transactions holding write locks in each store's first reply to resolve, so a read of a
+busy current tail or of `incomingEvents` under heavy logging takes up to a transaction's resolution longer. The cost
+is the reader's alone; the service and loggers are unaffected.
+
+The reader holds test hooks per instance (`testAfterIncomingRead`, `testDuringIncomingWalk`, `testAfterTailsRead`,
+`testAfterContainingNode`, `testBeforeFirstObjectRead`, and the `restarts` counter), so instances are not shared
+between reads in tests.
 
 ## 7. Duplicates
 
@@ -138,7 +163,8 @@ exactly-once must carry their own event identity in the payload. The paths found
 
 1. **Replayed insert.** `logSystemEvent` and an unpinned `prepareSystemEventLogEntry` transaction are
    `replaySafe` (an incoming insert is no pin). A replay of the insert transaction landing after the service moved
-   and deleted its entry inserts it again (its `requireDoesNotExist` now holds, the key being gone), so the event is logged a second time.
+   and deleted its entry inserts it again (its `requireDoesNotExist` now holds, the key being gone), so the event is
+   logged a second time.
 2. **Reader racing a move.** The reader reads incoming and then the tails: an entry moved from incoming into a tail
    between the two reads is returned from both.
 3. **Reader racing a compaction.** The reader reads the tails and later reaches the new full object: records that
@@ -162,6 +188,10 @@ The cap is a property of where the log is stored, not of the event:
 - The `DroppedEvent` replacement is a record like any other and is placed by timestamp whenever it fits. When it
   cannot be placed (its run of equal timestamps already fills an object, or the cap is below one replacement
   record) the record vanishes without trace and `LogWriter` logs a warning. That is the only traceless loss.
+- A late record merges into an existing full object (section 5) only while that object still packs under the caps.
+  An object that no longer does (its content was written under a larger cap than its pool's or the allocator's
+  current one) takes nothing: every late record in its range becomes a `DroppedEvent` (`LogPlanner.planLate`), and
+  the replacement cannot merge either, so it too vanishes without trace, with `LogWriter`'s warning.
 
 ## 9. Observers and messages
 
@@ -198,7 +228,8 @@ On `AspenClient`:
 - `readSystemEvents(from, to, limit)`: the reader. `decodeSystemEvent(entry)`: the entry's `Event`, when its factory
   is registered.
 - `addSystemEventObserver` / `removeSystemEventObserver` / `listSystemEventObservers`: edit `ObserversKey` with a
-  revision-checked write that retries on conflict, then send `ReloadObservers`. An unchanged list commits nothing.
+  revision-checked write that retries on conflict, then send `ReloadObservers`. An edit that changes nothing (adding
+  an observer already listed, removing one that is not) commits nothing.
 - `setSystemLogAllocator(id)`: section 10.
 
 The command line has `event-log` (display a range), `event-log-observers`, `event-log-add-observer` and

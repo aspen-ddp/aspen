@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.common.eventlog
 
 import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject}
-import org.aspen_ddp.aspen.client.tkvl.{DataObjectTKVL, KVObjectRootManager}
+import org.aspen_ddp.aspen.client.tkvl.{DataObjectTKVL, KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, Value}
 import scribe.Logging
@@ -9,6 +9,7 @@ import scribe.Logging
 import java.util.UUID
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.{ExecutionContext, Future}
+import scala.util.control.NonFatal
 import scala.util.{Failure, Success}
 
 object EventLogReader:
@@ -30,14 +31,20 @@ object EventLogReader:
   * committing between two of the reads yields duplicates (an entry read before and again after it moved), never a
   * gap. Undecodable incoming values are skipped; the service deletes them.
   *
+  * Every read is settled (AspenClient.settledReader): it reflects every transaction committed before it began. A
+  * read that shows a move applied proves the move committed before the next read began, so the next read shows the
+  * move's records where it put them, even when that object lives in another pool whose stores have not yet applied
+  * it. An ordinary read could return the state the move replaced there, as this client does not know the move
+  * committed (DESIGN.md section 6.1).
+  *
   * A split or rekey moves records between full objects, so the walk's keys may be stale by the time an object is
   * read. Every object's header is checked against the walk: its filedKey must be the key it was found under, and an
   * upper bound must be the next key the walk found (the object is the last when the walk found none). A split sets
   * the rewritten object's upper bound to the new part's key and a rekey changes the filedKey, so either, committed
   * between the walk and the object read, fails the check. The walk's first key must be the one it was started from,
   * so a rekey that deletes it between finding it and walking fails too. So does an object read as InvalidObject or
-  * a record whose type id the state read does not know. The read then restarts from the state object, at most MaxRestarts times,
-  * and fails with IllegalStateException after that.
+  * a record whose type id the state read does not know. The attempt is then abandoned and the read starts again from
+  * incomingEvents, at most MaxRestarts times, and fails with IllegalStateException after that.
   *
   * Each instance holds test seams and counts its restarts, so instances are not shared between reads in tests.
   */
@@ -46,6 +53,14 @@ final class EventLogReader(client: AspenClient) extends Logging:
   import EventLogReader.*
 
   private given ExecutionContext = client.clientContext
+
+  private val reader = client.settledReader
+
+  /** Runs between the incomingEvents walk and the state read, once per attempt */
+  private[eventlog] var testAfterIncomingRead: () => Future[Unit] = () => Future.unit
+
+  /** Runs once per attempt, inside the incomingEvents walk, after its first entry is visited */
+  private[eventlog] var testDuringIncomingWalk: () => Future[Unit] = () => Future.unit
 
   /** Runs between the tail reads and the tree walk, once per attempt */
   private[eventlog] var testAfterTailsRead: () => Future[Unit] = () => Future.unit
@@ -77,15 +92,27 @@ final class EventLogReader(client: AspenClient) extends Logging:
   private def inRange(from: HLCTimestamp, to: Option[HLCTimestamp])(ts: HLCTimestamp): Boolean =
     ts >= from && to.forall(ts <= _)
 
-  /** The decodable entries of incomingEvents in the range */
+  /** The decodable entries of incomingEvents in the range. The walk survives the joins the service's deletes cause
+    * (TieredKeyValueList.foreach resumes after the last key visited) */
   private def readIncoming(ptr: KeyValueObjectPointer,
                            from: HLCTimestamp,
                            to: Option[HLCTimestamp]): Future[Vector[EventLogEntry]] =
-    SystemEventLog.incomingTree(client, ptr).foldLeft(Vector.empty[EventLogEntry]): (acc, contents) =>
-      acc ++ contents.valuesIterator.flatMap: vs =>
-        try Some(EventLogEntry.decode(vs.value.bytes)).filter(e => inRange(from, to)(e.timestamp))
-        catch
-          case _: Throwable => None
+    val found = ArrayBuffer.empty[EventLogEntry]
+    var first = true
+    val tree = TieredKeyValueList(client,
+      KVObjectRootManager(client, EventLogState.IncomingKey, ptr, readWith = Some(reader)))
+    tree.foreach: (_, _, vs) =>
+      try
+        val e = EventLogEntry.decode(vs.value.bytes)
+        if inRange(from, to)(e.timestamp) then found += e
+      catch
+        case NonFatal(_) => ()
+      if first then
+        first = false
+        testDuringIncomingWalk()
+      else
+        Future.unit
+    .map(_ => found.toVector)
 
   private def readOnce(from: HLCTimestamp,
                        to: Option[HLCTimestamp],
@@ -93,15 +120,16 @@ final class EventLogReader(client: AspenClient) extends Logging:
     for
       ptr <- SystemEventLog.statePointer(client)
       incoming <- readIncoming(ptr, from, to)
-      kvos <- client.read(ptr, "event log state")
+      _ <- testAfterIncomingRead()
+      kvos <- reader.read(ptr, "event log state")
       typeIds = EventLogState.decodeTypeIds(kvos.contents(EventLogState.TypeIdsKey).value.bytes)
       tails = EventLogState.decodeTails(kvos.contents(EventLogState.TailsKey).value.bytes)
-      tailStates <- Future.traverse(tails.pointers)(p => client.read(p, "event log tail"))
+      tailStates <- Future.traverse(tails.pointers)(p => reader.read(p, "event log tail"))
       _ <- testAfterTailsRead()
       tailRecords = tailStates.flatMap(s => LogRecords.decodeFrames(s.data.getByteArray))
         .filter(r => inRange(from, to)(r.timestamp))
       // A fresh root manager per attempt, so a restart never walks cached nodes
-      logged <- KVObjectRootManager(client, EventLogState.LoggedKey, ptr).getDataObjectTree()
+      logged <- KVObjectRootManager(client, EventLogState.LoggedKey, ptr, readWith = Some(reader)).getDataObjectTree()
       fullRecords <- walk(logged, from, to, limit)
     yield
       val merged: Vector[Either[LoggedRecord, EventLogEntry]] =
@@ -147,7 +175,7 @@ final class EventLogReader(client: AspenClient) extends Logging:
           testBeforeFirstObjectRead()
       for
         _ <- seam
-        state <- client.read(pointer, "event log full object")
+        state <- reader.read(pointer, "event log full object")
       yield
         val (header, records) = FullObject.decode(state.data.getByteArray)
         if header.filedKey != key || header.upperBound.exists(ub => !next.contains(ub)) then

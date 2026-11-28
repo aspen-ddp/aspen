@@ -5,12 +5,14 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceSetId
+import org.aspen_ddp.aspen.common.network.{TxFinalized, TxMessage, TxResolved}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.store.backend.{MapBackend, RocksDBConfig}
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration.{Duration, MILLISECONDS}
 import scala.util.Random
 
 class EventLogAllocatorSuite extends EventLogSuiteBase:
@@ -106,3 +108,54 @@ class EventLogAllocatorSuite extends EventLogSuiteBase:
       err should not be null
       afterAllocator shouldBe beforeAllocator
       after.nodeAllocator.tiers.toList shouldBe before.nodeAllocator.tiers.toList
+
+  atest("a move whose outcome its tails' pool has not heard yet is still read"):
+    given ExecutionContext = executionContext
+    // Enough to compact after the change, so the tails move to the new pool
+    val es = entries(130, 1000, 5)
+    var holding = false
+    var held = List[TxMessage]()
+    var released = false
+    for
+      poolId <- createPool()
+      _ <- client.setSystemLogAllocator(PoolObjectAllocatorId(poolId))
+      ptr <- SystemEventLog.statePointer(client)
+      _ = makeService(ptr)
+      _ <- logInGroups(es)
+      _ <- awaitIncomingEmpty()
+      st <- readState()
+      _ = st.tails.pointers.foreach(p => p.poolId shouldBe poolId)
+      newPool = (0 until poolIda.width).map(i => StoreId(poolId, i.toByte)).toSet
+      // The new pool's stores never lead, and hear no outcome while holding: they vote commit for the next move and
+      // keep its lock, while the bootstrap pool applies it. This client learns commits only from votes and keeps no
+      // status cache, so nothing it reads tells it the move committed except the move's applied effects
+      _ = net.unreachableStores = newPool
+      _ = net.dropTxMessage =
+            case m @ (_: TxResolved | _: TxFinalized) if holding && newPool.contains(m.to) =>
+              held = held :+ m
+              true
+            case _ => false
+      _ = holding = true
+      e = EventLogEntry(HLCTimestamp.now, typeA, "moved while held".getBytes)
+      _ <- client.logSystemEvent(e)
+      // Gone from incomingEvents: its move committed and applied there, not yet at the tail
+      _ <- awaitIncomingEmpty()
+      reader = new EventLogReader(client)
+      // The outcome reaches the new pool only after the reader has read incomingEvents and sent its tail reads
+      _ = reader.testAfterIncomingRead = () =>
+            client.backgroundTaskManager.schedule(Duration(300, MILLISECONDS)):
+              executionContext.execute: () =>
+                holding = false
+                net.dropTxMessage = _ => false
+                net.unreachableStores = Set()
+                released = true
+                held.foreach(net.deliverTransactionMessage)
+            Future.unit
+      read <- reader.read(EventLogReader.Earliest, None, None)
+      releasedBeforeRead = released
+    yield
+      // An ordinary read of the tail returns the state the move replaced (three matching replies holding a lock of
+      // a transaction this client does not know committed), and the read omits e. A settled read waits for the lock
+      read should contain (e)
+      releasedBeforeRead shouldBe true
+      multiset(read).filter(_._1 != e) shouldBe multiset(es)

@@ -1,65 +1,67 @@
 TODO
 ====
 
-FSIF throughput after device I/O isolation (measured 2026-11-24, docs/host-threading-measurement.md "Device I/O
-isolation: before/after")
-  - Status: investigation and fix done (2026-11-24). The cause below is fixed by the FSIF device journal (one
-    preallocated journal per device, spec docs/superpowers/specs/2026-11-24-fsif-device-journal-design.md).
-    Microbenchmark (FsifDeviceBench, docs/host-threading-measurement.md "FSIF device journal"), mean ops/s over six
-    runs against the old tree's three: 1 thread 2231 vs 39, 2: 1532 vs 48, 4: 2638 vs 113, 8: 2409 vs 240, 16: 2246
-    vs 376, 24: 2644 vs 644. 1-2 threads collapse in some runs (288-578, reads queued behind the data pool), 4 never
-    below 2449. `DeviceIo.defaultDataThreads` is now 4 (was max(4, CPUs/2)).
-  - Remaining (the user runs it: needs root and TCMU): the fio procedure of docs/host-threading-measurement.md, both
-    trees back to back, alternating, three runs each, at the new default. Success: FSIF randrw and seqwrite
-    throughput and fsync latency no worse than the fd82a6f3 baseline (spec section 7 step 2). The caveats below
-    apply.
-  - What degraded: FSIF needs many more I/O threads per device than before to reach the same throughput. Before
-    (fd82a6f3), every FSIF store shared one host-wide `sharedIo` pool of max(4, CPUs) = 24 threads and a
-    `sharedSerial` pool of max(2, CPUs) = 24 threads. After, each device has its own `dataEc` of
-    `--device-io-threads` threads and one serial thread.
-    - At the design default of 4 data threads, a 16-store pool on one device was 20-28% slower:
-      - randrw-verify read IOPS 409 against 510;
-      - seqwrite 91 against 108 MiB/s;
-      - two devices 386 against 499 read IOPS and 89 against 122 MiB/s;
-      - fsyncs about 2x longer.
-    - Throughput rises steadily with the thread count (2, 4, 8, 12 threads give 322, 409, 430, 528 read IOPS). The
-      default was raised to max(4, CPUs/2) (`DeviceIo.defaultDataThreads`), which brings throughput back to baseline.
-    - Still worse at the default: randrw fsync avg 816 ms against 472-540 before (one device). seqwrite fsync and
-      every clat number are equal or better.
-    - Cost of the workaround: a host with many devices now runs CPUs/2 data threads per device. Idle pools time out,
-      but a busy host has far more FSIF threads than before.
-  - Cause (investigated 2026-11-24, microbenchmark; the fio/TCMU runs were not repeated):
-    - Each store has its own journal, and each batch is one blocking write + force on a data thread
-      (`JournalWriter.send`). The vdisk workload commits every transaction on all 16 stores, so each transaction
-      needs 16 fsyncs on the device. Each appends to its file, so each fdatasync is an ext4 jbd2 commit (~10 ms
-      here; ext4 batches concurrent fsyncs into one commit, max_batch_time 15 ms). ext4 merges only the fsyncs in
-      flight together, so with N data threads a transaction pays about 16/N fsync rounds, and reads queue behind
-      the forces on the same pool.
-    - Thread wake/sleep cost is not the limit: with threads >= stores the pool wait is 0.1-0.5 ms against a 10 ms
-      force.
-    - Microbenchmark: 16 real FsifBackends on one ThreadedDeviceIo, NVMe/ext4, randrw-like (50/50 ranged writes on
-      all stores and reads on 10, depth 8). ops/s by data threads: 1: 49, 4: 131, 12: 374, 16: 602, 24: 767, 32: 751.
-      Read latency 39 ms at 4 threads, 6.3 at 16, 1.7 at 24. Journal force ~9.7 ms at every count; at 4 threads
-      tasks waited ~32 ms for a pool slot.
-      - The threads needed follow the store count: 8 stores gave 619 ops/s at 8 threads, 762 at 12.
-      - Serial threads (1 against 4, at 4 and 16 data threads) made no difference: the serialEc suspect is ruled out.
-      - One store on one thread gave 962 ops/s, more than 16 stores on 32 threads.
-      - A plain-Java model: one shared journal file on one thread did 490 tx/s (1355 preallocated, overwrite-only);
-        16 separate journals peaked at 381 with 16 threads. Preallocated per-store journals: one fsync took 1.4 ms
-        against 5 ms, but 16 concurrent ones degraded past 8 threads (each issues its own device flush).
-    - This explains the measured numbers: the old 24 shared threads covered 16 stores; CPUs/2 = 12 does not, hence
-      the remaining randrw fsync gap. Untested prediction: `--device-io-threads=24` closes it.
-    - Chosen direction, now built: one journal per device, shared by its stores (device-level group commit),
-      preallocated so a force changes no metadata.
-  - Caveats for the fio re-measure:
-    - Every number above was taken with vdisk-server's full piece scan on cached reads, which made each cache-hit read
-      60-70 us slower on a fragmented block; it is fixed in dda89905.
-      - That fix sped the baseline's RocksDB randrw by ~45%.
-      - FSIF was not re-measured after it, so the FSIF gap and the thread count needed may differ now. Re-measure
-        both trees first, with HEAD's vdisk-server on both.
-    - Cross-session drift is ~15% (two baseline sessions gave 510 and 585 read IOPS). Run the trees back to back,
-      alternating, three or more runs each.
-    - Host and vdisk-server share the machine in this benchmark. Watch host CPU: more device threads can starve
-      vdisk-server, which is what produced the remaining RocksDB no-fsync gap.
-    - Avoid the TCMU 30 s SYNCHRONIZE CACHE timeout (ext4 goes read-only, on both trees) by laying out small files one
-      at a time.
+Add an EventLogging system composed of the following parts
+ - An EventLogEntry class that is comprised of
+   - An 8-byte timestamp containing the number of nanoseconds since the epoch
+   - A type UUID
+   - A byte array of data for the entry
+ - An Event trait or abstract class containing:
+   - An 8-byte timestamp containing the number of nanoseconds since the epoch
+   - A type UUID
+ - An abstract EventFactory for use with the RegisteredTypeFactory that contains
+   - def createEvent(e: EventLogEntry): Event
+ - An abstract event EventObserver comprised of
+   - observedTypes: Option[Set[UUID]] - used to say which event types this observer is interested in. If None, the
+     observer is interested in all event types
+   - def observe(e: Event): Unit
+ - An abstract EventObserverFactory for use with the RegisteredTypeFactory that contains:
+   - def createEventObserver(typeUUID: UUID, configData: Array[Byte]): EventObserver
+ - An EventLogDurableService
+   - The state object for the durable service contains:
+     - An "incomingEvents" TKVL. Event creators will insert new log entries by creating a random UUID to serve
+       as the key and a serialized EventLogEntry as the value (use ProtocolBuffers for the EventLogEntry encoding
+       to allow for easy extension in the future)
+     - A "loggedEvents" DataObject TKVL where the key is the 8-byte timestamp of the lowest entry in log for a
+       data object containing logged events.
+     - A mapping between event type UUIDs and an internally-assigned 2-byte integer for that type UUID
+     - A list of (event observer type UUID, Array[Byte])
+     - A logObjectAllocatorUUID which will be the UUID of an ObjectAllocator for allocating DataObjects that will
+       serve as the permanent home for logged events.
+   - Behavior
+     - At startup, load the UUID to internal integer map and create EventObservers for all the event observer type
+       UUIDs (use the registered type factories and the associated config data array to create these instances)
+     - The service polls the incomingEvents TKVL (and accepts a nudge message to do an immediate scan), copies all
+       found events over to the loggedEvents tree, and deletes the entries from the incomingEvents tree
+     - Whenever a new event type UUID is found, it assigns it the next highest internal id and updates the map in the
+       state object
+       - The purpose of this is to reduce storage size. UUIDs are used to ensure no two ids will ever accidentally
+         collide but we will never have very many distinct event types in the same system. Likely less than 100 in real
+         systems but we'll use a 2 byte integer just to be safe.
+     - The loggedEvents tree is a tree of timestamps pointing to DataObjects containing log entries
+       - The key is the smallest timestamp contained within the object
+       - The object content is just a list of serialized EventLogEntry instances (but using the 2-byte integer in place
+         of the full UUID) that are sorted by timestamp from smallest to largest
+       - Note that most of the inserts will go to the right-most object however, it is possible for delayed events to
+         be entered into the incomingEvents tree so updates to older objects must be supported. We do not need to
+         optimize for this though so the likely case will be to simply "split" the node similar to we do for TKVL nodes.
+       - Each data object should be compressed with the zstd-jni library and kept to approximately 2mb in size. This is
+         a soft limit only. If a massive log entry causes an object to greatly exceed this soft limit, that's fine.
+     - After each event is written to the loggedEvents tree, the service will use the registered type factory system
+       to create an Event instance for the entry and then pass the event object to all EventObservers that have the
+       event's type UUID in its observedTypes set or if observedTypes is None (which indicates an interest in all
+       Events)
+     - Check the loggedEvents root and logObjectAllocatorUUID for a change in the object allocators to use and update
+       internal state to use them if a new allocator has been assigned.
+  - Add a SystemEventLog to the bootstrap process to ensure a default, system-wide event log is running at all times,
+    like the Rebalance service. Default to allocating all objects from the bootstrap pool
+  - Add an AspenClient.prepareSystemEventLogEntry(e: EventLogEntry): Future[Unit]
+    - prepares a transaction for entering the log entry into the system's event log incomingEvents tree
+    - the Future completes when the transaction is ready to commit
+  - Add an AspenClient.logSystemEvent(e: EventLogEntry): Future[Unit]
+    - thin wrapper calling prepareSystemEventLogEntry with a transaction and committing it. Do not automatically
+      retry on failure and be sure the scaladoc calls this out.
+  - Add an AspenClient.setSystemLogAllocator(objectAllocatorId: UUID): Future[Unit]
+    - Verify that the supplied object allocator ID exists
+    - Update the root of the loggedEvents TKVL to use the new allocator
+    - Update the service's state to set logObjectAllocatorUUID to the new allocator

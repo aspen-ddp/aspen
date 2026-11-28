@@ -40,6 +40,11 @@ class DataObjectTKVL(val client: AspenClient, val rootManager: RootManager):
 
   def get(key: Key): Future[Option[Value]] = checked(engine.get(key))
 
+  /** The tier-0 node whose range holds `key`, or None for an empty tree. Its entries need not include one at or
+    * below `key`: the node's minimum entry may have been deleted.
+    */
+  def getContainingNode(key: Key): Future[Option[ListNode]] = checked(engine.getContainingNode(key))
+
   /** With `requireDoesNotExist`, the transaction fails with `KeyAlreadyExists` if the tree holds `key` */
   def set(key: Key, value: Value, requireDoesNotExist: Boolean = false)(using Transaction): Future[Unit] =
     checked(engine.set(key, value, if requireDoesNotExist then PutRequirement.MustNotExist else PutRequirement.Checked))
@@ -67,10 +72,12 @@ class DataObjectTKVL(val client: AspenClient, val rootManager: RootManager):
     checked(engine.foreach((_, k, v) => fn(k, v), stopWhen))
 
   /** Visit every entry at or above `minKey`, in ascending key order. The bound is inclusive, as for
-    * `TieredKeyValueList.foreachFrom`.
+    * `TieredKeyValueList.foreachFrom`. Ends early, reading nothing more, once `stopWhen` holds; see
+    * TierEngine.foreach.
     */
-  def foreachFrom(minKey: Key, fn: (Key, Value) => Future[Unit]): Future[Unit] =
-    checked(engine.foreachFrom(minKey, (_, k, v) => fn(k, v)))
+  def foreachFrom(minKey: Key, fn: (Key, Value) => Future[Unit], stopWhen: () => Boolean = () => false)
+  : Future[Unit] =
+    checked(engine.foreachFrom(minKey, (_, k, v) => fn(k, v), stopWhen))
 
   /** Visit every entry in `[minKey, maxKey)`, in ascending key order. */
   def foreachInRange(minKey: Key, maxKey: Key, fn: (Key, Value) => Future[Unit]): Future[Unit] =

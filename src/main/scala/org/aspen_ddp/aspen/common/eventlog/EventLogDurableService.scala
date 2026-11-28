@@ -5,7 +5,8 @@ import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.tkvl.{DataObjectTKVL, KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.ServiceMessage
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectRevision,
+  Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.{NoTask, ScheduledTask}
 import org.aspen_ddp.aspen.compute.{DurableService, DurableServiceFactory}
@@ -191,24 +192,32 @@ class EventLogDurableService(val client: AspenClient,
       () => first.isDefined
     ).map(_ => first.map(LogKey.decode))
 
-  /** Loads the full object covering ts: the one filed under the largest key at or below ts, else the first */
+  /** Loads the full object covering ts: the one filed under the largest key at or below ts, else the first.
+    *
+    * Late records sit near tailFloor, at the end of an ever-growing tree, so the search starts from the tier-0 node
+    * containing ts: from its largest key at or below ts, walking on only to read the following key (one node, or
+    * two when that key is in the next node). Only when that node holds no key at or below ts (ts before every key,
+    * or the node's minimum entry deleted by a rekey) does it walk from the start of the tree.
+    */
   private def loadCovering(logged: DataObjectTKVL, ts: HLCTimestamp): Future[LoadedFull] =
     var covering: Option[(HLCTimestamp, DataObjectPointer)] = None
     var next: Option[HLCTimestamp] = None
-    logged.foreach(
-      (k, v) =>
-        if next.isEmpty then
-          val key = LogKey.decode(k)
-          if covering.isEmpty || key <= ts then
-            covering = Some(key -> DataObjectPointer(v.bytes))
-          else
-            next = Some(key)
-        Future.unit,
-      () => next.isDefined
-    ).flatMap: _ =>
-      covering match
+    def visit(k: Key, v: Value): Future[Unit] =
+      if next.isEmpty then
+        val key = LogKey.decode(k)
+        if covering.isEmpty || key <= ts then
+          covering = Some(key -> DataObjectPointer(v.bytes))
+        else
+          next = Some(key)
+      Future.unit
+    for
+      onode <- logged.getContainingNode(LogKey(ts))
+      floor = onode.flatMap(_.entries.map(_._1).takeWhile(k => LogKey.decode(k) <= ts).lastOption)
+      _ <- logged.foreachFrom(floor.getOrElse(Key.AbsoluteMinimum), visit, () => next.isDefined)
+      full <- covering match
         case Some((key, ptr)) => LogWriter.loadFull(client, key, ptr, next)
         case None => Future.failed(new IllegalStateException("loggedEvents is empty, so no record can be late"))
+    yield full
 
   private def moveBatch(): Future[BatchResult] =
     for

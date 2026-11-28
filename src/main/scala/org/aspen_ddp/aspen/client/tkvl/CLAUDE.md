@@ -4,7 +4,8 @@
 - A tree is KeyValue-object or DataObject based (`TreeKind` in its `Root`); shared logic is `TierEngine` over a
   pluggable `NodeEncoding`. `DataObjectTKVL` is more compact, stores values only (no per-key revisions/requirements)
   and uses whole-node revision checks: intended for single-writer / low-contention use. A second update to one of its
-  nodes in a transaction fails with `NodeAlreadyModified`; `getContainingNode`/`TieredKeyValueListNode` are KV-only.
+  nodes in a transaction fails with `NodeAlreadyModified`; `TieredKeyValueListNode` is KV-only
+  (`DataObjectTKVL.getContainingNode` returns the generic `ListNode`).
 - `prepareUpdates(inserts: List[TKVLInsert], deletes)` changes many keys in one transaction on either kind, updating
   each node once. `TKVLInsert.requireDoesNotExist` makes allocate-and-insert retry loops safe. Writes are per-key
   checked by default; `PutRequirement` (`MustNotExist`, ...) chooses the check. A `DoesNotExist` put is no pin, so it

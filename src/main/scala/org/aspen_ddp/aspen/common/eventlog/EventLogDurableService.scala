@@ -84,6 +84,10 @@ object EventLogDurableService extends DurableServiceFactory with Logging:
   * loser aborts and its next batch re-reads. Scans run one at a time; a nudge arriving during a scan makes it scan
   * again once done.
   *
+  * Each batch reads AllocatorKey: new full objects come from the allocator it names. Tails allocated from another
+  * (Tails.allocator) are replaced at the next compaction: new tails from the current allocator take the compaction's
+  * refill, and the old ones are refcount-decremented in the same transaction.
+  *
   * Nudges are best-effort; polling covers lost ones.
   */
 class EventLogDurableService(val client: AspenClient,
@@ -96,7 +100,17 @@ class EventLogDurableService(val client: AspenClient,
   private given ExecutionContext = client.clientContext
 
   private val incoming: TieredKeyValueList = SystemEventLog.incomingTree(client, statePointer)
-  private val loggedRoot = KVObjectRootManager(client, EventLogState.LoggedKey, statePointer)
+  // Rebuilt whenever LoggedKey's revision changes, so the root's NodeAllocator, which setSystemLogAllocator rewrites,
+  // is never used from a stale cache. Only moveBatch's scan uses it, one at a time.
+  private var loggedRoot = KVObjectRootManager(client, EventLogState.LoggedKey, statePointer)
+  private var loggedRootRevision: Option[ObjectRevision] = None
+
+  private def loggedRootFor(kvos: KeyValueObjectState): KVObjectRootManager =
+    val revision = kvos.contents(EventLogState.LoggedKey).revision
+    if !loggedRootRevision.contains(revision) then
+      loggedRoot = KVObjectRootManager(client, EventLogState.LoggedKey, statePointer)
+      loggedRootRevision = Some(revision)
+    loggedRoot
 
   private var scanning = false
   private var rescan = false
@@ -288,6 +302,8 @@ class EventLogDurableService(val client: AspenClient,
     val tails = EventLogState.decodeTails(value(EventLogState.TailsKey).value.bytes)
     val tailFloor = EventLogState.decodeTailFloor(value(EventLogState.TailFloorKey).value.bytes)
     val allocatorId = EventLogState.decodeAllocator(value(EventLogState.AllocatorKey).value.bytes)
+    // Tails from an older allocator move to the current one at the next compaction
+    val migrateTails = tails.allocator != allocatorId
 
     // DroppedEvent always has an id before any batch is planned, so drop replacements can name it
     val needed = (batch.flatMap(_.entry.map(_.typeUUID)) :+ DroppedEvent.TypeUUID).distinct.filterNot(typeIds.contains)
@@ -319,9 +335,13 @@ class EventLogDurableService(val client: AspenClient,
                    first: Option[HLCTimestamp],
                    late: Option[LoadedFull],
                    cap: Option[Int]): LogPlan =
+        // While the tails await migration, each tail's cap is also the new pool's: a compacting plan refills new
+        // tails from the current allocator, a plan that does not appends to the old ones, and the plan may be either
+        def tailCap(t: LoadedTail): Option[Int] =
+          if migrateTails then (t.maxSize.toList ++ cap.toList).minOption else t.maxSize
         LogPlanner.plan(PlanInput(
           batch = records,
-          tails = loaded.zipWithIndex.map((t, i) => TailView(i, t.length, t.maxSize)),
+          tails = loaded.zipWithIndex.map((t, i) => TailView(i, t.length, tailCap(t))),
           current = tails.current,
           tailRecords = tailRecords,
           tailFloor = tailFloor,
@@ -355,7 +375,7 @@ class EventLogDurableService(val client: AspenClient,
         yield result
 
       for
-        logged <- loggedRoot.getDataObjectTree()
+        logged <- loggedRootFor(kvos).getDataObjectTree()
         first <- firstFullKey(logged)
         // The covering object of the oldest late record; the plan merges every late record in its range
         oldestLate = first.flatMap(_ => records.iterator.map(_.timestamp).filter(_ <= tailFloor).minOption)
@@ -384,17 +404,21 @@ class EventLogDurableService(val client: AspenClient,
               if ids.size != typeIds.size then
                 reqs ::= KeyValueUpdate.KeyRevision(EventLogState.TypeIdsKey, value(EventLogState.TypeIdsKey).revision)
                 ops ::= Insert(EventLogState.TypeIdsKey, EventLogState.encodeTypeIds(ids))
-              if plan.newCurrent != tails.current || compaction.isDefined then
-                ops ::= Insert(EventLogState.TailsKey,
-                  EventLogState.encodeTails(tails.copy(current = plan.newCurrent)))
               compaction.foreach: c =>
                 ops ::= Insert(EventLogState.TailFloorKey, EventLogState.encodeTailFloor(c.newTailFloor))
-              tx.update(statePointer, None, None, reqs, ops)
 
               for
-                _ <- LogWriter(plan, loaded, late, allocator, logged)
+                newTails <- LogWriter(plan, loaded, late, allocator, logged, migrateTails)
                 _ <- incoming.prepareUpdates(Nil, Nil, moved.toList.map(in => in.key -> in.revision))
-              yield ()
+              yield
+                val nextTails = newTails match
+                  case Some(pointers) => Some(EventLogState.Tails(pointers, plan.newCurrent, allocatorId))
+                  case None if plan.newCurrent != tails.current || compaction.isDefined =>
+                    Some(tails.copy(current = plan.newCurrent))
+                  case None => None
+                nextTails.foreach: t =>
+                  ops ::= Insert(EventLogState.TailsKey, EventLogState.encodeTails(t))
+                tx.update(statePointer, None, None, reqs, ops)
             .map: _ =>
               // The observer list read with this batch's state is current for events moved by it
               try

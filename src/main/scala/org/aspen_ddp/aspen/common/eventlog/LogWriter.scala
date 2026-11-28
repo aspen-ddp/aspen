@@ -78,12 +78,21 @@ object LogWriter extends Logging:
     * the compaction's new keys and the rewrite's, goes into one `prepareUpdates` batch, so each tree node is updated
     * once. A Drop needs no write (its record is consumed, its replacement placed by another step); one whose
     * replacement fit nowhere is logged.
+    *
+    * With `migrateTails`, a Compact moves the tails to `allocator` instead of overwriting them: TailCount new tails
+    * are allocated there holding the post-compaction frames, and each old tail is exclusively revision locked at the
+    * revision read (so an append committed since aborts this compaction, as an overwrite would) and its refcount
+    * decremented, its only write. The caller stores the returned new tails in TailsKey in the same transaction.
+    * Without a Compact, `migrateTails` changes nothing.
+    *
+    * @return the new tails, when migrated
     */
   def apply(plan: LogPlan,
             tails: Vector[LoadedTail],
             late: Option[LoadedFull],
             allocator: ObjectAllocator,
-            logged: DataObjectTKVL)(using tx: Transaction): Future[Unit] =
+            logged: DataObjectTKVL,
+            migrateTails: Boolean = false)(using tx: Transaction): Future[Option[Vector[DataObjectPointer]]] =
     given ExecutionContext = allocator.client.clientContext
 
     val compaction = plan.steps.collect { case c: LogStep.Compact => c }
@@ -102,6 +111,7 @@ object LogWriter extends Logging:
     val byTail = plan.steps
       .collect { case LogStep.AppendToTail(i, rs) => i -> rs }
       .groupMapReduce(_._1)(_._2)(_ ++ _)
+    def content(i: Int): Array[Byte] = byTail.get(i).fold(Array.emptyByteArray)(LogRecords.encodeFrame)
 
     compaction.headOption match
       case None =>
@@ -118,9 +128,13 @@ object LogWriter extends Logging:
           case LoadedTail.Rewritable(state, _) => state
           case LoadedTail.Appendable(p, _) =>
             throw new IllegalStateException(s"Compaction needs every tail read whole; tail ${p.pointer.id} was not")
-        states.zipWithIndex.foreach: (state, i) =>
-          val content = byTail.get(i).fold(Array.emptyByteArray)(LogRecords.encodeFrame)
-          tx.overwrite(state.pointer, state.revision, DataBuffer(content))
+        if !migrateTails then
+          states.zipWithIndex.foreach: (state, i) =>
+            tx.overwrite(state.pointer, state.revision, DataBuffer(content(i)))
+        else
+          states.foreach: state =>
+            tx.exclusiveLockRevision(state.pointer, state.revision)
+            tx.setRefcount(state.pointer, state.refcount, state.refcount.decrement())
 
     rewrite.headOption.foreach: r =>
       val (header, records) = r.objects.head
@@ -132,15 +146,23 @@ object LogWriter extends Logging:
       pointers <- allocateAll(newObjects, allocator)
       (inserts, deletes) = treeChanges(rewrite.headOption, late, newObjects.map(_._1).zip(pointers))
       _ <- if inserts.isEmpty && deletes.isEmpty then Future.unit else logged.prepareUpdates(inserts, deletes)
-    yield ()
+      newTails <-
+        if migrateTails && compaction.nonEmpty then
+          allocateSequentially(tails.indices.toVector.map(content), allocator).map(Some(_))
+        else
+          Future.successful(None)
+    yield newTails
 
-  /** Allocates the objects sequentially, so allocations are staged in order */
   private def allocateAll(objects: Vector[(FullObjectHeader, Vector[LoggedRecord])], allocator: ObjectAllocator)
                          (using Transaction, ExecutionContext): Future[Vector[DataObjectPointer]] =
-    objects.foldLeft(Future.successful(Vector.empty[DataObjectPointer])): (acc, obj) =>
-      val (header, records) = obj
+    allocateSequentially(objects.map((header, records) => FullObject.encode(header, records)), allocator)
+
+  /** Allocates the objects sequentially, so allocations are staged in order */
+  private def allocateSequentially(contents: Vector[Array[Byte]], allocator: ObjectAllocator)
+                                  (using Transaction, ExecutionContext): Future[Vector[DataObjectPointer]] =
+    contents.foldLeft(Future.successful(Vector.empty[DataObjectPointer])): (acc, content) =>
       acc.flatMap: pointers =>
-        allocator.allocateDataObject(DataBuffer(FullObject.encode(header, records))).map(pointers :+ _)
+        allocator.allocateDataObject(DataBuffer(content)).map(pointers :+ _)
 
   /** The loggedEvents batch: every new object inserted under its filedKey; a rekeyed rewrite files the rewritten
     * object under its new key and removes the old one. When a new part is filed under the old key, its put replaces

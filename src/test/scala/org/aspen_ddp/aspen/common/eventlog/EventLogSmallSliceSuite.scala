@@ -1,13 +1,11 @@
 package org.aspen_ddp.aspen.common.eventlog
 
-import org.aspen_ddp.aspen.client.{PoolObjectAllocatorId, Transaction}
-import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.client.PoolObjectAllocatorId
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceSetId
-import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.store.backend.{MapBackend, RocksDBConfig}
 
 import java.util.UUID
@@ -18,7 +16,8 @@ import scala.util.Random
   *
   * The bootstrap pool, which holds incomingEvents, keeps no slice limit: with the log in the same pool, an event that
   * fits incomingEvents always fits a log object, so nothing could be dropped. The log is pointed at a second, small
-  * pool instead (its allocator and all ten tails), written straight into the service state.
+  * pool instead with setSystemLogAllocator. Its tails stay in the bootstrap pool until the first compaction, capped
+  * meanwhile by the small pool's maxObjectSize too, then move to the small pool.
   */
 class EventLogSmallSliceSuite extends EventLogSuiteBase:
 
@@ -44,29 +43,6 @@ class EventLogSmallSliceSuite extends EventLogSuiteBase:
       _ <- waitForTransactionsToComplete()
     yield poolId
 
-  /** Points the log allocator at `poolId` and replaces the tails with empty ones allocated there */
-  private def moveLogTo(poolId: PoolId): Future[Unit] =
-    given ExecutionContext = executionContext
-    for
-      ptr <- SystemEventLog.statePointer(client)
-      pool <- client.getStoragePool(poolId)
-      _ <- client.transact: tx =>
-             given Transaction = tx
-             for
-               kvos <- client.read(ptr)
-               tails <- Future.traverse(Vector.fill(EventLogState.TailCount)(()))(_ =>
-                          pool.allocator.allocateDataObject(DataBuffer(Array.emptyByteArray)))
-             yield
-               val allocator = PoolObjectAllocatorId(poolId)
-               def req(k: org.aspen_ddp.aspen.common.objects.Key) = KeyRevision(k, kvos.contents(k).revision)
-               tx.update(ptr, None, None,
-                 List(req(EventLogState.AllocatorKey), req(EventLogState.TailsKey)),
-                 List(
-                   Insert(EventLogState.AllocatorKey, EventLogState.encodeAllocator(allocator)),
-                   Insert(EventLogState.TailsKey,
-                     EventLogState.encodeTails(EventLogState.Tails(tails, 0, allocator)))))
-    yield ()
-
   private def incompressible(rnd: Random, size: Int): Array[Byte] =
     val a = new Array[Byte](size)
     rnd.nextBytes(a)
@@ -81,7 +57,7 @@ class EventLogSmallSliceSuite extends EventLogSuiteBase:
     for
       poolId <- createLogPool()
       pool <- client.getStoragePool(poolId)
-      _ <- moveLogTo(poolId)
+      _ <- client.setSystemLogAllocator(PoolObjectAllocatorId(poolId))
       // Logged before the service starts, so both move in one batch
       _ <- logInGroups(List(small, big))
       ptr <- SystemEventLog.statePointer(client)
@@ -108,7 +84,7 @@ class EventLogSmallSliceSuite extends EventLogSuiteBase:
     for
       poolId <- createLogPool()
       pool <- client.getStoragePool(poolId)
-      _ <- moveLogTo(poolId)
+      _ <- client.setSystemLogAllocator(PoolObjectAllocatorId(poolId))
       _ <- logInGroups(entries, 5)
       ptr <- SystemEventLog.statePointer(client)
       _ = makeService(ptr)
@@ -141,7 +117,7 @@ class EventLogSmallSliceSuite extends EventLogSuiteBase:
     val c = s"${UUID.randomUUID()}|ALL"
     for
       poolId <- createLogPool()
-      _ <- moveLogTo(poolId)
+      _ <- client.setSystemLogAllocator(PoolObjectAllocatorId(poolId))
       _ <- client.addSystemEventObserver(ObserverFactory.typeUUID, c.getBytes)
       _ <- logInGroups(List(small, big))
       ptr <- SystemEventLog.statePointer(client)

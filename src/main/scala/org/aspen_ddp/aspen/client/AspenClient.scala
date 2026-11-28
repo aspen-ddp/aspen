@@ -1005,6 +1005,13 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   def logSystemEvent(e: EventLogEntry): Future[Unit] =
     SystemEventLog.logSystemEvent(this, e)
 
+  /** Directs the system event log to allocator `id`, failing when no such allocator exists. New full log objects
+   *  and new loggedEvents tree nodes come from `id`; the tails are replaced by new ones from `id` at the event log
+   *  service's next compaction. Objects already written stay where they are.
+   */
+  def setSystemLogAllocator(id: ObjectAllocatorId): Future[Unit] =
+    SystemEventLog.setAllocator(this, id)
+
   /** The system event log's entries timestamped in `[from, to]` (`from` defaults to the earliest timestamp; `to`
    *  None: no upper bound), sorted by timestamp, at most `limit` of them, type ids mapped back to type UUIDs. Entries
    *  logged but not yet moved by the event log service are included. No entry logged before the read began is

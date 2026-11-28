@@ -1,7 +1,8 @@
 package org.aspen_ddp.aspen.common.eventlog
 
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocatorId, Transaction}
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, TKVLInsert, TieredKeyValueList}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, NodeAllocator, Root, TKVLInsert, TieredKeyValueList,
+  TreeKind}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.eventlog.EventLogState.ObserverConfig
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, Value}
@@ -103,6 +104,35 @@ object SystemEventLog extends Logging:
   def removeObserver(client: AspenClient, factoryType: UUID, config: Array[Byte]): Future[Unit] =
     val o = ObserverConfig(factoryType, config)
     modifyObservers(client, _.filterNot(_ == o))
+
+  /** Points the log at allocator `id`: it must exist (`getAllocator`). One transaction rewrites the state's
+    * AllocatorKey and, in the loggedEvents Root under LoggedKey, only the NodeAllocator: every tier now allocates from
+    * `id`, at the existing tier-0 node size, lowered to `id`'s node size limit when that is smaller. The tree's nodes
+    * stay where they are; only new ones go to `id`. Both keys are revision checked (the pin). New full objects come
+    * from `id` from the service's next batch on; the tails move at its next compaction.
+    */
+  def setAllocator(client: AspenClient, id: ObjectAllocatorId): Future[Unit] =
+    given ExecutionContext = client.clientContext
+    for
+      allocator <- client.getAllocator(id)
+      ptr <- statePointer(client)
+      _ <- client.transactUntilSuccessful: tx =>
+             for
+               kvos <- client.read(ptr, "event log state")
+               loggedVs = kvos.contents(EventLogState.LoggedKey)
+               root = Root(client, loggedVs.value.bytes)
+               size = NodeAllocator.fittingNodeSize(root.nodeAllocator.maxNodeSize(0),
+                        NodeAllocator.nodeSizeLimit(allocator, TreeKind.DataObjects))
+               nodeAllocator = new NodeAllocator(client, List((id, size)))
+               _ <- nodeAllocator.validate(TreeKind.DataObjects)
+             yield
+               val allocatorVs = kvos.contents(EventLogState.AllocatorKey)
+               tx.update(ptr, None, None,
+                 List(KeyValueUpdate.KeyRevision(EventLogState.LoggedKey, loggedVs.revision),
+                   KeyValueUpdate.KeyRevision(EventLogState.AllocatorKey, allocatorVs.revision)),
+                 List(Insert(EventLogState.LoggedKey, root.copy(nodeAllocator = nodeAllocator).encode()),
+                   Insert(EventLogState.AllocatorKey, EventLogState.encodeAllocator(id))))
+    yield nudge(client)
 
   /** Best-effort: the service's poll covers a lost message */
   private def reloadObservers(client: AspenClient): Unit =

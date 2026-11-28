@@ -3,19 +3,26 @@ package org.aspen_ddp.aspen.client.tkvl
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, RegisteredTypeFactory, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, ObjectReader, RegisteredTypeFactory, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
+/** `readWith` reads the root's host object and the root node (and so, through the nodes, every read of a walk from
+  * the root); the client when None. A reader with settled reads (AspenClient.settledReader) makes the tree's reads
+  * settled. Not encoded: a decoded root manager reads with its client
+  */
 class KVObjectRootManager(val client: AspenClient,
                           val treeKey: Key,
                           val pointer: KeyValueObjectPointer,
-                          val cache: TierCache = TierCache.default()) extends RootManager {
+                          val cache: TierCache = TierCache.default(),
+                          readWith: Option[ObjectReader] = None) extends RootManager {
 
   import KVObjectRootManager._
+
+  private val reader: ObjectReader = readWith.getOrElse(client)
 
   given ExecutionContext = client.clientContext
 
@@ -29,7 +36,7 @@ class KVObjectRootManager(val client: AspenClient,
   private def readRData(): Future[RootState] = {
     val p = Promise[RootState]()
 
-    client.read(pointer, s"Object hosting TKVL Root for tree $treeKey").onComplete {
+    reader.read(pointer, s"Object hosting TKVL Root for tree $treeKey").onComplete {
       case Failure(err) => p.failure(err)
       case Success(container) =>
 
@@ -41,7 +48,7 @@ class KVObjectRootManager(val client: AspenClient,
             root.orootObject match {
               case None => p.success(RootState(root, v.revision, None))
               case Some(rootObject) =>
-                NodeEncoding(root.kind).read(client, rootObject, Key.AbsoluteMinimum, root.ordering,
+                NodeEncoding(root.kind).read(reader, rootObject, Key.AbsoluteMinimum, root.ordering,
                   s"Root node for TKVL tree $treeKey").onComplete {
                   case Failure(err) =>
                     // Tree has been deleted but the root has not yet been updated
@@ -63,7 +70,7 @@ class KVObjectRootManager(val client: AspenClient,
   }
 
   def readStoredRoot(): Future[Root] =
-    client.read(pointer, s"Object hosting TKVL Root for tree $treeKey").map: container =>
+    reader.read(pointer, s"Object hosting TKVL Root for tree $treeKey").map: container =>
       container.contents.get(treeKey) match
         case None => throw new InvalidRoot
         case Some(v) =>

@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.tkvl
 import org.aspen_ddp.aspen.client.TestTransactions
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.{AspenClient, GroupObjectAllocatorId, ObjectAllocator, ObjectAllocatorId, PoolObjectAllocatorId, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, GroupObjectAllocatorId, ObjectAllocator, ObjectAllocatorId, ObjectReader, PoolObjectAllocatorId, Transaction}
 import org.aspen_ddp.aspen.common.metadata.AllocationGroupState
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
@@ -373,6 +373,7 @@ class KeyValueNodeEncodingSuite extends IntegrationTestSuite:
 
   atest("a node that is not a KeyValueListNode is rejected"):
     val other = new ListNode:
+      def reader: ObjectReader = client
       def pointer: ObjectPointer = radicle
       def minimum: Key = Key.AbsoluteMinimum
       def maximum: Option[Key] = None

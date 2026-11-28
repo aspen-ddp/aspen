@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.TestTransactions
 import java.util.UUID
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.{ObjectAllocator, Transaction}
+import org.aspen_ddp.aspen.client.{ObjectAllocator, ObjectReader, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -20,6 +20,7 @@ class TierEngineSuite extends IntegrationTestSuite:
 
   /** A tier-0 node with no right link, so a descent to it reads nothing */
   private class StubNode(val pointer: ObjectPointer) extends ListNode:
+    def reader: ObjectReader = client
     def minimum: Key = Key.AbsoluteMinimum
     def maximum: Option[Key] = None
     def link: Option[NodeLink] = None

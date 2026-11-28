@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.tkvl
 
-import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, ObjectAllocator, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, ObjectAllocator, ObjectReader, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, ObjectId, ObjectPointer, ObjectRevision, Value}
 
 import scribe.Logging
@@ -60,7 +60,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
         oroot match
           case None => Future.successful(None)
           case Some(root) =>
-            fetchContainingNode(client, tier, 0, ordering, key, root, Set(), cache = cache).map:
+            fetchContainingNode(root.reader, tier, 0, ordering, key, root, Set(), cache = cache).map:
               case Left(_) => throw new BrokenTree()
               case Right(node) => Some(node)
 
@@ -249,9 +249,10 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
               yield
                 NodeWalk(visited, complete)
 
-  /** Reads the node `link` points to, the right neighbour of `node`. `label` names the walk, for diagnostics. */
+  /** Reads the node `link` points to, the right neighbour of `node`, with the reader `node` was read with. `label`
+    * names the walk, for diagnostics. */
   private def readRight(node: ListNode, link: NodeLink, label: String): Future[ListNode] =
-    encodingFor(node).read(client, link.pointer, link.minimum, node.ordering,
+    encodingFor(node).read(node.reader, link.pointer, link.minimum, node.ordering,
       s"$label() TKVL node ${node.pointer.id}. Minimum: ${node.minimum}.")
 
   def set(key: Key,
@@ -598,7 +599,7 @@ object TierEngine:
    With linksTo, which names a node on targetTier whose minimum is target, this instead finds the node on
    targetTier immediately to its left. See fetchPredecessor.
    */
-  private[tkvl] def fetchContainingNode(client: AspenClient,
+  private[tkvl] def fetchContainingNode(reader: ObjectReader,
                                         currentTier: Int,
                                         targetTier: Int,
                                         ordering: KeyOrdering,
@@ -608,9 +609,9 @@ object TierEngine:
                                         reversePath: List[ListNode] = Nil,
                                         linksTo: Option[ObjectId] = None,
                                         cache: TierCache = NoCache): Future[Either[Set[ObjectId], ListNode]] =
-    given ExecutionContext = client.clientContext
+    given ExecutionContext = reader.client.clientContext
 
-    fetchContainingNodePath(client, currentTier, targetTier, ordering, target,
+    fetchContainingNodePath(reader, currentTier, targetTier, ordering, target,
       currentNode, initialBlacklist, reversePath, linksTo, cache).map:
       case Left(l) => Left(l)
       case Right(rpath) => Right(rpath.head)
@@ -631,7 +632,7 @@ object TierEngine:
    read it. The deleted root held only its AbsoluteMinimum child, which became the new root, so
    the restart descends from that child one tier down instead.
    */
-  private[tkvl] def fetchContainingNodePath(client: AspenClient,
+  private[tkvl] def fetchContainingNodePath(reader: ObjectReader,
                                             currentTier: Int,
                                             targetTier: Int,
                                             ordering: KeyOrdering,
@@ -642,24 +643,24 @@ object TierEngine:
                                             linksTo: Option[ObjectId] = None,
                                             cache: TierCache = NoCache): Future[Either[Set[ObjectId], List[ListNode]]] =
 
-    given ExecutionContext = client.clientContext
+    given ExecutionContext = reader.client.clientContext
 
     def leftmostChild(encoding: NodeEncoding, stale: ListNode): Future[ListNode] =
       stale.get(Key.AbsoluteMinimum) match
         case None => Future.failed(new BrokenTree())
         case Some(v) =>
-          encoding.read(client, ObjectPointer(v.bytes), Key.AbsoluteMinimum, ordering,
+          encoding.read(reader, ObjectPointer(v.bytes), Key.AbsoluteMinimum, ordering,
             s"TKVL restart below deleted root ${stale.pointer.id}")
 
     def refresh(encoding: NodeEncoding, node: ListNode): Future[ListNode] =
-      encoding.read(client, node.pointer, node.minimum, ordering,
+      encoding.read(reader, node.pointer, node.minimum, ordering,
         s"Refresh TKVL node ${node.pointer.id}. Minimum: ${node.minimum}")
 
     def attempt(encoding: NodeEncoding,
                 tier: Int,
                 start: ListNode,
                 restarts: Int): Future[Either[Set[ObjectId], List[ListNode]]] =
-      descend(client, encoding, tier, targetTier, ordering, target, start, initialBlacklist, reversePath, linksTo,
+      descend(reader, encoding, tier, targetTier, ordering, target, start, initialBlacklist, reversePath, linksTo,
         cache).recoverWith:
         case _: InvalidObject if restarts < MaxJoinRaceRestarts =>
           refresh(encoding, start).map(n => (tier, n)).recoverWith:
@@ -671,11 +672,11 @@ object TierEngine:
   /** Scans right from `node` to the node of its tier whose range holds `target`, or the last node of the tier.
     * Fails with `BelowMinimumError` if `target` is below `node`'s range.
     */
-  private[tkvl] def scanToContainingNode(client: AspenClient,
+  private[tkvl] def scanToContainingNode(reader: ObjectReader,
                                          encoding: NodeEncoding,
                                          node: ListNode,
                                          target: Key): Future[ListNode] =
-    given ExecutionContext = client.clientContext
+    given ExecutionContext = reader.client.clientContext
 
     def scan(n: ListNode): Future[ListNode] = n.link match
       case None => Future.successful(n)
@@ -683,7 +684,7 @@ object TierEngine:
         if n.keyInRange(target) then
           Future.successful(n)
         else
-          encoding.read(client, right.pointer, right.minimum, n.ordering,
+          encoding.read(reader, right.pointer, right.minimum, n.ordering,
             s"Scanning right TKVL node ${right.pointer.id}. Minimum: ${right.minimum}. target: $target").flatMap(scan)
 
     // exit immediately if the requested key is below the minimum range
@@ -696,16 +697,16 @@ object TierEngine:
     * `target` is that linked node's minimum. Returns the node that links to it or, when nothing in the scanned range
     * does (it was already unlinked), the last node scanned.
     */
-  private def scanToLinkingNode(client: AspenClient,
+  private def scanToLinkingNode(reader: ObjectReader,
                                 encoding: NodeEncoding,
                                 node: ListNode,
                                 target: Key,
                                 linkedId: ObjectId): Future[ListNode] =
-    given ExecutionContext = client.clientContext
+    given ExecutionContext = reader.client.clientContext
 
     def scan(n: ListNode): Future[ListNode] = n.link match
       case Some(right) if right.pointer.id != linkedId && n.ordering.compare(right.minimum, target) < 0 =>
-        encoding.read(client, right.pointer, right.minimum, n.ordering,
+        encoding.read(reader, right.pointer, right.minimum, n.ordering,
           s"Scanning right TKVL node ${right.pointer.id} for the node linking to $linkedId").flatMap(scan)
       case _ => Future.successful(n)
 
@@ -719,16 +720,16 @@ object TierEngine:
     * Descends through the tiers above `nodeTier` like a lookup of `linkedMinimum`, except that it takes the entry
     * strictly below `linkedMinimum`, so the work is a descent plus a short scan right instead of a walk of the tier.
     */
-  private[tkvl] def fetchPredecessor(client: AspenClient,
+  private[tkvl] def fetchPredecessor(reader: ObjectReader,
                                      rootTier: Int,
                                      nodeTier: Int,
                                      ordering: KeyOrdering,
                                      linkedMinimum: Key,
                                      linkedNode: ObjectId,
                                      rootNode: ListNode): Future[Either[Set[ObjectId], Option[ListNode]]] =
-    given ExecutionContext = client.clientContext
+    given ExecutionContext = reader.client.clientContext
 
-    fetchContainingNode(client, rootTier, nodeTier, ordering, linkedMinimum, rootNode, Set(),
+    fetchContainingNode(reader, rootTier, nodeTier, ordering, linkedMinimum, rootNode, Set(),
       linksTo = Some(linkedNode)).map:
       case Left(l) => Left(l)
       case Right(n) => Right(n.link.filter(_.pointer.id == linkedNode).map(_ => n))
@@ -744,7 +745,7 @@ object TierEngine:
     * `target`, so only a failed read of it evicts P. A predecessor search (linksTo) skips the range check, since it
     * deliberately descends to the left of `target`.
     */
-  private def descend(client: AspenClient,
+  private def descend(reader: ObjectReader,
                       encoding: NodeEncoding,
                       currentTier: Int,
                       targetTier: Int,
@@ -756,14 +757,14 @@ object TierEngine:
                       linksTo: Option[ObjectId],
                       cache: TierCache): Future[Either[Set[ObjectId], List[ListNode]]] = {
 
-    given ExecutionContext = client.clientContext
+    given ExecutionContext = reader.client.clientContext
 
     if (currentTier == targetTier) {
       // Once we're on the right tier, we can rely on consistent right pointers to scan to the
       // containing node
       val fscan = linksTo match
-        case None => scanToContainingNode(client, encoding, currentNode, target)
-        case Some(id) => scanToLinkingNode(client, encoding, currentNode, target, id)
+        case None => scanToContainingNode(reader, encoding, currentNode, target)
+        case Some(id) => scanToLinkingNode(reader, encoding, currentNode, target, id)
       fscan.map(n => Right(n :: reversePath))
     } else {
 
@@ -774,7 +775,7 @@ object TierEngine:
           p.success(Left(blacklist + currentNode.pointer.id))
         } else {
           val (minimum, pointer) = candidates.head
-          fetchNode(client, encoding, ordering, currentTier - 1, minimum, pointer, blacklist, cache) foreach {
+          fetchNode(reader, encoding, ordering, currentTier - 1, minimum, pointer, blacklist, cache) foreach {
             case Left(blklst) =>
               if !blacklist.contains(pointer.id) then
                 cache.stale(currentTier, currentNode)
@@ -782,7 +783,7 @@ object TierEngine:
             case Right(next) =>
               if first && linksTo.isEmpty && !next.keyInRange(target) then
                 cache.stale(currentTier, currentNode)
-              descend(client, encoding, currentTier-1, targetTier, ordering, target,
+              descend(reader, encoding, currentTier-1, targetTier, ordering, target,
                 next, blacklist, currentNode :: reversePath, linksTo, cache).onComplete {
                 case Failure(err) => p.failure(err)
                 // `next` holds nothing to descend into, as when joins removed its first entries but left its
@@ -815,7 +816,7 @@ object TierEngine:
     * On tier >= 1 a node in `cache` is returned without a read, and a node read is put in it unless the cache was
     * cleared during the read.
     */
-  private def fetchNode(client: AspenClient,
+  private def fetchNode(reader: ObjectReader,
                         encoding: NodeEncoding,
                         ordering: KeyOrdering,
                         tier: Int,
@@ -824,7 +825,7 @@ object TierEngine:
                         blacklist: Set[ObjectId],
                         cache: TierCache): Future[Either[Set[ObjectId], ListNode]] = {
 
-    given ExecutionContext = client.clientContext
+    given ExecutionContext = reader.client.clientContext
 
     if (blacklist.contains(pointer.id)) {
       Future.successful(Left(blacklist))
@@ -837,7 +838,7 @@ object TierEngine:
           // Captured before the read, so a node read across a clear() is not put back
           val generation = cache.generation
 
-          Future.delegate(encoding.read(client, pointer, minimum, ordering,
+          Future.delegate(encoding.read(reader, pointer, minimum, ordering,
             s"TKVL read of tier $tier, key: $minimum")) onComplete {
             case Failure(_) => p.success(Left(blacklist + pointer.id))
             case Success(node) =>

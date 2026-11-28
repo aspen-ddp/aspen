@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.client.tkvl
 
 import java.util.UUID
 
+import org.aspen_ddp.aspen.client.ObjectReader
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.scalatest.funsuite.AnyFunSuite
@@ -13,6 +14,7 @@ class TierCacheSuite extends AnyFunSuite:
   private val poolId = PoolId(new UUID(0, 5))
 
   private class StubNode(val pointer: ObjectPointer) extends ListNode:
+    def reader: ObjectReader = throw new UnsupportedOperationException("a cache entry is never read from")
     def minimum: Key = Key.AbsoluteMinimum
     def maximum: Option[Key] = None
     def link: Option[NodeLink] = None

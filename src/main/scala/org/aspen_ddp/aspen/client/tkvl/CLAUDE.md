@@ -30,6 +30,12 @@
   `JoinFinalizationAction` removes its key's entry only while the entry names the joined node, under the revision as
   read, so a repeat or late run leaves the entry a later split at the same minimum added.
 - Left to right navigation in a tier is guaranteed to be consistent. Navigation between tiers is not
+- Readers: every `ListNode` carries the `ObjectReader` it was read with (`ListNode.reader`), and the entry walks,
+  descents and right scans (`TierEngine.containingNode`, `readRight`, the `fetch*`/`scan*` helpers, which take an
+  `ObjectReader`) read the nodes they reach with the reader of the node they came from. `KVObjectRootManager`'s
+  `readWith` sets the reader of the root's host object and root node, and so of a whole read walk (the event log
+  reader passes `client.settledReader`). Write paths (`prepareUpdates`, joins, splits, `foreachNode`) read with the
+  client
 - The entry walks (`foreach*`, through `TierEngine.walk`) survive joins: a right-neighbour read that fails because a
   join deleted the neighbour (often caused by `fn` itself deleting what it visits) descends again to the node holding
   the last visited key and continues after it, up to `MaxJoinRaceRestarts` restarts in a row without a visited key.

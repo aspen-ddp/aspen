@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.client.tkvl
 
+import org.aspen_ddp.aspen.client.ObjectReader
 import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, ObjectPointer, ObjectRefcount, ObjectRevision, Value}
 
 /** Pointer to the next node to the right in a tier, along with that node's minimum key. */
@@ -7,6 +8,8 @@ final case class NodeLink(minimum: Key, pointer: ObjectPointer)
 
 /** Kind-agnostic view of one node of a tier, independent of how the node is stored. */
 trait ListNode:
+  /** The reader this node was read with. Tree walks read the nodes they reach from it with the same reader */
+  def reader: ObjectReader
   def pointer: ObjectPointer
   def minimum: Key
   def maximum: Option[Key]

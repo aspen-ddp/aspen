@@ -103,7 +103,7 @@ class EventLogReaderSuite extends EventLogSuiteBase:
       held = l.objects(0).records.size
       late = (0 until held).map(k => EventLogEntry(HLCTimestamp(l.base + Spacing * k + 5), typeA, data(100)))
       reader = new EventLogReader(client)
-      _ = reader.testAfterTreeRead = once:
+      _ = reader.testBeforeFirstObjectRead = once:
         for
           _ <- logTogether(late)
           _ <- awaitIncomingEmpty()
@@ -112,7 +112,7 @@ class EventLogReaderSuite extends EventLogSuiteBase:
           objs.size should be > l.objects.size
           objs(0).state.pointer shouldBe l.objects(0).state.pointer
           objs(0).header.upperBound shouldBe defined
-      result <- reader.read(HLCTimestamp.Zero, None, None)
+      result <- reader.read(EventLogReader.Earliest, None, None)
     yield
       result shouldBe (l.entries ++ late).sortBy(_.timestamp)
       reader.restarts shouldBe 1
@@ -127,7 +127,7 @@ class EventLogReaderSuite extends EventLogSuiteBase:
       count = Iterator.from(1).takeWhile(n => fits(n.toLong * recordSize(100))).max
       late = (0 until count).map(k => EventLogEntry(HLCTimestamp(l.base - Spacing * (count - k)), typeA, data(100)))
       reader = new EventLogReader(client)
-      _ = reader.testAfterTreeRead = once:
+      _ = reader.testBeforeFirstObjectRead = once:
         for
           _ <- logTogether(late)
           _ <- awaitIncomingEmpty()
@@ -137,9 +137,32 @@ class EventLogReaderSuite extends EventLogSuiteBase:
           LogKey.decode(objs(0).key) shouldBe late.head.timestamp
           objs(1).key shouldBe l.objects(0).key
           objs(1).state.pointer should not be l.objects(0).state.pointer
-      result <- reader.read(HLCTimestamp.Zero, None, None)
+      result <- reader.read(EventLogReader.Earliest, None, None)
     yield
       result shouldBe (late ++ l.entries).sortBy(_.timestamp)
+      reader.restarts shouldBe 1
+
+  atest("a reader whose walk start is rekeyed away restarts instead of skipping the covering object"):
+    given ExecutionContext = executionContext
+    for
+      l <- logged()
+      // Inside the first object's range, so the walk starts at its key, which the rekey then deletes
+      from = l.entries(5).timestamp
+      late = EventLogEntry(HLCTimestamp(l.base - 5), typeA, data(10))
+      reader = new EventLogReader(client)
+      _ = reader.testAfterContainingNode = once:
+        for
+          _ <- logTogether(Seq(late))
+          _ <- awaitIncomingEmpty()
+          objs <- fullObjects()
+        yield
+          // Rekeyed without a split: same object, new key, the old key gone
+          objs.size shouldBe l.objects.size
+          LogKey.decode(objs(0).key) shouldBe late.timestamp
+          objs(0).state.pointer shouldBe l.objects(0).state.pointer
+      result <- reader.read(from, None, None)
+    yield
+      result shouldBe l.entries.filter(_.timestamp >= from)
       reader.restarts shouldBe 1
 
   atest("a reader racing compaction may duplicate but never omits"):
@@ -157,7 +180,7 @@ class EventLogReaderSuite extends EventLogSuiteBase:
           _ <- awaitIncomingEmpty()
           objs <- fullObjects()
         yield objs.size should be > l.objects.size
-      result <- reader.read(HLCTimestamp.Zero, None, None)
+      result <- reader.read(EventLogReader.Earliest, None, None)
     yield
       reader.restarts shouldBe 0
       result.map(_.timestamp) shouldBe result.map(_.timestamp).sorted
@@ -166,6 +189,31 @@ class EventLogReaderSuite extends EventLogSuiteBase:
       tailed.foreach(e => counts.getOrElse(e, 0) shouldBe 2)
       l.entries.filterNot(tailed.toSet).foreach(e => counts.getOrElse(e, 0) shouldBe 1)
       result.toSet.subsetOf((l.entries ++ more).toSet) shouldBe true
+
+  atest("entries logged but not yet moved by the service are returned"):
+    given ExecutionContext = executionContext
+    val base = HLCTimestamp.now.asLong
+    val entries = (0 until 5).toVector.map(i => EventLogEntry(HLCTimestamp(base + Spacing * i), typeA, data(20)))
+    for
+      // No service runs, so the entries stay in incomingEvents
+      _ <- logInGroups(entries.reverse, 2)
+      waiting <- incomingEntries()
+      all <- client.readSystemEvents()
+      ranged <- client.readSystemEvents(entries(1).timestamp, Some(entries(3).timestamp))
+      limited <- client.readSystemEvents(limit = Some(2))
+    yield
+      multiset(waiting) shouldBe multiset(entries)
+      all shouldBe entries
+      ranged shouldBe entries.slice(1, 4)
+      limited shouldBe entries.take(2)
+
+  atest("a read from the default start includes timestamps below zero"):
+    given ExecutionContext = executionContext
+    val negative = EventLogEntry(HLCTimestamp(Long.MinValue + 1), typeA, data(20))
+    for
+      _ <- logInGroups(Seq(negative))
+      all <- client.readSystemEvents()
+    yield all shouldBe Vector(negative)
 
   atest("decodeSystemEvent returns None for an unregistered type and a DroppedEvent for its type"):
     val entry = EventLogEntry(HLCTimestamp.now, UUID.randomUUID(), Array[Byte](1, 2, 3))

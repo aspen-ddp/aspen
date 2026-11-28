@@ -1004,13 +1004,14 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   def logSystemEvent(e: EventLogEntry): Future[Unit] =
     SystemEventLog.logSystemEvent(this, e)
 
-  /** The system event log's entries timestamped in `[from, to]` (`to` None: no upper bound), sorted by timestamp,
-   *  at most `limit` of them, type ids mapped back to type UUIDs. No entry the log held when the read began is
-   *  omitted, but an entry may appear more than once (logged twice, or read in a tail and again in the full object
-   *  a concurrent compaction moved it to). A read racing changes that move records between full objects restarts,
+  /** The system event log's entries timestamped in `[from, to]` (`from` defaults to the earliest timestamp; `to`
+   *  None: no upper bound), sorted by timestamp, at most `limit` of them, type ids mapped back to type UUIDs. Entries
+   *  logged but not yet moved by the event log service are included. No entry logged before the read began is
+   *  omitted, but an entry may appear more than once (logged twice, or read before and again after the service
+   *  moved it on: from incomingEvents to a tail, or from a tail to a full object). A read racing changes that move records between full objects restarts,
    *  failing with IllegalStateException after `EventLogReader.MaxRestarts` restarts.
    */
-  def readSystemEvents(from: HLCTimestamp = HLCTimestamp.Zero,
+  def readSystemEvents(from: HLCTimestamp = EventLogReader.Earliest,
                        to: Option[HLCTimestamp] = None,
                        limit: Option[Int] = None): Future[Vector[EventLogEntry]] =
     new EventLogReader(this).read(from, to, limit)

@@ -899,3 +899,41 @@ message LoggedRecord {
   uint32 type_id = 2;
   bytes data = 3;
 }
+
+//---------------------------------------------------------------------------
+//- System event log service state and messages
+//---------------------------------------------------------------------------
+message EventLogTypeIdEntry {
+  UUID type_uuid = 1;
+  uint32 type_id = 2;
+}
+
+message EventLogTypeIds {
+  repeated EventLogTypeIdEntry entries = 1;
+}
+
+message EventLogObserverConfig {
+  UUID factory_type = 1;
+  bytes config = 2;
+}
+
+message EventLogObservers {
+  repeated EventLogObserverConfig observers = 1;
+}
+
+message EventLogTails {
+  repeated bytes pointers = 1;
+  uint32 current = 2;
+  bytes allocator = 3;
+}
+
+message EventLogNudge {}
+
+message EventLogReloadObservers {}
+
+message EventLogMessage {
+  oneof msg {
+    EventLogNudge nudge = 1;
+    EventLogReloadObservers reloadObservers = 2;
+  }
+}

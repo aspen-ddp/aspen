@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
 
 import java.util.UUID
 import java.nio.charset.StandardCharsets
-import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root, SinglePoolNodeAllocator, TreeKind}
+import org.aspen_ddp.aspen.client.tkvl.{DataObjectNodeEncoding, NodeAllocator, Root, SinglePoolNodeAllocator, TreeKind}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
@@ -298,9 +298,14 @@ object Bootstrap:
       networkCachingServicePtr)
 
     // The EventLogDurableService (the system event log) is likewise a system-critical singleton. Its state names an
-    // empty KV tree of incoming entries, an empty DataObject tree of log objects and the empty tail objects.
+    // empty KV tree of incoming entries, an empty DataObject tree of log objects and the empty tail objects. The
+    // DataObject tree gets its empty root node here: creating it later would write the tree's root into the state
+    // object, which a compaction transaction already updates (tails, tailFloor), and a transaction updates each object
+    // at most once.
     val eventLogIncoming = allocateTree(ByteArrayKeyOrdering)
-    val eventLogLogged = Root(0, ByteArrayKeyOrdering, None, bootstrapNodeAllocator, TreeKind.DataObjects)
+    val eventLogLoggedNode = allocateData(DataObjectNodeEncoding.encode(Nil, Key.AbsoluteMinimum, None))
+    val eventLogLogged = Root(0, ByteArrayKeyOrdering, Some(eventLogLoggedNode), bootstrapNodeAllocator,
+      TreeKind.DataObjects)
     val eventLogTails = Vector.fill(EventLogState.TailCount)(allocateData(Array.empty))
     val eventLogServicePtr = allocate(SystemEventLog.initialState(eventLogIncoming, eventLogLogged, eventLogTails,
       PoolObjectAllocatorId(Radicle.poolId)).toList)

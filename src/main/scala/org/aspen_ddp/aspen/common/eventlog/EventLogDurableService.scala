@@ -67,6 +67,11 @@ object EventLogDurableService extends DurableServiceFactory with Logging:
 
 /** Moves entries from incomingEvents into the log objects, one bounded batch per transaction.
   *
+  * A batch goes into the tails. When no tail has room for one of its records, the same transaction compacts: every
+  * tail's records are sorted into new full objects inserted into loggedEvents, the tails emptied (and refilled with
+  * the rest of the batch) and tailFloor advanced. An entry too large for any log object is replaced by a
+  * DroppedEvent with its timestamp.
+  *
   * Every move transaction deletes the moved incoming keys at their read KeyRevision (its pin) and checks the tails and
   * the state keys it writes, so two instances overlapping after a lease handoff never both commit the same entry: the
   * loser aborts and its next batch re-reads. Scans run one at a time; a nudge arriving during a scan makes it scan
@@ -219,46 +224,78 @@ class EventLogDurableService(val client: AspenClient,
           DropReason.ExceededMaximumLogEntrySize)
         LoggedRecord(d.timestamp, droppedId, d.data)
 
+      def planWith(loaded: Vector[LoadedTail],
+                   tailRecords: Option[Vector[LoggedRecord]],
+                   first: Option[HLCTimestamp],
+                   cap: Option[Int]): LogPlan =
+        LogPlanner.plan(PlanInput(
+          batch = records,
+          tails = loaded.zipWithIndex.map((t, i) => TailView(i, t.length, t.maxSize)),
+          current = tails.current,
+          tailRecords = tailRecords,
+          tailFloor = tailFloor,
+          firstFullKey = first,
+          lateTarget = None,
+          target = cap.fold(targetObjectSize)(math.min(targetObjectSize, _)),
+          newObjectCap = cap,
+          dropReplacement = dropReplacement))
+
+      /** The plan from the tails' lengths alone. When an in-order record is left over, no tail had room for it, so
+        * the tails are read whole and the batch planned again, now able to compact them.
+        */
+      def planBatch(first: Option[HLCTimestamp], cap: Option[Int]): Future[(LogPlan, Vector[LoadedTail])] =
+        for
+          loaded <- Future.traverse(tails.pointers)(LogWriter.load(client, _))
+          plan = planWith(loaded, None, first, cap)
+          inOrderLeft = plan.consumed.size < records.size && {
+            val taken = java.util.Collections.newSetFromMap(new IdentityHashMap[LoggedRecord, java.lang.Boolean]())
+            plan.consumed.foreach(taken.add)
+            records.exists(r => !taken.contains(r) && (first.isEmpty || r.timestamp > tailFloor))
+          }
+          result <-
+            if !inOrderLeft then
+              Future.successful((plan, loaded))
+            else
+              Future.traverse(tails.pointers)(LogWriter.loadWhole(client, _)).map: whole =>
+                val tailRecords = whole.flatMap(t => LogRecords.decodeFrames(t.state.data.getByteArray))
+                (planWith(whole, Some(tailRecords), first, cap), whole)
+        yield result
+
       for
-        loaded <- Future.traverse(tails.pointers)(LogWriter.load(client, _))
         logged <- loggedRoot.getDataObjectTree()
         first <- firstFullKey(logged)
         allocator <- client.getAllocator(allocatorId)
+        (plan, loaded) <- planBatch(first, allocator.maxObjectSize)
         result <-
-          val cap = allocator.maxObjectSize
-          val plan = LogPlanner.plan(PlanInput(
-            batch = records,
-            tails = loaded.zipWithIndex.map((t, i) => TailView(i, t.length, t.maxSize)),
-            current = tails.current,
-            tailRecords = None,
-            tailFloor = tailFloor,
-            firstFullKey = first,
-            lateTarget = None,
-            target = cap.fold(targetObjectSize)(math.min(targetObjectSize, _)),
-            newObjectCap = cap,
-            dropReplacement = dropReplacement))
-
           val moved = plan.consumed.map(keyOf.get) ++ undecodable
           if moved.isEmpty then
             logger.warn(s"EventLogDurableService: ${records.size} incoming entries cannot be placed")
             Future.successful(BatchResult.Stuck)
           else
+            val compaction = plan.steps.collectFirst { case c: LogStep.Compact => c }
             client.transact: tx =>
               given Transaction = tx
-              LogWriter(plan, loaded)
 
-              var reqs = List.empty[KeyValueUpdate.KeyRequirement]
+              // Every move checks TailsKey, so an instance holding stale state cannot append after another advanced
+              // `current` or compacted; its transaction aborts and its next batch re-reads
+              val tailsReq = KeyValueUpdate.KeyRevision(EventLogState.TailsKey, value(EventLogState.TailsKey).revision)
+              var reqs = List[KeyValueUpdate.KeyRequirement](tailsReq)
               var ops = List.empty[Insert]
               if ids.size != typeIds.size then
                 reqs ::= KeyValueUpdate.KeyRevision(EventLogState.TypeIdsKey, value(EventLogState.TypeIdsKey).revision)
                 ops ::= Insert(EventLogState.TypeIdsKey, EventLogState.encodeTypeIds(ids))
-              if plan.newCurrent != tails.current then
-                reqs ::= KeyValueUpdate.KeyRevision(EventLogState.TailsKey, value(EventLogState.TailsKey).revision)
+              if plan.newCurrent != tails.current || compaction.isDefined then
                 ops ::= Insert(EventLogState.TailsKey,
                   EventLogState.encodeTails(tails.copy(current = plan.newCurrent)))
-              if ops.nonEmpty then
-                tx.update(statePointer, None, None, reqs, ops)
+              compaction.foreach: c =>
+                reqs ::= KeyValueUpdate.KeyRevision(EventLogState.TailFloorKey,
+                  value(EventLogState.TailFloorKey).revision)
+                ops ::= Insert(EventLogState.TailFloorKey, EventLogState.encodeTailFloor(c.newTailFloor))
+              tx.update(statePointer, None, None, reqs, ops)
 
-              incoming.prepareUpdates(Nil, Nil, moved.toList.map(in => in.key -> in.revision))
+              for
+                _ <- LogWriter(plan, loaded, allocator, logged)
+                _ <- incoming.prepareUpdates(Nil, Nil, moved.toList.map(in => in.key -> in.revision))
+              yield ()
             .map(_ => BatchResult.Moved)
       yield result

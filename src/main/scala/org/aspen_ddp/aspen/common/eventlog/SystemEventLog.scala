@@ -29,13 +29,23 @@ object SystemEventLog extends Logging:
       EventLogState.TailsKey -> EventLogState.encodeTails(EventLogState.Tails(tails, 0, allocator)),
       EventLogState.TailFloorKey -> EventLogState.encodeTailFloor(HLCTimestamp.Zero))
 
+  // ServiceEntry.statePointer never changes, so it is looked up once per client; weak keys vanish with their client
+  private val statePointers =
+    java.util.Collections.synchronizedMap(new java.util.WeakHashMap[AspenClient, KeyValueObjectPointer]())
+
   /** The service state object's pointer, from the services tree */
   private[aspen] def statePointer(client: AspenClient): Future[KeyValueObjectPointer] =
     given ExecutionContext = client.clientContext
-    val tkvl = TieredKeyValueList(client, KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer))
-    tkvl.get(Key(EventLogDurableService.ServiceUUID)).map:
-      case Some(vs) => ServiceEntry.decode(vs.value.bytes).statePointer
-      case None => throw new IllegalStateException("EventLogDurableService is not registered")
+    Option(statePointers.get(client)) match
+      case Some(ptr) => Future.successful(ptr)
+      case None =>
+        val tkvl = TieredKeyValueList(client, KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer))
+        tkvl.get(Key(EventLogDurableService.ServiceUUID)).map:
+          case Some(vs) =>
+            val ptr = ServiceEntry.decode(vs.value.bytes).statePointer
+            statePointers.put(client, ptr)
+            ptr
+          case None => throw new IllegalStateException("EventLogDurableService is not registered")
 
   private[aspen] def incomingTree(client: AspenClient, statePointer: KeyValueObjectPointer): TieredKeyValueList =
     TieredKeyValueList(client, KVObjectRootManager(client, EventLogState.IncomingKey, statePointer))

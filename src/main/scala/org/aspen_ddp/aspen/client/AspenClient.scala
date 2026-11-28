@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.internal.transaction.{MissedUpdateMarker, Tran
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.config.BootstrapConfig
-import org.aspen_ddp.aspen.common.eventlog.{EventLogEntry, SystemEventLog}
+import org.aspen_ddp.aspen.common.eventlog.{Event, EventFactory, EventLogEntry, EventLogReader, SystemEventLog}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, IDAPolicy, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
@@ -1003,6 +1003,22 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    */
   def logSystemEvent(e: EventLogEntry): Future[Unit] =
     SystemEventLog.logSystemEvent(this, e)
+
+  /** The system event log's entries timestamped in `[from, to]` (`to` None: no upper bound), sorted by timestamp,
+   *  at most `limit` of them, type ids mapped back to type UUIDs. No entry the log held when the read began is
+   *  omitted, but an entry may appear more than once (logged twice, or read in a tail and again in the full object
+   *  a concurrent compaction moved it to). A read racing changes that move records between full objects restarts,
+   *  failing with IllegalStateException after `EventLogReader.MaxRestarts` restarts.
+   */
+  def readSystemEvents(from: HLCTimestamp = HLCTimestamp.Zero,
+                       to: Option[HLCTimestamp] = None,
+                       limit: Option[Int] = None): Future[Vector[EventLogEntry]] =
+    new EventLogReader(this).read(from, to, limit)
+
+  /** `e` as an Event, by its type's registered EventFactory; None when no EventFactory is registered for it */
+  def decodeSystemEvent(e: EventLogEntry): Option[Event] =
+    typeRegistry.getType[RegisteredTypeFactory](e.typeUUID).collect:
+      case f: EventFactory => f.createEvent(e)
 
   private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]]
 

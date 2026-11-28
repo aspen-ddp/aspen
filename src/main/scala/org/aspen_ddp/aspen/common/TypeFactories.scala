@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.common
 
 import org.aspen_ddp.aspen.client.RegisteredTypeFactory
 import org.aspen_ddp.aspen.client.internal.allocation.{FsifIndexAllocationStrategy, FsifReleaseIndicesTask}
+import org.aspen_ddp.aspen.common.eventlog.DroppedEvent
 import org.aspen_ddp.aspen.common.metadata.management.{FailedStorageDeviceDurableTask, MigratePoolToSetDurableTask, UpdateAllocationGroupUsageTask}
 
 object TypeFactories:
@@ -11,5 +12,6 @@ object TypeFactories:
     MigratePoolToSetDurableTask,
     FailedStorageDeviceDurableTask,
     FsifIndexAllocationStrategy,
-    FsifReleaseIndicesTask
+    FsifReleaseIndicesTask,
+    DroppedEvent
   )

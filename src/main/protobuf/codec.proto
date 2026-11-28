@@ -874,3 +874,21 @@ message NetworkStoreSnapshot {
   uint64 scan_start = 1;
   repeated NetworkSnapshotStore stores = 2;
 }
+
+//---------------------------------------------------------------------------
+//- System event log
+//---------------------------------------------------------------------------
+message EventLogEntry {
+  fixed64 timestamp = 1;
+  UUID type_uuid = 2;
+  bytes data = 3;
+}
+
+enum DropReason {
+  DROP_REASON_EXCEEDED_MAXIMUM_LOG_ENTRY_SIZE = 0;
+}
+
+message DroppedEventData {
+  UUID dropped_type = 1;
+  DropReason reason = 2;
+}

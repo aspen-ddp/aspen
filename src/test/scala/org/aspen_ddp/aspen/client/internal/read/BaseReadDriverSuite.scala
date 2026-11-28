@@ -635,6 +635,22 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     awaitedBy(m).size shouldBe sent + 1
   }
 
+  test("the settled backoff engages and grows when the unparked replies take longer than it") {
+    val m = new SchedulingClient
+    val (r, advance) = clockedSettledReader(m)
+    reply(r, ds0, rev, Set(t))
+    // Each reply comes 15 ms after its re-read, longer than the first backoff, but far sooner than a parked read's
+    // expiry: the store did not park it
+    val delays = (1 to 4).map: _ =>
+      advance(15.millis.toNanos)
+      val sentBefore = awaitedBy(m).size
+      reply(r, ds0, rev, Set(t))
+      awaitedBy(m).size shouldBe sentBefore
+      m.scheduler.pending.size shouldBe 1
+      m.scheduler.runNext()
+    delays.toList shouldBe List(10.millis, 20.millis, 40.millis, 80.millis)
+  }
+
   test("a delayed settled re-read is not sent once the read has completed") {
     val m = new SchedulingClient
     val (r, _) = clockedSettledReader(m)

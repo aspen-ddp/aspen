@@ -4,7 +4,8 @@ import scala.concurrent.duration.FiniteDuration
 
 /** A system event log read (AspenClient.readSystemEvents) did not finish within `timeout`. The log is not readable
   * right now: typically a store holding the lock of a transaction that cannot yet be decided is unreachable, and a
-  * settled read must wait for it (DESIGN.md section 6). Nothing partial is returned */
-class SystemEventLogReadTimeout(val timeout: FiniteDuration)
+  * settled read must wait for it (DESIGN.md section 6). Nothing partial is returned. `cause` is the ReadTimeout
+  * (naming the object that could not settle) when a read timed out */
+class SystemEventLogReadTimeout(val timeout: FiniteDuration, cause: Throwable | Null = null)
   extends Exception(s"The system event log could not be read within $timeout. It is not readable right now: a store " +
-    "holding an undecided transaction may be unreachable. Try again later")
+    "holding an undecided transaction may be unreachable. Try again later", cause)

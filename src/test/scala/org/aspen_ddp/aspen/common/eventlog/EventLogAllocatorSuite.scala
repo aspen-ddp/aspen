@@ -188,6 +188,8 @@ class EventLogAllocatorSuite extends EventLogSuiteBase:
     yield
       err shouldBe a[SystemEventLogReadTimeout]
       err.asInstanceOf[SystemEventLogReadTimeout].timeout shouldBe timeout
+      // The cause names the object that could not settle
+      err.getCause shouldBe a[org.aspen_ddp.aspen.client.ReadTimeout]
       elapsed should be >= timeout
       // Once the outcome arrives the log reads in full
       read should contain (e)

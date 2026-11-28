@@ -15,6 +15,8 @@
   `ReadTimeout` and runs `onComplete`, cancelling `SimpleReadDriver`'s retransmits) and releases the read. A read
   that completes first cancels the task. The task captures only the read's id, never the driver: a cancelled task
   stays queued in BackgroundTaskManager's scheduler until its delay, and must not retain a completed read's slices.
+  The one exception is a settled read's delayed re-read (`BaseReadDriver.rereadSettling`, below): it captures the
+  driver, bounded by its delay of at most `ParkedReadWait` (1 s), and only settled reads schedule one.
   An untimed read (`Duration.Inf`, the default) schedules nothing.
   `BaseAspenClient`'s read bodies take the timeout; the public `ObjectReader` methods pass `Duration.Inf`
 - A stale pointer or cached state of a deleted object can neither read nor revive it, even through a store that
@@ -77,10 +79,13 @@
   soundness, so a settled read never returns early; a caller that must not wait forever uses `settledReaderBy` and
   fails. A store at `Frontend.MaxParkedReads` answers the awaiting re-read at once, still locked; re-sending at once
   would ping-pong at network speed on an overloaded store for as long as the holder stays undecided, so a reply to an
-  awaiting re-read that came back sooner than the store's backoff is re-read after it (`BaseReadDriver.rereadSettling`:
-  per store, 10 ms doubling to `ParkedReadWait`, reset once the store settles; at most one delayed re-read per store,
-  on `backgroundTaskManager`). Any other reply (the first, one after a full resend's quick answer outside a backoff, a
-  parked read answered at its expiry) is re-read at once. Only the settled path backs off: ordinary reads and the
+  awaiting re-read that still holds an awaited lock and came back sooner than `ParkedReadWait` after it was sent (not
+  parked: a parked re-read is answered early only once none of its locks holds, so round-trip time does not matter)
+  delays the next re-read by the store's backoff (`BaseReadDriver.rereadSettling`: per store, 10 ms doubling to
+  `ParkedReadWait`, reset once the store settles; at most one delayed re-read per store, on `backgroundTaskManager`).
+  A reply at or past `ParkedReadWait` (a parked read answered at its expiry), or the first, is re-read at once; one
+  after a full resend is re-read at once only when no backoff is pending and no awaiting re-read was sent within
+  `ParkedReadWait`. Only the settled path backs off: ordinary reads and the
   known-committed re-read are unchanged. Sound because a commit voter holds T's locks until it applies T
   (`Tx.doCommit` releases and applies in one executor step), T committed means `writeThreshold` voters per object,
   and the stores that neither applied T nor held its lock number at most `width - writeThreshold`, below the read

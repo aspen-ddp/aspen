@@ -116,15 +116,18 @@ abstract class BaseReadDriver(
 
   def settle(): Unit = synchronized { settling = true }
 
-  /** Re-reads a settling store awaiting `locks`. A reply to an awaiting re-read that came back sooner than the
-    * store's backoff (not parked: the store is at its cap) is re-read after the backoff, which then doubles up to
-    * Frontend.ParkedReadWait. Any other reply (the first, one after a full resend, or a parked read answered at its
-    * expiry) is re-read at once. While a delayed re-read is scheduled, no other is sent */
+  /** Re-reads a settling store awaiting `locks`. A parked re-read names the awaited locks and is answered early only
+    * once none of them holds, so a reply still holding one that comes back sooner than Frontend.ParkedReadWait
+    * after the last awaiting re-read was sent was not parked (the store is at its cap), however long the round trip
+    * took: the next re-read waits the store's backoff, which then doubles up to ParkedReadWait. A reply at or past
+    * that (a parked read answered at its expiry), or with no awaiting re-read sent yet (the first), is re-read at
+    * once. While a delayed re-read is scheduled no other is sent, so a reply after a full resend is re-read at once
+    * only when no backoff is pending and no awaiting re-read went out within ParkedReadWait */
   private def rereadSettling(store: StoreId, locks: Set[TransactionId]): Unit =
     if !settleDelayed.contains(store) then
       val now = nanoTime()
       val backoff = settleBackoff.getOrElse(store, BaseReadDriver.SettleBackoffStart)
-      if settleSentAt.get(store).exists(sent => now - sent < backoff.toNanos) then
+      if settleSentAt.get(store).exists(sent => now - sent < BaseReadDriver.SettleBackoffMax.toNanos) then
         settleDelayed += store
         settleBackoff += store -> (backoff * 2).min(BaseReadDriver.SettleBackoffMax)
         client.backgroundTaskManager.schedule(backoff):

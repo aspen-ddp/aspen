@@ -93,7 +93,7 @@ final class EventLogReader(client: AspenClient) extends Logging:
     val reader = client.settledReaderBy(deadline)
     def attempt(n: Int): Future[Vector[EventLogEntry]] =
       Future.delegate(readOnce(reader, from, to, limit)).recoverWith:
-        case err if isTimeout(err) => Future.failed(new SystemEventLogReadTimeout(timeout))
+        case err if isTimeout(err) => Future.failed(new SystemEventLogReadTimeout(timeout, err))
         case err @ (_: Inconsistent | _: InvalidObject) =>
           if deadline.isOverdue() then
             Future.failed(new SystemEventLogReadTimeout(timeout))

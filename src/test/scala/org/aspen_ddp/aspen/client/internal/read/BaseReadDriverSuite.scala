@@ -496,4 +496,59 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, kvs(withKey = true)))
     Await.result(r.readResult, 1.second).asInstanceOf[KeyValueObjectState].contents.contains(kvKey) shouldBe true
   }
+
+  // Settled reads (BaseReadDriver.settle)
+
+  private def settledReader(m: ReadDriverClient) =
+    val r = mkReader(m)
+    r.settle()
+    r
+
+  private val t = TransactionId(new UUID(0, 7))
+  private val later = TransactionId(new UUID(0, 8))
+  private val tRev = ObjectRevision(t)
+
+  private def reply(r: BaseReadDriver, store: StoreId, revision: ObjectRevision, locks: Set[TransactionId]): Unit =
+    val ts = HLCTimestamp.now
+    r.receiveReadResponse(ReadResponse(client, store, readUUID, ts,
+      Right(ReadResponse.CurrentState(revision, ref, ts, 4, Some(odata), locks))))
+
+  private def awaitedBy(m: RecordingClient): List[(StoreId, Set[TransactionId])] =
+    m.requests.collect { case rd: Read => rd.toStore -> rd.awaitCommit }
+
+  test("a settled read withholds a reply holding locks and re-reads it awaiting them") {
+    // T committed (two of three stores voted commit) but nothing applied it, and this client does not know it
+    // committed: an ordinary read would return the revision T replaces, from these three replies
+    val m = new RecordingClient
+    val r = settledReader(m)
+    reply(r, ds0, rev, Set(t))
+    reply(r, ds1, rev, Set(t))
+    reply(r, ds2, rev, Set())
+    r.readResult.isCompleted should be (false)
+    awaitedBy(m).toSet should be (Set(ds0 -> Set(t), ds1 -> Set(t)))
+
+    // Once the stores apply T, their parked re-reads are answered with it
+    reply(r, ds0, tRev, Set())
+    r.readResult.isCompleted should be (false)
+    reply(r, ds1, tRev, Set())
+    r.readResult.value.get.get.revision should be (tRev)
+  }
+
+  test("an ordinary read returns the replaced revision from the same replies") {
+    val r = mkReader(ReadDriverClient.NoOp(client))
+    reply(r, ds0, rev, Set(t))
+    reply(r, ds1, rev, Set(t))
+    r.readResult.value.get.get.revision should be (rev)
+  }
+
+  test("a settled read does not wait for locks a store takes after its first reply") {
+    val m = new RecordingClient
+    val r = settledReader(m)
+    reply(r, ds0, rev, Set(t))
+    reply(r, ds1, tRev, Set())
+    // ds0 has released t but meanwhile locked `later`, which its first reply did not hold: settled
+    reply(r, ds0, tRev, Set(later))
+    r.readResult.value.get.get.revision should be (tRev)
+    awaitedBy(m) should be (List(ds0 -> Set(t)))
+  }
 }

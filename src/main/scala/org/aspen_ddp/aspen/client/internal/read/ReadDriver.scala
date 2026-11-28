@@ -15,6 +15,9 @@ trait ReadDriver {
   /** Called to begin the read process. Read messages must not be sent until this method is called */
   def begin(): Unit
 
+  /** Makes this a settled read (ReadManager.read's `settled`). Called before `begin`, never after */
+  def settle(): Unit
+
   /** Called to abandon the read. This calls should cancel all activity scheduled for the future */
   def shutdown(): Unit
 

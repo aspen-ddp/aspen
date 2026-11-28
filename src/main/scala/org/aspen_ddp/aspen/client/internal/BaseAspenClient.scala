@@ -105,7 +105,10 @@ abstract class BaseAspenClient(
   // ---- Reads ----
   //
   // Each read method's body takes the timeout ReadManager.read applies. The ObjectReader overrides pass Duration.Inf
-  // (untimed); TimedObjectReader, from withReadTimeout, passes its own
+  // (untimed); TimedObjectReader, from withReadTimeout, passes its own. Each also takes `settled`
+  // (ReadManager.read), which only SettledObjectReader, from settledReader, sets
+
+  override private[aspen] lazy val settledReader: ObjectReader = new SettledObjectReader(this)
 
   override def withReadTimeout(timeout: Duration): ObjectReader = timeout match
     case Duration.Inf => this
@@ -113,49 +116,52 @@ abstract class BaseAspenClient(
     case _ => throw new IllegalArgumentException(s"A read timeout must be positive or Duration.Inf, not $timeout")
 
   override def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] =
-    read(pointer, comment, Duration.Inf)
+    read(pointer, comment, Duration.Inf, settled = false)
 
-  private[client] def read(pointer: DataObjectPointer, comment: String, timeout: Duration): Future[DataObjectState] =
+  private[client] def read(pointer: DataObjectPointer, comment: String, timeout: Duration,
+                           settled: Boolean): Future[DataObjectState] =
     resolveIdaWithin(pointer, timeout).flatMap { (ida, remaining) =>
-      rmgr.read(pointer, ida, comment, timeout = remaining).map(_.asInstanceOf[DataObjectState])
+      rmgr.read(pointer, ida, comment, timeout = remaining, settled = settled).map(_.asInstanceOf[DataObjectState])
     }
 
   override def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] =
-    read(pointer, comment, Duration.Inf)
+    read(pointer, comment, Duration.Inf, settled = false)
 
   private[client] def read(pointer: KeyValueObjectPointer, comment: String,
-                           timeout: Duration): Future[KeyValueObjectState] =
+                           timeout: Duration, settled: Boolean): Future[KeyValueObjectState] =
     resolveIdaWithin(pointer, timeout).flatMap { (ida, remaining) =>
-      rmgr.read(pointer, ida, comment, timeout = remaining).map(_.asInstanceOf[KeyValueObjectState])
+      rmgr.read(pointer, ida, comment, timeout = remaining, settled = settled).map(_.asInstanceOf[KeyValueObjectState])
     }
 
   override def readKeys(pointer: KeyValueObjectPointer, keys: List[Key], comment: String): Future[KeyValueObjectState] =
-    readKeys(pointer, keys, comment, Duration.Inf)
+    readKeys(pointer, keys, comment, Duration.Inf, settled = false)
 
   private[client] def readKeys(pointer: KeyValueObjectPointer, keys: List[Key], comment: String,
-                               timeout: Duration): Future[KeyValueObjectState] =
+                               timeout: Duration, settled: Boolean): Future[KeyValueObjectState] =
     resolveIdaWithin(pointer, timeout).flatMap { (ida, remaining) =>
-      rmgr.read(pointer, ida, comment, readType = KeySet(keys), timeout = remaining).map(_.asInstanceOf[KeyValueObjectState])
+      rmgr.read(pointer, ida, comment, readType = KeySet(keys), timeout = remaining, settled = settled).map(_.asInstanceOf[KeyValueObjectState])
     }
 
   override def readKeyRange(pointer: KeyValueObjectPointer, startKey: Key, endKey: Key, ordering: KeyOrdering,
                             comment: String): Future[KeyValueObjectState] =
-    readKeyRange(pointer, startKey, endKey, ordering, comment, Duration.Inf)
+    readKeyRange(pointer, startKey, endKey, ordering, comment, Duration.Inf, settled = false)
 
   private[client] def readKeyRange(pointer: KeyValueObjectPointer, startKey: Key, endKey: Key, ordering: KeyOrdering,
-                                   comment: String, timeout: Duration): Future[KeyValueObjectState] =
+                                   comment: String, timeout: Duration,
+                                   settled: Boolean): Future[KeyValueObjectState] =
     resolveIdaWithin(pointer, timeout).flatMap { (ida, remaining) =>
-      rmgr.read(pointer, ida, comment, readType = KeyRange(startKey, endKey, ordering), timeout = remaining)
+      rmgr.read(pointer, ida, comment, readType = KeyRange(startKey, endKey, ordering), timeout = remaining,
+        settled = settled)
         .map(_.asInstanceOf[KeyValueObjectState])
     }
 
   override def readMetadata(pointer: ObjectPointer, comment: String): Future[MetadataObjectState] =
-    readMetadata(pointer, comment, Duration.Inf)
+    readMetadata(pointer, comment, Duration.Inf, settled = false)
 
   private[client] def readMetadata(pointer: ObjectPointer, comment: String,
-                                   timeout: Duration): Future[MetadataObjectState] =
+                                   timeout: Duration, settled: Boolean): Future[MetadataObjectState] =
     resolveIdaWithin(pointer, timeout).flatMap { (ida, remaining) =>
-      rmgr.read(pointer, ida, comment, readType = MetadataOnly(), timeout = remaining).map(_.asInstanceOf[MetadataObjectState])
+      rmgr.read(pointer, ida, comment, readType = MetadataOnly(), timeout = remaining, settled = settled).map(_.asInstanceOf[MetadataObjectState])
     }
 
   /** Resolves the IDA within `timeout`, as resolveIdaWithin, and requires range read support */
@@ -192,7 +198,8 @@ abstract class BaseAspenClient(
     * for the resolved IDA
     */
   private def readByteRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)], tail: (IDA & AppendableIDA) => Int,
-                             comment: String, timeout: Duration): Future[DataObjectRangesState] =
+                             comment: String, timeout: Duration,
+                             settled: Boolean): Future[DataObjectRangesState] =
     // Resolved first so that an empty list still fails for an IDA without range reads
     resolveAppendableIda(pointer, timeout).flatMap { (ida, remaining) =>
       if ranges.exists((offset, length) => offset < 0 || length < 0) then
@@ -201,16 +208,17 @@ abstract class BaseAspenClient(
         val sliceRanges = ranges.map: (offset, length) =>
           val (start, end) = ida.sliceRangeFor(offset, length)
           (start, end - start)
-        rmgr.read(pointer, ida, comment, readType = ByteRanges(sliceRanges, tail(ida)), timeout = remaining)
+        rmgr.read(pointer, ida, comment, readType = ByteRanges(sliceRanges, tail(ida)), timeout = remaining,
+          settled = settled)
           .map(_.asInstanceOf[DataObjectRangesState])
     }
 
   override def readRange(pointer: DataObjectPointer, offset: Int, length: Option[Int],
                          comment: String): Future[DataObjectRangeState] =
-    readRange(pointer, offset, length, comment, Duration.Inf)
+    readRange(pointer, offset, length, comment, Duration.Inf, settled = false)
 
   private[client] def readRange(pointer: DataObjectPointer, offset: Int, length: Option[Int], comment: String,
-                                timeout: Duration): Future[DataObjectRangeState] =
+                                timeout: Duration, settled: Boolean): Future[DataObjectRangeState] =
     if offset < 0 || length.exists(_ < 0) then
       Future.failed(new IllegalArgumentException(s"Invalid range: offset $offset length $length"))
     else
@@ -221,7 +229,7 @@ abstract class BaseAspenClient(
             val (start, end) = ida.sliceRangeFor(offset, n)
             ByteRanges(List((start, end - start)), 0)
           case None => ByteRanges(List((ida.sliceOffsetFor(offset), Int.MaxValue)), 0)
-        rmgr.read(pointer, ida, comment, readType = readType, timeout = remaining).map: os =>
+        rmgr.read(pointer, ida, comment, readType = readType, timeout = remaining, settled = settled).map: os =>
           trimRange(os.asInstanceOf[DataObjectRangesState].ranges.head, offset, length)
       }
 
@@ -242,32 +250,32 @@ abstract class BaseAspenClient(
 
   override def readRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)],
                           comment: String): Future[List[DataObjectRangeState]] =
-    readRanges(pointer, ranges, comment, Duration.Inf)
+    readRanges(pointer, ranges, comment, Duration.Inf, settled = false)
 
   private[client] def readRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)], comment: String,
-                                 timeout: Duration): Future[List[DataObjectRangeState]] =
-    readByteRanges(pointer, ranges, _ => 0, comment, timeout).map(trimmedPieces(_, ranges))
+                                 timeout: Duration, settled: Boolean): Future[List[DataObjectRangeState]] =
+    readByteRanges(pointer, ranges, _ => 0, comment, timeout, settled).map(trimmedPieces(_, ranges))
 
   override def readRangedWriteState(pointer: DataObjectPointer, writes: List[RangedWrite],
                                     comment: String): Future[RangedWriteState] =
-    readRangedWriteState(pointer, writes, comment, Duration.Inf)
+    readRangedWriteState(pointer, writes, comment, Duration.Inf, settled = false)
 
   private[client] def readRangedWriteState(pointer: DataObjectPointer, writes: List[RangedWrite], comment: String,
-                                           timeout: Duration): Future[RangedWriteState] =
+                                           timeout: Duration, settled: Boolean): Future[RangedWriteState] =
     // The length probe and one range per write are a single request, so they share a revision
     val ranges = writes.map(w => (w.offset, w.data.length))
-    readByteRanges(pointer, ranges, _.lengthProbeBytes, comment, timeout).flatMap: state =>
+    readByteRanges(pointer, ranges, _.lengthProbeBytes, comment, timeout, settled).flatMap: state =>
       state.appendPosition match
         case Some(position) =>
           Future.successful(RangedWriteFetch.combine(pointer, writes, position, trimmedPieces(state, ranges)))
         case None => Future.failed(new CorruptedObject(pointer))
 
   override def readAppendPosition(pointer: DataObjectPointer, comment: String): Future[AppendPosition] =
-    readAppendPosition(pointer, comment, Duration.Inf)
+    readAppendPosition(pointer, comment, Duration.Inf, settled = false)
 
   private[client] def readAppendPosition(pointer: DataObjectPointer, comment: String,
-                                         timeout: Duration): Future[AppendPosition] =
-    readByteRanges(pointer, Nil, _.lengthProbeBytes, comment, timeout).flatMap: state =>
+                                         timeout: Duration, settled: Boolean): Future[AppendPosition] =
+    readByteRanges(pointer, Nil, _.lengthProbeBytes, comment, timeout, settled).flatMap: state =>
       state.appendPosition match
         case Some(position) => Future.successful(position)
         case None => Future.failed(new CorruptedObject(pointer))

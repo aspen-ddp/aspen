@@ -394,7 +394,8 @@
 - Parked reads (client 1-RTT commit design section 5): a client read whose `Read.awaitCommit` names a transaction
   holding a write lock on the object's in-memory state (`lockedWriteTransactions`) is parked (`parkRead`, keyed by
   object and `readUUID`: a resent read replaces its entry) instead of answered: the client knows that transaction
-  committed, and the reply would only show its lock again. Every `Tx.unlock` calls `answerParkedReads(objects)`, which
+  committed, or (a settled read, `client/internal/CLAUDE.md`) waits for it to resolve either way, and the reply would
+  only show its lock again. Every `Tx.unlock` calls `answerParkedReads(objects)`, which
   answers each parked read on them none of whose named transactions still holds a lock there; so commit, abort,
   expiry discard (`Tx.expire`) and forget all release them. `doCommit` drops its locks before applying, but calls
   `answerParkedReads` only after `issueCommits` applied the update in memory, so the answer shows it. Past

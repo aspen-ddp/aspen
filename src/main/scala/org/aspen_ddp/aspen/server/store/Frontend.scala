@@ -1853,8 +1853,8 @@ class Frontend(val storeId: StoreId,
   private var overReadBound = false
 
   /** Parks a re-read whose client knows a transaction committed that still holds a write lock on the object here
-    * (Read.awaitCommit): answered now, it would only show the lock again, and the client would re-read until this
-    * store applies the commit. It is answered once none of the named transactions holds a lock on the object
+    * (Read.awaitCommit), or, for a settled read, waits for such a transaction to resolve either way: answered now, it
+    * would only show the lock again, and the client would re-read until this store applies the commit. It is answered once none of the named transactions holds a lock on the object
     * (answerParkedReads), or at parkedReadWait with the state as it is then (expireParkedReads). Never past
     * MaxParkedReads. Only an in-memory state can hold locks, so a read that would reach the backend is not parked.
     * Safety is unaffected: a parked read only delays its own answer

@@ -83,6 +83,35 @@ abstract class BaseReadDriver(
       committedLockRereads += 1
       sendReadRequest(store, committed)
 
+  /** A settled read (`settle`) hands the object reader no store's reply until that store holds none of the write locks
+    * its first reply held: such a reply is re-read with `awaitCommit` naming them, so the store parks it until they
+    * release. Locks a store takes after its first reply are not waited for, so a busy object cannot hold the read
+    * forever: each of the first reply's lock holders resolves (commit, abort or expiry) within the horizon.
+    *
+    * Why this makes the result reflect every transaction T that committed before the read began: T committed means
+    * `writeThreshold` stores of this object's pool voted commit, and a commit voter holds T's locks until it applies
+    * T (`Tx.doCommit` releases them and applies in one step on the store's executor). So each of those voters' first
+    * replies shows T applied or holds T's lock, and a voter's reply reaches the object reader only once T is applied.
+    * Stores that neither applied T nor hold its lock number at most `width - writeThreshold`, below the read
+    * threshold, so no revision preceding T can gather `consistentRestoreThreshold` matching replies
+    */
+  private var settling = false
+
+  /** Settled reads: each store's locks still awaited (from its first reply). A store's entry is empty once settled */
+  private var awaitedLocks: Map[StoreId, Set[TransactionId]] = Map()
+
+  def settle(): Unit = synchronized { settling = true }
+
+  /** For a settled read: the awaited locks the store's reply still holds, recording its first reply's locks. Empty
+    * once the store has settled: its later replies go to the object reader as in an ordinary read */
+  private def unsettledLocks(store: StoreId, locks: Set[TransactionId]): Set[TransactionId] =
+    if !settling then
+      Set()
+    else
+      val pending = awaitedLocks.getOrElse(store, locks).intersect(locks)
+      awaitedLocks += store -> pending
+      pending
+
   private def elapsedMillis: Long = (System.nanoTime() - startNanos) / 1000000
 
   /** The last reply of each store: revision, timestamp and write locks, or the error */
@@ -158,6 +187,10 @@ abstract class BaseReadDriver(
     }
     val hasLocksForKnownCommittedTransactions = committedLocks.nonEmpty
 
+    val settleLocks = response.result match
+      case Left(_) => Set[TransactionId]()
+      case Right(cs) => unsettledLocks(response.fromStore, cs.lockedWriteTransactions)
+
     val isUnknownStoreResponse = response.result match
       case Left(err) =>
         if err == ReadError.StoreNotFound then
@@ -173,16 +206,16 @@ abstract class BaseReadDriver(
     // not read its own new object. The store parks the re-read until the allocation applies (Frontend.parkAllocationRead)
     val isAllocationPending = response.result == Left(ReadError.AllocationPending)
 
-    if (isUnknownStoreResponse || isAllocationPending || hasLocksForKnownCommittedTransactions) {
-      // We know for certain that the response from this store has out-of-date information. Transactions _should_
-      // resolve quickly so we'll immediately reread from the store
+    if (isUnknownStoreResponse || isAllocationPending || hasLocksForKnownCommittedTransactions || settleLocks.nonEmpty) {
+      // We know for certain that the response from this store has out-of-date information, or a settled read awaits
+      // the locks its first reply held. Transactions _should_ resolve quickly so we'll immediately reread from the store
       if hasLocksForKnownCommittedTransactions then
         committedLockRereads += 1
         if elapsedMillis >= BaseReadDriver.SlowReadMillis && !committedLockStoresReported.contains(response.fromStore) then
           committedLockStoresReported += response.fromStore
           logger.warn(s"Read UUID $readUUID of object ${objectPointer.id}: store ${response.fromStore} still holds a " +
             s"lock of a committed transaction after ${elapsedMillis}ms. Replies so far: $responseSummary")
-      sendReadRequest(response.fromStore, committedLocks)
+      sendReadRequest(response.fromStore, committedLocks ++ settleLocks)
     }
     else {
       response.result.foreach: cs =>

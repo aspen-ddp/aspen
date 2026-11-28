@@ -87,18 +87,25 @@ class ReadManager(val client: ReadDriverClient, val driverFactory: ReadDriver.Fa
     * A finite `timeout` bounds the read: once it expires, an incomplete read fails with ReadTimeout, its driver
     * stops (ReadDriver.timeOut) and the read is released. An infinite one, the default, schedules nothing: the read
     * retries until it completes.
+    *
+    * A `settled` read returns a state that reflects every transaction that committed before the read began, even one
+    * no store has applied yet (BaseReadDriver.settle): it waits for the write locks each store's first reply holds
+    * to release. An ordinary read may return the state such a transaction replaces, when the client cannot tell it
+    * committed (it is neither in the status cache nor applied at another store of the object).
     */
   def read(
             objectPointer: ObjectPointer,
             ida: IDA,
             comment: String,
             readType: ReadType = FullObject(),
-            timeout: Duration = Duration.Inf
+            timeout: Duration = Duration.Inf,
+            settled: Boolean = false
             ): Future[ObjectState] = {
 
     val readUUID = UUID.randomUUID()
 
     val driver = driverFactory(client, objectPointer, ida, readUUID, comment, readType)
+    if settled then driver.settle()
 
     synchronized { outstandingReads += (readUUID -> driver) }
 

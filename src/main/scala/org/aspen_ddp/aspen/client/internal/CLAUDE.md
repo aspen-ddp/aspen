@@ -62,3 +62,15 @@
   them (`Frontend.parkRead`, `server/store/CLAUDE.md`), so the re-read is answered once with the applied commit
   rather than spinning on the lock. A store that answers it anyway (cap, `ParkedReadWait`) is re-read again as before.
   First reads and full resends carry it empty
+- Settled reads (`ReadManager.read(..., settled = true)`, `BaseReadDriver.settle`; public form `AspenClient.settledReader`,
+  `internal/SettledObjectReader`): the result reflects every transaction that committed before the read began, even
+  one no store has applied and this client does not know committed. An ordinary read can miss such a T: a client that
+  learned T only by seeing it applied on another object (in another pool) gets `consistentRestoreThreshold` matching
+  replies at the revision T replaces, from voters that hold T's lock but have not applied it. A settled read hands the
+  object reader no store's reply until that store holds none of the write locks its first reply held: such a reply is
+  re-read with `awaitCommit` naming them (the store parks it until they release, `Frontend.parkRead`). Locks taken
+  after the first reply are not waited for, so a busy object cannot hold the read beyond one resolution of each first
+  lock holder (bounded by the horizon). Sound because a commit voter holds T's locks until it applies T
+  (`Tx.doCommit` releases and applies in one executor step), T committed means `writeThreshold` voters per object,
+  and the stores that neither applied T nor held its lock number at most `width - writeThreshold`, below the read
+  threshold. Cost is on the settled reader only; used by the system event log reader (`common/eventlog/DESIGN.md` 6.1)

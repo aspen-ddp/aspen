@@ -91,6 +91,15 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     */
   def withReadTimeout(timeout: scala.concurrent.duration.Duration): ObjectReader
 
+  /** A reader whose every read is settled: the state it returns reflects every transaction that committed before the
+    * read began, even one no store of the object has applied yet, where an ordinary read can return the state such a
+    * transaction replaces when this client cannot tell it committed (it learned the commit only through another
+    * object). A settled read waits for the transactions holding write locks in each store's first reply to resolve,
+    * so it is slower on a busy object; for a reader that needs a transaction it saw applied on one object to show on
+    * every object it reads next (the system event log reader, `client/internal/CLAUDE.md`). Untimed
+    */
+  private[aspen] def settledReader: ObjectReader
+
   def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState]
 
   def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState]
@@ -1007,7 +1016,9 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
   /** Directs the system event log to allocator `id`, failing when no such allocator exists. New full log objects
    *  and new loggedEvents tree nodes come from `id`; the tails are replaced by new ones from `id` at the event log
-   *  service's next compaction. Objects already written stay where they are.
+   *  service's next compaction. Objects already written stay where they are. An allocator whose object size cap is
+   *  smaller than the current one's turns tail records larger than the new cap into `DroppedEvent`s at that
+   *  compaction (common/eventlog/DESIGN.md section 8).
    */
   def setSystemLogAllocator(id: ObjectAllocatorId): Future[Unit] =
     SystemEventLog.setAllocator(this, id)

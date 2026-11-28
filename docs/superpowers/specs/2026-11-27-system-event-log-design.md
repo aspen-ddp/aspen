@@ -118,7 +118,7 @@ Considered:
   its observer set (decided by the user). Since the message is best-effort, each poll also compares the `observers`
   key's revision with the one last loaded, and reloads when it differs, so a lost message only delays the change.
 - **Poll**: a non-concurrent polling task (as `RebalancingDurableService`) plus a nudge `ServiceMessage` that
-  triggers an immediate scan. Each scan walks `incomingEvents` and moves entries in bounded batches (bounded by bytes
+  triggers an immediate scan. Default poll period 15 s (per-client test seam). Each scan walks `incomingEvents` and moves entries in bounded batches (bounded by bytes
   and count so a transaction stays reasonably sized; bounds are the builder's call). One transaction per batch:
   - write the batch to the current tail (or compact first / rewrite an old full object for late events);
   - delete the moved incoming keys at their read `KeyRevision` (this is the transaction's pin);
@@ -148,9 +148,10 @@ a DataObject-tree variant is needed), the 10 empty tail objects, empty `typeIds`
 
 - `prepareSystemEventLogEntry(e: EventLogEntry)(using Transaction): Future[Unit]` — inserts `e` under a fresh random
   UUID key (`requireDoesNotExist`) into the system log's `incomingEvents`. Completes when the transaction is ready to
-  commit. Does not nudge; such entries are picked up by the next poll (documented).
-- `logSystemEvent(e: EventLogEntry): Future[Unit]` — one transaction around the above, commit, then a best-effort
-  nudge. **No automatic retry on failure**; the scaladoc says so.
+  commit. It also registers a best-effort nudge on the transaction's `result` future, sent only on a successful
+  commit (decided by the user), so callers composing their own transactions get prompt pickup too.
+- `logSystemEvent(e: EventLogEntry): Future[Unit]` — one transaction around the above and commit; the nudge comes
+  from `prepareSystemEventLogEntry`. **No automatic retry on failure**; the scaladoc says so.
 - **Pin rule**: a `DoesNotExist` insert is not a pin, so `logSystemEvent`'s transaction is marked
   `Transaction.replaySafe("event log entries may be duplicated")`. A replay that lands after the service has moved
   and deleted the entry re-inserts it and produces a duplicate log entry; duplicates are explicitly allowed.
@@ -189,6 +190,26 @@ and byte count:
 Also `event-log-observers` (list), `event-log-add-observer <factory-uuid> [--config-file <path>]` and
 `event-log-remove-observer <factory-uuid> [--config-file <path>]`. Exact command names are the builder's call.
 
+## Package documentation
+
+`common/eventlog/DESIGN.md` (decided by the user) describes the whole event log subsystem: the data types, the
+service state, incoming -> tails -> full objects, compaction, late events, the reader and the client API. It calls
+out these surprises explicitly:
+
+- **Duplicates**: a replayed `logSystemEvent` / unpinned `prepareSystemEventLogEntry` transaction that lands after
+  the service moved and deleted its entry; a reader racing compaction (tails read, then the new full object); and any
+  other duplicate path found during implementation.
+- **Dropped events**: an event too large for one log object is replaced by a `DroppedEvent`. This depends on where the
+  log is stored: an allocator with a fixed maximum object size (`maxObjectSize`, from the pool or group slice limit)
+  sets the hard cap, so the same event may be logged on one allocator and dropped on another. Events larger than the
+  `incomingEvents` node limit fail at insert instead.
+- **Best-effort observers**: events committed just before a crash or a service move are never observed; nudges and
+  reload messages may be lost (polling covers them).
+- **Storage optimizations**: tails on Replication or RandomAccessReedSolomon pools are written by appending zstd
+  frames; on other IDAs they are rewritten whole. Full objects are always written once, as one frame.
+
+A short `common/eventlog/CLAUDE.md` points to DESIGN.md and lists the invariants for code changes.
+
 ## Constraints
 
 - Root CLAUDE.md invariants: pin rule, allocations stored in another object, crash-only, HLC for time, collisions are
@@ -203,7 +224,7 @@ Also `event-log-observers` (list), `event-log-add-observer <factory-uuid> [--con
 
 - Package: `common/eventlog` alongside `common/rebalancing`.
 - HLC timestamps and `ObjectAllocatorId` instead of raw nanos / bare UUIDs (above).
-- Default poll period 5 s plus nudge; `logSystemEvent` nudges, `prepareSystemEventLogEntry` does not.
+- Poll period 15 s (decided by the user) plus the commit nudge.
 - Tail count 10, tail target = full target / 10.
 - Tails migrate to a new allocator at the next compaction.
 - `Event.describe` added for display.

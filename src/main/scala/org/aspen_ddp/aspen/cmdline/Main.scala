@@ -9,6 +9,7 @@ import org.aspen_ddp.aspen.client.internal.SimpleAspenClient
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
 import org.aspen_ddp.aspen.client.*
+import org.aspen_ddp.aspen.common.eventlog.{Event, EventLogEntry, EventLogReader}
 import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.common.config.{BootstrapConfig, ClientConfig}
@@ -141,6 +142,12 @@ object Main {
                   diskGroupName:String="",
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None,
+                  eventSince:Option[HLCTimestamp]=None,
+                  eventUntil:Option[HLCTimestamp]=None,
+                  eventType:Option[UUID]=None,
+                  eventLimit:Option[Int]=None,
+                  observerFactory:String="",
+                  observerConfigFile:Option[os.Path]=None,
                   networkCacheDir:Option[os.Path]=None,
                   loadJars:Option[String]=None,
                   storeThreads:Option[Int]=None,
@@ -873,6 +880,47 @@ object Main {
         action((x, c) => c.copy(rebalancePeriodUnit = Some(x))),
     )
 
+  private def eventLogArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      clientConfigArg(p),
+      bootstrapHostOption(p),
+
+      opt[String]("since").valueName("<time>").
+        text("Earliest entry to show, an ISO-8601 instant such as 2026-11-27T20:14:03Z").
+        validate(x => parseEventTime(x).map(_ => ())).
+        action((x, c) => c.copy(eventSince = parseEventTime(x).toOption.map(eventTimeToHLC))),
+
+      opt[String]("until").valueName("<time>").
+        text("Latest entry to show, an ISO-8601 instant such as 2026-11-27T20:14:03Z").
+        validate(x => parseEventTime(x).map(_ => ())).
+        action((x, c) => c.copy(eventUntil = parseEventTime(x).toOption.map(eventTimeToHLCUpperBound))),
+
+      opt[String]("type").valueName("<uuid>").text("Show only entries of this event type").
+        validate(validateUUID("Event type must be a valid UUID")).
+        action((x, c) => c.copy(eventType = Some(UUID.fromString(x)))),
+
+      opt[Int]("limit").valueName("<N>").text("Show at most N entries").
+        validate(x => if x > 0 then success else failure("--limit must be positive")).
+        action((x, c) => c.copy(eventLimit = Some(x))),
+    )
+
+  private def eventLogObserverArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      clientConfigArg(p),
+      bootstrapHostOption(p),
+
+      arg[String]("<factory-uuid>").text("UUID of the EventObserverFactory type").
+        action((x, c) => c.copy(observerFactory = x)).
+        validate(validateUUID("Observer factory id must be a valid UUID")),
+
+      opt[os.Path]("config-file").valueName("<path>").
+        text("File holding the observer's configuration bytes (default: empty)").
+        validate(x => if os.isFile(x) then success else failure(s"Config file does not exist: $x")).
+        action((x, c) => c.copy(observerConfigFile = Some(x))),
+    )
+
   private def migratePoolArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
@@ -960,6 +1008,10 @@ object Main {
     Command("accept-rebuild-loss", "Lets a store's rebuild finish without the objects its pool cannot supply, recording each in the ErrorTree", acceptRebuildLossArgs),
     Command("rebalance", "Rebalances a level-0 storage device set", rebalanceArgs),
     Command("system-rebalance-period", "Displays or sets the automatic rebalancing period", systemRebalancePeriodArgs),
+    Command("event-log", "Displays the system event log", eventLogArgs),
+    Command("event-log-observers", "Lists the system event log's observers", configOnlyArgs),
+    Command("event-log-add-observer", "Adds an observer to the system event log", eventLogObserverArgs),
+    Command("event-log-remove-observer", "Removes an observer from the system event log", eventLogObserverArgs),
     Command("migrate-pool", "Migrates a storage pool to a different storage device set", migratePoolArgs),
     Command("list-pools", "Lists all storage pools", configOnlyArgs),
     Command("list-hosts", "Lists all hosts", configOnlyArgs),
@@ -1127,6 +1179,12 @@ object Main {
             case "rebalance" => rebalance(session, cfg.setId)
             case "system-rebalance-period" =>
               systemRebalancePeriod(session, cfg.rebalancePeriod, cfg.rebalancePeriodUnit)
+            case "event-log" => event_log(session, cfg.eventSince, cfg.eventUntil, cfg.eventType, cfg.eventLimit)
+            case "event-log-observers" => event_log_observers(session)
+            case "event-log-add-observer" =>
+              event_log_observer_change(session, cfg.observerFactory, cfg.observerConfigFile, add = true)
+            case "event-log-remove-observer" =>
+              event_log_observer_change(session, cfg.observerFactory, cfg.observerConfigFile, add = false)
             case "migrate-pool" => migrate_pool(session, cfg.poolName, cfg.deviceSetName)
             case "list-pools"             => list_entries(session, "Storage Pools",     _.listStoragePools(),      _.uuid)
             case "list-hosts"             => list_entries(session, "Hosts",             _.listHosts(),             _.uuid)
@@ -2690,6 +2748,100 @@ object Main {
         println(s"Rebalance enrolled for storage device set $setIdStr")
       case Failure(err) =>
         println(s"Rebalance failed to enroll: ${err.getMessage}")
+
+  private val EventTimeFormat: java.time.format.DateTimeFormatter =
+    java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(java.time.ZoneOffset.UTC)
+
+  /** An ISO-8601 instant given to --since or --until */
+  private[cmdline] def parseEventTime(s: String): Either[String, java.time.Instant] =
+    try Right(java.time.Instant.parse(s))
+    catch
+      case _: java.time.format.DateTimeParseException =>
+        Left(s"'$s' is not an ISO-8601 instant such as 2026-11-27T20:14:03Z")
+
+  /** The smallest HLC timestamp of the instant's millisecond */
+  private[cmdline] def eventTimeToHLC(t: java.time.Instant): HLCTimestamp =
+    HLCTimestamp(t.toEpochMilli << 16)
+
+  /** The largest HLC timestamp of the instant's millisecond, so that an inclusive upper bound covers all of it */
+  private[cmdline] def eventTimeToHLCUpperBound(t: java.time.Instant): HLCTimestamp =
+    HLCTimestamp((t.toEpochMilli << 16) | 0xFFFFL)
+
+  /** The event log line of `e`: instant, type name (or UUID), description. `decoded` is None when the type has no
+   *  registered EventFactory, `name` None when it has no registered factory name. */
+  private[cmdline] def formatEventLine(e: EventLogEntry, decoded: Option[Event], name: Option[String]): String =
+    val when = EventTimeFormat.format(java.time.Instant.ofEpochMilli(e.timestamp.wallTime))
+    decoded match
+      case None => s"$when  ${e.typeUUID} (no factory, ${e.data.length} bytes)"
+      case Some(ev) =>
+        val d = ev.describe
+        s"$when  ${name.getOrElse(e.typeUUID.toString)}  ${if d.isEmpty then s"${e.data.length} bytes" else d}"
+
+  /** Prints the system event log. The type filter is applied here, so the limit is applied after it. */
+  def event_log(session: ClientSession,
+                since: Option[HLCTimestamp],
+                until: Option[HLCTimestamp],
+                eventType: Option[UUID],
+                limit: Option[Int]): Int =
+    configureLogging()
+
+    val (client, network, radicle) = createAspenClient(session)
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    val from = since.getOrElse(EventLogReader.Earliest)
+    val f = eventType match
+      case None => client.readSystemEvents(from, until, limit)
+      case Some(t) =>
+        client.readSystemEvents(from, until, None).map: entries =>
+          val matching = entries.filter(_.typeUUID == t)
+          limit.fold(matching)(matching.take)
+
+    awaitAndReport(f):
+      case Success(entries) =>
+        entries.foreach: e =>
+          val name = client.typeRegistry.getType[RegisteredTypeFactory](e.typeUUID)
+            .map(_.getClass.getSimpleName.stripSuffix("$"))
+          println(formatEventLine(e, client.decodeSystemEvent(e), name))
+      case Failure(err) =>
+        println(s"Could not read the event log: ${err.getMessage}")
+
+  def event_log_observers(session: ClientSession): Int =
+    configureLogging()
+
+    val (client, network, radicle) = createAspenClient(session)
+    network.startIoThread(client)
+
+    awaitAndReport(client.listSystemEventObservers()):
+      case Success(observers) =>
+        if observers.isEmpty then
+          println("No event log observers")
+        else
+          observers.foreach(o => println(s"${o.factoryType}  config: ${o.config.length} bytes"))
+      case Failure(err) =>
+        println(s"Could not list the event log observers: ${err.getMessage}")
+
+  def event_log_observer_change(session: ClientSession,
+                                factoryStr: String,
+                                configFile: Option[os.Path],
+                                add: Boolean): Int =
+    configureLogging()
+
+    val (client, network, radicle) = createAspenClient(session)
+    network.startIoThread(client)
+
+    val factory = UUID.fromString(factoryStr)
+    val config = configFile.map(os.read.bytes).getOrElse(Array.empty[Byte])
+
+    val f = if add then client.addSystemEventObserver(factory, config)
+            else client.removeSystemEventObserver(factory, config)
+
+    awaitAndReport(f):
+      case Success(_) =>
+        println(s"Event log observer $factory ${if add then "added" else "removed"}")
+      case Failure(err) =>
+        println(s"Could not ${if add then "add" else "remove"} the event log observer: ${err.getMessage}")
 
   /** Display the automatic rebalancing period, or set it. checkConfig has already rejected a
    *  malformed period, so the Left branch here is belt and braces. */

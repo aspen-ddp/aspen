@@ -287,6 +287,59 @@ class MainSuite extends AnyFunSuite with Matchers:
       Console.withErr(OutputStream.nullOutputStream()):
         Main.buildParser.parse(Seq(cmd, cfgs) ++ args, Main.Args())
 
+  test("event-log parses its options as HLC bounds, a type and a limit"):
+    val bare = parseCmd("event-log").getOrElse(fail("event-log did not parse"))
+    bare.mode shouldBe "event-log"
+    bare.eventSince shouldBe None
+    val a = parseCmd("event-log", "--since", "2026-11-27T20:14:03.112Z", "--until", "2026-11-27T20:15:00Z",
+      "--type", "367b01ad-b822-4827-8603-97fb0308abd6", "--limit", "5").getOrElse(fail("options did not parse"))
+    val since = java.time.Instant.parse("2026-11-27T20:14:03.112Z").toEpochMilli
+    a.eventSince shouldBe Some(HLCTimestamp(since << 16))
+    a.eventUntil shouldBe Some(HLCTimestamp((java.time.Instant.parse("2026-11-27T20:15:00Z").toEpochMilli << 16) | 0xFFFFL))
+    a.eventType shouldBe Some(UUID.fromString("367b01ad-b822-4827-8603-97fb0308abd6"))
+    a.eventLimit shouldBe Some(5)
+    parseCmd("event-log", "--since", "yesterday") shouldBe None
+    parseCmd("event-log", "--until", "2026-11-27") shouldBe None
+    parseCmd("event-log", "--type", "not-a-uuid") shouldBe None
+    parseCmd("event-log", "--limit", "0") shouldBe None
+
+  test("event-log-observers and the add/remove commands parse their arguments"):
+    parseCmd("event-log-observers").map(_.mode) shouldBe Some("event-log-observers")
+    val id = "367b01ad-b822-4827-8603-97fb0308abd6"
+    withTempDir("observer-config"): dir =>
+      val cfg = emptyFile(dir / "observer.cfg")
+      for cmd <- Seq("event-log-add-observer", "event-log-remove-observer") do
+        val a = parseCmd(cmd, id).getOrElse(fail(s"$cmd did not parse"))
+        a.observerFactory shouldBe id
+        a.observerConfigFile shouldBe None
+        parseCmd(cmd, id, "--config-file", cfg).flatMap(_.observerConfigFile) shouldBe Some(os.Path(cfg))
+        parseCmd(cmd, "not-a-uuid") shouldBe None
+        parseCmd(cmd) shouldBe None
+        parseCmd(cmd, id, "--config-file", (dir / "missing").toString) shouldBe None
+
+  test("formatEventLine matches the documented sample format"):
+    import org.aspen_ddp.aspen.common.eventlog.{DropReason, DroppedEvent, Event, EventLogEntry}
+    val ts = HLCTimestamp(java.time.Instant.parse("2026-11-27T20:14:05.870Z").toEpochMilli << 16)
+    val dropped = DroppedEvent(ts, UUID.fromString("c3d4c3d4-0000-0000-0000-000000000000"),
+      DropReason.ExceededMaximumLogEntrySize)
+    val droppedEntry = DroppedEvent.entryFor(EventLogEntry(ts, dropped.droppedType, Array.empty),
+      DropReason.ExceededMaximumLogEntrySize)
+    Main.formatEventLine(droppedEntry, Some(dropped), Some("DroppedEvent")) shouldBe
+      "2026-11-27T20:14:05.870Z  DroppedEvent  type=c3d4c3d4-0000-0000-0000-000000000000 " +
+        "reason=exceeded maximum log entry size"
+
+    val typeId = UUID.fromString("a1b2a1b2-0000-0000-0000-000000000000")
+    val plain = new Event:
+      def timestamp = ts
+      def typeUUID = typeId
+    val entry = EventLogEntry(ts, typeId, new Array[Byte](7))
+    Main.formatEventLine(entry, Some(plain), Some("Thing")) shouldBe "2026-11-27T20:14:05.870Z  Thing  7 bytes"
+    Main.formatEventLine(entry, Some(plain), None) shouldBe s"2026-11-27T20:14:05.870Z  $typeId  7 bytes"
+
+    val unknown = EventLogEntry(HLCTimestamp(java.time.Instant.parse("2026-11-27T20:14:06.001Z").toEpochMilli << 16),
+      typeId, new Array[Byte](312))
+    Main.formatEventLine(unknown, None, None) shouldBe s"2026-11-27T20:14:06.001Z  $typeId (no factory, 312 bytes)"
+
   test("create-disk requires --group and no longer takes --pool"):
     val group = parseCmd("create-disk", "d", "1G", "--group", "g").getOrElse(fail("--group did not parse"))
     group.diskName shouldBe "d"

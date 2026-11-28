@@ -892,3 +892,10 @@ message DroppedEventData {
   UUID dropped_type = 1;
   DropReason reason = 2;
 }
+
+// One record inside a zstd frame of a log object; frames hold length-delimited LoggedRecords
+message LoggedRecord {
+  fixed64 timestamp = 1;
+  uint32 type_id = 2;
+  bytes data = 3;
+}
